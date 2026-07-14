@@ -340,6 +340,10 @@ fn serve_roster_over_http(body: Vec<u8>) -> (String, Arc<AtomicBool>, std::threa
         while !stop_thread.load(Ordering::Relaxed) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    // On BSD/macOS the accepted socket INHERITS the listener's O_NONBLOCK (Linux
+                    // does not) — undo it, or the header loop below breaks instantly on WouldBlock
+                    // and answers before the request has arrived (the surviving macOS CI flake).
+                    let _ = stream.set_nonblocking(false);
                     // Read to END-OF-HEADERS, not just one read: a GET can arrive split across TCP
                     // segments, and responding + dropping with unread request bytes still buffered
                     // makes the close an RST that can destroy the in-flight response (the macOS CI
@@ -366,10 +370,15 @@ fn serve_roster_over_http(body: Vec<u8>) -> (String, Arc<AtomicBool>, std::threa
                     let _ = stream.write_all(header.as_bytes());
                     let _ = stream.write_all(&body);
                     let _ = stream.flush();
-                    // Half-close, then drain until the peer closes: no unread bytes may remain at
-                    // drop, so the final close is a FIN (never a response-killing RST).
+                    // Half-close, then drain until the peer closes (FIN) or the 2s timeout: no
+                    // unread bytes may remain at drop, so the final close is a FIN (never a
+                    // response-killing RST).
                     let _ = stream.shutdown(std::net::Shutdown::Write);
-                    let _ = stream.read(&mut buf);
+                    while let Ok(n) = stream.read(&mut buf) {
+                        if n == 0 {
+                            break;
+                        }
+                    }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(5));
@@ -379,6 +388,51 @@ fn serve_roster_over_http(body: Vec<u8>) -> (String, Arc<AtomicBool>, std::threa
         }
     });
     (format!("http://127.0.0.1:{port}/roster.json"), stop, handle)
+}
+
+/// The stub itself must tolerate a SLOW client — connect first, request later, split across
+/// writes. On BSD/macOS an accepted socket INHERITS the listener's O_NONBLOCK (unlike Linux),
+/// so without an explicit `set_nonblocking(false)` the header read-loop exits instantly on
+/// WouldBlock, the stub answers before the request arrived, the drain is a no-op, and the
+/// late request bytes turn the close into a response-killing RST — the macOS-only CI flake
+/// that survived the read-to-end-of-headers deflake.
+#[tokio::test]
+async fn the_roster_http_stub_survives_a_slow_split_request() {
+    let (url, stop, handle) = serve_roster_over_http(b"{\"ok\":true}".to_vec());
+    let port: u16 = url
+        .rsplit(':')
+        .next()
+        .unwrap()
+        .split('/')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let body = tokio::task::spawn_blocking(move || {
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect stub");
+        // Dawdle after connecting, then send the GET in two halves — the accept-to-first-byte
+        // and mid-headers gaps a loaded CI runner produces.
+        std::thread::sleep(Duration::from_millis(150));
+        s.write_all(b"GET /roster.json HTTP/1.1\r\nHost: 127.0.0.1\r\n")
+            .unwrap();
+        s.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        s.write_all(b"Connection: close\r\n\r\n").unwrap();
+        s.flush().unwrap();
+        let mut resp = Vec::new();
+        s.read_to_end(&mut resp)
+            .expect("read full response (no RST)");
+        resp
+    })
+    .await
+    .unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.starts_with("HTTP/1.1 200 OK") && text.ends_with("{\"ok\":true}"),
+        "slow split request must still get the complete response, got: {text:?}"
+    );
+    stop.store(true, Ordering::Relaxed);
+    let _ = handle.join();
 }
 
 /// **The M3c URL-poll convergence (spec §4.3 HTTPS fallback).** Node B is roster-mode at serial 1
