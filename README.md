@@ -157,8 +157,7 @@ fingerprint confirmations that make it safe) is in the
 | `mcpmesh-codec` | The one NDJSON frame codec both ends of every wire share |
 | `mcpmesh-local-api` | The local control API (`mcpmesh-local/1`) clients and plugins build on |
 
-Design notes, wire protocol, and the threat model (P1–P14) live in the
-design spec (internal; publication planned — the `spec §` citations in code refer to it). Identity is self-sovereign:
+Identity is self-sovereign:
 devices hold keys that never leave the machine, people are verified device→user bindings, and
 names you see are petnames *you* chose. By default connections bootstrap via iroh's public relays;
 `relay_mode = "custom"` / `discovery_mode = "custom"` in the config let you self-host both, and
