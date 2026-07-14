@@ -23,7 +23,8 @@ hand-edited, and no key ever moves between machines.
 **Homebrew (macOS/Linux):**
 
 ```
-brew install --HEAD --build-from-source packaging/homebrew/mcpmesh.rb
+brew tap counterpunchtech/mcpmesh https://github.com/counterpunchtech/mcpmesh
+brew install --HEAD counterpunchtech/mcpmesh/mcpmesh
 # after the first tagged release, simply: brew install mcpmesh
 ```
 

@@ -15,7 +15,8 @@ Two people, two machines. Alice will share an MCP server with Bob; then Bob will
 Install on both machines first (macOS/Linux):
 
 ```sh
-brew install --HEAD --build-from-source packaging/homebrew/mcpmesh.rb
+brew tap counterpunchtech/mcpmesh https://github.com/counterpunchtech/mcpmesh
+brew install --HEAD counterpunchtech/mcpmesh/mcpmesh
 # or, from source:  cargo install --path cli
 ```
 

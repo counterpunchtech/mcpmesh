@@ -5,7 +5,8 @@
 # (the release runbook step) so `brew install mcpmesh` (no `--HEAD`) works from the tarball.
 #
 # NOT a CI blocker: `brew install` cannot run end-to-end in CI. Validation here is `ruby -c` (syntax);
-# a real `brew install --HEAD --build-from-source packaging/homebrew/mcpmesh.rb` is a runbook step.
+# a real tap + `brew install --HEAD counterpunchtech/mcpmesh/mcpmesh` is a runbook step (the repo
+# doubles as its own tap: this formula lives at Formula/mcpmesh.rb).
 class Mcpmesh < Formula
   desc "Peer-to-peer MCP transport — serve and mount MCP servers across machines"
   homepage "https://runbolo.com"
