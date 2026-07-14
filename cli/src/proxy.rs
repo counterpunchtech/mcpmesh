@@ -69,8 +69,11 @@ pub async fn run(peer: String, service: String) -> Result<()> {
 /// Bidirectionally pump MCP frames between the AI client's stdio and the control connection
 /// (one codec everywhere, D6). Generic over the four byte substrates so an in-memory variant
 /// is testable without a subprocess. The two directions run as independent concurrent loops —
-/// the same anti-deadlock discipline as the backends' pump — and the first EOF/close in
-/// either direction tears the session down (clean EOF on remote close, spec §8).
+/// the same anti-deadlock discipline as the backends' pump. Teardown is driven by the CONTROL
+/// side closing (clean EOF on remote close, spec §8); the stdin direction ending only
+/// half-closes toward the daemon and then drains, because a synthesized -32055 can already be
+/// buffered on the control socket when the stdin->control write hits the dead pipe — the AI
+/// client must still be handed that well-formed answer, not a bare EOF (§8).
 pub(crate) async fn pump_stdio<SI, SO, CR, CW>(
     stdin: SI,
     mut stdout: SO,
@@ -98,6 +101,11 @@ where
                 Ok(None) | Err(_) => break, // stdin EOF / IO error → the AI client is done
             }
         }
+        // Half-close toward the daemon (it tears the session down and closes in turn), then
+        // park forever: this direction must never win the select! below, so the control ->
+        // stdout drain always runs to control EOF.
+        let _ = control_writer.shutdown().await;
+        std::future::pending::<()>().await
     };
     // control (the daemon's session pipe) -> stdout (AI client). Relays session responses AND
     // a synthesized -32055/-32054 error frame verbatim (spec §8).
@@ -203,11 +211,67 @@ mod tests {
                 other => panic!("expected a frame, got {other:?}"),
             }
 
-            // Closing stdin ends the pump (clean EOF, §8).
+            // Closing stdin half-closes toward the daemon (the daemon end reads EOF)…
             drop(a_in);
+            assert!(
+                daemon_reader.next().await.unwrap().is_none(),
+                "stdin close must propagate to the daemon as a half-close"
+            );
+            // …and the daemon closing in turn ends the pump (clean EOF, §8).
+            drop(daemon_reader);
+            drop(dc_w);
             pump.await.unwrap().unwrap();
         })
         .await
         .expect("pump test timed out");
+    }
+
+    /// The unreachable race (spec §8): the daemon can synthesize a -32055 and close the
+    /// control connection BEFORE the pump is first polled, while the AI client's initialize
+    /// is already sitting in stdin. The stdin->control direction then breaks on a dead pipe —
+    /// and the pump must still drain the buffered error frame to stdout rather than tear the
+    /// session down around it. Looped because the pre-fix loss was a scheduling coin flip
+    /// (select! polls branches in random order).
+    #[tokio::test]
+    async fn buffered_error_frame_survives_a_dead_control_writer() {
+        timeout(Duration::from_secs(10), async {
+            for _ in 0..50 {
+                let (mut a_in, b_in) = duplex(64 * 1024);
+                let (a_out, b_out) = duplex(64 * 1024);
+                let (pc, dc) = duplex(64 * 1024);
+                let (pc_r, pc_w) = split(pc);
+                let (dc_r, mut dc_w) = split(dc);
+
+                // The daemon: -32055 synthesized and connection closed, all pre-pump.
+                let err = json!({"jsonrpc":"2.0","id":null,"error":{"code":-32055,"message":"peer unreachable","data":{"source":"mcpmesh"}}});
+                write_frame(&mut dc_w, &err).await.unwrap();
+                drop(dc_w);
+                drop(dc_r);
+
+                // The AI client: initialize already buffered in stdin when the pump starts.
+                let init = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}});
+                write_frame(&mut a_in, &init).await.unwrap();
+
+                let pump = tokio::spawn(pump_stdio(
+                    b_in,
+                    b_out,
+                    FrameReader::new(pc_r, MAX_FRAME_BYTES),
+                    pc_w,
+                ));
+
+                let mut a_out_reader = FrameReader::new(a_out, MAX_FRAME_BYTES);
+                match a_out_reader.next().await.unwrap() {
+                    Some(Inbound::Frame(f)) => assert_eq!(
+                        f["error"]["code"], -32055,
+                        "the buffered -32055 must reach stdout: {f}"
+                    ),
+                    other => panic!("the -32055 must reach stdout, got {other:?}"),
+                }
+                drop(a_in);
+                pump.await.unwrap().unwrap();
+            }
+        })
+        .await
+        .expect("drain test timed out");
     }
 }
