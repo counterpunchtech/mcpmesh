@@ -3,11 +3,14 @@
 **Share MCP servers with people you trust — peer to peer, no accounts, no cloud in the trust path.**
 
 Your AI client (Claude Desktop, or anything that speaks [MCP](https://modelcontextprotocol.io))
-can only use tools running on *your* machine. mcpmesh removes that wall: a friend or teammate can
-serve an MCP server from their machine, and your AI client mounts it as if it were local. Traffic
-flows over an end-to-end-encrypted peer-to-peer connection ([iroh](https://iroh.computer)/QUIC,
-with NAT hole-punching); nothing is shared unless its owner explicitly grants it, and every grant
-names exactly who gets access. Default-deny, always.
+can use tools running on your machine, or hosted MCP services someone operates for the public.
+What it can't do is reach the MCP server running on your friend's laptop — sharing a tool today
+means *running a service*: a public endpoint, TLS, OAuth, uptime. mcpmesh removes that wall: a
+friend or teammate serves an MCP server from their machine, and your AI client mounts it as if it
+were local — no hosting, no accounts, nothing published. Traffic flows over an end-to-end-encrypted
+peer-to-peer connection ([iroh](https://iroh.computer)/QUIC, with NAT hole-punching); nothing is
+shared unless its owner explicitly grants it, and every grant names exactly who gets access.
+Default-deny, always.
 
 ## The full walkthrough: Alice and Bob
 
