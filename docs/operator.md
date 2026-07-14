@@ -20,12 +20,17 @@ hand-edited, and no key ever moves between machines.
 
 ## 0. Install
 
+**crates.io (any platform with a Rust toolchain) — the simplest path:**
+
+```
+cargo install mcpmesh
+```
+
 **Homebrew (macOS/Linux):**
 
 ```
 brew tap counterpunchtech/mcpmesh https://github.com/counterpunchtech/mcpmesh
 brew install --HEAD counterpunchtech/mcpmesh/mcpmesh
-# after the first tagged release, simply: brew install mcpmesh
 ```
 
 **Debian/Ubuntu (.deb):**
