@@ -1,0 +1,35 @@
+[package]
+name = "mcpmesh-local-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "mcpmesh local control plane: UDS client/service seam and the shared *-local/1 vocabulary"
+
+[lints]
+workspace = true
+
+[features]
+# Types-only by default. `client` adds the tokio-backed UnixStream ControlClient + the
+# family NDJSON codec (re-exported from mcpmesh-codec — one implementation, both wire
+# ends). Deliberately NOT depending on mcpmesh-net (iroh), so kb and the host can link it
+# under host §7.1.
+client = ["dep:tokio", "dep:mcpmesh-codec"]
+# `service` is the plugin-daemon seam (kb, loc, …): UDS bind + peer-uid gate, the ONE
+# audience-authz expansion, [services.*] self-registration, and the *-local/1 JSON-RPC
+# conventions. Builds ON `client` (registration dials the control socket); adds rustix
+# (geteuid) + tracing (registration/gate diagnostics). Still no iroh — host §7.1 holds.
+service = ["client", "dep:rustix", "dep:tracing"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, optional = true }
+mcpmesh-codec = { workspace = true, optional = true }
+rustix = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = { workspace = true }

@@ -1,0 +1,126 @@
+[package]
+name = "mcpmesh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+readme = "../README.md"
+description = "Share MCP servers with people you trust — peer to peer, default-deny, no accounts"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "mcpmesh"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+clap.workspace = true
+figment.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+# `process` is added cli-local (the workspace tokio omits it — Task 3 detaches the
+# daemon via std::process): the `run` backend (Task 7) spawns a child MCP server per
+# session via tokio::process::Command with async stdin/stdout handles. No new crate.
+tokio = { workspace = true, features = ["process"] }
+tracing.workspace = true
+mcpmesh-trust.workspace = true
+mcpmesh-net.workspace = true
+# `service` (implies `client`): the daemon consumes the seam's ONE hardened UDS rule
+# (`ensure_private_dir`/`bind_uds` — symlink-refused 0700 owned dir, 0600 socket) for its own
+# control socket, and the porcelain client wraps the seam's no-iroh ControlClient (D5) —
+# adding daemon auto-start on top rather than re-implementing the wire.
+mcpmesh-local-api = { workspace = true, features = ["service"] }
+# Org-root VerifyingKey for roster install/load + the `org_root_pk` b64u decode (M3a Task 4).
+# Same crate mcpmesh-trust already pins (workspace `ed25519-dalek` 2, already in the lock via
+# trust/iroh) → a dependency edge only, NO new crate version, no deny.toml change.
+ed25519-dalek.workspace = true
+# Our own uid for the runtime-dir ownership + peer-uid checks (spec §11.2/§13), plus the
+# `fs::flock` single-daemon lock (Task 3). Already in the tree via iroh; SAFE wrappers (no
+# inline unsafe → satisfies forbid(unsafe)). Peer uid itself comes from tokio's
+# UnixStream::peer_cred() — no `nix` crate needed.
+rustix = { version = "1", features = ["process", "fs"] }
+# state.redb — the pure-Rust embedded KV the spec pins for the peer allowlist store
+# (§15). MIT OR Apache-2.0 (already in deny.toml allow); no C deps.
+redb = "2"
+# Surgical config.toml writes for `serve`/RegisterService (Task 9): read the doc as a
+# `toml::Table`, upsert the `[services.*]` entry, atomic-write back. Already in the tree via
+# figment (toml 0.8.x); the `display` (serialization) feature is default → no new crate.
+toml = "0.8"
+# base32 line-encoding for the `mcpmesh-invite:` artifact (Task 2). Already in the tree via
+# iroh (iroh-base pulls data-encoding 2.11); MIT (already in deny.toml allow) → no new
+# crate in the lock, no deny.toml change.
+data-encoding = "2"
+# blake3 transcript hash for the pairing short authentication code (Task 3, spec §4.2).
+# Already in the tree via iroh/redb (blake3 1.8.5 in the lock) → adding it as a direct dep
+# is a new dependency edge only, NO new crate version. License is `CC0-1.0 OR Apache-2.0 OR
+# Apache-2.0 WITH LLVM-exception` (all already in deny.toml allow) → no deny.toml change.
+blake3 = "1"
+# OS CSPRNG for the 32-byte pairing invite secret (Task 5, spec §4.2). Same source M0's
+# device-key mint uses (`rand::rngs::OsRng`, mcpmesh-trust) — the workspace `rand` 0.8 dep,
+# already in the lock via ed25519-dalek → a dependency edge only, NO new crate version.
+rand.workspace = true
+iroh.workspace = true
+# Roster + presence gossip topics (spec §4.3/§10.1). iroh-gossip 0.101.0 depends on iroh "1"
+# → unifies on the workspace-pinned iroh =1.0.1, NO iroh bump. Network wrappers land in T2/T3;
+# T1 uses only the pure blake3 topic derivation. New crate versions in the lock (see M3c T1).
+iroh-gossip = { workspace = true }
+# Roster-blob fetch only (spec §4.3/§9). iroh-blobs 0.103.0 depends on iroh ^1.0.0 → unifies on
+# =1.0.1, NO iroh bump. Keeps its default fs-store+rpc features (bao-tree/irpc/reflink-copy +
+# rpc machinery are the new transitives). MIT/Apache-2.0 (already in deny.toml allow).
+iroh-blobs = { workspace = true }
+# HTTPS roster poll (spec §4.3), rustls-tls (no OpenSSL). reqwest 0.13.4 is ALREADY in the lock
+# transitively via iroh → adds ZERO new crate version, a dependency edge only.
+reqwest = { workspace = true }
+# The rustls CryptoProvider install (M3c T7). reqwest 0.13.4 (`rustls-no-provider`) resolves the
+# provider via `CryptoProvider::get_default()` at client-build time and PANICS if none is installed;
+# iroh 1.0.1 passes ring per-endpoint and installs NO process-default. So `daemon::serve_forever`
+# installs a ring process-default provider ONCE before building any reqwest client (`ring` feature,
+# NOT the aws-lc-rs default → no aws-lc-sys/OpenSSL). rustls 0.23.41 is ALREADY in the lock via iroh
+# (tls-ring) → a dependency edge only, ZERO new crate version; `default-features = false` keeps the
+# aws-lc-rs default OUT.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# The gossip broadcast/receive payload type (`Bytes`) + the `StreamExt::next` the GossipReceiver
+# stream yields (T2). Both already in the lock via iroh/iroh-gossip → dependency edges only, NO new
+# crate version. Not re-exported nameably by iroh-gossip, so direct deps ([RECONCILE-GOSSIP-API]).
+bytes = { workspace = true }
+n0-future = { workspace = true }
+# Custom-discovery pkarr relay URLs (spec §10.3, `[network] discovery_urls`): iroh's
+# `PkarrPublisher/Resolver::builder(url::Url)` take the `url` type directly. Already in the
+# lock via iroh/reqwest → a dependency edge only, NO new crate version.
+url = { workspace = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+assert_cmd.workspace = true
+# Log-capture for the pairing-rendezvous surface-discipline test (Task 5): assert no peer
+# EndpointId leaks into a refusal's logs. Already in the lock via iroh (0.3.x) → a dev-only
+# dependency edge, NO new crate version, no deny.toml change.
+tracing-subscriber = "0.3"
+# The `tests/*.rs` integration crate is separate from the package: it sees the `mcpmesh` lib
+# + dev-deps only, so tokio (for `#[tokio::test]`) and serde_json must be listed here too.
+tokio.workspace = true
+serde_json.workspace = true
+
+# Debian packaging (spec §16 M4). `cargo-deb` reads this declarative table — no debian/{control,rules}
+# shell. Build with `cargo install cargo-deb && cargo deb -p mcpmesh` (a runbook step; cargo-deb is NOT a
+# CI dependency, so this is validated only for TOML/parse correctness via `cargo metadata`). The
+# operator runbook (docs/operator.md) is shipped separately; keep assets to the binary here to
+# avoid a build-order dependency on files generated elsewhere.
+[package.metadata.deb]
+maintainer = "Bolo <security@runbolo.com>"
+copyright = "2026, Bolo contributors"
+extended-description = """\
+Peer-to-peer MCP transport: serve local MCP servers to allowlisted peers and mount remote peers' \
+services through a local stdio proxy, over an end-to-end-encrypted iroh mesh. See `mcpmesh doctor` for \
+a local health check and docs/operator.md for the operator runbook."""
+section = "net"
+priority = "optional"
+depends = "$auto"
+assets = [
+    ["target/release/mcpmesh", "usr/bin/", "755"],
+]

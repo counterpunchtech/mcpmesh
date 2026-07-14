@@ -1,0 +1,26 @@
+[package]
+name = "mcpmesh-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "mcpmesh session transport: identity-scoped MCP services served and dialed over iroh/QUIC"
+
+[lints]
+workspace = true
+
+[dependencies]
+iroh.workspace = true
+rmcp.workspace = true
+tokio.workspace = true
+mcpmesh-codec.workspace = true  # the family codec — ONE implementation, both wire ends (§7.3)
+# DEFAULT-FEATURES ONLY (types-level: serde/serde_json, no tokio/rustix/iroh): the ONE §5
+# principal-set expansion (`principal_set`) lives on local-api's dependency-free vocabulary
+# surface so the mesh allow check, the plugin seam, and the blob gate can never drift (D1).
+mcpmesh-local-api.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+anyhow.workspace = true  # SessionBackend::run + serve/connect return anyhow::Result (endpoint.rs)

@@ -1,0 +1,529 @@
+//! The shared plugin-platform seam (`service` feature): everything a plugin daemon
+//! (kb, loc, …) needs to face the platform, extracted from the kb/loc byte-duplicates so
+//! each rule has ONE home:
+//!
+//! - §1 UDS faces: [`ensure_private_dir`] + [`bind_uds`] + [`check_peer_uid`] (0700
+//!   symlink-refused owned runtime dir, 0600 socket, same-uid gate). The mcpmesh daemon's
+//!   own control socket (`cli/src/ipc.rs`) binds through the SAME rule.
+//! - §2 THE audience-authz expansion: [`peer_audiences`] — `groups ∪ {name} ∪ {user_id}`,
+//!   default-deny. The single implementation both kb and loc gate on.
+//! - §3 `[services.*]` self-registration: [`register_service`] (empty allowlist; failures
+//!   logged, never silently swallowed).
+//! - §4 the control-socket sibling rule: [`mcpmesh_control_socket_from`].
+//! - §5 `*-local/1` JSON-RPC conventions: [`ok`]/[`err`]/[`reply`]/[`internal`], the strict
+//!   [`required_string_array`] param parse, and [`people_from_status`].
+//! - §6 the `*-local/1` Hello first frame: [`send_hello`].
+//!
+//! Deliberately NOT extracted (KISS until a third plugin proves the abstraction): state
+//! models, Paths structs, tool dispatch/specs, fan-out policy, and each plugin's MCP
+//! session skeleton in `remote.rs`.
+use std::io;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+
+use serde_json::{Value, json};
+use tokio::io::AsyncWrite;
+use tokio::net::{UnixListener, UnixStream};
+
+use crate::client::{ClientError, connect_control};
+use crate::codec::write_frame;
+use crate::protocol::{BackendSpec, Hello, Request};
+
+// ---------------------------------------------------------------------------------------
+// §1 UDS faces
+// ---------------------------------------------------------------------------------------
+
+/// Create + security-check a private runtime dir (mcpmesh §13 — ONE hardened rule for every
+/// UDS face in the family; the daemon control socket and the plugin seam both bind through
+/// it): `create_dir_all`, refuse a symlink, chmod 0700, verify we own it. Idempotent.
+///
+/// The checks are load-bearing, not decorative: `create_dir_all` is a no-op when the dir
+/// already exists, so a pre-existing dir planted by another user — or a symlink redirecting
+/// to one we own (or one we don't) — must be refused before we trust it to hold a socket.
+/// `symlink_metadata` does not follow the link, and it runs BEFORE the chmod so a planted
+/// symlink can never make us chmod its target.
+pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::create_dir_all(dir)?;
+    let is_symlink = std::fs::symlink_metadata(dir)?.file_type().is_symlink();
+    if is_symlink {
+        return Err(io::Error::other(format!(
+            "runtime dir {} is a symlink; refusing",
+            dir.display()
+        )));
+    }
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    let meta = std::fs::metadata(dir)?;
+    if meta.uid() != rustix::process::geteuid().as_raw() {
+        return Err(io::Error::other(format!(
+            "runtime dir {} is not owned by us",
+            dir.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Bind a listener at `path`: harden the parent runtime dir ([`ensure_private_dir`] —
+/// create, refuse-symlink, chmod 0700, verify ownership), remove any stale socket, bind,
+/// and chmod the socket 0600.
+///
+/// §hardening (loc-L6): the parent dir is forced private because the `XDG_RUNTIME_DIR`
+/// fallback is `std::env::temp_dir()`, whose subdirs are NOT otherwise guaranteed private.
+/// The 0700 dir + 0600 socket are defense in depth only — [`check_peer_uid`] remains the
+/// real gate on every accepted connection.
+pub fn bind_uds(path: &Path) -> io::Result<UnixListener> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        ensure_private_dir(parent)?;
+    }
+    // A leftover socket file from a crashed daemon blocks bind with EADDRINUSE.
+    let _ = std::fs::remove_file(path);
+    let listener = UnixListener::bind(path)
+        .map_err(|e| io::Error::new(e.kind(), format!("bind {path:?}: {e}")))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| io::Error::new(e.kind(), format!("chmod 0600 {path:?}: {e}")))?;
+    Ok(listener)
+}
+
+/// Is this connection's peer the same uid as us? `false` (refuse) on a different uid OR an
+/// unreadable peer credential — default-deny, defense in depth beyond the 0600 socket.
+/// [RECONCILE-PEERUID]: `UnixStream::peer_cred()` -> `UCred::uid()`; `rustix::process::geteuid()`.
+pub fn check_peer_uid(stream: &UnixStream) -> bool {
+    let Ok(cred) = stream.peer_cred() else {
+        tracing::warn!("peer_cred unreadable: refusing local connection");
+        return false;
+    };
+    let peer = cred.uid();
+    let me = rustix::process::geteuid().as_raw();
+    if peer != me {
+        tracing::warn!(peer, me, "refusing cross-uid local connection");
+        return false;
+    }
+    true
+}
+
+// ---------------------------------------------------------------------------------------
+// §2 THE audience-authz expansion (default-deny)
+// ---------------------------------------------------------------------------------------
+
+/// `peer_audiences = peer.groups ∪ {peer.name} ∪ {peer.user_id}` (kb-mesh §4) — THE ONE
+/// implementation of the caller-audience expansion every plugin gates on (kb re-exports it
+/// as `effective_audiences`). An absent/empty peer yields an EMPTY set — default deny.
+///
+/// Never trusts a self-asserted value: the whole peer object is the platform-injected,
+/// forge-proof `_meta["mcpmesh/peer"]` (the mcpmesh daemon authoritatively OVERWRITES it, so
+/// `groups`/`user_id` can't be caller-forged).
+///
+/// `user_id` is the person's self-sovereign id (`b64u:<user_pk>`, present once a device→user
+/// binding is verified — pairing OR roster). Including it means content shared to a PERSON
+/// reaches ALL their devices (each presents the same verified user_id under a distinct
+/// petname), whereas `name` (the petname) scopes to one device and `groups` to a roster set —
+/// three legitimate granularities.
+///
+/// M3 (identity hardening): re-keying authz on `endpoint_id` instead of the display petname
+/// lands HERE, once, when it lands.
+pub fn peer_audiences(peer: &Value) -> Vec<String> {
+    // The expansion itself is THE shared `principal_set` (crate::principals — the §5 flat
+    // namespace, one implementation for the mesh allow check, this seam, and the blob-scope
+    // gate); this fn only adapts the platform-injected peer JSON onto it.
+    let groups: Vec<String> = peer
+        .get("groups")
+        .and_then(|g| g.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|g| g.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    crate::principal_set(
+        peer.get("name").and_then(|v| v.as_str()),
+        peer.get("user_id").and_then(|v| v.as_str()),
+        &groups,
+    )
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+// ---------------------------------------------------------------------------------------
+// §3 [services.*] self-registration
+// ---------------------------------------------------------------------------------------
+
+/// Register (or idempotently update) `[services.<service_name>]` on the running mcpmesh
+/// daemon: a SOCKET backend pointing at `backend_sock`, with an EMPTY allowlist — local-only
+/// until the user explicitly grants a peer (platform D5: reachability is a user grant; the
+/// content itself is gated per-audience inside each plugin's service).
+///
+/// §loc-L2: a failure is ALWAYS logged here (`tracing::warn`) before being returned, so a
+/// daemon treating registration as best-effort (`let _ =` — the mcpmesh daemon may not be up
+/// in a headless test) can never silently swallow it.
+pub async fn register_service(
+    control_sock: &Path,
+    service_name: &str,
+    backend_sock: &Path,
+) -> Result<(), ClientError> {
+    let result = async {
+        let mut client = connect_control(control_sock).await?;
+        client
+            .request(Request::RegisterService {
+                name: service_name.to_string(),
+                backend: BackendSpec::Socket {
+                    path: backend_sock.to_string_lossy().into_owned(),
+                },
+                allow: vec![],
+            })
+            .await?;
+        Ok(())
+    }
+    .await;
+    if let Err(e) = &result {
+        tracing::warn!(
+            service = service_name,
+            control_sock = %control_sock.display(),
+            error = %e,
+            "mcpmesh service registration failed — service stays unregistered until the daemon restarts"
+        );
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------------------
+// §4 the control-socket sibling rule
+// ---------------------------------------------------------------------------------------
+
+/// The running mcpmesh daemon's control socket under a runtime `base`: `<base>/mcpmesh/mcpmesh.sock`
+/// (mcpmesh §13). A plugin's own runtime dir is `<base>/<plugin>`, so pass its PARENT — both
+/// daemons place their per-daemon subdir under the same base. Mirrors mcpmesh's
+/// `default_socket_path()`; plugins cannot depend on `mcpmesh-trust` (host §7.1), so the formula
+/// is replicated, not imported.
+///
+/// NOTE residual duplication: `kb-core::paths` keeps a private copy of this one-liner for its
+/// own `Paths` (kb-core is a lower layer that must not depend on mcpmesh-local-api's `service`
+/// feature) — a cross-reference comment there points back here. loc uses THIS copy.
+pub fn mcpmesh_control_socket_from(base: &Path) -> PathBuf {
+    base.join("mcpmesh").join("mcpmesh.sock")
+}
+
+// ---------------------------------------------------------------------------------------
+// §5 *-local/1 JSON-RPC conventions
+// ---------------------------------------------------------------------------------------
+
+/// JSON-RPC error code: invalid params (also the shared "unknown method" code).
+pub const ERR_PARAMS: i64 = -32602;
+/// JSON-RPC error code: internal error.
+pub const ERR_INTERNAL: i64 = -32603;
+
+/// A JSON-RPC success frame (absent id → null, the notification-shaped degenerate case).
+pub fn ok(id: Option<Value>, result: Value) -> Value {
+    json!({"jsonrpc":"2.0","id": id.unwrap_or(Value::Null),"result": result})
+}
+
+/// A JSON-RPC error frame.
+pub fn err(id: Option<Value>, code: i64, message: &str) -> Value {
+    json!({"jsonrpc":"2.0","id": id.unwrap_or(Value::Null),"error":{"code":code,"message":message}})
+}
+
+/// Wrap a handler's `Result` into a JSON-RPC response frame (the `*-local/1` dispatch shape).
+pub fn reply(id: Value, r: Result<Value, (i64, String)>) -> Value {
+    match r {
+        Ok(v) => json!({"jsonrpc":"2.0","id":id,"result":v}),
+        Err((code, message)) => {
+            json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}})
+        }
+    }
+}
+
+/// Map an internal failure to `(ERR_INTERNAL, "internal error")`: log the detail locally,
+/// NEVER echo it to the caller (a retriever IO error may embed a filesystem path — e.g. a
+/// hashed audience dir — that must not reach a peer or even the owner surface).
+pub fn internal(e: impl std::fmt::Display) -> (i64, String) {
+    tracing::warn!(error = %e, "internal error (detail withheld from the caller)");
+    (ERR_INTERNAL, "internal error".to_string())
+}
+
+/// STRICT `params[key]` string-array parse: the key must be present, an array, and every
+/// element a string — anything else is `ERR_PARAMS`. Destructive setters (share lists) MUST
+/// use this: a lenient `unwrap_or_default()` would read a malformed request as "share with
+/// NOBODY" and persist `[]` (loc-L5 — an accidental unshare-everyone).
+pub fn required_string_array(params: &Value, key: &str) -> Result<Vec<String>, (i64, String)> {
+    let arr = params
+        .get(key)
+        .and_then(|v| v.as_array())
+        .ok_or((ERR_PARAMS, format!("{key} (array of strings) is required")))?;
+    arr.iter()
+        .map(|v| {
+            v.as_str()
+                .map(str::to_owned)
+                .ok_or((ERR_PARAMS, format!("{key} must contain only strings")))
+        })
+        .collect()
+}
+
+/// Extract the friendly people directory from an mcpmesh `status` result (`share_targets`):
+/// one entry per paired peer — the owner's petname for it + its verified `user_id` (or
+/// null). Pure over the JSON so it is unit-tested without a live mcpmesh. Surface-clean:
+/// petname + user_id only, never a transport id / service list.
+pub fn people_from_status(status: &Value) -> Vec<Value> {
+    status["peers"]
+        .as_array()
+        .map(|peers| {
+            peers
+                .iter()
+                .filter_map(|p| {
+                    let name = p["name"].as_str()?;
+                    Some(json!({ "name": name, "user_id": p["user_id"].as_str() }))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------------------
+// §6 the *-local/1 Hello first frame
+// ---------------------------------------------------------------------------------------
+
+/// Write the `*-local/N` Hello first frame (the shared handshake convention: every owner-face
+/// server sends `{api, api_version, stack_version}` before anything else).
+pub async fn send_hello<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    api: &str,
+    api_version: &str,
+    stack_version: &str,
+) -> io::Result<()> {
+    let hello = serde_json::to_value(Hello {
+        api: api.into(),
+        api_version: api_version.into(),
+        stack_version: stack_version.into(),
+    })
+    .expect("Hello serializes");
+    write_frame(writer, &hello).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec::{FrameReader, Inbound, MAX_FRAME_BYTES};
+    use crate::protocol::{API_NAME, API_VERSION};
+    use serde_json::json;
+
+    #[test]
+    fn peer_audiences_is_groups_union_name_union_user_id() {
+        let peer = json!({"name":"bob-laptop","user_id":"b64u:BOB","groups":["eng","ops"]});
+        let mut a = peer_audiences(&peer);
+        a.sort();
+        assert_eq!(a, vec!["b64u:BOB", "bob-laptop", "eng", "ops"]);
+        // DEFAULT-DENY: an absent/empty peer yields nothing.
+        assert!(peer_audiences(&json!({})).is_empty());
+        // Empty-string name/user_id never become audiences.
+        assert_eq!(
+            peer_audiences(&json!({"name":"bob","user_id":"","groups":[]})),
+            vec!["bob"]
+        );
+    }
+
+    #[test]
+    fn people_from_status_extracts_petname_and_user_id() {
+        let status = json!({"peers":[
+            {"name":"bob","services":["kb"],"user_id":"b64u:CGnYVhFY"},
+            {"name":"carol","services":[]}
+        ]});
+        assert_eq!(
+            people_from_status(&status),
+            vec![
+                json!({"name":"bob","user_id":"b64u:CGnYVhFY"}),
+                json!({"name":"carol","user_id":null}),
+            ]
+        );
+        assert!(people_from_status(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn mcpmesh_control_socket_is_the_mcpmesh_sibling_dir() {
+        assert_eq!(
+            mcpmesh_control_socket_from(Path::new("/run/user/1000")),
+            Path::new("/run/user/1000/mcpmesh/mcpmesh.sock")
+        );
+    }
+
+    #[test]
+    fn internal_error_does_not_echo_detail() {
+        // A retriever IO error may embed a hashed audience-dir path — it must NOT reach a peer.
+        let (code, msg) =
+            internal("open /home/me/.local/share/kb/index/abc123def456/notes.jsonl: No such file");
+        assert_eq!(code, ERR_INTERNAL);
+        assert!(
+            !msg.contains("/home/me"),
+            "no filesystem path in the caller-visible message"
+        );
+        assert!(
+            !msg.contains("index/"),
+            "no index dir in the caller-visible message"
+        );
+        assert_eq!(msg, "internal error");
+    }
+
+    #[test]
+    fn required_string_array_is_strict() {
+        // Present + array of strings → the values.
+        let ok_p = json!({"audiences": ["b64u:BOB", "eng"]});
+        assert_eq!(
+            required_string_array(&ok_p, "audiences").unwrap(),
+            vec!["b64u:BOB".to_string(), "eng".to_string()]
+        );
+        // Empty array is a VALID explicit "share with nobody".
+        assert_eq!(
+            required_string_array(&json!({"audiences": []}), "audiences").unwrap(),
+            Vec::<String>::new()
+        );
+        // Missing key, wrong type, or a non-string element → ERR_PARAMS (never an implicit []).
+        for bad in [
+            json!({}),
+            json!({"audiences": "eng"}),
+            json!({"audiences": 42}),
+            json!({"audiences": ["eng", 7]}),
+            json!({"audiences": null}),
+        ] {
+            let e = required_string_array(&bad, "audiences").unwrap_err();
+            assert_eq!(e.0, ERR_PARAMS, "payload {bad} must be a params error");
+        }
+    }
+
+    #[test]
+    fn ok_err_and_reply_shape_json_rpc_frames() {
+        let o = ok(Some(json!(1)), json!({"x": true}));
+        assert_eq!(o["id"], 1);
+        assert_eq!(o["result"]["x"], true);
+        let e = err(None, ERR_PARAMS, "bad");
+        assert_eq!(e["id"], Value::Null);
+        assert_eq!(e["error"]["code"], ERR_PARAMS);
+        let r = reply(json!(7), Err((ERR_INTERNAL, "internal error".into())));
+        assert_eq!(r["error"]["code"], ERR_INTERNAL);
+        assert_eq!(
+            reply(json!(8), Ok(json!({"ok":true})))["result"]["ok"],
+            true
+        );
+    }
+
+    #[tokio::test]
+    async fn bind_uds_forces_0600_socket_and_0700_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().join("plug");
+        // Pre-create the runtime dir LAX (0755) — bind_uds must tighten it (loc-L6).
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let sock = run.join("plug.sock");
+        let _listener = bind_uds(&sock).unwrap();
+        let dir_mode = std::fs::metadata(&run).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "runtime dir forced private");
+        let sock_mode = std::fs::metadata(&sock).unwrap().permissions().mode() & 0o777;
+        assert_eq!(sock_mode, 0o600, "socket is owner-only");
+        // Re-bind over a stale socket file succeeds (crash recovery).
+        drop(_listener);
+        let _again = bind_uds(&sock).unwrap();
+    }
+
+    /// D3 hardening parity: a SYMLINKED runtime dir is refused before any chmod/bind — a
+    /// planted `link -> dir` must never redirect the socket (mcpmesh §13, same rule as the
+    /// daemon control socket).
+    #[tokio::test]
+    async fn bind_uds_refuses_a_symlinked_runtime_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let err = bind_uds(&link.join("plug.sock")).unwrap_err();
+        assert!(
+            err.to_string().contains("symlink"),
+            "refusal names the symlink: {err}"
+        );
+        // And ensure_private_dir itself refuses directly too.
+        assert!(ensure_private_dir(&link).is_err());
+        // The real dir still binds fine (the check refuses links, not dirs).
+        let _ok = bind_uds(&real.join("plug.sock")).unwrap();
+    }
+
+    #[tokio::test]
+    async fn check_peer_uid_accepts_a_same_uid_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("uid.sock");
+        let listener = bind_uds(&sock).unwrap();
+        let client = UnixStream::connect(&sock).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        // Both ends of a same-process connection are, by construction, the same uid.
+        assert!(check_peer_uid(&server));
+        assert!(check_peer_uid(&client));
+    }
+
+    #[tokio::test]
+    async fn send_hello_writes_the_family_hello_frame() {
+        let (mut a, b) = tokio::io::duplex(1024);
+        send_hello(&mut a, "loc-local/1", "1", "0.1.0")
+            .await
+            .unwrap();
+        drop(a);
+        let mut reader = FrameReader::new(b, MAX_FRAME_BYTES);
+        let frame = match reader.next().await.unwrap().unwrap() {
+            Inbound::Frame(v) => v,
+            Inbound::Violation(v) => panic!("violation: {v:?}"),
+        };
+        assert_eq!(frame["api"], "loc-local/1");
+        assert_eq!(frame["api_version"], "1");
+        assert_eq!(frame["stack_version"], "0.1.0");
+    }
+
+    /// A stub mcpmesh daemon that answers one `register_service`, asserting the wire shape.
+    #[tokio::test]
+    async fn register_service_registers_a_socket_backend_with_empty_allow() {
+        let dir = tempfile::tempdir().unwrap();
+        let control = dir.path().join("mcpmesh.sock");
+        let listener = tokio::net::UnixListener::bind(&control).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, mut writer) = stream.into_split();
+            write_frame(
+                &mut writer,
+                &serde_json::to_value(Hello {
+                    api: API_NAME.into(),
+                    api_version: API_VERSION.into(),
+                    stack_version: "0.1.0".into(),
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+            let mut reader = FrameReader::new(read_half, MAX_FRAME_BYTES);
+            let req = match reader.next().await.unwrap().unwrap() {
+                Inbound::Frame(v) => v,
+                Inbound::Violation(_) => panic!("violation"),
+            };
+            assert_eq!(req["method"], "register_service");
+            assert_eq!(req["params"]["name"], "loc");
+            assert_eq!(
+                req["params"]["backend"]["socket"]["path"],
+                "/run/x/loc/loc.sock"
+            );
+            assert_eq!(req["params"]["allow"], json!([]));
+            write_frame(
+                &mut writer,
+                &json!({"jsonrpc":"2.0","id":1,"result":{"ok":true}}),
+            )
+            .await
+            .unwrap();
+        });
+        register_service(&control, "loc", Path::new("/run/x/loc/loc.sock"))
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        // And the failure path returns Err (after logging) instead of swallowing (loc-L2).
+        let gone = dir.path().join("nobody-home.sock");
+        assert!(
+            register_service(&gone, "loc", Path::new("/x"))
+                .await
+                .is_err()
+        );
+    }
+}
