@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 462 120" role="img" aria-label="mcpmesh">
+  <!-- Light-theme lockup; docs/logo-dark.svg is the same drawing with light ink.
+       The README picks between them with a <picture> tag (GitHub-deterministic). -->
+  <!-- The mark: two strands, one pairing. Amber threads through teal — over at the top
+       crossing, under at the bottom — a real weave, not an overlap. -->
+  <g fill="none" stroke-width="10" stroke-linecap="round">
+    <!-- teal ring (drawn first: under at top, over at bottom) -->
+    <circle cx="46" cy="60" r="24" stroke="#2fa99e"/>
+    <!-- amber ring covers teal at both crossings… -->
+    <circle cx="78" cy="60" r="24" stroke="#e8a23d"/>
+    <!-- …then the teal BOTTOM arc is re-laid on top: alternating weave. Both endpoints land
+         where teal already shows (inside amber's counter / open space), so the caps vanish. -->
+    <path d="M 66.8 72 A 24 24 0 0 1 25.2 72" stroke="#2fa99e"/>
+  </g>
+  <!-- The wordmark: hand-drawn monoline, no font dependency. x-height 40 (y 40–80),
+       stroke 8, arches spring at y=50 with r=10 apexes at the x-height. -->
+  <g fill="none" stroke-width="8" stroke-linecap="round" stroke-linejoin="round" stroke="#26333b">
+    <!-- m -->
+    <path d="M 128 80 V 50 A 10 10 0 0 1 148 50 V 80 M 148 50 A 10 10 0 0 1 168 50 V 80"/>
+    <!-- c -->
+    <path d="M 209.3 48.7 A 16 16 0 1 0 209.3 71.3"/>
+    <!-- p -->
+    <path d="M 224 44 V 94 M 224 60 A 16 16 0 1 0 256 60 A 16 16 0 1 0 224 60"/>
+    <!-- m -->
+    <path d="M 272 80 V 50 A 10 10 0 0 1 292 50 V 80 M 292 50 A 10 10 0 0 1 312 50 V 80"/>
+    <!-- e -->
+    <path d="M 328 60 H 360 A 16 16 0 1 0 355.3 71.3"/>
+    <!-- s: two stacked 225° arcs, tangent (both moving +x) at the waist (386,61) -->
+    <path d="M 392.7 44.8 A 9.5 9.5 0 1 0 386 61 A 9.5 9.5 0 1 1 379.3 77.2"/>
+    <!-- h -->
+    <path d="M 412 80 V 26 M 412 50 A 10 10 0 0 1 432 50 V 80"/>
+  </g>
+</svg>

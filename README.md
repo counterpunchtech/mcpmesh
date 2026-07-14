@@ -1,28 +1,53 @@
-# mcpmesh
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/logo-dark.svg">
+    <img src="docs/logo.svg" width="440" alt="mcpmesh">
+  </picture>
+</p>
 
-**Share MCP servers with people you trust — peer to peer, no accounts, no cloud in the trust path.**
+<p align="center"><b>Share MCP servers with people you trust — peer to peer, no accounts, no cloud.</b></p>
 
-Your AI client (Claude Desktop, or anything that speaks [MCP](https://modelcontextprotocol.io))
-can use tools running on your machine, or hosted MCP services someone operates for the public.
-What it can't do is reach the MCP server running on your friend's laptop — sharing a tool today
-means *running a service*: a public endpoint, TLS, OAuth, uptime. mcpmesh removes that wall: a
-friend or teammate serves an MCP server from their machine, and your AI client mounts it as if it
-were local — no hosting, no accounts, nothing published. Traffic flows over an end-to-end-encrypted
-peer-to-peer connection ([iroh](https://iroh.computer)/QUIC, with NAT hole-punching); nothing is
-shared unless its owner explicitly grants it, and every grant names exactly who gets access.
-Default-deny, always.
+mcpmesh lets your AI use your friends' tools. Take any
+[MCP](https://modelcontextprotocol.io) server running on your machine — your notes, your code
+search, your scripts — and share it with a specific person; their AI client (Claude Desktop, or
+anything that speaks MCP) mounts it as if it were local. No hosting, no OAuth, nothing published
+to the internet: an end-to-end-encrypted connection straight between your two machines.
+
+## Quick start
+
+One minute, two machines — call them `you` and `friend`:
+
+```sh
+cargo install mcpmesh    # on both machines (macOS/Linux)
+
+# you — share a folder of notes as an MCP server, under a name you pick:
+mcpmesh serve notes -- npx -y @modelcontextprotocol/server-filesystem ~/notes
+mcpmesh invite notes     # prints a one-time mcpmesh-invite:… line — send it to your friend
+
+# friend — redeem the invite, then plug the share into Claude Desktop:
+mcpmesh pair mcpmesh-invite:…
+mcpmesh setup claude you/notes
+```
+
+Both sides now see the same short code (like `tango-fig-cabbage`). Read it to each other —
+matching words mean the pairing is authentic. That's it: your friend's AI can search your notes
+over an encrypted peer-to-peer link, and the pairing works both ways when they want to share back.
+
+## Why it's safe to try
+
+- **Default-deny.** Nothing is shared until you run `serve` + `invite`, every grant names exactly
+  who gets access, and `mcpmesh pair --remove` cuts a peer off instantly.
+- **No middleman.** Traffic is end-to-end encrypted, machine to machine
+  ([iroh](https://iroh.computer)/QUIC with NAT hole-punching). No account to create, no server of
+  ours in the trust path.
+- **Tamper-evident invites.** Invites are one-time and expiring, and the spoken safety code
+  catches a tampered invite before anything is shared.
 
 ## The full walkthrough: Alice and Bob
 
 Two people, two machines. Alice will share an MCP server with Bob; then Bob will share one back.
-Install on both machines first (macOS/Linux):
-
-```sh
-cargo install mcpmesh
-# or via Homebrew:   brew tap counterpunchtech/mcpmesh https://github.com/counterpunchtech/mcpmesh
-#                    brew install --HEAD counterpunchtech/mcpmesh/mcpmesh
-# or from a clone:   cargo install --path cli
-```
+Install on both machines first (`cargo install mcpmesh` as above, or via Homebrew:
+`brew tap counterpunchtech/mcpmesh https://github.com/counterpunchtech/mcpmesh && brew install --HEAD counterpunchtech/mcpmesh/mcpmesh`).
 
 ### 1. Alice serves an MCP server and invites Bob
 
