@@ -340,11 +340,25 @@ fn serve_roster_over_http(body: Vec<u8>) -> (String, Arc<AtomicBool>, std::threa
         while !stop_thread.load(Ordering::Relaxed) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    // Drain the request (a GET fits in one read); a short timeout so a half-open peer
-                    // never wedges the loop. Then write a Content-Length-framed, Connection: close body.
+                    // Read to END-OF-HEADERS, not just one read: a GET can arrive split across TCP
+                    // segments, and responding + dropping with unread request bytes still buffered
+                    // makes the close an RST that can destroy the in-flight response (the macOS CI
+                    // flake: reqwest "received unexpected message from connection"). Short timeout so
+                    // a half-open peer never wedges the loop.
                     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                    let mut buf = [0u8; 2048];
-                    let _ = stream.read(&mut buf);
+                    let mut buf = [0u8; 4096];
+                    let mut total = 0;
+                    while total < buf.len() {
+                        match stream.read(&mut buf[total..]) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                total += n;
+                                if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     let header = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         body.len()
@@ -352,6 +366,10 @@ fn serve_roster_over_http(body: Vec<u8>) -> (String, Arc<AtomicBool>, std::threa
                     let _ = stream.write_all(header.as_bytes());
                     let _ = stream.write_all(&body);
                     let _ = stream.flush();
+                    // Half-close, then drain until the peer closes: no unread bytes may remain at
+                    // drop, so the final close is a FIN (never a response-killing RST).
+                    let _ = stream.shutdown(std::net::Shutdown::Write);
+                    let _ = stream.read(&mut buf);
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(5));
