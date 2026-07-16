@@ -13,6 +13,10 @@ search, your scripts — and share it with a specific person; their AI client (C
 anything that speaks MCP) mounts it as if it were local. No hosting, no OAuth, nothing published
 to the internet: an end-to-end-encrypted connection straight between your two machines.
 
+Prefer a guided tour? [docs/presentation.html](docs/presentation.html) is a nine-slide overview
+of what mcpmesh is and how it works — one self-contained HTML file, so GitHub shows its source;
+open it in any browser to view the slides.
+
 ## Quick start
 
 One minute, two machines — call them `you` and `friend`:
