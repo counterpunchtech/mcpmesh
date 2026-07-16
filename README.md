@@ -27,12 +27,15 @@ cargo install mcpmesh    # on both machines (macOS/Linux)
 mcpmesh serve notes -- npx -y @modelcontextprotocol/server-filesystem ~/notes
 mcpmesh invite notes     # prints a one-time mcpmesh-invite:… line — send it to your friend
 
-# friend — redeem the invite, then plug the share into Claude Desktop:
+# friend — redeem the invite:
 mcpmesh pair mcpmesh-invite:…
-mcpmesh setup claude you/notes
 ```
 
-Both sides now see the same short code (like `tango-fig-cabbage`). Read it to each other —
+`pair` prints the exact next steps: the safety code to confirm, and the one command that plugs the
+share into Claude Code (`claude mcp add you-notes -- mcpmesh connect you/notes`) or the entry to
+paste into Claude Desktop. Run `mcpmesh use you/notes` any time to see them again.
+
+Both sides also see the same short code (like `tango-fig-cabbage`). Read it to each other —
 matching words mean the pairing is authentic. That's it: your friend's AI can search your notes
 over an encrypted peer-to-peer link, and the pairing works both ways when they want to share back.
 
@@ -66,7 +69,13 @@ alice$ mcpmesh invite notes
 One-time invite (expires in 24h). Share it out-of-band:
   mcpmesh-invite:…
 Whoever redeems it can access: notes
+
+Next: send them that line over any channel. They redeem it with `mcpmesh pair <line>`,
+which prints a short safety code — run `mcpmesh status` to see yours and confirm the two
+match, out loud. Same words = the pairing is authentic.
 ```
+
+Every command tells you what to do next, so you can follow the flow without the docs open.
 
 Alice sends that `mcpmesh-invite:…` line to Bob over any channel — chat, email, a sticky note.
 The channel doesn't need to be secure: tampering with the invite makes the next step's code
@@ -77,7 +86,22 @@ mismatch, and the invite is one-time and expiring.
 ```sh
 bob$ mcpmesh pair mcpmesh-invite:…
 Paired with alice — code: tango-fig-cabbage
-Confirm this code matches what alice sees. You can mount: alice/notes
+Next: confirm this code matches what alice sees, out loud (they see it under `mcpmesh status`).
+Same words = the pairing is authentic.
+
+You can now use: alice/notes
+
+Tools from alice run on alice's machine. Treat their output as you would anything else alice sends you.
+
+To use in Claude Code, run:
+  claude mcp add alice-notes -- mcpmesh connect alice/notes
+
+To use in Claude Desktop, add this under "mcpServers" in
+  ~/Library/Application Support/Claude/claude_desktop_config.json
+then quit and restart Claude Desktop:
+  "alice-notes": {"command": "mcpmesh", "args": ["connect", "alice/notes"]}
+
+Any other MCP client: add a stdio server with the command `mcpmesh connect alice/notes`.
 ```
 
 One redemption pairs the two machines **both ways** — each side now knows and trusts the other's
@@ -104,14 +128,24 @@ transit — unpair and start over. Do this before using the service; it's the wh
 
 ### 4. Bob mounts the service in his AI client
 
+Bob follows the instructions `pair` already printed — one command for Claude Code:
+
 ```sh
-bob$ mcpmesh setup claude alice/notes
+bob$ claude mcp add alice-notes -- mcpmesh connect alice/notes
 ```
 
-That writes Claude Desktop's config so Alice's notes server appears as a normal local MCP server
-(for any other MCP client, add `--print` and paste the entry into that client's config). Bob's AI
-can now search Alice's notes — every request travels the encrypted P2P session straight to
-Alice's machine.
+…or the pasted entry for Claude Desktop. (Lost the block? `mcpmesh use alice/notes` prints it
+again.) Alice's notes server now appears as a normal local MCP server, and Bob's AI can search it —
+every request travels the encrypted P2P session straight to Alice's machine.
+
+Run that command as printed, with no `--scope`: it lands in Claude Code's default *local* scope and
+connects right away. Adding `--scope project` instead writes a checked-in `.mcp.json`, which Claude
+Code holds at **pending approval** until someone approves it interactively — a sensible guard against
+servers arriving through a shared repo, but it looks like the mount silently failed if you weren't
+expecting it.
+
+mcpmesh prints these steps rather than editing your AI client's config for you: it's your config,
+and a line you pasted yourself is one you can find and remove later.
 
 ### 5. Bob shares something back
 
@@ -124,8 +158,11 @@ bob$   mcpmesh invite code
 
 alice$ mcpmesh pair mcpmesh-invite:…       # Bob's invite this time
 Paired with bob — code: quartz-melon-drift
-Confirm this code matches what bob sees. You can mount: bob/code
-alice$ mcpmesh setup claude bob/code
+Next: confirm this code matches what bob sees, out loud …
+
+You can now use: bob/code
+…
+alice$ claude mcp add bob-code -- mcpmesh connect bob/code   # the command `pair` just printed
 ```
 
 Grants accumulate — this second pairing adds `bob/code` to what Alice may dial without touching
@@ -135,10 +172,15 @@ and more services; every grant is explicit and per-service.
 ### 6. See and undo everything
 
 ```sh
-mcpmesh status               # what you serve, to whom; what you can reach; recent pairings
+mcpmesh status               # what you serve, to whom; what you can reach; recent pairings; what to do next
+mcpmesh use alice/notes      # the exact steps to mount a peer's service in your AI client
 mcpmesh doctor               # local, read-only health check of this machine's setup
 mcpmesh pair --remove alice  # unpair: alice loses access to YOUR services from now on
 ```
+
+`status` closes with a **next steps** block — the exact command for whatever this machine can do
+from where it is (share something, invite someone to a service nobody can reach yet, redeem an
+invite, or mount a peer's service). It's silent when there's nothing to nudge.
 
 ## For teams: roster mode
 

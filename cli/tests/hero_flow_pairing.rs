@@ -5,7 +5,8 @@
 //! completed: here the trust is written by the REAL pairing ceremony — `invite` mints, `pair`
 //! redeems over `mcpmesh/pair/1`, the inviter-side grant appends the redeemer to the service allow,
 //! and only THEN can the redeemer use the service. The literal four commands are `serve` (Alice's
-//! `[services.notes]`), `invite`, `pair`, and `connect` (`connect` exercises what `setup` wires).
+//! `[services.notes]`), `invite`, `pair`, and `connect` (`connect` is what `pair`'s printed
+//! instructions tell the AI client to run).
 //!
 //! ── 5-clause decomposition (all in the ONE narrative `four_command_hero_flow`, per the plan's
 //!    "strongest single flow" preference; each step is banner-marked) ──

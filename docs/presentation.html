@@ -653,7 +653,7 @@
         <div class="step"><div class="n">1</div><div class="v">serve</div><p>Register any <span class="gloss" data-tip="A small program that gives an AI extra tools — search my notes, run my scripts. It speaks MCP (the Model Context Protocol), so any MCP-capable AI app can use it.">MCP server</span> under a name you pick.</p></div>
         <div class="step"><div class="n">2</div><div class="v">invite</div><p>Mint a one-time, expiring invite for that share.</p></div>
         <div class="step"><div class="n">3</div><div class="v">pair</div><p>Your friend redeems it — the machines now trust each other.</p></div>
-        <div class="step"><div class="n">4</div><div class="v">setup</div><p>One command wires it into their AI client's config.</p></div>
+        <div class="step"><div class="n">4</div><div class="v">connect</div><p><code class="inline">pair</code> prints the exact command to wire it into their AI client.</p></div>
       </div>
       <div class="grid2">
         <div class="term">
@@ -667,7 +667,9 @@
           <div class="bar">friend</div>
           <pre><span class="p">$</span> mcpmesh <span class="a">pair</span> mcpmesh-invite:…
 Paired with you — code: <span class="g">tango-fig-cabbage</span>
-<span class="p">$</span> mcpmesh <span class="a">setup</span> claude you/notes
+<span class="c">You can now use: you/notes</span>
+<span class="c">To use in Claude Code, run:</span>
+<span class="p">$</span> claude mcp add you-notes -- mcpmesh <span class="a">connect</span> you/notes
 <span class="c">Their AI can now search your notes.</span></pre>
         </div>
       </div>

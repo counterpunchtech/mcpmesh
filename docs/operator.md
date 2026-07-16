@@ -70,9 +70,15 @@ alice$ mcpmesh serve notes -- npx -y @modelcontextprotocol/server-filesystem ~/n
 alice$ mcpmesh invite notes          # prints a one-time mcpmesh-invite:… line — send it to Bob out-of-band
 
 # Bob redeems it and mounts it in his AI client:
-bob$   mcpmesh pair mcpmesh-invite:…   # prints a short code (e.g. "tango-fig-cabbage")
-bob$   mcpmesh setup claude alice/notes
+bob$   mcpmesh pair mcpmesh-invite:…   # prints a short code (e.g. "tango-fig-cabbage"), the
+                                       # mount target, and the exact AI-client steps
+bob$   claude mcp add alice-notes -- mcpmesh connect alice/notes   # the command `pair` printed
 ```
+
+`pair` prints the AI-client instructions inline (Claude Code's command, Claude Desktop's config
+entry + path + restart, and the generic stdio command for anything else); `mcpmesh use
+alice/notes` reprints them on demand. mcpmesh never writes a third-party client's config itself —
+the operator pastes what they can later find and remove.
 
 Confirm the SAS code on both sides before using the service — it authenticates the pairing (§4.2).
 Bob's `pair` prints the code; Alice runs `mcpmesh status` and reads the SAME code under

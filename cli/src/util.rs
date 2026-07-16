@@ -34,10 +34,10 @@ pub fn epoch_now_i64() -> i64 {
 /// parse. This mirrors the M0 device-key mint fix.
 ///
 /// Best-effort temp cleanup on any failure, so a failed write/sync/rename never orphans a
-/// `*.tmp.*` next to the target. (The ONE deliberately weaker sibling is `main.rs`'s
-/// `merge_client_config`, which writes a THIRD-PARTY app's config: best-effort by design,
-/// no fsync — see its doc.) `kb-core/src/fsutil.rs` mirrors this discipline on the plugin
-/// side (layering forbids sharing the code) — keep the two in step.
+/// `*.tmp.*` next to the target. (mcpmesh writes only its OWN files this way — it never edits a
+/// third-party AI client's config; `proxy::client_instruction_lines` PRINTS what to paste
+/// instead.) `kb-core/src/fsutil.rs` mirrors this discipline on the plugin side (layering forbids
+/// sharing the code) — keep the two in step.
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};

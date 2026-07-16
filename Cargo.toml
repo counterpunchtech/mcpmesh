@@ -3,7 +3,7 @@ resolver = "3"
 members = ["codec", "net", "trust", "local-api", "cli"]
 
 [workspace.package]
-version = "0.1.0"          # lockstep with the private monorepo this repo is mirrored from (see CONTRIBUTING.md)
+version = "0.2.0"          # lockstep with the private monorepo this repo is mirrored from (see CONTRIBUTING.md)
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.95.0"
@@ -43,7 +43,7 @@ rmcp = { version = "=2.1.0", features = ["client", "server", "macros"] }  # offi
 url = "2"  # pkarr relay URLs (spec §10.3): iroh's Pkarr builders take `url::Url` directly
 # Internal crates: `path` drives the workspace build; `version` is REQUIRED for crates.io
 # (`cargo publish` rewrites path deps to registry deps and refuses version-less ones).
-mcpmesh-codec = { path = "codec", version = "0.1.0" }
-mcpmesh-net = { path = "net", version = "0.1.0" }
-mcpmesh-trust = { path = "trust", version = "0.1.0" }
-mcpmesh-local-api = { path = "local-api", version = "0.1.0" }
+mcpmesh-codec = { path = "codec", version = "0.2.0" }
+mcpmesh-net = { path = "net", version = "0.2.0" }
+mcpmesh-trust = { path = "trust", version = "0.2.0" }
+mcpmesh-local-api = { path = "local-api", version = "0.2.0" }

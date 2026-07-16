@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -9,7 +9,25 @@ use mcpmesh_local_api::{
     RosterStatus, StatusResult,
 };
 use mcpmesh_trust::{DeviceKey, paths};
-use serde_json::{Value, json};
+use serde_json::json;
+
+/// The one worked `serve` example the CLI shows, as a macro so the runtime constant
+/// ([`SERVE_EXAMPLE`], for `status`'s next-steps footer) and clap's compile-time `after_help`
+/// (which takes only literals, hence `concat!`, hence not a `const`) come from ONE source and
+/// cannot drift.
+///
+/// `serve <name> -- <command>` is mechanism-first: it runs ANY stdio MCP server and has no opinion
+/// about which. That generality is a wall for someone who doesn't already have one running, so the
+/// example is deliberately a COMPLETE command needing nothing but npx, sharing a folder — the most
+/// legible thing mcpmesh does, and a real MCP server rather than an mcpmesh-specific toy.
+macro_rules! serve_example {
+    () => {
+        "mcpmesh serve notes -- npx -y @modelcontextprotocol/server-filesystem ~/notes"
+    };
+}
+
+/// The [`serve_example!`] command as a runtime string (see that macro for why it is one).
+const SERVE_EXAMPLE: &str = serve_example!();
 
 #[derive(Parser)]
 #[command(name = "mcpmesh", version)]
@@ -29,6 +47,15 @@ enum Cmd {
     Doctor,
     /// Register and serve a local MCP server to allowlisted peers (spec §6.1). Auto-starts
     /// the daemon, writes the `[services.<name>]` config entry, and hot-reloads serving.
+    ///
+    /// Everything after `--` is just the command that runs a stdio MCP server — any one, under a
+    /// name you pick. No MCP server of your own? The example below shares a folder and needs
+    /// nothing but npx.
+    #[command(after_help = concat!(
+        "Example — share a folder of notes (needs npx; no MCP server of your own required):\n  ",
+        serve_example!(),
+        "\n\nThen `mcpmesh invite notes` mints an invite to send whoever you're sharing with."
+    ))]
     Serve {
         /// Service name — how peers address it (`connect <peer>/<name>`).
         name: String,
@@ -64,16 +91,12 @@ enum Cmd {
         #[arg(long, value_name = "petname")]
         remove: Option<String>,
     },
-    /// Write an AI client's config entry that mounts `<peer>/<service>` through the proxy
-    /// (spec §8/§11.1). Prints the trust-boundary line to stderr at mount time.
-    Setup {
-        /// The AI client to configure (e.g. `claude`).
-        client: String,
+    /// Print the exact steps to use a peer's service from your AI client — the Claude Code command,
+    /// the Claude Desktop config entry + where it goes, and the generic stdio command any other MCP
+    /// client takes (spec §8/§11.1). `pair` prints this automatically; run `use` to see it again.
+    Use {
         /// The service to mount, as `<peer>/<service>`.
         target: String,
-        /// Print the config entry to stdout instead of writing the client's config file.
-        #[arg(long)]
-        print: bool,
     },
     /// Roster mode: join an org from its invite (spec §4.4 step 2). Mints your user key, pins the
     /// org root, and prints the join code to send the operator plus the org-root fingerprint to
@@ -299,11 +322,7 @@ fn main() -> anyhow::Result<()> {
         Some(Cmd::Connect { target }) => run_connect(target),
         Some(Cmd::Invite { services }) => run_invite(services),
         Some(Cmd::Pair { invite, remove }) => run_pair(invite, remove),
-        Some(Cmd::Setup {
-            client,
-            target,
-            print,
-        }) => run_setup(client, target, print),
+        Some(Cmd::Use { target }) => run_use(target),
         Some(Cmd::Join {
             org_invite,
             name,
@@ -392,6 +411,13 @@ fn run_serve(name: String, allow: Option<String>, cmd: Vec<String>) -> anyhow::R
             })
             .await?;
         println!("serving '{name}'");
+        // The next exact instruction. Nothing is shared until someone is granted access, so the
+        // invite is ALWAYS the next step — `--allow` names petnames, but only a redeemed invite
+        // (or a roster) makes a petname resolve to a real peer.
+        println!(
+            "Next: run `mcpmesh invite {name}` to mint a one-time invite, and send it to the \
+             person you want to share it with."
+        );
         Ok(())
     })
 }
@@ -480,30 +506,48 @@ fn invite_lines(invite: &InviteResult, services: &[String], now: u64) -> Vec<Str
         ),
         format!("  {}", invite.invite_line),
         format!("Whoever redeems it can access: {}", services.join(", ")),
+        String::new(),
+        "Next: send them that line over any channel. They redeem it with `mcpmesh pair <line>`,"
+            .to_string(),
+        "which prints a short safety code — run `mcpmesh status` to see yours and confirm the two"
+            .to_string(),
+        "match, out loud. Same words = the pairing is authentic.".to_string(),
     ]
 }
 
-/// Render the `mcpmesh pair` success output. Pure so it is unit-testable. Surface-clean (§1.5): it
-/// carries only the peer petname, the display-only SAS, and the local `<peer>/<service>` mount
-/// names — NEVER a raw EndpointId (the daemon never sends one in a `PairResult`).
+/// Render the `mcpmesh pair` success output: the SAS, the ceremony as the next step, what the
+/// pairing just unlocked, and EXACTLY how to use it from an AI client (spec §8/§11.1 — the block
+/// [`proxy::client_instruction_lines`] owns). Pure so it is unit-testable. Surface-clean (§1.5): it
+/// carries only the peer petname, the display-only SAS, the local `<peer>/<service>` mount names,
+/// and the `mcpmesh connect` command — NEVER a raw EndpointId (the daemon never sends one in a
+/// `PairResult`).
+///
+/// The ceremony line comes FIRST and says "next" deliberately: confirming the code is what makes
+/// the pairing authentic, and it must happen before the service is used, not after.
 fn pair_lines(result: &PairResult) -> Vec<String> {
     let peer = &result.peer_petname;
-    let mut lines = vec![format!("Paired with {peer} — code: {}", result.sas_code)];
+    let mut lines = vec![
+        format!("Paired with {peer} — code: {}", result.sas_code),
+        format!(
+            "Next: confirm this code matches what {peer} sees, out loud (they see it under \
+             `mcpmesh status`). Same words = the pairing is authentic."
+        ),
+    ];
+    // Defensive: a real pairing always grants ≥1 service (invite requires one), but never dangle a
+    // "You can now use:" with nothing after it.
     if result.services.is_empty() {
-        // Defensive: a real pairing always grants ≥1 service (invite requires one), but never
-        // dangle a "You can mount:" with nothing after it.
-        lines.push(format!("Confirm this code matches what {peer} sees."));
-    } else {
-        let mounts = result
-            .services
-            .iter()
-            .map(|s| format!("{peer}/{s}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        lines.push(format!(
-            "Confirm this code matches what {peer} sees. You can mount: {mounts}"
-        ));
+        return lines;
     }
+    let mounts = result
+        .services
+        .iter()
+        .map(|s| format!("{peer}/{s}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    lines.push(String::new());
+    lines.push(format!("You can now use: {mounts}"));
+    lines.push(String::new());
+    lines.extend(proxy::client_instruction_lines(peer, &result.services));
     lines
 }
 
@@ -524,116 +568,14 @@ fn friendly_expiry(expires_at_epoch: u64, now: u64) -> String {
     format!("in {hours}h")
 }
 
-/// `mcpmesh setup <client> <peer>/<service> [--print]`: mint the AI client's config entry.
-/// The §11.1 trust-boundary line always goes to stderr (never corrupting machine-consumed
-/// stdout). `--print` writes the entry to stdout (the always-safe, testable path); otherwise
-/// it best-effort merges into the known client's config, falling back to printing with a
-/// message when the client is unknown or its config is unwritable.
-fn run_setup(client: String, target: String, print: bool) -> anyhow::Result<()> {
+/// `mcpmesh use <peer>/<service>`: print the exact steps to mount the service in an AI client
+/// (spec §8/§11.1) — the same block `pair` prints, on demand. Local + read-only: it renders
+/// instructions from the target NAME, so it needs no daemon and never asserts the grant exists
+/// (a typo'd target simply produces instructions whose `connect` refuses later, plainly).
+fn run_use(target: String) -> anyhow::Result<()> {
     let (peer, service) = proxy::split_target(&target)?;
-    // spec §11.1: state the trust boundary plainly at mount time.
-    eprintln!(
-        "Tools from {peer}/{service} run on {peer}'s machine. \
-         Treat their output as you would any third-party MCP server."
-    );
-    let entry = proxy::setup_entry(&peer, &service);
-    let rendered = serde_json::to_string_pretty(&entry)?;
-    if print {
-        println!("{rendered}");
-        return Ok(());
-    }
-    match client_config_path(&client) {
-        Some(path) => match merge_client_config(&path, &peer, &service) {
-            Ok(()) => eprintln!("configured {peer}-{service} in {}", path.display()),
-            Err(e) => {
-                eprintln!(
-                    "could not write {} ({e}); printing the entry instead:",
-                    path.display()
-                );
-                println!("{rendered}");
-            }
-        },
-        None => {
-            eprintln!("unknown client '{client}'; printing the entry instead:");
-            println!("{rendered}");
-        }
-    }
-    Ok(())
-}
-
-/// The config file path for a known AI client, or `None` for an unrecognized one (→ the
-/// caller falls back to `--print`). M2a supports `claude` (Claude Desktop). Best-effort: the
-/// path is where the client conventionally keeps its config; whether it exists is checked at
-/// write time.
-fn client_config_path(client: &str) -> Option<PathBuf> {
-    match client {
-        "claude" => claude_desktop_config_path(),
-        _ => None,
-    }
-}
-
-/// Claude Desktop's config path: `~/Library/Application Support/Claude/claude_desktop_config.json`
-/// on macOS, `~/.config/Claude/claude_desktop_config.json` elsewhere.
-fn claude_desktop_config_path() -> Option<PathBuf> {
-    let home = PathBuf::from(std::env::var_os("HOME")?);
-    #[cfg(target_os = "macos")]
-    let path = home
-        .join("Library/Application Support/Claude")
-        .join("claude_desktop_config.json");
-    #[cfg(not(target_os = "macos"))]
-    let path = home
-        .join(".config/Claude")
-        .join("claude_desktop_config.json");
-    Some(path)
-}
-
-/// Merge the `<peer>-<service>` server into a client config, PRESERVING any existing
-/// `mcpServers` (spec §8's block is one entry among many). Refuses when the client's config
-/// directory does not exist — we do not create a third-party app's directory; the caller then
-/// falls back to `--print`. The write is atomic (temp + rename) so a torn write can never
-/// corrupt the user's config.
-///
-/// DELIBERATELY weaker than the crate's `util::atomic_write` (no fsync, pid-only temp name):
-/// this writes a THIRD-PARTY app's config file, best-effort by design — a lost-on-power-cut
-/// write just means re-running `setup`, and the single short-lived CLI process makes an
-/// in-process temp-name collision impossible. Our OWN config/roster/state keep the strong
-/// fsync + per-call-unique discipline.
-fn merge_client_config(path: &Path, peer: &str, service: &str) -> anyhow::Result<()> {
-    let dir = path.parent().context("config path has no parent")?;
-    anyhow::ensure!(
-        dir.is_dir(),
-        "client config dir {} does not exist",
-        dir.display()
-    );
-    let mut doc: Value = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| json!({}));
-    if !doc.is_object() {
-        doc = json!({});
-    }
-    let obj = doc.as_object_mut().expect("doc is an object");
-    let servers = obj.entry("mcpServers").or_insert_with(|| json!({}));
-    if !servers.is_object() {
-        *servers = json!({});
-    }
-    servers
-        .as_object_mut()
-        .expect("mcpServers is an object")
-        .insert(
-            format!("{peer}-{service}"),
-            proxy::server_object(peer, service),
-        );
-    let rendered = serde_json::to_string_pretty(&doc)?;
-
-    let tmp = path.with_extension(format!("mcpmesh.tmp.{}", std::process::id()));
-    std::fs::write(&tmp, rendered.as_bytes())
-        .with_context(|| format!("write temp config {}", tmp.display()))?;
-    // On rename failure, don't leave the temp orphaned in the user's config dir.
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(anyhow::Error::new(e))
-            .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()));
+    for line in proxy::client_instruction_lines(&peer, &[service]) {
+        println!("{line}");
     }
     Ok(())
 }
@@ -1327,6 +1269,65 @@ fn render_status(fingerprint: &str, hello: &Hello, status: &StatusResult, has_ro
             println!("{line}");
         }
     }
+
+    // The next-steps footer, last: whatever this node can actually DO from here, as exact commands.
+    // Empty → nothing prints (a node with nothing to nudge shows a clean status).
+    let next = next_steps_lines(status);
+    if !next.is_empty() {
+        println!();
+        for line in next {
+            println!("{line}");
+        }
+    }
+}
+
+/// Render the `status` next-steps footer: the exact command for each thing this node can do from
+/// where it currently is. Pure so it is unit-testable. Surface-clean (§1.5): petnames + service
+/// names + porcelain commands only.
+///
+/// Each step is offered only when it is genuinely the user's next move, so a fully configured node
+/// prints no nag — the footer is guidance, not decoration.
+fn next_steps_lines(status: &StatusResult) -> Vec<String> {
+    let mut steps = Vec::new();
+
+    // Something reachable → how to actually put it in an AI client (the question `use` answers).
+    if let Some((peer, service)) = status
+        .peers
+        .iter()
+        .find_map(|p| p.services.first().map(|s| (&p.name, s)))
+    {
+        steps.push(format!(
+            "  Use {peer}/{service} from your AI client: `mcpmesh use {peer}/{service}`"
+        ));
+    }
+
+    if status.services.is_empty() {
+        steps.push(
+            "  Share one of your MCP servers: `mcpmesh serve <name> -- <command that runs it>`"
+                .to_string(),
+        );
+        // Don't assume they HAVE one: a complete command that needs nothing but npx.
+        steps.push(format!(
+            "    No MCP server yet? Share a folder: `{SERVE_EXAMPLE}`"
+        ));
+    } else if let Some(svc) = status.services.iter().find(|s| s.allow.is_empty()) {
+        // Serving, but nobody is admitted — the service is invisible until someone is invited.
+        steps.push(format!(
+            "  Nobody can reach '{}' yet: `mcpmesh invite {}`",
+            svc.name, svc.name
+        ));
+    }
+
+    if status.peers.is_empty() {
+        steps.push("  Someone sent you an invite? `mcpmesh pair mcpmesh-invite:…`".to_string());
+    }
+
+    if steps.is_empty() {
+        return steps;
+    }
+    let mut lines = vec!["next steps:".to_string()];
+    lines.extend(steps);
+    lines
 }
 
 /// Render the recent-pairings block of `status`: one line per completed inviter-side pairing,
@@ -1451,6 +1452,8 @@ fn load_device_key() -> anyhow::Result<DeviceKey> {
 
 #[cfg(test)]
 mod tests {
+    use mcpmesh_local_api::{PeerInfo, ServiceInfo};
+
     use super::*;
 
     const DAY: u64 = 24 * 60 * 60;
@@ -1463,12 +1466,22 @@ mod tests {
         };
         let lines = invite_lines(&invite, &["notes".to_string()], 1_000_000);
         assert_eq!(
-            lines,
-            vec![
+            lines[..3],
+            [
                 "One-time invite (expires in 24h). Share it out-of-band:".to_string(),
                 "  mcpmesh-invite:MFRGGZDF".to_string(),
                 "Whoever redeems it can access: notes".to_string(),
             ]
+        );
+        // The next exact instruction — what the OTHER person runs, and the ceremony that follows.
+        let rendered = lines.join("\n");
+        assert!(
+            rendered.contains("Next:") && rendered.contains("mcpmesh pair"),
+            "the invite must name the redeemer's exact next command:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("mcpmesh status"),
+            "the invite must point at where the inviter confirms the code:\n{rendered}"
         );
     }
 
@@ -1493,12 +1506,24 @@ mod tests {
         };
         let lines = pair_lines(&result);
         assert_eq!(lines[0], "Paired with alice — code: tango-fig-42");
-        assert_eq!(
-            lines[1],
-            "Confirm this code matches what alice sees. You can mount: alice/notes"
-        );
         // The SAS line is exactly `... — code: <words>` (the §4.2 human-checkable format).
         assert!(lines[0].contains("code: tango-fig-42"));
+        let rendered = lines.join("\n");
+        // The NEXT exact instruction: the ceremony comes before use.
+        assert!(
+            rendered.contains("Next: confirm this code matches what alice sees"),
+            "pair must name the ceremony as the next step:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("You can now use: alice/notes"),
+            "pair must name the mount target:\n{rendered}"
+        );
+        // …and then EXACTLY how to use it — the block `setup` used to half-write.
+        assert!(
+            rendered.contains("claude mcp add alice-notes -- mcpmesh connect alice/notes")
+                && rendered.contains("claude_desktop_config.json"),
+            "pair must print the client instructions inline:\n{rendered}"
+        );
     }
 
     #[test]
@@ -1508,10 +1533,16 @@ mod tests {
             sas_code: "a-b-c".into(),
             services: vec!["notes".into(), "kb".into()],
         };
-        let lines = pair_lines(&result);
-        assert_eq!(
-            lines[1],
-            "Confirm this code matches what alice sees. You can mount: alice/notes, alice/kb"
+        let rendered = pair_lines(&result).join("\n");
+        assert!(
+            rendered.contains("You can now use: alice/notes, alice/kb"),
+            "both grants are named as mount targets:\n{rendered}"
+        );
+        // Both get their own copy-pasteable Claude Code line.
+        assert!(
+            rendered.contains("claude mcp add alice-notes -- mcpmesh connect alice/notes")
+                && rendered.contains("claude mcp add alice-kb -- mcpmesh connect alice/kb"),
+            "every granted service gets its own instruction:\n{rendered}"
         );
     }
 
@@ -1547,8 +1578,125 @@ mod tests {
         };
         let lines = pair_lines(&result);
         assert_eq!(lines[0], "Paired with alice — code: a-b-c");
-        assert_eq!(lines[1], "Confirm this code matches what alice sees.");
-        assert!(!lines[1].contains("You can mount"));
+        let rendered = lines.join("\n");
+        // The ceremony still gets named — it is the one step that always applies.
+        assert!(rendered.contains("Next: confirm this code matches what alice sees"));
+        // But nothing was granted, so there is nothing to mount and nothing to instruct.
+        assert!(
+            !rendered.contains("You can now use") && !rendered.contains("claude mcp add"),
+            "no dangling mount/instruction block with nothing granted:\n{rendered}"
+        );
+    }
+
+    fn status_with(services: Vec<ServiceInfo>, peers: Vec<PeerInfo>) -> StatusResult {
+        StatusResult {
+            stack_version: "0".into(),
+            services,
+            peers,
+            roster: None,
+            presence: Vec::new(),
+            self_user_id: None,
+            recent_pairings: Vec::new(),
+        }
+    }
+
+    fn service(name: &str, allow: &[&str]) -> ServiceInfo {
+        ServiceInfo {
+            name: name.into(),
+            allow: allow.iter().map(|s| s.to_string()).collect(),
+            backend: BackendKind::Run,
+        }
+    }
+
+    fn peer(name: &str, services: &[&str]) -> PeerInfo {
+        PeerInfo {
+            name: name.into(),
+            services: services.iter().map(|s| s.to_string()).collect(),
+            user_id: None,
+        }
+    }
+
+    #[test]
+    fn next_steps_on_a_fresh_node_name_both_directions() {
+        // Nothing served, nobody paired: the two things a new user can actually do, spelled out.
+        let rendered = next_steps_lines(&status_with(vec![], vec![])).join("\n");
+        assert!(
+            rendered.contains("mcpmesh serve <name> --"),
+            "a fresh node must be told how to share:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("mcpmesh pair"),
+            "a fresh node must be told how to redeem an invite:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn next_steps_offer_a_runnable_serve_example_to_someone_with_no_mcp_server() {
+        // `serve <name> -- <command>` assumes you already HAVE an MCP server to point it at. Most
+        // people do not, so the fresh-node footer also carries one complete, runnable command that
+        // needs nothing but npx — a folder share, the thing mcpmesh is most obviously for.
+        let rendered = next_steps_lines(&status_with(vec![], vec![])).join("\n");
+        assert!(
+            rendered.contains(SERVE_EXAMPLE),
+            "a fresh node must offer a runnable serve example:\n{rendered}"
+        );
+        // It is a whole command, not a fragment: name, the `--` separator, and the server command.
+        assert!(
+            SERVE_EXAMPLE.contains("mcpmesh serve notes --")
+                && SERVE_EXAMPLE.contains("@modelcontextprotocol/server-filesystem"),
+            "the example must be complete and copy-pasteable: {SERVE_EXAMPLE}"
+        );
+    }
+
+    #[test]
+    fn next_steps_point_a_served_but_ungranted_service_at_invite() {
+        // Serving, but nobody can reach it — the exact command that fixes that, naming the service.
+        let rendered =
+            next_steps_lines(&status_with(vec![service("notes", &[])], vec![])).join("\n");
+        assert!(
+            rendered.contains("mcpmesh invite notes"),
+            "an ungranted service must be pointed at `invite <name>`:\n{rendered}"
+        );
+        // Already granted → nothing to nag about.
+        let granted = next_steps_lines(&status_with(
+            vec![service("notes", &["bob"])],
+            vec![peer("bob", &[])],
+        ))
+        .join("\n");
+        assert!(
+            !granted.contains("mcpmesh invite notes"),
+            "a granted service needs no invite nag:\n{granted}"
+        );
+    }
+
+    #[test]
+    fn next_steps_point_a_reachable_peer_service_at_use() {
+        // Something is reachable → the exact command that turns it into a working AI-client mount.
+        let rendered =
+            next_steps_lines(&status_with(vec![], vec![peer("alice", &["notes"])])).join("\n");
+        assert!(
+            rendered.contains("mcpmesh use alice/notes"),
+            "a reachable peer service must be pointed at `use`:\n{rendered}"
+        );
+        // A peer granting nothing yet has no `use` step to offer.
+        let bare = next_steps_lines(&status_with(vec![], vec![peer("alice", &[])])).join("\n");
+        assert!(
+            !bare.contains("mcpmesh use"),
+            "a peer with no grants offers no use step:\n{bare}"
+        );
+    }
+
+    #[test]
+    fn next_steps_are_silent_on_a_fully_configured_node() {
+        // Serving to a real peer AND able to reach one: nothing to nudge — no footer at all.
+        let lines = next_steps_lines(&status_with(
+            vec![service("notes", &["bob"])],
+            vec![peer("bob", &["code"])],
+        ));
+        // The only step left is the `use` hint for bob/code; the serve/invite/pair nags are gone.
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("mcpmesh use bob/code"));
+        assert!(!rendered.contains("mcpmesh serve") && !rendered.contains("mcpmesh pair"));
     }
 
     #[test]

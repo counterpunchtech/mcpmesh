@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use assert_cmd::cargo::cargo_bin;
 use mcpmesh::client::{ControlClient, DaemonLaunch, connect_control, ensure_daemon_with};
+use mcpmesh::daemon::STACK_VERSION;
 use mcpmesh::{Request, StatusResult};
 use mcpmesh_local_api::BackendSpec;
 use serde_json::json;
@@ -120,7 +121,7 @@ async fn ensure_daemon_autostarts_reuses_and_serves_status() {
             .expect("first ensure_daemon");
         assert_eq!(first.hello().api, "mcpmesh-local/1");
         assert_eq!(first.hello().api_version, "1.0");
-        assert_eq!(first.hello().stack_version, "0.1.0");
+        assert_eq!(first.hello().stack_version, STACK_VERSION);
         assert!(launch.socket.exists(), "daemon bound the control socket");
 
         // Second call: the daemon is live → reuse it (fast-path connect, no new spawn).
@@ -150,7 +151,7 @@ async fn ensure_daemon_autostarts_reuses_and_serves_status() {
 
         // Status: empty registry, correct stack version.
         let s = status(&mut first).await;
-        assert_eq!(s.stack_version, "0.1.0");
+        assert_eq!(s.stack_version, STACK_VERSION);
         assert!(s.services.is_empty(), "no services registered in M2a");
         assert!(s.peers.is_empty(), "no peers known in M2a");
 
@@ -161,7 +162,7 @@ async fn ensure_daemon_autostarts_reuses_and_serves_status() {
             .await
             .expect("status with params:{} is answered");
         let s2: StatusResult = serde_json::from_value(raw).expect("StatusResult deserializes");
-        assert_eq!(s2.stack_version, "0.1.0");
+        assert_eq!(s2.stack_version, STACK_VERSION);
 
         // Shut the daemon down over the socket. The daemon raises its stop signal BEFORE
         // best-effort-acking (so an explicit stop always stops), so the ack is best-effort;
@@ -186,8 +187,8 @@ async fn racing_ensure_daemon_calls_converge_on_one_daemon() {
         let mut b = b.expect("racing caller B");
         assert_eq!(a.hello().api, "mcpmesh-local/1");
         assert_eq!(b.hello().api, "mcpmesh-local/1");
-        assert_eq!(status(&mut a).await.stack_version, "0.1.0");
-        assert_eq!(status(&mut b).await.stack_version, "0.1.0");
+        assert_eq!(status(&mut a).await.stack_version, STACK_VERSION);
+        assert_eq!(status(&mut b).await.stack_version, STACK_VERSION);
 
         a.request_value(&json!({ "method": "shutdown" })).await.ok();
         wait_until_down(&launch.socket).await;
@@ -386,7 +387,7 @@ async fn porcelain_autostarts_daemon_and_second_call_reuses_it() {
             "status prints the api name: {stdout1}"
         );
         assert!(
-            stdout1.contains("0.1.0"),
+            stdout1.contains(STACK_VERSION),
             "status prints the stack version: {stdout1}"
         );
         assert!(
@@ -399,7 +400,7 @@ async fn porcelain_autostarts_daemon_and_second_call_reuses_it() {
         let stdout2 = String::from_utf8_lossy(&out2.stdout);
         assert!(out2.status.success(), "second status exit 0");
         assert!(stdout2.contains("mcpmesh-local/1"));
-        assert!(stdout2.contains("0.1.0"));
+        assert!(stdout2.contains(STACK_VERSION));
 
         // Exactly one control socket ever bound (single-daemon-per-uid).
         assert_eq!(
@@ -444,7 +445,7 @@ async fn non_porcelain_client_drives_status_over_local_api() {
         // Drive status over the wire and parse the typed result.
         let result = raw.request(Request::Status).await.expect("status request");
         let s: StatusResult = serde_json::from_value(result).expect("StatusResult deserializes");
-        assert_eq!(s.stack_version, "0.1.0");
+        assert_eq!(s.stack_version, STACK_VERSION);
 
         let _ = raw.request_value(&json!({ "method": "shutdown" })).await;
         wait_until_down(&launch.socket).await;

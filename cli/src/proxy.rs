@@ -9,18 +9,22 @@
 //! stdout closes). No mid-session re-dial (§8) — the AI client re-invokes if it wants a fresh
 //! session.
 //!
-//! `setup` (spec §11.1) lives here too as the config-entry authority: [`setup_entry`] mints
-//! the `mcpServers` block a client config needs, and [`split_target`] parses the shared
-//! `<peer>/<service>` argument.
+//! The config-entry authority lives here too: `mcp_servers_entry` mints the one `mcpServers`
+//! entry shape a client config needs, [`client_instruction_lines`] renders the plain-language
+//! "here is exactly what to do next" block (spec §11.1 — including the trust-boundary line) that
+//! `pair` and `use` print, and [`split_target`] parses the shared `<peer>/<service>` argument.
+//!
+//! We PRINT those instructions rather than writing a third-party app's config file: the config
+//! shapes and locations are the AI clients' to change, a half-working writer that silently targets
+//! the wrong file is worse than no writer, and a human who pastes the line knows what they mounted.
 use anyhow::{Context, Result};
 use mcpmesh_net::framing::{FrameReader, Inbound, write_frame};
-use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 use crate::client::ensure_daemon;
 use crate::ipc::MAX_FRAME_BYTES;
 
-/// Parse `<peer>/<service>` — the single argument shape `connect` and `setup` share. Both
+/// Parse `<peer>/<service>` — the single argument shape `connect` and `use` share. Both
 /// halves must be non-empty (a bare `alice` or `alice/` is a usage error, not a dial that
 /// silently fails later).
 pub fn split_target(target: &str) -> Result<(String, String)> {
@@ -34,21 +38,76 @@ pub fn split_target(target: &str) -> Result<(String, String)> {
     Ok((peer.to_string(), service.to_string()))
 }
 
-/// The single mcpServers *server object* that mounts `<peer>/<service>` through the proxy
-/// (spec §8): `{ "command": "mcpmesh", "args": ["connect", "<peer>/<service>"] }`. The one
-/// place this shape is defined — both [`setup_entry`] (for `--print`) and the client-config
-/// writer (for the file merge) use it, so they can never drift.
-pub fn server_object(peer: &str, service: &str) -> Value {
-    json!({ "command": "mcpmesh", "args": ["connect", format!("{peer}/{service}")] })
+/// One `mcpServers` entry that mounts `<peer>/<service>` through the proxy (spec §8), rendered as
+/// the text a human pastes into a client config:
+/// `"<peer>-<service>": {"command": "mcpmesh", "args": ["connect", "<peer>/<service>"]}`.
+///
+/// Rendered rather than `serde_json`-serialized so the keys keep their conventional
+/// `command`-then-`args` order (a `serde_json::Value` sorts them alphabetically, which reads
+/// backwards in a config file). The two interpolated NAMES still go through `serde_json`, so a
+/// petname carrying a quote or a backslash can never produce broken JSON.
+fn mcp_servers_entry(peer: &str, service: &str) -> String {
+    let name = serde_json::to_string(&format!("{peer}-{service}")).expect("a string serializes");
+    let target = serde_json::to_string(&format!("{peer}/{service}")).expect("a string serializes");
+    format!(r#"{name}: {{"command": "mcpmesh", "args": ["connect", {target}]}}"#)
 }
 
-/// The AI-client config entry that mounts `<peer>/<service>` through the proxy (spec §8):
-/// ```json
-/// { "mcpServers": { "<peer>-<service>": {
-///     "command": "mcpmesh", "args": ["connect", "<peer>/<service>"] } } }
-/// ```
-pub fn setup_entry(peer: &str, service: &str) -> Value {
-    json!({ "mcpServers": { format!("{peer}-{service}"): server_object(peer, service) } })
+/// Where Claude Desktop keeps its config, rendered for humans to open. `$HOME` is expanded when
+/// known so the line is copy-pasteable as-is; it degrades to `~` rather than failing (this is a
+/// display string in an instruction block, never a path we write).
+fn claude_desktop_config_path() -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
+    if cfg!(target_os = "macos") {
+        format!("{home}/Library/Application Support/Claude/claude_desktop_config.json")
+    } else {
+        format!("{home}/.config/Claude/claude_desktop_config.json")
+    }
+}
+
+/// The plain-language block telling a human EXACTLY how to use `<peer>/<service…>` from their AI
+/// client — printed by `pair` (right when the grant lands) and by `use` (to see it again). Pure so
+/// it is unit-testable.
+///
+/// Every line is either a sentence or a command to copy: the Claude Code invocation, the Claude
+/// Desktop config path + entry + restart step, and the generic stdio command any other MCP client
+/// takes. It opens with the §11.1 trust boundary — this is the mount-time moment that line exists
+/// for. Surface-clean (§1.5): petnames, service names, and the `mcpmesh connect` command only —
+/// never an EndpointId.
+///
+/// Empty `services` renders NOTHING (no dangling "add this to your config" with no entry under it).
+pub fn client_instruction_lines(peer: &str, services: &[String]) -> Vec<String> {
+    if services.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![
+        format!(
+            "Tools from {peer} run on {peer}'s machine. Treat their output as you would \
+             anything else {peer} sends you."
+        ),
+        String::new(),
+        "To use in Claude Code, run:".to_string(),
+    ];
+    for s in services {
+        lines.push(format!(
+            "  claude mcp add {peer}-{s} -- mcpmesh connect {peer}/{s}"
+        ));
+    }
+    lines.push(String::new());
+    lines.push("To use in Claude Desktop, add this under \"mcpServers\" in".to_string());
+    lines.push(format!("  {}", claude_desktop_config_path()));
+    lines.push("then quit and restart Claude Desktop:".to_string());
+    for (i, s) in services.iter().enumerate() {
+        // Compact one-line entries; every one but the last is comma-terminated, so the whole block
+        // pastes between the braces of `mcpServers` and is valid JSON.
+        let comma = if i + 1 < services.len() { "," } else { "" };
+        lines.push(format!("  {}{comma}", mcp_servers_entry(peer, s)));
+    }
+    lines.push(String::new());
+    lines.push(format!(
+        "Any other MCP client: add a stdio server with the command `mcpmesh connect {peer}/{}`.",
+        services[0]
+    ));
+    lines
 }
 
 /// Run the proxy: connect the daemon, open the session (the shared client's `open_session`
@@ -134,26 +193,90 @@ where
 mod tests {
     use std::time::Duration;
 
-    use serde_json::json;
+    use serde_json::{Value, json};
     use tokio::io::{duplex, split};
     use tokio::time::timeout;
 
     use super::*;
 
     #[test]
-    fn setup_entry_has_the_exact_wire_shape() {
-        // The §8 config block, verbatim (compared as parsed JSON so formatting is irrelevant).
+    fn mcp_servers_entry_parses_back_to_the_exact_wire_shape() {
+        // The rendered entry is real JSON with the §8 shape: wrap it in the braces it is pasted
+        // between and parse it back (proving both validity and shape, whatever the formatting).
+        let doc: Value =
+            serde_json::from_str(&format!("{{{}}}", mcp_servers_entry("alice", "notes"))).unwrap();
         assert_eq!(
-            setup_entry("alice", "notes"),
-            json!({
-                "mcpServers": {
-                    "alice-notes": {
-                        "command": "mcpmesh",
-                        "args": ["connect", "alice/notes"]
-                    }
-                }
-            })
+            doc,
+            json!({ "alice-notes": { "command": "mcpmesh", "args": ["connect", "alice/notes"] } })
         );
+    }
+
+    #[test]
+    fn mcp_servers_entry_escapes_an_exotic_petname() {
+        // A petname carrying a quote must not produce broken JSON (it is rendered, not serialized).
+        let doc: Value =
+            serde_json::from_str(&format!("{{{}}}", mcp_servers_entry(r#"a"b"#, "notes"))).unwrap();
+        assert_eq!(
+            doc,
+            json!({ r#"a"b-notes"#: { "command": "mcpmesh", "args": ["connect", r#"a"b/notes"#] } })
+        );
+    }
+
+    #[test]
+    fn client_instruction_lines_name_both_clients_with_copyable_commands() {
+        let lines = client_instruction_lines("alice", &["notes".to_string()]);
+        let rendered = lines.join("\n");
+        // Claude Code: the exact command, copy-pasteable.
+        assert!(
+            rendered.contains("claude mcp add alice-notes -- mcpmesh connect alice/notes"),
+            "the Claude Code command must be spelled out verbatim:\n{rendered}"
+        );
+        // Claude Desktop: the exact config path, the exact entry, and the restart step.
+        assert!(
+            rendered.contains("claude_desktop_config.json"),
+            "the Claude Desktop config path must be named:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                r#""alice-notes": {"command": "mcpmesh", "args": ["connect", "alice/notes"]}"#
+            ),
+            "the Claude Desktop entry must be copy-pasteable:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("mcpServers") && rendered.to_lowercase().contains("restart"),
+            "the Desktop instructions must say where it goes and to restart:\n{rendered}"
+        );
+        // §11.1: the trust boundary is stated plainly at mount time.
+        assert!(
+            rendered.contains("run on alice's machine"),
+            "the trust-boundary line must survive:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn client_instruction_lines_render_every_granted_service() {
+        // Multiple grants: one Claude Code line each, and a comma-joined Desktop block (valid JSON
+        // once pasted between the braces of `mcpServers` — every entry but the last is comma'd).
+        let services = vec!["notes".to_string(), "kb".to_string()];
+        let rendered = client_instruction_lines("alice", &services).join("\n");
+        assert!(rendered.contains("claude mcp add alice-notes -- mcpmesh connect alice/notes"));
+        assert!(rendered.contains("claude mcp add alice-kb -- mcpmesh connect alice/kb"));
+        assert!(
+            rendered.contains(r#""connect", "alice/notes"]},"#),
+            "all but the last Desktop entry are comma-terminated:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(r#""connect", "alice/kb"]}"#)
+                && !rendered.contains(r#""connect", "alice/kb"]},"#),
+            "the last Desktop entry has no trailing comma:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn client_instruction_lines_are_empty_without_services() {
+        // Nothing granted → nothing to instruct (the caller prints no block at all, rather than a
+        // dangling "add this to your config" with no entry under it).
+        assert!(client_instruction_lines("alice", &[]).is_empty());
     }
 
     #[test]

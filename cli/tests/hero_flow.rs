@@ -38,7 +38,7 @@ use iroh::address_lookup::MemoryLookup;
 use mcpmesh::allowlist::{AllowlistGate, PeerEntry, PeerStore};
 use mcpmesh::client::connect_control;
 use mcpmesh::config::Config;
-use mcpmesh::daemon::{self, build_services};
+use mcpmesh::daemon::{self, STACK_VERSION, build_services};
 use mcpmesh_net::framing::{FrameReader, Inbound, write_frame};
 use mcpmesh_net::{TrustGate, connect, serve};
 use serde_json::{Value, json};
@@ -247,7 +247,7 @@ async fn hero_flow_minus_pairing() {
         // seeds an empty snapshot deliberately.)
         let s: mcpmesh::StatusResult =
             serde_json::from_value(result).expect("StatusResult deserializes");
-        assert_eq!(s.stack_version, "0.1.0");
+        assert_eq!(s.stack_version, STACK_VERSION);
 
         control.abort();
     })
