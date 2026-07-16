@@ -541,6 +541,66 @@
     color: var(--faint);
     letter-spacing: 0.08em;
   }
+
+  /* ---- jargon popups: hover or focus any dotted term ---- */
+  .gloss {
+    border-bottom: 1px dotted var(--amber);
+    cursor: help;
+    position: relative;
+  }
+  .gloss::after {
+    content: attr(data-tip);
+    position: absolute;
+    left: 50%;
+    bottom: calc(100% + 10px);
+    transform: translate(-50%, 4px);
+    width: max-content;
+    max-width: min(300px, 76vw);
+    background: var(--panel);
+    color: var(--ink);
+    border: 1px solid var(--line-strong);
+    border-radius: 9px;
+    padding: 10px 13px;
+    font-family: var(--display);
+    font-size: 13.5px;
+    font-weight: 400;
+    font-style: normal;
+    letter-spacing: 0;
+    line-height: 1.5;
+    text-transform: none;
+    white-space: normal;
+    text-align: left;
+    box-shadow: 0 10px 28px rgba(5, 9, 16, 0.28);
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+    transition: opacity 0.18s ease, transform 0.18s ease;
+    z-index: 40;
+  }
+  .gloss::before {
+    content: '';
+    position: absolute;
+    left: 50%;
+    bottom: calc(100% + 6px);
+    transform: translateX(-50%) rotate(45deg);
+    width: 9px;
+    height: 9px;
+    background: var(--panel);
+    border-right: 1px solid var(--line-strong);
+    border-bottom: 1px solid var(--line-strong);
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+    transition: opacity 0.18s ease;
+    z-index: 41;
+  }
+  .gloss:hover::after, .gloss:focus::after { opacity: 1; visibility: visible; transform: translate(-50%, 0); }
+  .gloss:hover::before, .gloss:focus::before { opacity: 1; visibility: visible; }
+  .gloss:focus { outline: none; }
+  .gloss:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; border-radius: 4px; }
+  @media (prefers-reduced-motion: reduce) {
+    .gloss::after { transition: opacity 0.1s linear; transform: translate(-50%, 0); }
+  }
 </style>
 
 <div class="deck" id="deck">
@@ -550,10 +610,10 @@
     <div class="frame">
       <div class="eyebrow">counterpunchtech / mcpmesh</div>
       <h1>mcpmesh</h1>
-      <p class="lede" style="font-size: clamp(18px, 2.4vw, 25px); max-width: 30em;"><strong>Share MCP servers with people you trust</strong> — peer to peer, <span class="em">no accounts, no cloud.</span></p>
+      <p class="lede" style="font-size: clamp(18px, 2.4vw, 25px); max-width: 30em;"><strong>Share <span class="gloss" data-tip="A small program that gives an AI extra tools — search my notes, run my scripts. It speaks MCP (the Model Context Protocol), so any MCP-capable AI app can use it.">MCP servers</span> with people you trust</strong> — <span class="gloss" data-tip="Your two machines talk directly to each other — no company server sits in the middle handling your data.">peer to peer</span>, <span class="em">no accounts, no cloud.</span></p>
       <div class="wire" style="max-width: 560px;">
         <div class="endpoint"><div class="dot"></div><div class="who">you</div></div>
-        <div class="link"><div class="cable wire-flow"></div><div class="tag">end-to-end encrypted</div></div>
+        <div class="link"><div class="cable wire-flow"></div><div class="tag"><span class="gloss" data-tip="Encrypted on the sender's machine and only decrypted on the receiver's. Nothing along the way — routers, relays, ISPs — can read it.">end-to-end encrypted</span></div></div>
         <div class="endpoint"><div class="dot"></div><div class="who">friend</div></div>
       </div>
       <div class="hint">→ arrow keys or the rail below to navigate</div>
@@ -565,7 +625,7 @@
     <div class="frame">
       <div class="eyebrow">The problem</div>
       <h2>Your AI's tools end at your machine.</h2>
-      <p class="lede">MCP servers — your notes, your code search, your scripts — run locally, wired into <strong>your</strong> AI client. The moment you want a friend's AI to use one of them, today's answer is heavyweight: host it on the internet, add OAuth, create accounts, trust a cloud middleman.</p>
+      <p class="lede"><span class="gloss" data-tip="Small programs that give an AI extra tools — search my notes, run my scripts. They speak MCP (the Model Context Protocol), so any MCP-capable AI app can use them.">MCP servers</span> — your notes, your code search, your scripts — run locally, wired into <strong>your</strong> AI client. The moment you want a friend's AI to use one of them, today's answer is heavyweight: host it on the internet, add <span class="gloss" data-tip="The “Sign in with Google/GitHub…” permission dance apps use to reach your accounts. mcpmesh has nothing to sign into.">OAuth</span>, create accounts, trust a cloud middleman.</p>
       <div class="kicker">All you actually wanted was: <em>“my AI can use my friend's tools, and theirs can use mine.”</em></div>
     </div>
   </section>
@@ -575,11 +635,11 @@
     <div class="frame">
       <div class="eyebrow">What it is</div>
       <h2>Any MCP server, shared with a specific person.</h2>
-      <p class="lede">Register any MCP server under a name you pick, hand one person an invite, and their AI client — Claude Desktop, or anything that speaks MCP — <strong>mounts it as if it were local</strong>. Requests travel an encrypted connection straight between your two machines.</p>
+      <p class="lede">Register any <span class="gloss" data-tip="A small program that gives an AI extra tools — search my notes, run my scripts. It speaks MCP (the Model Context Protocol), so any MCP-capable AI app can use it.">MCP server</span> under a name you pick, hand one person an invite, and their AI client — Claude Desktop, or anything that speaks MCP — <strong>mounts it as if it were local</strong>. Requests travel an encrypted connection straight between your two machines.</p>
       <div class="grid3">
         <div class="card"><span class="k">No hosting</span><p>Nothing is published to the internet. Your server keeps running where it always did — on your machine.</p></div>
-        <div class="card"><span class="k">No accounts</span><p>No signup, no OAuth, no directory. Identity is a keypair on your device; names are petnames you choose.</p></div>
-        <div class="card"><span class="k">No middleman</span><p>iroh/QUIC with NAT hole-punching: end-to-end encrypted, machine to machine. No server of ours in the trust path.</p></div>
+        <div class="card"><span class="k">No accounts</span><p>No signup, no <span class="gloss" data-tip="The “Sign in with Google/GitHub…” permission dance apps use to reach your accounts. mcpmesh has nothing to sign into.">OAuth</span>, no directory. Identity is a <span class="gloss" data-tip="Two mathematically linked cryptographic keys. The private half never leaves your device; the public half is how other machines recognize it.">keypair</span> on your device; names are <span class="gloss" data-tip="Your own nickname for a peer — like a contact name in your phone. Local to you; there are no global usernames to register or squat.">petnames</span> you choose.</p></div>
+        <div class="card"><span class="k">No middleman</span><p><span class="gloss" data-tip="An open-source networking library for direct, encrypted device-to-device connections. mcpmesh builds all peer traffic on it.">iroh</span>/<span class="gloss" data-tip="The modern encrypted internet transport that HTTP/3 runs on — fast connections with encryption built in.">QUIC</span> with <span class="gloss" data-tip="The trick that lets two machines behind ordinary home routers connect directly — no port forwarding, no setup.">NAT hole-punching</span>: <span class="gloss" data-tip="Encrypted on the sender's machine and only decrypted on the receiver's. Nothing along the way can read it.">end-to-end encrypted</span>, machine to machine. No server of ours in the trust path.</p></div>
       </div>
     </div>
   </section>
@@ -590,7 +650,7 @@
       <div class="eyebrow">How you use it</div>
       <h2>Four verbs. One minute.</h2>
       <div class="steps">
-        <div class="step"><div class="n">1</div><div class="v">serve</div><p>Register any MCP server under a name you pick.</p></div>
+        <div class="step"><div class="n">1</div><div class="v">serve</div><p>Register any <span class="gloss" data-tip="A small program that gives an AI extra tools — search my notes, run my scripts. It speaks MCP (the Model Context Protocol), so any MCP-capable AI app can use it.">MCP server</span> under a name you pick.</p></div>
         <div class="step"><div class="n">2</div><div class="v">invite</div><p>Mint a one-time, expiring invite for that share.</p></div>
         <div class="step"><div class="n">3</div><div class="v">pair</div><p>Your friend redeems it — the machines now trust each other.</p></div>
         <div class="step"><div class="n">4</div><div class="v">setup</div><p>One command wires it into their AI client's config.</p></div>
@@ -619,13 +679,13 @@ Paired with you — code: <span class="g">tango-fig-cabbage</span>
     <div class="frame">
       <div class="eyebrow">The ceremony</div>
       <h2>Two screens, same three words.</h2>
-      <p class="lede">After pairing, both machines display the same short code. Read it to each other out loud — <strong>matching words mean the pairing is authentic</strong>. The invite channel doesn't need to be secure: tampering with an invite makes the codes mismatch.</p>
+      <p class="lede">After <span class="gloss" data-tip="The one-time handshake after redeeming an invite: both devices learn each other's keys and can verify each other from then on.">pairing</span>, both machines display the same short code. Read it to each other out loud — <strong>matching words mean the pairing is authentic</strong>. The invite channel doesn't need to be secure: tampering with an invite makes the codes mismatch.</p>
       <div class="codeslab" role="img" aria-label="Safety code: tango fig cabbage">
         <span>tango</span><span class="sep">·</span><span>fig</span><span class="sep">·</span><span>cabbage</span>
       </div>
       <ul class="tight">
         <li><strong>Invites are one-time and expiring</strong> — a stolen invite line goes stale, and a redeemed one is spent.</li>
-        <li><strong>Names are petnames.</strong> “alice” is <em>your</em> name for <em>your</em> peer, local to you — there are no global identities to squat or spoof.</li>
+        <li><strong>Names are <span class="gloss" data-tip="Your own nickname for a peer — like a contact name in your phone. Local to you; there are no global usernames to register or squat.">petnames</span>.</strong> “alice” is <em>your</em> name for <em>your</em> peer, local to you — there are no global identities to squat or spoof.</li>
         <li><strong>Pairing is mutual, access is not.</strong> One redemption makes the two devices know each other; every service grant stays explicit and one-way until given.</li>
       </ul>
     </div>
@@ -636,20 +696,20 @@ Paired with you — code: <span class="g">tango-fig-cabbage</span>
     <div class="frame">
       <div class="eyebrow">How it works</div>
       <h2>How a request travels.</h2>
-      <p class="lede">Bob's AI thinks it's talking to a local MCP server. The proxy hands frames to a per-user daemon, which dials Alice's device directly and is vetted at her door before her real server hears a word.</p>
+      <p class="lede">Bob's AI thinks it's talking to a local MCP server. The <span class="gloss" data-tip="A go-between that forwards messages unchanged — here it just shuttles bytes between the AI app and the daemon.">proxy</span> hands frames to a per-user <span class="gloss" data-tip="A background program that's always running quietly. This one holds your keys, your peer list, and your open connections.">daemon</span>, which dials Alice's device directly and is vetted at her door before her real server hears a word.</p>
       <div class="arch">
         <div class="machine">
           <div class="mlabel">bob's machine</div>
           <div class="node"><div class="t">AI client</div><div class="d">Claude Desktop · speaks MCP over stdio</div></div>
-          <div class="vlink"><span class="arr">│</span> stdio, verbatim frames <span class="arr">│</span></div>
+          <div class="vlink"><span class="arr">│</span> <span class="gloss" data-tip="Standard input/output — the plain text pipe two programs on one machine use to talk to each other.">stdio</span>, verbatim frames <span class="arr">│</span></div>
           <div class="node"><div class="t">mcpmesh connect alice/notes</div><div class="d">thin proxy · interprets nothing</div></div>
-          <div class="vlink"><span class="arr">│</span> local socket <span class="arr">│</span></div>
+          <div class="vlink"><span class="arr">│</span> <span class="gloss" data-tip="A private channel between programs on the same machine, protected by your operating-system user permissions.">local socket</span> <span class="arr">│</span></div>
           <div class="node"><div class="t">mcpmesh daemon</div><div class="d">owns keys, peers, dialing &amp; sessions</div></div>
         </div>
         <div class="archlink">
-          <div class="lab">iroh / QUIC</div>
+          <div class="lab"><span class="gloss" data-tip="An open-source networking library for direct, encrypted device-to-device connections. mcpmesh builds all peer traffic on it.">iroh</span> / <span class="gloss" data-tip="The modern encrypted internet transport that HTTP/3 runs on — fast connections with encryption built in.">QUIC</span></div>
           <div class="cable wire-flow"></div>
-          <div class="lab">end-to-end encrypted<br /><span class="sub">NAT hole-punched · relay only for rendezvous</span></div>
+          <div class="lab"><span class="gloss" data-tip="Encrypted on the sender's machine and only decrypted on the receiver's. Nothing along the way can read it.">end-to-end encrypted</span><br /><span class="sub"><span class="gloss" data-tip="The trick that lets two machines behind ordinary home routers connect directly — no port forwarding, no setup.">NAT hole-punched</span> · <span class="gloss" data-tip="A public helper server used only to introduce two machines (and to carry traffic when no direct path exists). It sees only encrypted bytes.">relay</span> only for <span class="gloss" data-tip="The “meet here first” step: both machines check in at a known spot to find each other, then talk directly.">rendezvous</span></span></div>
         </div>
         <div class="machine">
           <div class="mlabel">alice's machine</div>
@@ -667,10 +727,10 @@ Paired with you — code: <span class="g">tango-fig-cabbage</span>
   <section class="slide" aria-label="Trust model">
     <div class="frame">
       <div class="eyebrow">Trust model</div>
-      <h2>Default-deny, and everything undoable.</h2>
+      <h2><span class="gloss" data-tip="Everything is off until you explicitly switch it on. No access is ever implied or automatic.">Default-deny</span>, and everything undoable.</h2>
       <div class="grid2">
         <div class="card"><h3>Nothing shared until you say so</h3><p>No service is reachable until you run <code class="inline">serve</code> + <code class="inline">invite</code>, and every grant names exactly who gets access to exactly which service. Grants accumulate; none is implied.</p></div>
-        <div class="card"><h3>Self-sovereign identity</h3><p>Device keys never leave the machine. People are verified device→user bindings, so sharing with a person reaches all their paired devices — still with no registry anywhere.</p></div>
+        <div class="card"><h3>Self-sovereign identity</h3><p><span class="gloss" data-tip="Each machine's private cryptographic key — the thing that proves “this is really Bob's laptop.” It is generated on the device and never copied off it.">Device keys</span> never leave the machine. People are verified <span class="gloss" data-tip="A signed statement that “this device belongs to this person” — so sharing with a person covers all of their devices.">device→user bindings</span>, so sharing with a person reaches all their paired devices — still with no registry anywhere.</p></div>
         <div class="card"><h3>Instant revocation</h3><p><code class="inline">mcpmesh pair --remove alice</code> cuts a peer off from your services immediately. <code class="inline">status</code> shows everything you serve and reach; <code class="inline">doctor</code> health-checks the setup.</p></div>
         <div class="card"><h3>The boundary, in one line</h3><p>mcpmesh authenticates <strong>who</strong> you're talking to and encrypts the pipe — it does not vet <strong>what</strong> a peer's server says. Treat a peer's tool output like any content from that person.</p></div>
       </div>
@@ -682,10 +742,10 @@ Paired with you — code: <span class="g">tango-fig-cabbage</span>
     <div class="frame">
       <div class="eyebrow">For teams</div>
       <h2>Roster mode: an org in a signed file.</h2>
-      <p class="lede">Pairing is person-to-person. Roster mode layers team membership on the same machinery: an operator runs <code class="inline">mcpmesh org create</code>, members <code class="inline">mcpmesh join</code>, and membership lives in a <strong>signed roster document</strong> on any static web host.</p>
+      <p class="lede">Pairing is person-to-person. Roster mode layers team membership on the same machinery: an operator runs <code class="inline">mcpmesh org create</code>, members <code class="inline">mcpmesh join</code>, and membership lives in a <strong><span class="gloss" data-tip="A team membership list stamped with a cryptographic signature. Any edit by anyone but the org breaks the stamp — so the file can be hosted anywhere.">signed roster document</span></strong> on any <span class="gloss" data-tip="A server that only hands out files and runs no code — a storage bucket, GitHub Pages, a closet server.">static web host</span>.</p>
       <div class="grid3">
-        <div class="card"><span class="k">Signature is the boundary</span><p>The org root key signs the roster. The web host, the network, and the gossip layer are all untrusted transport — they can only fail to deliver, never forge.</p></div>
-        <div class="card"><span class="k">Any static host</span><p>A roster is a JSON file. Serve it from a bucket, a Pages site, a closet server — nodes poll the URL and gossip newer serials to each other.</p></div>
+        <div class="card"><span class="k">Signature is the boundary</span><p>The <span class="gloss" data-tip="The organization's master signing key. Only rosters stamped by it are accepted — so the server hosting the file needs no trust at all.">org root key</span> signs the roster. The web host, the network, and the gossip layer are all untrusted transport — they can only fail to deliver, never forge.</p></div>
+        <div class="card"><span class="k">Any static host</span><p>A roster is a JSON file. Serve it from a bucket, a Pages site, a closet server — nodes poll the URL and <span class="gloss" data-tip="Peers spread news to each other directly — “seen version 7 yet?” — until the whole team has it. No central broadcaster.">gossip</span> newer <span class="gloss" data-tip="The roster's version number. Nodes always adopt the newest roster they can verify, and never go backwards.">serials</span> to each other.</p></div>
         <div class="card"><span class="k">Revocation severs</span><p>Removing a member publishes a new roster serial; every node converges on it and cuts the member's live sessions everywhere.</p></div>
       </div>
     </div>
@@ -695,12 +755,12 @@ Paired with you — code: <span class="g">tango-fig-cabbage</span>
   <section class="slide" aria-label="Under the hood and status">
     <div class="frame">
       <div class="eyebrow">Under the hood</div>
-      <h2>Five small crates, one wire format.</h2>
+      <h2>Five small <span class="gloss" data-tip="Rust's word for a software package — like an npm or pip package.">crates</span>, one wire format.</h2>
       <div class="crates">
-        <div class="row"><div class="name">mcpmesh</div><div class="what">The binary: the porcelain verbs, plus a per-user daemon it auto-starts</div></div>
-        <div class="row"><div class="name">mcpmesh-net</div><div class="what">Transport kernel — iroh/QUIC sessions, accept-time trust gating</div></div>
-        <div class="row"><div class="name">mcpmesh-trust</div><div class="what">Keys, signed rosters, device→user bindings — no network code</div></div>
-        <div class="row"><div class="name">mcpmesh-codec</div><div class="what">The one NDJSON frame codec both ends of every wire share</div></div>
+        <div class="row"><div class="name">mcpmesh</div><div class="what">The binary: the <span class="gloss" data-tip="Borrowed from git: the friendly, human-facing commands (serve, invite, pair…) as opposed to the internal plumbing.">porcelain verbs</span>, plus a per-user <span class="gloss" data-tip="A background program that's always running quietly. This one holds your keys, your peer list, and your open connections.">daemon</span> it auto-starts</div></div>
+        <div class="row"><div class="name">mcpmesh-net</div><div class="what">Transport kernel — <span class="gloss" data-tip="iroh: an open-source library for direct, encrypted device-to-device connections. QUIC: the encrypted transport HTTP/3 runs on.">iroh/QUIC</span> sessions, accept-time trust gating</div></div>
+        <div class="row"><div class="name">mcpmesh-trust</div><div class="what">Keys, signed rosters, <span class="gloss" data-tip="A signed statement that “this device belongs to this person” — so sharing with a person covers all of their devices.">device→user bindings</span> — no network code</div></div>
+        <div class="row"><div class="name">mcpmesh-codec</div><div class="what">The one <span class="gloss" data-tip="Newline-delimited JSON: one message per line of plain text — trivially easy to read, log, and debug.">NDJSON</span> frame codec both ends of every wire share</div></div>
         <div class="row"><div class="name">mcpmesh-local-api</div><div class="what">The local control API (<code class="inline">mcpmesh-local/1</code>) clients and plugins build on</div></div>
       </div>
       <div class="footline">
@@ -772,6 +832,9 @@ Paired with you — code: <span class="g">tango-fig-cabbage</span>
         case 'End': go(slides.length - 1); e.preventDefault(); break;
       }
     });
+
+    // Jargon terms open on keyboard focus too (and on tap, via the focus this grants).
+    document.querySelectorAll('.gloss').forEach(function (t) { t.tabIndex = 0; });
 
     var fromHash = parseInt((location.hash || '').slice(1), 10);
     if (fromHash >= 1 && fromHash <= slides.length) current = fromHash - 1;
