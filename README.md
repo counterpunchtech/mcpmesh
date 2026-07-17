@@ -213,6 +213,21 @@ combination you configure.
 the pipe — it does not vet *what* a peer's MCP server says. Treat tool output from a peer like
 any content from that person.
 
+## Building on mcpmesh
+
+To share a tool, you write an ordinary [MCP](https://modelcontextprotocol.io) server — the same
+artifact you'd hand to Claude Desktop — and `serve` it. That works in any language with an MCP SDK,
+with no mcpmesh code: the mesh hands your server the **cryptographically verified caller identity**
+per call (an env var for a spawned server, an `initialize` `_meta` field for a warm one), so you can
+scope what you disclose to *who* is asking.
+
+If you're instead building something that *drives* the mesh — a GUI, a launcher, a plugin daemon —
+it talks to the per-user daemon over `mcpmesh-local/1`: newline-delimited JSON over a same-user Unix
+socket, simple enough to implement in any language. The
+[**`mcpmesh-local/1` protocol spec**](docs/local-protocol.md) documents the framing, the handshake,
+every method, and the identity contract. Rust clients can depend on the
+[`mcpmesh-local-api`](https://crates.io/crates/mcpmesh-local-api) crate directly instead.
+
 ## Platform support
 
 macOS and Linux (x86_64 / aarch64). Rust ≥ 1.95 to build from source. Windows is not supported
