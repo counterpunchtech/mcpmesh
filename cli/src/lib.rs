@@ -17,6 +17,7 @@ pub mod limits;
 pub mod pairing;
 pub mod proxy;
 pub mod roster;
+pub mod stream;
 pub mod util;
 
 pub use mcpmesh_local_api::{Hello, Request, StatusResult};

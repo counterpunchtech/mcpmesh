@@ -107,6 +107,22 @@ impl ControlClient {
         Ok((self.reader, self.writer))
     }
 
+    /// Send a parameterless stream-upgrade request WITHOUT reading a response — like
+    /// [`open_session`](Self::open_session), but generic on the `method`: after this call the
+    /// socket stops being request/response and becomes a one-way push stream of frames the caller
+    /// READS (the `subscribe` telemetry surface). Returns the framed halves — the SAME
+    /// `FrameReader` that read the Hello, so any frame the daemon pipelined behind it is never
+    /// lost. The write half is handed back so the caller can hold the connection open (a watcher
+    /// only reads, but dropping the writer would half-close the socket).
+    pub async fn open_stream(
+        mut self,
+        method: &str,
+    ) -> Result<(FrameReader<OwnedReadHalf>, OwnedWriteHalf), ClientError> {
+        let frame = serde_json::json!({ "method": method });
+        write_frame(&mut self.writer, &frame).await?;
+        Ok((self.reader, self.writer))
+    }
+
     /// Publish a local file into `scope`; return the minted `mcpmesh/blob/1` ticket + hash.
     pub async fn blob_publish(
         &mut self,
@@ -218,6 +234,7 @@ mod tests {
             presence: vec![],
             self_user_id: None,
             recent_pairings: vec![],
+            reachability: vec![],
         };
         write_frame(
             &mut writer,

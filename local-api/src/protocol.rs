@@ -52,6 +52,18 @@ pub struct PeerInfo {
     pub user_id: Option<String>,
 }
 
+/// Advisory reachability of a paired peer (spec: pairing-mode liveness). Surface-clean (§1.5):
+/// a petname + a bool + latency/age NUMBERS — never an endpoint-id, key, or transport path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerReachability {
+    pub name: String,    // the peer's petname
+    pub reachable: bool, // result of the last probe (false if never probed)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtt_ms: Option<u64>, // last measured round-trip, if reachable
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_secs: Option<u64>, // None = never probed (consumer shows "checking…")
+}
+
 /// Roster-mode status (spec §4.4). Surface-clean roster VOCABULARY only: org_id, serial, a plain
 /// state word, and the pinned org-root FINGERPRINT in short words — never raw keys/EndpointIds/serials-
 /// as-transport-vocab (§1.5). Absent in a pure-pairing daemon.
@@ -120,6 +132,10 @@ pub struct StatusResult {
     /// `#[serde(default, skip_serializing_if = "Vec::is_empty")]` so an older payload round-trips.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recent_pairings: Vec<RecentPairing>,
+    /// Advisory reachability of paired peers, from the on-demand probe cache. Empty until the
+    /// first probe completes. Additive (§6.1): default + skip-if-empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reachability: Vec<PeerReachability>,
 }
 
 /// Control-API requests. Serialized as `{ "method": "...", "params": {...} }`
@@ -247,6 +263,10 @@ pub enum Request {
     /// the server dispatches on the `method` string. Tag `"audit_summary"` (snake_case);
     /// `method_of` reads the `method` string generically (no per-variant arm).
     AuditSummary,
+    /// Open a live event stream (pairing liveness & health telemetry). Like `open_session`, the
+    /// connection STOPS being request/response after this call and becomes a one-way push stream
+    /// of `StreamFrame`s. Parameterless. Tag `"subscribe"`.
+    Subscribe,
 }
 
 /// Result of [`Request::OrgJoin`] — the pinned org id echoed back (surface-clean; the fingerprint is
@@ -388,6 +408,40 @@ pub const API_VERSION: &str = "1.0";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peer_reachability_serde_is_additive() {
+        let r = PeerReachability {
+            name: "bob".into(),
+            reachable: true,
+            rtt_ms: Some(42),
+            age_secs: Some(3),
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["name"], "bob");
+        assert_eq!(v["reachable"], true);
+        assert_eq!(v["rtt_ms"], 42);
+        assert_eq!(v["age_secs"], 3);
+        // Never-probed peer: optionals elided, not null.
+        let unknown = PeerReachability {
+            name: "carol".into(),
+            reachable: false,
+            rtt_ms: None,
+            age_secs: None,
+        };
+        let uv = serde_json::to_value(&unknown).unwrap();
+        assert!(uv.get("rtt_ms").is_none() && uv.get("age_secs").is_none());
+        // An older StatusResult (no reachability field) still deserializes.
+        let old = serde_json::json!({"stack_version":"0.1.0","services":[],"peers":[]});
+        let s: StatusResult = serde_json::from_value(old).unwrap();
+        assert!(s.reachability.is_empty());
+    }
+
+    #[test]
+    fn subscribe_method_tag_resolves() {
+        let req = serde_json::to_value(Request::Subscribe).unwrap();
+        assert_eq!(method_of(&req), Some("subscribe"));
+    }
 
     #[test]
     fn hello_result_roundtrips() {
@@ -713,6 +767,7 @@ mod tests {
             presence: vec![],
             self_user_id: Some("b64u:selfpk".into()),
             recent_pairings: vec![],
+            reachability: vec![],
         };
         let v = serde_json::to_value(&s).unwrap();
         assert_eq!(v["services"][0]["backend"], "run");
@@ -775,6 +830,7 @@ mod tests {
             ],
             self_user_id: None,
             recent_pairings: vec![],
+            reachability: vec![],
         };
         let v = serde_json::to_value(&s).unwrap();
         assert_eq!(v["roster"]["org_id"], "acme");
@@ -810,6 +866,7 @@ mod tests {
                 sas_code: "tango-fig-cabbage".into(),
                 paired_at_epoch: 1_800_000_000,
             }],
+            reachability: vec![],
         };
         let v = serde_json::to_value(&s).unwrap();
         assert_eq!(v["recent_pairings"][0]["peer_petname"], "bob");

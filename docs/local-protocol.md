@@ -90,7 +90,7 @@ target from any language — see the notes below.
 
 - `method` — the method name (snake_case; see the [table](#methods)).
 - `params` — a per-method object. **Omit it, send `null`, or send `{}`** for parameterless methods
-  (`status`, `blob_list`, `audit_summary`); all three are accepted.
+  (`status`, `blob_list`, `audit_summary`, `subscribe`); all three are accepted.
 - `id` / `jsonrpc` — **optional on the request.** The daemon echoes whatever `id` you send (defaulting
   to `null`) back on the response, so include one if you pipeline concurrent requests and need to
   correlate them. One request/response per turn on a single connection needs no `id`.
@@ -119,8 +119,8 @@ Presence of `error` instead of `result` means the call failed; read `error.code`
 
 ## Methods
 
-Every method is one frame in, one frame out — **except `open_session`**, which upgrades the
-connection (see [Sessions](#sessions)).
+Every method is one frame in, one frame out — **except `open_session` and `subscribe`**, which
+upgrade the connection (see [Sessions](#sessions) and [Live event stream](#live-event-stream)).
 
 Methods split into two groups by audience:
 
@@ -139,6 +139,7 @@ Methods split into two groups by audience:
 | `peer_remove` | `{petname}` | `{}` (ack) |
 | `peer_rename` | `{to, user_id?, petname?}` — rename a person by `user_id`, else a provisional contact by `petname` | `{}` (ack) |
 | `open_session` | `{peer, service}` | *no response frame — see [Sessions](#sessions)* |
+| `subscribe` | *(none)* | *no response frame — a one-way live stream; see [Live event stream](#live-event-stream)* |
 | `roster_install` | `{path, org_root_pk?}` — `path` is a local file the daemon reads; `org_root_pk` pins the root on first install | `{org_id, serial, severed}` |
 | `org_join` | `{org_id, org_root_pk, user_id, user_key}` — `user_key` is a local path; the key never crosses the socket | `{org_id}` |
 | `set_roster_url` | `{url}` | `{}` (ack) |
@@ -161,13 +162,28 @@ them directly, which is within the trust boundary.
   "self_user_id": "b64u:…",
   "roster":   {"org_id":"…","serial":42,"state":"approved","org_root_fingerprint":"tango-fig-cabbage"},
   "presence": [{"user_id":"b64u:…","device_label":"laptop","role":"primary","online":true}],
-  "recent_pairings": [{"peer_petname":"bob","sas_code":"tango-fig-cabbage","paired_at_epoch":1751760000}]
+  "recent_pairings": [{"peer_petname":"bob","sas_code":"tango-fig-cabbage","paired_at_epoch":1751760000}],
+  "reachability": [{"name":"bob","reachable":true,"rtt_ms":42,"age_secs":3}]
 }
 ```
 
 `roster`, `presence`, `self_user_id`, and `recent_pairings` are optional — absent on a pure-pairing
 daemon with no roster and no user key. `backend` reports the *kind* (`"run"` \| `"socket"`) only,
 never the command or path.
+
+`reachability` is **advisory** — an on-demand liveness read of your paired peers, populated by a
+probe cache the daemon refreshes lazily. It is empty until the first probe completes. A `status`
+call kicks off a background refresh for any peer whose entry is stale or missing, but **never blocks
+on a probe**. Each entry is a **petname** (`name`, never an endpoint-id), a `reachable` bool (the
+last probe result), `rtt_ms` (the last measured round-trip, present only when reachable), and
+`age_secs` (how long ago the entry was measured). `age_secs` is **absent** for a peer that has never
+been probed — render that as "checking…", not "offline".
+
+Under the hood the daemon measures reachability with a trust-gated, peer-facing probe over the
+`mcpmesh/ping/1` ALPN: it dials the peer, and a **paired** peer answers one pong carrying its
+`stack_version`. Only paired peers pong — an unpaired scanner's probe is closed with no answer, so
+the probe leaks no presence to strangers. (This ALPN is a peer-transport detail; you never speak it
+over this local socket — you read its result in `reachability`.)
 
 Note the surface discipline that runs through every response: names are **petnames and self-sovereign
 `user_id`s** (opaque `b64u:` identifiers spanning a person's devices), never raw endpoint
@@ -199,6 +215,95 @@ server produced. A session severed mid-stream instead surfaces as a clean EOF.
 This is exactly what `mcpmesh connect <peer>/<service>` does; an embedding client that wants to mount
 a remote service itself reproduces this upgrade. Reference:
 [`cli/src/proxy.rs`](../cli/src/proxy.rs).
+
+## Live event stream
+
+`subscribe` is the other method that upgrades the connection. Like [`open_session`](#sessions), the
+socket **stops being request/response** after this call. The client sends:
+
+```json
+{"method":"subscribe"}
+```
+
+…and then does **not** read a JSON-RPC response. Instead the daemon pushes a **one-way** stream of
+newline-delimited frames — a live view of the mesh for an embedding UI to render — until the client
+disconnects. There is no request channel back; to stop, close the connection.
+
+Every frame is a JSON object tagged by a `"type"` field, in one of three shapes.
+
+**`snapshot`** — always the **first** frame: a point-in-time picture, so a fresh subscriber renders
+immediately without replaying history. It carries the currently-open sessions and the paired-peer
+`reachability` (the same list [`status`](#statusresult) reports).
+
+```json
+{
+  "type": "snapshot",
+  "active_sessions": [{"peer": "bob", "service": "notes", "opened_at": 1751760000}],
+  "reachability": [{"name": "bob", "reachable": true, "rtt_ms": 42, "age_secs": 3}]
+}
+```
+
+Each `active_sessions` entry is one live session: the caller's petname/`user_id` (`peer`), the
+mounted `service`, and `opened_at` (epoch seconds). This list is the starting state — a client keeps
+its session view current by applying subsequent `session_open`/`session_close` events to it. Only a
+`session_open` **without** an error status opens a real session: a `session_open` carrying
+`status: "error"` is a terminal *attempted-and-failed* marker (a failed dial — see below)
+that never pairs with a `session_close`, so a client must **not** add it to the active view — doing so
+strands a phantom session. The snapshot's `active_sessions` already excludes failed dials.
+
+**`event`** — one audit record, emitted live as it happens. `record` is the daemon's audit record
+**verbatim** — the same schema written to the local audit log, so the stream and the log carry one
+shape.
+
+```json
+{
+  "type": "event",
+  "record": {
+    "ts": "2026-07-03T14:02:11.480Z",
+    "kind": "request",
+    "peer": "bob",
+    "service": "notes",
+    "method": "tools/call",
+    "tool": "read_file",
+    "args_hash": "blake3:…",
+    "bytes_out": 6210,
+    "status": "ok",
+    "latency_ms": 41
+  }
+}
+```
+
+`record.kind` is one of `session_open`, `session_close`, `request`, `blob_fetch`, `trust`. `ts` is
+an RFC3339-millis UTC timestamp. Every field beyond `ts` and `kind` is optional and present only
+when it applies:
+
+- `peer` — the caller's petname/`user_id` (absent on a local-only event with no remote peer).
+- `service` — the mounted service name.
+- On a `request` (one proxied MCP line): `method` (the MCP method, e.g. `tools/call`), `tool` (the
+  tool **name** only, for a `tools/call`), `args_hash` (a `"blake3:…"` digest of the arguments —
+  **never** the raw arguments), `bytes_out` (a byte **count** of the response, never its content),
+  `status` (`"ok"` \| `"error"`), and `latency_ms`.
+- On a `blob_fetch` or `trust`: `target` — the blob's `"blake3:…"` hash, or the trust operation's
+  target (a petname or `org/serial`) — and, on a `trust`, `event` (the trust verb: `pair`, `unpair`,
+  `roster_install`, `revoke`).
+
+A **failed dial** surfaces as a `session_open` with `status: "error"` — it reached no backend, so it
+is otherwise never session-audited; this frame records the attempted-and-failed reach.
+
+Upholding the surface discipline: a record carries names, counts, and a status — a petname/`user_id`,
+a service name, a method/tool name, an argument **digest**, and byte/latency **numbers** — never raw
+arguments, response content, endpoint-ids, or keys.
+
+**`lagged`** — the subscriber fell behind the daemon's bounded event ring and `dropped` records were
+skipped. The stream is **not** dropped and continues; **reconnect** to get a fresh `snapshot` and
+resume in sync.
+
+```json
+{"type": "lagged", "dropped": 12}
+```
+
+`mcpmesh internal watch` is a thin reference consumer of this stream. Reference:
+[`cli/src/stream.rs`](../cli/src/stream.rs).
 
 ## The identity contract
 
@@ -294,6 +399,7 @@ This document describes the surface; the code defines it.
 - Frame codec — [`codec/src/lib.rs`](../codec/src/lib.rs)
 - Socket path resolution — [`trust/src/paths.rs`](../trust/src/paths.rs)
 - Identity injection — [`cli/src/backends/`](../cli/src/backends/)
+- Live event-stream frames — [`cli/src/stream.rs`](../cli/src/stream.rs)
 
 The `mcpmesh-local-api` crate is [published to crates.io](https://crates.io/crates/mcpmesh-local-api):
 Rust clients can depend on it directly (`client` feature) rather than reimplementing the wire format.

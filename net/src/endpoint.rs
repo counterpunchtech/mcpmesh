@@ -37,6 +37,13 @@ pub const ALPN_MCP: &[u8] = b"mcpmesh/mcp/1";
 /// handler; net only owns the ALPN string (the wire vocabulary registry).
 pub const ALPN_PAIR: &[u8] = b"mcpmesh/pair/1";
 
+/// ALPN for the reachability probe (pairing-mode liveness). A dialer connects, opens one
+/// bi-stream, and sends a ping frame; the responder — ONLY for a trust-gated (paired) peer —
+/// writes one pong frame `{"stack_version": "..."}` and closes. An unpaired scanner's connection
+/// is closed with NO pong (no presence leak). The cli owns the accept handler (trust-gated there);
+/// net owns only the ALPN string (the wire vocabulary registry, like `ALPN_PAIR`).
+pub const ALPN_PING: &[u8] = b"mcpmesh/ping/1";
+
 /// QUIC application close code for gate refusal, sent BEFORE any MCP traffic
 /// (spec §5, D5/D8). Mirrors HTTP 401 for operator legibility.
 pub const CLOSE_UNAUTHORIZED: u32 = 401;

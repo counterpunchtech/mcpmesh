@@ -11,6 +11,8 @@ use serde_json::Value;
 #[serde(rename_all = "snake_case")]
 pub enum AuditKind {
     /// A mesh session opened (a backend was selected for an authenticated peer).
+    /// (A `session_open` with `status:"error"` is a synthesized FAILED-dial marker — no backend
+    /// was reached; it records an attempted-and-failed reach for the telemetry stream.)
     SessionOpen,
     /// A mesh session closed (the backend returned / the session tore down).
     SessionClose,
@@ -89,6 +91,15 @@ impl AuditRecord {
         r.peer = peer;
         r.service = Some(service);
         r
+    }
+
+    /// Set the record's `status` (`"ok"`/`"error"`/`"denied"`), returning `self` for chaining.
+    /// Marks a synthesized failure record — e.g. the `session_open` for a FAILED dial, which
+    /// reaches no backend and so is never audited by the far side's session guard — without a
+    /// dedicated constructor. DRY: reuses the existing optional `status` field.
+    pub fn with_status(mut self, status: &str) -> Self {
+        self.status = Some(status.into());
+        self
     }
 
     pub fn session_close(ts: String, peer: Option<String>, service: String) -> Self {

@@ -30,7 +30,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
 
-use crate::audit::{AuditRecord, RequestAuditor, now_ts};
+use crate::audit::RequestAuditor;
 
 /// The `retry_after_ms` hint on a concurrency-cap refusal (spec §7.4). Unlike a token bucket there is
 /// no exact refill instant — a held permit frees when a peer session ends — so a fixed ~1s nudge.
@@ -139,11 +139,12 @@ impl SpawnBackend {
         let peer = identity
             .as_ref()
             .map(|id| id.user_id.clone().unwrap_or_else(|| id.name.clone()));
-        self.audit.record(AuditRecord::session_open(
-            now_ts(),
-            peer.clone(),
-            self.service.clone(),
-        ));
+        // Session lifecycle via the RAII guard: it emits `session_open` now and, on drop (every exit
+        // path — EOF, error, panic), emits `session_close` and removes the live-table row. Held for
+        // the whole session scope, so it MUST outlive the pump below.
+        let _session = self
+            .audit
+            .session(peer.clone().unwrap_or_default(), self.service.clone());
         let auditor = RequestAuditor::new(self.audit.clone(), peer.clone(), self.service.clone());
 
         // Pump the two directions concurrently until either side EOFs/closes (shared
@@ -162,11 +163,7 @@ impl SpawnBackend {
             ),
         )
         .await;
-        self.audit.record(AuditRecord::session_close(
-            now_ts(),
-            peer,
-            self.service.clone(),
-        ));
+        // `_session` drops here (or on any early return above), emitting `session_close`.
         outcome
     }
 }

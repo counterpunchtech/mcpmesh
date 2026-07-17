@@ -11,8 +11,8 @@ pub use principals::principal_set;
 pub use protocol::{
     API_NAME, API_VERSION, AuditSummaryResult, BackendKind, BackendSpec, BlobFetchResult,
     BlobPublishResult, BlobScopeList, Hello, InviteResult, OrgJoinResult, PairResult, PeerInfo,
-    PresencePeer, RecentPairing, Request, RosterInstallResult, RosterStatus, ScopeInfo,
-    ServiceInfo, StatusResult, method_of,
+    PeerReachability, PresencePeer, RecentPairing, Request, RosterInstallResult, RosterStatus,
+    ScopeInfo, ServiceInfo, StatusResult, method_of,
 };
 
 #[cfg(feature = "client")]

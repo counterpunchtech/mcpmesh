@@ -5,8 +5,9 @@
 //! on this machine.
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 use crate::audit::record::AuditRecord;
 
@@ -15,6 +16,11 @@ use crate::audit::record::AuditRecord;
 /// (spec §11.3 robustness). On overflow, `record()` DROPS the record with a warning rather than
 /// awaiting — the hot path never blocks on the audit channel.
 const AUDIT_CHANNEL_DEPTH: usize = 1024;
+
+/// Ring-buffer depth of the live broadcast fan-out (the telemetry stream tap). A slow subscriber
+/// that falls this far behind gets a `Lagged` from `recv()` rather than blocking `record()` — the
+/// hot path never waits on a live consumer. Bounded so a stuck subscriber cannot grow memory.
+const STREAM_BROADCAST_DEPTH: usize = 256;
 
 /// Append one record as a single JSONL line to `<dir>/<YYYY-MM>.jsonl` (the monthly file — the
 /// rotation boundary is the calendar month, derived from the record's own `ts`). The directory is
@@ -38,11 +44,32 @@ pub(crate) fn append_record(dir: &Path, rec: &AuditRecord) -> std::io::Result<()
     f.write_all(&line)
 }
 
+/// One live mesh session, for the telemetry snapshot. Surface-clean: `peer` is the
+/// user_id-or-petname the audit records carry, never an endpoint-id. `opened_at` is epoch seconds.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ActiveSession {
+    pub peer: String,
+    pub service: String,
+    pub opened_at: i64,
+}
+
 /// A running audit log: a handle over the sender half of the writer channel. Cheap to clone (an
 /// `Arc` over the sender). The writer task drains the channel and appends each record on the
 /// blocking pool for the daemon's lifetime.
+///
+/// It is also the telemetry hub: alongside the unchanged file-writer path, `record` fans every
+/// record out to a `broadcast` channel (live subscribers) and the RAII [`SessionGuard`] maintains a
+/// live-session table so "which sessions are open right now" is queryable.
 pub struct AuditLog {
     tx: mpsc::Sender<AuditRecord>,
+    /// Live fan-out of every record to `subscribe()`rs. Independent of the file path — a full ring
+    /// buffer or zero subscribers never affects the writer channel or blocks `record`.
+    bcast: broadcast::Sender<AuditRecord>,
+    /// Currently-open sessions keyed by a monotonic id (so a guard removes exactly its own row).
+    /// Behind a `Mutex`; the lock is never held across an `.await`.
+    live: Mutex<HashMap<u64, ActiveSession>>,
+    /// Monotonic session-id source for the live table.
+    seq: AtomicU64,
 }
 
 impl AuditLog {
@@ -52,6 +79,7 @@ impl AuditLog {
     /// the task never exits on an IO error, so a transient full disk does not disable auditing.
     pub fn spawn(dir: PathBuf) -> Arc<Self> {
         let (tx, mut rx) = mpsc::channel::<AuditRecord>(AUDIT_CHANNEL_DEPTH);
+        let (bcast, _) = broadcast::channel(STREAM_BROADCAST_DEPTH);
         tokio::spawn(async move {
             while let Some(rec) = rx.recv().await {
                 let dir = dir.clone();
@@ -63,7 +91,12 @@ impl AuditLog {
                 }
             }
         });
-        Arc::new(Self { tx })
+        Arc::new(Self {
+            tx,
+            bcast,
+            live: Mutex::new(HashMap::new()),
+            seq: AtomicU64::new(0),
+        })
     }
 
     /// Record one event — NON-BLOCKING and infallible from the caller's view (spec §11.3). Uses
@@ -71,8 +104,65 @@ impl AuditLog {
     /// DROPS the record with a debug log and returns immediately. The hot path NEVER awaits the disk
     /// and an audit failure NEVER propagates into a session.
     pub fn record(&self, rec: AuditRecord) {
+        // Live fan-out FIRST (a cheap clone): an `Err` means zero subscribers — fine, ignore it.
+        // This never blocks and never affects the file path below (spec §11.3 preserved).
+        let _ = self.bcast.send(rec.clone());
         if let Err(e) = self.tx.try_send(rec) {
             tracing::debug!(%e, "audit channel full or closed; dropping record (best-effort)");
+        }
+    }
+
+    /// A live receiver of every subsequent `AuditRecord` (the telemetry stream tap). Lagging past the
+    /// ring-buffer depth surfaces as `RecvError::Lagged`, never as back-pressure on `record`.
+    pub fn subscribe(&self) -> broadcast::Receiver<AuditRecord> {
+        self.bcast.subscribe()
+    }
+
+    /// Snapshot of currently-open sessions, sorted by open time. Sessions sharing an epoch-second
+    /// have an unspecified relative order (the sort key is `opened_at` only).
+    pub fn active_sessions(&self) -> Vec<ActiveSession> {
+        let mut v: Vec<ActiveSession> = self
+            .live
+            .lock()
+            .expect("audit live lock")
+            .values()
+            .cloned()
+            .collect();
+        v.sort_by_key(|s| s.opened_at);
+        v
+    }
+
+    /// Emit `session_open`, insert the session into the live table, and return its id (the RAII
+    /// [`SessionGuard`] holds it to remove exactly this row on drop). The lock is released before
+    /// return and never held across an `.await`.
+    fn open_tracked(&self, peer: String, service: String) -> u64 {
+        let id = self.seq.fetch_add(1, Ordering::Relaxed);
+        self.record(AuditRecord::session_open(
+            now_ts(),
+            Some(peer.clone()),
+            service.clone(),
+        ));
+        self.live.lock().expect("audit live lock").insert(
+            id,
+            ActiveSession {
+                peer,
+                service,
+                opened_at: crate::util::epoch_now_i64(),
+            },
+        );
+        id
+    }
+
+    /// Remove the session `id` from the live table and emit `session_close` (only if the row was
+    /// present, so a double-drop or disabled path is a no-op).
+    fn close_tracked(&self, id: u64) {
+        let removed = self.live.lock().expect("audit live lock").remove(&id);
+        if let Some(s) = removed {
+            self.record(AuditRecord::session_close(
+                now_ts(),
+                Some(s.peer),
+                s.service,
+            ));
         }
     }
 }
@@ -95,6 +185,48 @@ impl AuditSink {
     pub fn record(&self, rec: AuditRecord) {
         if let Some(log) = &self.0 {
             log.record(rec);
+        }
+    }
+
+    /// Begin a tracked session: emits `session_open` and tracks it in the live table. Drop the
+    /// returned [`SessionGuard`] to close it (emits `session_close` + table removal). A disabled sink
+    /// returns a no-op guard that does nothing on drop.
+    pub fn session(&self, peer: String, service: String) -> SessionGuard {
+        match &self.0 {
+            Some(log) => SessionGuard {
+                id: log.open_tracked(peer, service),
+                log: Some(log.clone()),
+            },
+            None => SessionGuard { log: None, id: 0 },
+        }
+    }
+
+    /// A live receiver of subsequent records, or `None` when auditing is disabled.
+    pub fn subscribe(&self) -> Option<broadcast::Receiver<AuditRecord>> {
+        self.0.as_ref().map(|log| log.subscribe())
+    }
+
+    /// Currently-open sessions (empty when disabled).
+    pub fn active_sessions(&self) -> Vec<ActiveSession> {
+        self.0
+            .as_ref()
+            .map(|log| log.active_sessions())
+            .unwrap_or_default()
+    }
+}
+
+/// RAII live-session guard: emits `session_open` on creation and `session_close` + table-removal on
+/// drop, so a session is tracked for exactly its lifetime regardless of how it ends (normal return,
+/// early return, or panic unwind). A guard built over a disabled sink does nothing.
+pub struct SessionGuard {
+    log: Option<Arc<AuditLog>>,
+    id: u64,
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        if let Some(log) = &self.log {
+            log.close_tracked(self.id);
         }
     }
 }
@@ -433,6 +565,66 @@ mod tests {
             !body.contains("sampling/createMessage"),
             "server-initiated request must not be logged"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn record_fans_out_to_a_live_subscriber() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = AuditLog::spawn(dir.path().to_path_buf());
+        let mut rx = log.subscribe();
+        log.record(AuditRecord::session_open(
+            now_ts(),
+            Some("bob".into()),
+            "notes".into(),
+        ));
+        let got = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.kind, crate::audit::record::AuditKind::SessionOpen);
+        assert_eq!(got.peer.as_deref(), Some("bob"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_guard_tracks_active_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = AuditSink::new(AuditLog::spawn(dir.path().to_path_buf()));
+        assert!(sink.active_sessions().is_empty());
+        {
+            let _s = sink.session("bob".into(), "notes".into());
+            let live = sink.active_sessions();
+            assert_eq!(live.len(), 1);
+            assert_eq!(live[0].peer, "bob");
+            assert_eq!(live[0].service, "notes");
+        }
+        // Guard dropped → session removed.
+        assert!(sink.active_sessions().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_guard_removes_only_its_own_row() {
+        // The core invariant of id-keying: dropping one guard removes EXACTLY its own session,
+        // leaving concurrent (overlapping-lifetime) sessions untouched.
+        let dir = tempfile::tempdir().unwrap();
+        let sink = AuditSink::new(AuditLog::spawn(dir.path().to_path_buf()));
+        let a = sink.session("alice".into(), "notes".into());
+        let b = sink.session("bob".into(), "notes".into());
+        assert_eq!(sink.active_sessions().len(), 2);
+        // Drop A → only B survives.
+        drop(a);
+        let live = sink.active_sessions();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].peer, "bob");
+        // Drop B → empty.
+        drop(b);
+        assert!(sink.active_sessions().is_empty());
+    }
+
+    #[test]
+    fn disabled_sink_session_is_a_noop() {
+        let sink = AuditSink::disabled();
+        let _s = sink.session("bob".into(), "notes".into());
+        assert!(sink.active_sessions().is_empty()); // no panic, no tracking
     }
 
     #[tokio::test]

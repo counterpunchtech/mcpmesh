@@ -169,9 +169,75 @@ async fn handle_conn(stream: UnixStream, state: Arc<DaemonState>) -> Result<()> 
                     )
                     .await;
                 }
+                if method_of(&req) == Some("subscribe") {
+                    // Like `open_session`, this upgrades the connection: after `subscribe` it STOPS
+                    // being request/response and becomes a one-way push stream of `StreamFrame`s
+                    // (`crate::stream`). The loop cannot continue — `write_half` moves into the
+                    // stream driver, which consumes the connection for the subscription's lifetime.
+                    return run_subscription(&state, write_half).await;
+                }
                 let resp = handle_request(&req, &state).await;
                 write_frame(&mut write_half, &resp).await?;
             }
+        }
+    }
+}
+
+/// Drive a live event stream over a subscribed control connection (Task 6). Mirrors
+/// [`open_session`](crate::daemon::open_session)'s upgrade: it consumes the write half for the
+/// subscription's lifetime. Sends the initial [`Snapshot`](crate::stream::StreamFrame::Snapshot)
+/// FIRST, then forwards every broadcast [`AuditRecord`](crate::audit::AuditRecord) as an
+/// [`Event`](crate::stream::StreamFrame::Event) frame until the client disconnects.
+///
+/// Backpressure (spec): a subscriber that falls behind the broadcast ring surfaces as
+/// `RecvError::Lagged(n)` → one [`Lagged`](crate::stream::StreamFrame::Lagged) frame, then the loop
+/// CONTINUES (the subscriber is never dropped on lag). A closed broadcast → clean return. A failed
+/// `write_frame` (the client is gone) → clean return. No lock is held across the `recv().await`.
+///
+/// When auditing is disabled (control-only daemon, or a mesh with no audit sink), `subscribe()`
+/// yields `None`: the snapshot is sent and the stream ends (no events will ever flow).
+async fn run_subscription(
+    state: &Arc<DaemonState>,
+    mut w: impl tokio::io::AsyncWrite + Unpin,
+) -> Result<()> {
+    use crate::stream::StreamFrame;
+    // The audit sink is the telemetry hub; the mesh (if any) feeds the reachability snapshot.
+    let (audit, mesh) = match state.mesh() {
+        Some(mesh) => (mesh.audit(), Some(mesh)),
+        None => (crate::audit::AuditSink::disabled(), None),
+    };
+    // Register the live receiver BEFORE snapshotting. If we snapshotted first, any record
+    // broadcast in the gap between `active_sessions()` and `subscribe()` would be LOST — absent from
+    // the snapshot (captured earlier) AND from the stream (receiver not yet registered), so a
+    // consumer could see a `session_close` for a session it never saw open. Subscribing first turns
+    // that race into an at-most-idempotent DOUBLE (a session may appear both in `active_sessions`
+    // and as a live `session_open`), which a state-projecting consumer absorbs harmlessly.
+    let rx = audit.subscribe();
+    let snapshot = StreamFrame::Snapshot {
+        active_sessions: audit.active_sessions(),
+        reachability: mesh.map(crate::daemon::reachability_of).unwrap_or_default(),
+    };
+    write_frame(&mut w, &serde_json::to_value(&snapshot)?).await?;
+
+    // Disabled sink → no live tap: the snapshot stands alone, then the stream ends.
+    let Some(mut rx) = rx else {
+        return Ok(());
+    };
+    use tokio::sync::broadcast::error::RecvError;
+    loop {
+        let frame = match rx.recv().await {
+            Ok(record) => StreamFrame::Event {
+                record: Box::new(record),
+            },
+            // Fell behind the ring: tell the subscriber, then KEEP streaming (never drop it).
+            Err(RecvError::Lagged(n)) => StreamFrame::Lagged { dropped: n },
+            Err(RecvError::Closed) => return Ok(()),
+        };
+        if write_frame(&mut w, &serde_json::to_value(&frame)?)
+            .await
+            .is_err()
+        {
+            return Ok(()); // client gone
         }
     }
 }
@@ -440,6 +506,14 @@ pub(crate) fn status_result(state: &DaemonState) -> StatusResult {
         .mesh()
         .map(|mesh| mesh.recent_pairings())
         .unwrap_or_default();
+    // Advisory reachability of paired peers, from the on-demand probe cache (spec: pairing-mode
+    // liveness). Mirrors the `presence` read above: cached values returned immediately, with any
+    // stale/missing entry refreshed on a background probe `reachability_of` spawns — status stays a
+    // non-blocking hot path. Surface-clean (§1.5): petnames + numbers only.
+    let reachability = state
+        .mesh()
+        .map(crate::daemon::reachability_of)
+        .unwrap_or_default();
     StatusResult {
         stack_version: state.stack_version.clone(),
         services,
@@ -448,6 +522,7 @@ pub(crate) fn status_result(state: &DaemonState) -> StatusResult {
         presence,
         self_user_id,
         recent_pairings,
+        reachability,
     }
 }
 

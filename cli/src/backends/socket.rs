@@ -21,7 +21,7 @@ use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixStream;
 
-use crate::audit::{AuditRecord, AuditSink, RequestAuditor, now_ts};
+use crate::audit::{AuditSink, RequestAuditor};
 
 /// The `socket` backend for one registered service. `path` is the long-running
 /// local MCP server's Unix-domain-socket path, dialed fresh per session. The caller
@@ -120,11 +120,12 @@ impl SocketBackend {
         let peer = identity
             .as_ref()
             .map(|id| id.user_id.clone().unwrap_or_else(|| id.name.clone()));
-        self.audit.record(AuditRecord::session_open(
-            now_ts(),
-            peer.clone(),
-            self.service.clone(),
-        ));
+        // Session lifecycle via the RAII guard: it emits `session_open` now and, on drop (every exit
+        // path — EOF, error, panic), emits `session_close` and removes the live-table row. Held for
+        // the whole session scope, so it MUST outlive the pump below.
+        let _session = self
+            .audit
+            .session(peer.clone().unwrap_or_default(), self.service.clone());
         // The per-request-line auditor (Task 4): hashes each caller request's args and correlates
         // the response. Threaded into the shared pump.
         let auditor = RequestAuditor::new(self.audit.clone(), peer.clone(), self.service.clone());
@@ -146,11 +147,7 @@ impl SocketBackend {
             ),
         )
         .await;
-        self.audit.record(AuditRecord::session_close(
-            now_ts(),
-            peer,
-            self.service.clone(),
-        ));
+        // `_session` drops here (or on any early return above), emitting `session_close`.
         outcome
     }
 }
@@ -763,5 +760,89 @@ mod tests {
         })
         .await
         .expect("session lifecycle audit test timed out");
+    }
+
+    /// While a session is live the audit sink's live-session table has exactly one row for the
+    /// resolved peer + service, and it is emptied once the session ends — proving the backend drives
+    /// the RAII session guard (not two bare open/close records) so the telemetry snapshot sees it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn socket_backend_populates_active_sessions_while_open() {
+        use crate::audit::{AuditLog, AuditSink};
+        timeout(Duration::from_secs(30), async {
+            let dir = tempfile::tempdir().unwrap();
+            let sock = dir.path().join("server.sock");
+            let listener = UnixListener::bind(&sock).unwrap();
+            let stub = tokio::spawn(stub_server(listener));
+
+            let sink = AuditSink::new(AuditLog::spawn(dir.path().join("audit")));
+
+            let (server_io, client_io) = duplex(64 * 1024);
+            let (sr, sw) = split(server_io);
+            let backend_transport = mcpmesh_net::transport::NdjsonTransport::new(sr, sw, MAX_FRAME);
+            let (cr, cw) = split(client_io);
+            let mut client = mcpmesh_net::transport::NdjsonTransport::new(cr, cw, MAX_FRAME);
+
+            let backend = SocketBackend {
+                path: sock.to_str().unwrap().to_string(),
+                service: "notes".into(),
+                audit: sink.clone(),
+                limiter: crate::limits::RateLimiter::unlimited_shared(),
+            };
+            let identity = Some(PeerIdentity {
+                endpoint: [0u8; 32],
+                name: "bob".into(),
+                user_id: None,
+                groups: vec![],
+            });
+            let initialize = json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"capabilities": {}}
+            });
+
+            assert!(
+                sink.active_sessions().is_empty(),
+                "no live session before the backend runs"
+            );
+
+            let session = tokio::spawn(async move {
+                backend
+                    .run_over(identity, initialize, backend_transport)
+                    .await
+            });
+
+            // Complete the handshake so the session's guard is definitely created (it is built before
+            // the pump, which forwards this initialize).
+            let init_resp = client.recv_value().await.unwrap().unwrap();
+            assert_eq!(init_resp["result"]["serverInfo"]["name"], "socket-stub");
+
+            // DURING the session: exactly one live row for the resolved peer + service.
+            let live = sink.active_sessions();
+            assert_eq!(live.len(), 1, "one live session while open");
+            assert_eq!(live[0].peer, "bob");
+            assert_eq!(live[0].service, "notes");
+
+            // Drive one tools/call so the stub's exchange completes cleanly before teardown.
+            client
+                .send_value(json!({
+                    "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": {"arguments": {"text": "live"}}
+                }))
+                .await
+                .unwrap();
+            let call_resp = client.recv_value().await.unwrap().unwrap();
+            assert_eq!(call_resp["result"]["content"][0]["text"], "live");
+
+            drop(client); // EOF → the backend returns → the guard drops → the row is removed
+            session.await.unwrap().expect("run_over Ok on EOF");
+            stub.await.unwrap();
+
+            // AFTER the session: the live table is empty again.
+            assert!(
+                sink.active_sessions().is_empty(),
+                "the guard drop removed the live session"
+            );
+        })
+        .await
+        .expect("active-sessions telemetry test timed out");
     }
 }

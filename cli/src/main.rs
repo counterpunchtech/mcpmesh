@@ -228,6 +228,11 @@ enum Internal {
         #[command(subcommand)]
         command: AuditCmd,
     },
+    /// Subscribe to the daemon's live event stream and pretty-print it (pairing liveness & health
+    /// telemetry). A thin reference consumer of the `subscribe` surface — the UAT/dogfood window on
+    /// the mesh. Auto-starts the daemon, prints a one-line snapshot summary, then a line per event
+    /// (and a lagged notice if a consumer falls behind). Runs until interrupted (Ctrl-C).
+    Watch,
 }
 
 #[derive(Subcommand)]
@@ -377,6 +382,9 @@ fn main() -> anyhow::Result<()> {
         Some(Cmd::Internal {
             command: Internal::Audit { command },
         }) => run_internal_audit(command),
+        Some(Cmd::Internal {
+            command: Internal::Watch,
+        }) => run_watch(),
         Some(Cmd::Doctor) => doctor::run_doctor(),
         Some(Cmd::Status) | None => run_status(),
     }
@@ -1237,6 +1245,26 @@ fn render_status(fingerprint: &str, hello: &Hello, status: &StatusResult, has_ro
         }
     }
 
+    // The reachability block (pairing-mode liveness): one line per paired peer with its advisory
+    // online/offline flag from the on-demand probe cache, plus the last RTT when online. A
+    // never-probed peer shows "…" (a refresh is already in flight). Empty → nothing prints.
+    // Surface-clean (§1.5): petname + a status word + a latency NUMBER only.
+    if !status.reachability.is_empty() {
+        println!();
+        println!("reachability:");
+        for r in &status.reachability {
+            let label = match (r.reachable, r.age_secs) {
+                (_, None) => "…", // never probed
+                (true, _) => "online",
+                (false, _) => "offline",
+            };
+            match r.rtt_ms {
+                Some(ms) if r.reachable => println!("  {} · {label} · {ms}ms", r.name),
+                _ => println!("  {} · {label}", r.name),
+            }
+        }
+    }
+
     // The recent-pairings block (spec §4.2 ceremony surface): the INVITER's half of "both humans
     // compare the code" — each pairing this daemon accepted since it started, newest first, with
     // the SAME display-only SAS the redeemer's `pair` printed. In-memory on the daemon (a restart
@@ -1421,6 +1449,77 @@ fn backend_kind_label(kind: BackendKind) -> &'static str {
     }
 }
 
+/// `mcpmesh internal watch`: subscribe to the daemon's live event stream and pretty-print it
+/// (pairing liveness & health telemetry). A thin reference consumer of the `subscribe` surface —
+/// the UAT/dogfood window on the mesh. Auto-starts the daemon, opens the stream (the same
+/// connection-upgrade as `open_session`, one-way after the request), and loops printing frames
+/// until the stream ends or the process is interrupted. Surface-clean (§1.5): the output carries
+/// only the petnames/user_ids/service names/numbers the frames themselves carry — never a raw
+/// endpoint-id (the frames don't carry one).
+fn run_watch() -> anyhow::Result<()> {
+    with_daemon(async move |client| {
+        // Hold the write half for the connection's lifetime: `watch` only READS, but dropping the
+        // writer would half-close the socket.
+        let (mut reader, _writer) = client.open_stream("subscribe").await?;
+        println!("watching the mesh — Ctrl-C to stop");
+        while let Some(inbound) = reader.next().await? {
+            if let mcpmesh_net::framing::Inbound::Frame(v) = inbound
+                && let Some(line) = render_frame(&v)
+            {
+                println!("{line}");
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Render one untyped `subscribe` stream frame to a display line, or `None` for a frame with no
+/// known type (forward-compat: an unrecognized frame is skipped, never a crash). Pure so the
+/// rendering is unit-testable without a live daemon. The frames are read as `serde_json::Value`
+/// (the typed `StreamFrame` lives daemon-side) and every field is read defensively — a missing
+/// `peer`/`service`/`ts` degrades to an empty piece, never an `unwrap` panic. Surface-clean
+/// (§1.5): only petnames/service names/user_ids/numbers appear — the stream carries no endpoint-id.
+fn render_frame(v: &serde_json::Value) -> Option<String> {
+    match v["type"].as_str()? {
+        "snapshot" => Some(format!(
+            "snapshot: {} active session(s), {} peer(s) known",
+            v["active_sessions"].as_array().map_or(0, |a| a.len()),
+            v["reachability"].as_array().map_or(0, |a| a.len()),
+        )),
+        "event" => {
+            let r = &v["record"];
+            let peer = r["peer"]
+                .as_str()
+                .map(|p| format!("{p} "))
+                .unwrap_or_default();
+            let service = r["service"]
+                .as_str()
+                .map(|s| format!("→ {s}"))
+                .unwrap_or_default();
+            // `status` is absent on a normal open/close but present ("error"/"ok"/"denied") on
+            // records like a failed dial (a `session_open` with `status:"error"`) — surface it so
+            // a failed reach doesn't render identically to a real session open.
+            let status = r["status"]
+                .as_str()
+                .map(|s| format!(" ({s})"))
+                .unwrap_or_default();
+            let line = format!(
+                "[{}] {} {peer}{service}",
+                r["ts"].as_str().unwrap_or(""),
+                r["kind"].as_str().unwrap_or("?"),
+            );
+            // A bare event (no peer/service) must not dangle a trailing separator/space; the
+            // status suffix (when present) follows the trimmed line.
+            Some(format!("{}{status}", line.trim_end()))
+        }
+        "lagged" => Some(format!(
+            "(lagged {} events — reconnect for a fresh snapshot)",
+            v["dropped"].as_u64().unwrap_or(0)
+        )),
+        _ => None,
+    }
+}
+
 /// `mcpmesh internal id`: print this machine's full endpoint id in iroh's base32 encoding — the
 /// same encoding `internal peer add <petname> <endpoint_id>` parses (`EndpointId` Display /
 /// `parse::<iroh::EndpointId>()`). This is the §1.5 "--verbose/doctor-class" raw-id surface
@@ -1597,6 +1696,7 @@ mod tests {
             presence: Vec::new(),
             self_user_id: None,
             recent_pairings: Vec::new(),
+            reachability: Vec::new(),
         }
     }
 
@@ -1992,5 +2092,115 @@ mod tests {
         assert_eq!(friendly_expiry(30, 0), "soon");
         // Already past → saturating, "soon" not a panic/underflow.
         assert_eq!(friendly_expiry(100, 1_000), "soon");
+    }
+
+    #[test]
+    fn render_frame_summarizes_a_snapshot() {
+        let v = json!({
+            "type": "snapshot",
+            "active_sessions": [
+                {"peer": "bob", "service": "notes", "opened_at": 1},
+                {"peer": "carol", "service": "kb", "opened_at": 2},
+            ],
+            "reachability": [{"name": "bob", "reachable": true}],
+        });
+        assert_eq!(
+            render_frame(&v).as_deref(),
+            Some("snapshot: 2 active session(s), 1 peer(s) known")
+        );
+        // A daemon with nothing live still summarizes cleanly (no panic on empty arrays).
+        let empty = json!({ "type": "snapshot", "active_sessions": [], "reachability": [] });
+        assert_eq!(
+            render_frame(&empty).as_deref(),
+            Some("snapshot: 0 active session(s), 0 peer(s) known")
+        );
+    }
+
+    #[test]
+    fn render_frame_renders_an_event_line() {
+        let v = json!({
+            "type": "event",
+            "record": { "ts": "2026-07-17T14:02:11.480Z", "kind": "session_open",
+                        "peer": "bob", "service": "notes" },
+        });
+        assert_eq!(
+            render_frame(&v).as_deref(),
+            Some("[2026-07-17T14:02:11.480Z] session_open bob → notes")
+        );
+    }
+
+    #[test]
+    fn render_frame_marks_a_failed_dial_with_its_status() {
+        // A failed dial arrives as a `session_open` carrying `status:"error"` — the line must
+        // append the status so it doesn't render identically to a real (statusless) open.
+        let failed = json!({
+            "type": "event",
+            "record": { "ts": "2026-07-17T14:02:11.480Z", "kind": "session_open",
+                        "peer": "bob", "service": "notes", "status": "error" },
+        });
+        assert_eq!(
+            render_frame(&failed).as_deref(),
+            Some("[2026-07-17T14:02:11.480Z] session_open bob → notes (error)")
+        );
+        // A normal open has no `status` field, so no suffix is appended.
+        let normal = json!({
+            "type": "event",
+            "record": { "ts": "2026-07-17T14:02:11.480Z", "kind": "session_open",
+                        "peer": "bob", "service": "notes" },
+        });
+        assert!(!render_frame(&normal).unwrap().contains('('));
+    }
+
+    #[test]
+    fn render_frame_tolerates_a_bare_event_record() {
+        // A trust/roster event may carry no peer/service — read the untyped JSON defensively
+        // (no unwrap on absent fields), and don't dangle a trailing separator.
+        let v = json!({
+            "type": "event",
+            "record": { "ts": "2026-07-17T14:02:11.480Z", "kind": "trust", "event": "unpair" },
+        });
+        assert_eq!(
+            render_frame(&v).as_deref(),
+            Some("[2026-07-17T14:02:11.480Z] trust")
+        );
+    }
+
+    #[test]
+    fn render_frame_tolerates_asymmetric_event_records() {
+        // peer present, service absent (a real shape — `blob_fetch` records carry a peer, no
+        // service): the peer renders with no dangling "→ " and no trailing space.
+        let peer_only = json!({
+            "type": "event",
+            "record": { "ts": "2026-07-17T14:02:11.480Z", "kind": "blob_fetch", "peer": "bob" },
+        });
+        assert_eq!(
+            render_frame(&peer_only).as_deref(),
+            Some("[2026-07-17T14:02:11.480Z] blob_fetch bob")
+        );
+        // service present, peer absent: the arrow renders with no phantom peer, no leading space.
+        let service_only = json!({
+            "type": "event",
+            "record": { "ts": "2026-07-17T14:02:11.480Z", "kind": "session_open", "service": "notes" },
+        });
+        assert_eq!(
+            render_frame(&service_only).as_deref(),
+            Some("[2026-07-17T14:02:11.480Z] session_open → notes")
+        );
+    }
+
+    #[test]
+    fn render_frame_renders_a_lagged_notice() {
+        let v = json!({ "type": "lagged", "dropped": 7 });
+        assert_eq!(
+            render_frame(&v).as_deref(),
+            Some("(lagged 7 events — reconnect for a fresh snapshot)")
+        );
+    }
+
+    #[test]
+    fn render_frame_skips_an_unknown_frame() {
+        // Robustness (§forward-compat): an unrecognized frame type is skipped, never a crash.
+        assert_eq!(render_frame(&json!({ "type": "future_kind" })), None);
+        assert_eq!(render_frame(&json!({ "not_a_frame": true })), None);
     }
 }

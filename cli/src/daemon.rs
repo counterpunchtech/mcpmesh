@@ -38,10 +38,11 @@ use mcpmesh_local_api::{
     ScopeInfo, ServiceInfo,
 };
 use mcpmesh_net::errors::{ERR_UNREACHABLE, synthesized};
-use mcpmesh_net::framing::{FrameReader, write_frame};
+use mcpmesh_net::framing::{FrameReader, Inbound, write_frame};
 use mcpmesh_net::registry::ConnRegistry;
 use mcpmesh_net::{
-    ALPN_MCP, ALPN_PAIR, ServiceEntry, Services, SessionBackend, TrustGate, run_mesh_connection,
+    ALPN_MCP, ALPN_PAIR, ALPN_PING, ServiceEntry, Services, SessionBackend, TrustGate,
+    run_mesh_connection,
 };
 use mcpmesh_trust::roster::validate::RosterState;
 use mcpmesh_trust::{DeviceKey, paths};
@@ -210,6 +211,12 @@ pub struct MeshState {
     /// input. std `Mutex` (never held across an await; push/snapshot are sync + tiny).
     pub(crate) recent_pairings:
         std::sync::Mutex<std::collections::VecDeque<mcpmesh_local_api::RecentPairing>>,
+    /// On-demand reachability probe cache (pairing-mode liveness). Keyed by endpoint-id INTERNALLY;
+    /// [`probe_peer`] writes it and [`reachability_of`] reads it (projecting to the §1.5 PETNAME —
+    /// never the id). In-memory + ephemeral: never persisted, lost on restart, never an
+    /// authorization input (advisory presence only). std `Mutex` — held only for the tiny
+    /// insert/clone, never across an await.
+    pub(crate) reachability: std::sync::Mutex<std::collections::HashMap<[u8; 32], ReachEntry>>,
 }
 
 /// Cap on the [`MeshState::recent_pairings`] ring: enough for a burst of ceremonies (a person
@@ -266,6 +273,7 @@ impl MeshState {
             roster_addr_book: std::sync::OnceLock::new(),
             self_binding: std::sync::OnceLock::new(),
             recent_pairings: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            reachability: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -1505,9 +1513,10 @@ async fn build_endpoint(
             b
         }
     };
-    // Roster mode advertises the gossip + blob ALPNs; a pure-pairing daemon advertises exactly
-    // mcp/1 + pair/1 (M2b parity — the roster-None invariant, [Important] 1).
-    let mut alpns = vec![ALPN_MCP.to_vec(), ALPN_PAIR.to_vec()];
+    // Roster mode advertises the gossip + blob ALPNs; every daemon (pairing or roster) also
+    // advertises ping/1, the trust-gated reachability probe (pairing-mode liveness) — it leaks
+    // nothing to a stranger (the accept arm gate-refuses an unresolved peer with no pong).
+    let mut alpns = vec![ALPN_MCP.to_vec(), ALPN_PAIR.to_vec(), ALPN_PING.to_vec()];
     if roster_mode {
         alpns.push(crate::roster::transport::GOSSIP_ALPN.to_vec());
         alpns.push(crate::roster::transport::BLOB_ALPN.to_vec());
@@ -1733,6 +1742,30 @@ pub fn spawn_accept_loop(mesh: Arc<MeshState>, services: Arc<Services>) -> JoinH
                             tracing::debug!(%e, "pair rendezvous error");
                         }
                     }
+                    a if a == ALPN_PING => {
+                        // Reachability pong (pairing-mode liveness) — TRUST-GATED: only pong to a
+                        // resolvable (paired) peer, so an unpaired scanner's dial is closed with NO
+                        // pong and learns nothing (no presence leak, spec §1.5). THIS gate is the
+                        // security boundary of the probe (mirrors the `gate.resolve` refusal in
+                        // `gate_and_register`). The EndpointId is not logged (surface-leak discipline).
+                        let remote = *conn.remote_id().as_bytes();
+                        if mesh.gate.resolve(&remote).is_none() {
+                            conn.close(mcpmesh_net::CLOSE_UNAUTHORIZED.into(), b"unauthorized");
+                            return;
+                        }
+                        // The dialer opens the bi-stream and sends one ping frame (which is what
+                        // makes `accept_bi` resolve — a silent QUIC stream is invisible to the peer);
+                        // we ignore its content and write the single pong. `finish()` + `stopped()`
+                        // ensure the pong is ACKed before `conn` drops (the pairing `send_reply`
+                        // discipline — a bare drop could preempt the un-acked reply).
+                        if let Ok((mut send, _recv)) = conn.accept_bi().await {
+                            let pong = serde_json::json!({ "stack_version": STACK_VERSION });
+                            if write_frame(&mut send, &pong).await.is_ok() {
+                                let _ = send.finish();
+                                let _ = send.stopped().await;
+                            }
+                        }
+                    }
                     a if a == crate::roster::transport::GOSSIP_ALPN => {
                         // Roster/presence gossip (spec §4.3/§10, roster mode only). Gate + register
                         // via [`gate_and_register`] (the shared D8 discipline: unresolved → 401,
@@ -1815,6 +1848,138 @@ async fn reload_accept_loop(mesh: &Arc<MeshState>, services: Services) {
         old.abort();
     }
     *guard = Some(spawn_accept_loop(mesh.clone(), Arc::new(services)));
+}
+
+// ───────────────────────────── reachability probe (pairing-mode liveness) ─────────────────────
+
+/// One cached reachability probe result (spec: pairing-mode liveness). Ephemeral, in-memory —
+/// stored in [`MeshState::reachability`], keyed by endpoint-id. `probed_at` is epoch seconds.
+#[derive(Clone)]
+pub struct ReachEntry {
+    pub reachable: bool,
+    pub rtt_ms: Option<u64>,
+    pub probed_at: i64,
+}
+
+/// Advisory reachability TTL: a cache entry older than this is refreshed by a NON-BLOCKING
+/// background probe on the next [`reachability_of`] read.
+pub const REACH_TTL_SECS: i64 = 20;
+
+/// The reachability probe's hard deadline — a peer that has not ponged within this window is
+/// reported unreachable. No retries/backoff/persistence (YAGNI); reachable ⇔ a pong in time.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Probe one peer over [`ALPN_PING`] and cache the result. Dials the peer BY ID (an id-only
+/// [`iroh::EndpointAddr`], exactly like `dial::dial_service`'s §10.2 fallback — discovery resolves
+/// the address from the id; hermetic localhost tests seed a `MemoryLookup`), sends one ping frame,
+/// reads the pong, and measures RTT (dial + round-trip). Writes the outcome into the in-memory
+/// [`MeshState::reachability`] cache and returns it. Reachable ⇔ a pong arrived within
+/// [`PROBE_TIMEOUT`]; a gate refusal (no pong) or any dial/IO failure is a clean `reachable:false`.
+pub async fn probe_peer(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> ReachEntry {
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(PROBE_TIMEOUT, probe_once(mesh, endpoint_id)).await;
+    let reachable = matches!(outcome, Ok(Ok(())));
+    let entry = ReachEntry {
+        reachable,
+        rtt_ms: reachable.then(|| started.elapsed().as_millis() as u64),
+        probed_at: epoch_now_i64(),
+    };
+    mesh.reachability
+        .lock()
+        .expect("reachability lock not poisoned")
+        .insert(endpoint_id, entry.clone());
+    entry
+}
+
+/// The dial → ping → pong half of [`probe_peer`], separated so the whole exchange is one timeout
+/// unit. Reuses the real iroh 1.0.1 call shapes from `dial.rs`/`pairing::rendezvous`
+/// (`endpoint.connect`, `open_bi`, `write_frame`, `finish`, a framed read).
+async fn probe_once(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> Result<()> {
+    let id = iroh::EndpointId::from_bytes(&endpoint_id)
+        .map_err(|e| anyhow::anyhow!("invalid endpoint id: {e}"))?;
+    let addr = iroh::EndpointAddr::from(id);
+    let conn = mesh.endpoint.connect(addr, ALPN_PING).await?;
+    // We open the bi-stream and send one ping frame — the write is what makes the responder's
+    // `accept_bi` resolve (a silent QUIC stream is invisible to the peer). We say nothing
+    // meaningful; the responder speaks the pong. `finish()` closes our (empty) send direction.
+    let (mut send, recv) = conn.open_bi().await?;
+    write_frame(&mut send, &serde_json::json!({ "ping": true })).await?;
+    let _ = send.finish();
+    let mut reader = FrameReader::new(
+        tokio::io::BufReader::new(recv),
+        mcpmesh_net::framing::MAX_FRAME_BYTES,
+    );
+    match reader.next().await? {
+        Some(Inbound::Frame(_)) => Ok(()), // any well-formed pong frame ⇒ reachable
+        _ => anyhow::bail!("no pong from peer"),
+    }
+}
+
+/// Build the `status` reachability list from the probe cache, and fire a NON-BLOCKING background
+/// refresh for any paired peer whose cache entry is missing or older than [`REACH_TTL_SECS`].
+/// NEVER blocks the caller on a probe: it returns the current cached view immediately and each
+/// refresh runs as its own spawned task (parallel probes, no join helper / new dependency needed —
+/// each `probe_peer` writes its own cache entry, read by the NEXT call).
+///
+/// §1.5 surface discipline: the cache is keyed by endpoint-id INTERNALLY, but every returned
+/// [`mcpmesh_local_api::PeerReachability`] carries only the peer's PETNAME — never the endpoint-id.
+pub fn reachability_of(mesh: &Arc<MeshState>) -> Vec<mcpmesh_local_api::PeerReachability> {
+    let now = epoch_now_i64();
+    // (petname, endpoint_id) for every paired peer — reuse the allowlist store's peer scan
+    // (fail-open: a corrupt row is skipped, not fatal). The store IS the paired-peer set.
+    let peers: Vec<(String, [u8; 32])> = mesh
+        .store
+        .list()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|e| (e.petname, e.endpoint_id))
+        .collect();
+    let cache = mesh
+        .reachability
+        .lock()
+        .expect("reachability lock not poisoned")
+        .clone();
+    let mut stale: Vec<[u8; 32]> = Vec::new();
+    let mut out = Vec::with_capacity(peers.len());
+    for (petname, eid) in peers {
+        match cache.get(&eid) {
+            Some(e) => {
+                let age = (now - e.probed_at).max(0);
+                if age > REACH_TTL_SECS {
+                    stale.push(eid);
+                }
+                out.push(mcpmesh_local_api::PeerReachability {
+                    name: petname,
+                    reachable: e.reachable,
+                    rtt_ms: e.rtt_ms,
+                    age_secs: Some(age as u64),
+                });
+            }
+            None => {
+                stale.push(eid);
+                out.push(mcpmesh_local_api::PeerReachability {
+                    name: petname,
+                    reachable: false,
+                    rtt_ms: None,
+                    age_secs: None, // never probed → consumer shows "checking…"
+                });
+            }
+        }
+    }
+    // KNOWN, BOUNDED v1 TRADEOFF: no in-flight dedup here. Rapid `status` polls against a DOWN
+    // peer can spawn a few OVERLAPPING probes in the ~`PROBE_TIMEOUT` window before the first
+    // result lands and writes `probed_at`. This is deliberately not guarded (no dedup set — YAGNI
+    // for v1): each probe is cheap, self-limits once its result is cached, and the overlap is
+    // bounded by `PROBE_TIMEOUT` (the probe's hard deadline) and `REACH_TTL_SECS` (which quiets
+    // refreshes once a fresh entry exists). Revisit only if probe cost or poll rate ever makes the
+    // transient overlap matter.
+    for eid in stale {
+        let mesh = mesh.clone();
+        tokio::spawn(async move {
+            probe_peer(&mesh, eid).await;
+        });
+    }
+    out
 }
 
 /// Reload the config from disk and hot-swap the accept loop with services rebuilt from it — the
@@ -2496,6 +2661,15 @@ where
     let transport = match dial_service(mesh, peer, service).await {
         Ok(t) => t,
         Err(e) => {
+            // A failed dial reaches no backend, so the far side's session guard never audits
+            // it (no session_open/close). Emit an error record HERE — exactly once, ONLY on
+            // this failure branch (the Ok arm pipes the session instead) — so the telemetry
+            // stream shows the attempted-and-failed reach. `peer` is the caller's
+            // petname/user_id (§1.5), never an endpoint-id.
+            mesh.audit().record(
+                AuditRecord::session_open(now_ts(), Some(peer.to_string()), service.to_string())
+                    .with_status("error"),
+            );
             // Dial establishment failed: hand the proxy a well-formed -32055 (not a hang),
             // which it relays to the AI client (spec §8). The error id is null — the AI
             // client's request id is not known daemon-side (the dial precedes the client's
