@@ -7,9 +7,8 @@
 //! PRIMITIVE (`MeshLimiters`/`RateLimiter`) directly; it does NOT drive the pump. The WIRE path — the
 //! pump synthesizing `-32053` back to the caller, DROPPING the over-limit request (not forwarding it),
 //! and KEEPING the session alive — is locked separately by `pump_rate_limit.rs`. The LITERAL
-//! 20×120×10-min run is the `#[ignore]`d `literal_20x120_10min` driver below +
-//! `docs/dev-load-20x120.md` (mirrors the two-machine NAT smoke test — a documented,
-//! hardware/soak demo, not a CI blocker).
+//! 20×120×10-min run is the `#[ignore]`d `literal_20x120_10min` driver below — a manual
+//! hardware/soak demo, not a CI blocker.
 use std::time::{Duration, Instant};
 
 use mcpmesh::config::LimitsCfg;
@@ -86,9 +85,9 @@ fn cheap_rejection_allocates_no_buckets_for_strangers() {
 }
 
 /// The LITERAL 20×120×10-min soak, `#[ignore]`d (CI never runs it — 10 minutes by design). Drives the
-/// primitive at the real cadence for the milestone demo. See `docs/dev-load-20x120.md`.
+/// primitive at the real cadence for the milestone demo. Run manually.
 #[test]
-#[ignore = "literal 10-minute soak; run via docs/dev-load-20x120.md"]
+#[ignore = "literal 10-minute soak; run manually"]
 fn literal_20x120_10min() {
     let ml = MeshLimiters::from_config(&LimitsCfg {
         rate_limit_per_min: 120,

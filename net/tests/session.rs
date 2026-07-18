@@ -213,8 +213,8 @@ async fn peer_not_in_service_allow_is_refused() -> anyhow::Result<()> {
 // Two-machine real-NAT smoke — the one M1 AC clause CI cannot exercise:
 // "two machines on different NATs complete an MCP session over mcpmesh/mcp/1"
 // (spec §16 AC; §10.2/§10.3). BOTH tests are `#[ignore]`d so CI never runs them
-// (one hangs 10 min by design; both need two machines). Drive them by hand per
-// docs/dev-two-machine-smoke.md.
+// (one hangs 10 min by design; both need two machines). Drive them by hand,
+// across two machines on different NATs (a maintainer release-validation step).
 //
 // They reuse the EchoBackend + initialize/echo path of
 // `known_peer_completes_initialize_and_echo` above; only the network and the
@@ -287,7 +287,7 @@ async fn smoke_endpoint(secret: Option<iroh::SecretKey>) -> anyhow::Result<iroh:
 /// EndpointAddr as one parseable `MCPMESH_SMOKE_PEER=<json>` line, and serves
 /// EchoBackend for ~10 minutes. Runs 10 min by design — no wrapping timeout.
 #[tokio::test]
-#[ignore = "two-machine NAT smoke: run manually per docs/dev-two-machine-smoke.md"]
+#[ignore = "two-machine NAT smoke: run manually across two machines on different NATs"]
 async fn two_machine_serve() -> anyhow::Result<()> {
     // Ephemeral server identity — it travels to the peer inside the printed addr.
     let server = smoke_endpoint(None).await?;
@@ -337,12 +337,12 @@ async fn two_machine_serve() -> anyhow::Result<()> {
 /// initialize + `tools/call` echo assertions as
 /// `known_peer_completes_initialize_and_echo`, asserting a byte-faithful echo.
 #[tokio::test]
-#[ignore = "two-machine NAT smoke: run manually per docs/dev-two-machine-smoke.md"]
+#[ignore = "two-machine NAT smoke: run manually across two machines on different NATs"]
 async fn two_machine_connect() -> anyhow::Result<()> {
     let raw = std::env::var("MCPMESH_SMOKE_PEER").map_err(|_| {
         anyhow::anyhow!(
             "MCPMESH_SMOKE_PEER unset. Run two_machine_serve on the peer machine and export the \
-             `MCPMESH_SMOKE_PEER=<json>` line it prints. See docs/dev-two-machine-smoke.md."
+             `MCPMESH_SMOKE_PEER=<json>` line it prints."
         )
     })?;
     // Tolerate the operator pasting the whole `MCPMESH_SMOKE_PEER=…` line or just the JSON.

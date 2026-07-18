@@ -4,12 +4,6 @@ The end-to-end procedures for standing up and running an mcpmesh **org** (roster
 day-one **pairing** flow. Every command here is porcelain from spec §1.6 — no config file is
 hand-edited, and no key ever moves between machines.
 
-> **Acceptance (spec §16 M4 AC4 — out of CI):** this runbook must be **executable by a non-author** —
-> someone who did not write mcpmesh follows it start to finish on a clean machine and reaches a working
-> deployment. That execution is the human-verification acceptance step (like the two-machine NAT smoke
-> test in `dev-two-machine-smoke.md`): it is not a CI gate; the runbook is the deliverable and a
-> non-author run is its sign-off. If a non-author gets stuck, the fix is to clarify **this file**.
-
 > **Trust model in one line:** the **org-root signature** is the trust boundary. Everything a joiner or
 > a peer receives (the roster, the invite) is verified against the pinned org-root public key. The
 > HTTPS host that serves `roster.json`, the chat channel that carries an invite, and the gossip network
