@@ -247,6 +247,6 @@ macOS and Linux (x86_64 / aarch64). Rust ≥ 1.95 to build from source. Windows 
 ## Status
 
 Pre-release. The wire protocol and config format can still change without migration paths.
-Security reports: security@runbolo.com.
+Security reports: knotanotsea@protonmail.com.
 
 License: MIT OR Apache-2.0.

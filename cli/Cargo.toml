@@ -112,8 +112,8 @@ serde_json.workspace = true
 # operator runbook (docs/operator.md) is shipped separately; keep assets to the binary here to
 # avoid a build-order dependency on files generated elsewhere.
 [package.metadata.deb]
-maintainer = "Bolo <security@runbolo.com>"
-copyright = "2026, Bolo contributors"
+maintainer = "mcpmesh <knotanotsea@protonmail.com>"
+copyright = "2026, mcpmesh contributors"
 extended-description = """\
 Peer-to-peer MCP transport: serve local MCP servers to allowlisted peers and mount remote peers' \
 services through a local stdio proxy, over an end-to-end-encrypted iroh mesh. See `mcpmesh doctor` for \

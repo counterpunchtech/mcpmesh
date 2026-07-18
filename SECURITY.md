@@ -6,7 +6,7 @@ mcpmesh moves MCP traffic between machines — reports are taken seriously.
 
 - Preferred: GitHub private vulnerability reporting — the **Report a vulnerability** button under
   this repository's Security tab.
-- Email: security@runbolo.com
+- Email: knotanotsea@protonmail.com
 
 Please do NOT open a public issue for a suspected vulnerability. You'll get an acknowledgement
 within a few days; coordinated disclosure preferred.
