@@ -9,7 +9,7 @@
 # doubles as its own tap: this formula lives at Formula/mcpmesh.rb).
 class Mcpmesh < Formula
   desc "Peer-to-peer MCP transport — serve and mount MCP servers across machines"
-  homepage "https://runbolo.com"
+  homepage "https://github.com/counterpunchtech/mcpmesh"
   license "MIT OR Apache-2.0"
   head "https://github.com/counterpunchtech/mcpmesh.git", branch: "main"
 
