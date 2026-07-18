@@ -6,7 +6,7 @@
 //! by presenting a device→user binding at pairing, so multiple devices sharing one `UserKey` resolve
 //! to the SAME `user_id` and kb audiences can key on the user rather than the per-device petname.
 //!
-//! The idea is adopted from bolo-harness's device-cert; the crypto is mcpmesh's OWN — this is a thin
+//! The idea is adopted from an earlier internal device-cert design; the crypto is mcpmesh's OWN — this is a thin
 //! wrapper over [`roster::sign::sign_device_binding`]/[`verify_device_binding`] (domain
 //! `mcpmesh/join/device-binding/1`) and [`roster::encode_b64u`], not a second cert implementation.
 use crate::keys::UserKey;
