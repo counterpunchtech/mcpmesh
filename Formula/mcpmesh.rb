@@ -1,15 +1,17 @@
 # Homebrew formula for the mcpmesh platform binary (spec §16 M4 packaging).
 #
-# `head`-only by design: it builds `mcpmesh` from the current `main` via `cargo install`, so it needs no
-# release-tarball `url`/`sha256` yet. At the first tagged release, add a stable `url` + `sha256` stanza
-# (the release runbook step) so `brew install mcpmesh` (no `--HEAD`) works from the tarball.
+# Stable installs build the tagged release tarball (`url` + `sha256` below — updated by the
+# release runbook at each tag); `--HEAD` builds the current `main`. Both go through
+# `cargo install` on the `cli` crate.
 #
 # NOT a CI blocker: `brew install` cannot run end-to-end in CI. Validation here is `ruby -c` (syntax);
-# a real tap + `brew install --HEAD counterpunchtech/mcpmesh/mcpmesh` is a runbook step (the repo
+# a real `brew install` from the local formula is the release-runbook step (the repo
 # doubles as its own tap: this formula lives at Formula/mcpmesh.rb).
 class Mcpmesh < Formula
   desc "Peer-to-peer MCP transport — serve and mount MCP servers across machines"
   homepage "https://github.com/counterpunchtech/mcpmesh"
+  url "https://github.com/counterpunchtech/mcpmesh/archive/refs/tags/v0.4.0.tar.gz"
+  sha256 "c71600c04154a2e1ee3df9d5946c491a8a12bb67e1a444a8f080a4f385e3a2f8"
   license "MIT OR Apache-2.0"
   head "https://github.com/counterpunchtech/mcpmesh.git", branch: "main"
 
