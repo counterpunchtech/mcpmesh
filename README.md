@@ -172,14 +172,18 @@ and more services; every grant is explicit and per-service.
 ### 6. See and undo everything
 
 ```sh
-mcpmesh status               # what you serve, to whom; what you can reach; recent pairings; what to do next
+mcpmesh status               # what you serve, to whom; which peers are online (+ RTT); recent pairings; next steps
 mcpmesh use alice/notes      # the exact steps to mount a peer's service in your AI client
 mcpmesh doctor               # local, read-only health check of this machine's setup
 mcpmesh pair --remove alice  # unpair: alice loses access to YOUR services from now on
 ```
 
-`status` closes with a **next steps** block — the exact command for whatever this machine can do
-from where it is (share something, invite someone to a service nobody can reach yet, redeem an
+`status` shows a **reachability** line per paired peer — online or offline, with a round-trip
+time — so you can see who's actually up before you dial. It's advisory and on-demand (a peer
+that's off just reads offline; it never blocks a dial), and it works both ways once you're paired.
+
+`status` also closes with a **next steps** block — the exact command for whatever this machine can
+do from where it is (share something, invite someone to a service nobody can reach yet, redeem an
 invite, or mount a peer's service). It's silent when there's nothing to nudge.
 
 ## For teams: roster mode
@@ -227,6 +231,13 @@ socket, simple enough to implement in any language. The
 [**`mcpmesh-local/1` protocol spec**](docs/local-protocol.md) documents the framing, the handshake,
 every method, and the identity contract. Rust clients can depend on the
 [`mcpmesh-local-api`](https://crates.io/crates/mcpmesh-local-api) crate directly instead.
+
+For a **live view of the mesh**, the daemon exposes an event stream (`subscribe`): an initial
+snapshot of active sessions and peer reachability, then per-event telemetry — sessions opening and
+closing, per-request latency and byte counts, trust changes — as it happens, enough to render the
+mesh in real time. `mcpmesh internal watch` is a thin reference consumer you can run to watch the
+stream in a terminal; the [protocol spec](docs/local-protocol.md#live-event-stream) has the frame
+shapes.
 
 ## Platform support
 
