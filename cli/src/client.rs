@@ -74,25 +74,37 @@ pub async fn ensure_daemon_with(launch: &DaemonLaunch) -> Result<ControlClient> 
 
 /// Spawn `mcpmesh internal daemon` DETACHED: stdio null, and the `std::process::Child` is
 /// dropped WITHOUT waiting or killing — std `Child::drop` neither reaps nor signals, so the
-/// daemon OUTLIVES us (no `kill_on_drop`). A redundant spawn is harmless: the flock loser
-/// exits 0. (Delta from the plan's `tokio::process` suggestion — declared: spawning is a
-/// synchronous syscall that needs no async runtime or tokio `process` feature.)
+/// daemon OUTLIVES us (no `kill_on_drop`). A redundant spawn is harmless: the singleton loser
+/// (flock on unix; pipe-bind on windows) exits 0. (Delta from the plan's `tokio::process`
+/// suggestion — declared: spawning is a synchronous syscall that needs no async runtime or
+/// tokio `process` feature.)
 fn spawn_detached(launch: &DaemonLaunch) -> Result<()> {
-    use std::os::unix::process::CommandExt;
-
     let mut cmd = std::process::Command::new(&launch.exe);
     cmd.arg("internal")
         .arg("daemon")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
         // Own process group (stable since 1.64, no `unsafe`): a terminal Ctrl-C sends SIGINT
         // to the spawner's foreground group only, so it must NOT reach this shared daemon —
         // otherwise one client's Ctrl-C would kill every session the daemon serves. The
         // remaining leak — terminal SIGHUP on hangup — needs a fresh session (`setsid` via
         // `pre_exec`, which is `unsafe` and barred by forbid(unsafe)); deferred, and the
         // flock singleton makes an accidental re-spawn after such a kill harmless anyway.
-        .process_group(0);
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS (0x0000_0008: no inherited console) + CREATE_NEW_PROCESS_GROUP
+        // (0x0000_0200): the Ctrl-C / console-close of the spawning shell must NOT reach the
+        // shared daemon — the same session isolation `process_group(0)` buys on unix. Both are
+        // safe std APIs (`creation_flags`); no `unsafe` involved.
+        cmd.creation_flags(0x0000_0008 | 0x0000_0200);
+    }
     for (key, value) in &launch.env {
         cmd.env(key, value);
     }

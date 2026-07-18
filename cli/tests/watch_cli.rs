@@ -9,6 +9,14 @@
 //! snapshot summary line + its startup banner, then kills it. The per-frame RENDERING of
 //! event/lagged/snapshot frames is unit-tested directly against the pure `render_frame` in
 //! `main.rs` (DRYer + deterministic than racing a subprocess for a live event).
+// Unix-only: the test process connects to the daemon's control endpoint at a hardcoded
+// filesystem socket path (`connect_control(<tmp>/mcpmesh/mcpmesh.sock)`), the path the
+// child computes on unix. On windows the endpoint is a hash-derived named pipe the test
+// cannot reconstruct without a forbidden windows twin. Windows coverage for the control
+// path lives at the transport layer (local-api transport::windows pipe tests) and the
+// client protocol layer (local-api client.rs seam tests); a windows daemon-subprocess
+// round-trip is deferred — see the plan's Task 6 "Windows coverage gap" note.
+#![cfg(unix)]
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader};
 use std::path::Path;

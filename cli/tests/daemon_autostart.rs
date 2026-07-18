@@ -3,6 +3,15 @@
 //! runtime dir is passed to the daemon CHILD's env — the test never mutates its own env
 //! (`set_var` is `unsafe` under `forbid(unsafe)`), so the socket path is derived explicitly
 //! and handed to the daemon out of band.
+// Unix-only: the launch fixture hardcodes the control endpoint as a filesystem socket path
+// (`<tmp>/mcpmesh/mcpmesh.sock`) and the test asserts `launch.socket.exists()` + dials it
+// via `connect_control`. On windows the endpoint is a hash-derived named pipe with no
+// filesystem presence, unreconstructable without a forbidden windows twin. Windows coverage
+// for the control path lives at the transport layer (local-api transport::windows pipe
+// tests) and the client protocol layer (local-api client.rs seam tests); a windows
+// daemon-subprocess autostart round-trip is deferred — see the plan's Task 6 "Windows
+// coverage gap" note.
+#![cfg(unix)]
 use std::ffi::OsString;
 use std::path::Path;
 use std::time::{Duration, Instant};

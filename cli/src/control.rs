@@ -1,7 +1,8 @@
 //! Server-side mcpmesh-local/1 dispatch (spec §6.1). On each accepted connection the SERVER
 //! writes a `Hello` frame FIRST ("the first exchange ... identifies the api"), then reads
 //! request frames, dispatches on the `method` string, and writes JSON-RPC-shaped response
-//! frames back. Same-uid peers only — the peer-uid gate runs before the hello.
+//! frames back. Same-uid peers only (the seam's platform gate — peer-euid on unix, owner-only
+//! pipe DACL on windows) — the gate runs before the hello.
 //!
 //! Dispatch discipline (Task 1 carry-forward): the method is extracted with
 //! [`mcpmesh_local_api::method_of`] and params are read PER-METHOD — never by deserializing
@@ -14,12 +15,12 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::Result;
+use mcpmesh_local_api::transport::{LocalListener, LocalStream};
 use mcpmesh_local_api::{
     API_NAME, API_VERSION, Hello, PeerInfo, ServiceInfo, StatusResult, method_of,
 };
 use mcpmesh_net::framing::{FrameReader, Inbound, write_frame};
 use serde_json::{Value, json};
-use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Notify;
 
 use crate::daemon::MeshState;
@@ -82,7 +83,7 @@ impl DaemonState {
 
 /// Accept control connections until a `shutdown` request stops the loop. Each connection is
 /// handled in its own task so independent clients never head-of-line-block one another.
-pub async fn serve_control(listener: UnixListener, state: Arc<DaemonState>) -> Result<()> {
+pub async fn serve_control(mut listener: LocalListener, state: Arc<DaemonState>) -> Result<()> {
     loop {
         tokio::select! {
             // `notify_one` stores a permit if the loop is momentarily between iterations, so
@@ -92,8 +93,8 @@ pub async fn serve_control(listener: UnixListener, state: Arc<DaemonState>) -> R
                 return Ok(());
             }
             accepted = listener.accept() => {
-                let (stream, _addr) = match accepted {
-                    Ok(pair) => pair,
+                let stream = match accepted {
+                    Ok(s) => s,
                     Err(e) => {
                         // Back off before retrying: a persistent accept error (e.g. EMFILE
                         // under fd exhaustion) would otherwise busy-spin the loop at 100% CPU.
@@ -113,15 +114,16 @@ pub async fn serve_control(listener: UnixListener, state: Arc<DaemonState>) -> R
     }
 }
 
-async fn handle_conn(stream: UnixStream, state: Arc<DaemonState>) -> Result<()> {
-    // Same-uid gate BEFORE any frame (spec §11.2 P12): refuse other users pre-hello. A
-    // cross-uid connection attempt is security-relevant, so it is logged at `warn!` here
-    // (returning Ok keeps the normal clean-close path at `debug!` in `serve_control`).
-    if let Err(e) = ipc::check_peer_uid(&stream) {
-        tracing::warn!(%e, "refused control connection from a different uid");
+async fn handle_conn(stream: LocalStream, state: Arc<DaemonState>) -> Result<()> {
+    // Same-user gate BEFORE any frame (spec §11.2 P12): refuse other users pre-hello (peer-euid
+    // on unix; on windows the pipe DACL already enforced this at connect). A cross-user
+    // connection attempt is security-relevant, so it is logged at `warn!` here (returning Ok
+    // keeps the normal clean-close path at `debug!` in `serve_control`).
+    if let Err(e) = ipc::check_peer(&stream) {
+        tracing::warn!(%e, "refused unauthorized control connection");
         return Ok(());
     }
-    let (read_half, mut write_half) = stream.into_split();
+    let (read_half, mut write_half) = mcpmesh_local_api::transport::split_local(stream);
 
     // The server speaks first: a `Hello` frame identifies the api (spec §6.1).
     let hello = Hello {

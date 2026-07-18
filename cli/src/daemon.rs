@@ -449,21 +449,32 @@ impl MeshState {
     }
 }
 
-/// Run the daemon. Acquires the singleton lock; if another daemon holds it, returns `Ok(())`
-/// (exit 0). Otherwise builds the endpoint + store + gate + service registry, starts the
-/// mesh serve loop, binds the control socket, and serves the control API until a `shutdown`
-/// request stops it.
+/// Run the daemon. On unix, acquires the per-uid flock singleton (another holder → exit 0);
+/// on Windows the control-endpoint bind in `serve_forever` is the singleton. Then binds the
+/// control endpoint FIRST, builds the endpoint + store + gate + service registry, starts the
+/// mesh serve loop, and serves the control API until a `shutdown` request stops it.
 pub fn run() -> Result<()> {
-    let runtime = paths::runtime_dir()?;
-    ipc::ensure_runtime_dir(&runtime)?;
-    let lock_path = runtime.join("mcpmesh.lock");
-    let Some(_lock) = acquire_singleton_lock(&lock_path)? else {
-        tracing::info!("another mcpmesh daemon already holds the singleton lock; exiting");
-        return Ok(());
+    // Unix singleton: the per-uid flock, taken BEFORE anything else so the stale-socket unlink
+    // and the state.redb open are single-daemon-safe. We hold the exclusive lock, so no other
+    // daemon is live: the stale-socket unlink cannot orphan anyone AND we are the sole opener of
+    // state.redb. `_lock` lives until this function returns (process lifetime for a serving
+    // daemon). Windows singleton: there is no advisory-lock/filesystem equivalent here — the
+    // control-pipe bind ITSELF is the singleton (a FILE_FLAG_FIRST_PIPE_INSTANCE create fails with
+    // AddrInUse once a peer daemon owns the pipe), which is why `serve_forever` binds the listener
+    // FIRST, before opening state.redb.
+    #[cfg(unix)]
+    let _lock = {
+        let runtime = paths::runtime_dir()?;
+        ipc::ensure_runtime_dir(&runtime)?;
+        let lock_path = runtime.join("mcpmesh.lock");
+        match acquire_singleton_lock(&lock_path)? {
+            Some(lock) => lock,
+            None => {
+                tracing::info!("another mcpmesh daemon already holds the singleton lock; exiting");
+                return Ok(());
+            }
+        }
     };
-    // We hold the exclusive lock: no other daemon is live, so the stale-socket unlink cannot
-    // orphan anyone AND we are the sole opener of state.redb. `_lock` lives until this
-    // function returns (process lifetime for a serving daemon).
     let socket = paths::default_socket_path()?;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -483,6 +494,25 @@ async fn serve_forever(socket: &Path) -> Result<()> {
     //    if a provider is already installed, which `let _ =` swallows (safe against a re-entry / a test
     //    that also installed one). This MUST precede the URL poll loop spawned below (§4.3 HTTPS poll).
     let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // 0a. Bind the control listener FIRST — before state.redb, the endpoint, or the audit log. On
+    //     Windows the pipe bind IS the singleton lock (there is no flock; `run` skips it there): a
+    //     FILE_FLAG_FIRST_PIPE_INSTANCE create returns AddrInUse once a peer daemon owns the pipe,
+    //     so binding early is what serializes daemons. On unix this AddrInUse arm is dead — `run`'s
+    //     flock already serialized us before we ever reached here — but the shape is uniform. The
+    //     socket/pipe creation has no side effects the later construction depends on, so hoisting it
+    //     only moves WHEN the endpoint appears (earlier), never WHAT gets built.
+    let listener = match ipc::bind_control_socket(socket).await {
+        Ok(l) => l,
+        Err(e)
+            if e.downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::AddrInUse) =>
+        {
+            tracing::info!("another mcpmesh daemon already owns the control endpoint; exiting");
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
 
     // 0b. The audit log (spec §11.3): one bounded-channel writer over <state_dir>/audit. Best-effort
     //     — record() never blocks or fails a session. Threaded into the backends (build_services_
@@ -766,8 +796,8 @@ async fn serve_forever(socket: &Path) -> Result<()> {
         respawn_poll_loop(&mesh, url).await;
     }
 
-    // 6. The control server on the UDS, running on the same runtime as the mesh serve loop.
-    let listener = ipc::bind_control_socket(socket).await?;
+    // 6. The control server on the local endpoint (bound in step 0a), running on the same runtime
+    //    as the mesh serve loop.
     let state = Arc::new(DaemonState::with_mesh(
         STACK_VERSION,
         mesh,
@@ -2731,7 +2761,9 @@ struct RegisterParams {
 
 /// Acquire the per-uid singleton lock (spec §13 single-daemon). Returns `Some(file)` when we
 /// win the exclusive advisory lock (hold it for the process lifetime; dropping it releases
-/// the lock), or `None` when another daemon already holds it (`EWOULDBLOCK`).
+/// the lock), or `None` when another daemon already holds it (`EWOULDBLOCK`). Unix-only: on
+/// Windows the control-pipe bind is the singleton (see `run`), so there is no flock path.
+#[cfg(unix)]
 fn acquire_singleton_lock(lock_path: &Path) -> Result<Option<File>> {
     use rustix::fs::{FlockOperation, flock};
     let file = std::fs::OpenOptions::new()

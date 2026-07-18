@@ -12,6 +12,14 @@
 //!
 //! Rosters are minted in-test via `mcpmesh_trust::roster::sign::mint_signed` (the production mint
 //! path M3b's `org approve` also uses).
+// Unix-only: the test process connects to the daemon's control endpoint at a hardcoded
+// filesystem socket path (`connect_control(<tmp>/mcpmesh/mcpmesh.sock)`), the path the
+// child computes on unix. On windows the endpoint is a hash-derived named pipe the test
+// cannot reconstruct without a forbidden windows twin. Windows coverage for the control
+// path lives at the transport layer (local-api transport::windows pipe tests) and the
+// client protocol layer (local-api client.rs seam tests); a windows daemon-subprocess
+// round-trip is deferred — see the plan's Task 6 "Windows coverage gap" note.
+#![cfg(unix)]
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};

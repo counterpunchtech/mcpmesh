@@ -50,6 +50,8 @@ fn load_or_generate_signing_key(path: &Path) -> Result<(SigningKey, bool), KeyEr
 
 /// Mint via same-directory temp file (0600 at create), fsync, then publish with hard_link — the key
 /// file either exists complete or not at all (spec §13), and an existing key is never overwritten.
+/// On Windows the key file inherits the user-profile ACL of %APPDATA% (owner-only by default);
+/// there is no mode bit to set.
 fn mint_signing_key_at(path: &Path) -> Result<SigningKey, KeyError> {
     // Parent dir is umask-default (typically 0755); a 0700-dir lint also belongs to `mcpmesh doctor`.
     if let Some(parent) = path.parent() {
@@ -163,7 +165,6 @@ impl UserKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn first_call_mints_and_second_call_reloads_same_key() {
@@ -176,8 +177,12 @@ mod tests {
         assert_eq!(k1.public_bytes(), k2.public_bytes());
     }
 
+    // Unix-only: asserts the 0600 mode bits, which windows key files carry via
+    // user-profile ACLs instead of a POSIX mode.
+    #[cfg(unix)]
     #[test]
     fn key_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("device.key");
         DeviceKey::load_or_generate(&path).unwrap();
@@ -205,10 +210,14 @@ mod tests {
         let op = dir.path().join("org-root.key");
         let (root1, created1) = OrgRootKey::load_or_generate(&op).unwrap();
         assert!(created1);
-        assert_eq!(
-            std::fs::metadata(&op).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&op).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
         let (root2, created2) = OrgRootKey::load_or_generate(&op).unwrap();
         assert!(!created2);
         assert_eq!(root1.public_bytes(), root2.public_bytes());
@@ -219,10 +228,14 @@ mod tests {
         // UserKey: same discipline, a DISTINCT type + key.
         let up = dir.path().join("user.key");
         let (user, _) = UserKey::load_or_generate(&up).unwrap();
-        assert_eq!(
-            std::fs::metadata(&up).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&up).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
         assert_ne!(user.public_bytes(), root1.public_bytes());
     }
 }

@@ -36,6 +36,14 @@
 //!  `org_enroll.rs`; copy `dual_alpn_endpoint` / `wait_for_len` / the `MeshState` assembly + the echo
 //!  stub from `hero_flow_roster.rs`. The harness is not yet a shared module, so the helpers are copied
 //!  as those tests do.)
+// Unix-only: the test process connects to the daemon's control endpoint at a hardcoded
+// filesystem socket path (`connect_control(<tmp>/mcpmesh/mcpmesh.sock)`), the path the
+// child computes on unix. On windows the endpoint is a hash-derived named pipe the test
+// cannot reconstruct without a forbidden windows twin. Windows coverage for the control
+// path lives at the transport layer (local-api transport::windows pipe tests) and the
+// client protocol layer (local-api client.rs seam tests); a windows daemon-subprocess
+// round-trip is deferred — see the plan's Task 6 "Windows coverage gap" note.
+#![cfg(unix)]
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -280,6 +288,7 @@ async fn full_enrollment_via_porcelain_admits_a_group_service_and_revocation_cut
         // The user key is minted 0600 (local; only its public half + the binding sig ride out).
         let ukey = jcfg.join("user.key");
         assert!(ukey.exists(), "the user key is minted");
+        // Redundant under the file gate but kept for clarity.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

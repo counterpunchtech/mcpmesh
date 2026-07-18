@@ -1,10 +1,12 @@
-//! Shared paths rule (spec §13): XDG form, resolved per-platform in one place.
+//! Shared paths rule (spec §13): resolved per-platform in one place (XDG on unix; APPDATA/LOCALAPPDATA + named-pipe names on windows).
 use std::path::PathBuf;
 
 /// The ONE XDG-basedir rule shared by [`config_dir`]/[`data_dir`]/[`state_dir`]:
 /// `$<var>/mcpmesh` when the var is set, non-empty, and absolute; otherwise
 /// `$HOME/<segments…>/mcpmesh`. A missing/empty `HOME` is a typed error — the same
-/// posture as [`runtime_dir`] (never a panic).
+/// posture as [`runtime_dir`] (never a panic). Unix-only wiring (see [`win_dir`] for
+/// the Windows sibling); `#[cfg(unix)]` because it is otherwise dead on Windows.
+#[cfg(unix)]
 fn xdg_dir(var: &str, home_segments: &[&str]) -> std::io::Result<PathBuf> {
     let xdg = std::env::var(var).ok();
     let home = std::env::var("HOME").ok();
@@ -13,7 +15,10 @@ fn xdg_dir(var: &str, home_segments: &[&str]) -> std::io::Result<PathBuf> {
 
 /// Pure core of the §13 rule (the same env-free split as [`runtime_dir_from`], so it is
 /// unit-testable without mutating process env). `xdg` is the raw `$<var>` value if set;
-/// `home` is the raw `$HOME` value if set.
+/// `home` is the raw `$HOME` value if set. Deliberately un-cfg'd (like [`win_dir_from`]) so its
+/// unit tests run on every host; its only non-test caller is the `#[cfg(unix)]` [`xdg_dir`], so
+/// plain windows `lib` builds see it as unused — `allow(dead_code)` rather than `#[cfg(unix)]` here.
+#[allow(dead_code)]
 fn xdg_dir_from(
     var: &str,
     xdg: Option<&str>,
@@ -42,10 +47,128 @@ fn xdg_dir_from(
     }
 }
 
+/// Windows sibling of [`xdg_dir_from`]: an absolute XDG override still wins (so the
+/// family's env-var test isolation works on every platform); otherwise
+/// `<base_env>\mcpmesh\<segments…>` where `base_env` is `%APPDATA%` (config) or
+/// `%LOCALAPPDATA%` (data/state). Missing base env is a typed error (HOME-parity).
+/// Deliberately un-cfg'd (like [`xdg_dir_from`]) so its unit tests run on every host;
+/// its only non-test caller is the `#[cfg(windows)]` [`win_dir`], so plain unix `lib`
+/// builds see it as unused — `allow(dead_code)` rather than `#[cfg(windows)]` here.
+#[allow(dead_code)]
+fn win_dir_from(
+    xdg: Option<&str>,
+    base: Option<&str>,
+    segments: &[&str],
+) -> std::io::Result<PathBuf> {
+    if let Some(x) = xdg
+        && !x.is_empty()
+        && std::path::Path::new(x).is_absolute()
+    {
+        return Ok(PathBuf::from(x).join("mcpmesh"));
+    }
+    match base {
+        Some(b) if !b.is_empty() => {
+            let mut dir = PathBuf::from(b);
+            dir.push("mcpmesh");
+            for seg in segments {
+                dir.push(seg);
+            }
+            Ok(dir)
+        }
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "APPDATA/LOCALAPPDATA is not set; set it or the XDG override to an absolute path",
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn win_dir(xdg_var: &str, base_var: &str, segments: &[&str]) -> std::io::Result<PathBuf> {
+    let xdg = std::env::var(xdg_var).ok();
+    let base = std::env::var(base_var).ok();
+    win_dir_from(xdg.as_deref(), base.as_deref(), segments)
+}
+
+/// FNV-1a, folded to 32 bits — deterministic across processes AND rustc versions
+/// (a `DefaultHasher` is not), because the daemon and a plugin daemon may be
+/// different binaries that must resolve the SAME pipe name. Un-cfg'd like
+/// [`win_dir_from`] so its behavior is tested on every host; only used outside tests
+/// on `#[cfg(windows)]`, hence the `allow`.
+#[allow(dead_code)]
+fn fnv8(s: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    format!("{:08x}", ((h >> 32) ^ h) as u32)
+}
+
+/// keep `[a-z0-9_-]`, lowercase the rest in, map anything else to `-`. Un-cfg'd like
+/// [`win_dir_from`]; see its comment for why the unused-on-unix `allow` is here
+/// instead of a `#[cfg(windows)]` gate.
+#[allow(dead_code)]
+fn sanitize_pipe_component(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            'a'..='z' | '0'..='9' | '_' | '-' => c,
+            'A'..='Z' => c.to_ascii_lowercase(),
+            _ => '-',
+        })
+        .collect()
+}
+
+/// Windows local endpoint: a named pipe, not a filesystem socket (design §1).
+/// `\\.\pipe\mcpmesh-<domain>-<user>[-<fnv8(XDG_RUNTIME_DIR)>]`. The name is only a
+/// rendezvous label — same-user enforcement is the pipe's owner-only DACL
+/// (`mcpmesh-local-api`'s bind), never the name. USERDOMAIN disambiguates a local and
+/// a domain account sharing a username; XDG_RUNTIME_DIR (set by hermetic tests on
+/// every platform) isolates parallel test daemons exactly as it does on Unix.
+/// Un-cfg'd like [`win_dir_from`]; see its comment for why the unused-on-unix
+/// `allow` is here instead of a `#[cfg(windows)]` gate.
+#[allow(dead_code)]
+fn windows_pipe_name_from(
+    domain: Option<&str>,
+    user: Option<&str>,
+    xdg: Option<&str>,
+) -> std::io::Result<PathBuf> {
+    let user = user.filter(|u| !u.is_empty()).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "USERNAME is not set; cannot derive a per-user pipe name",
+        )
+    })?;
+    let mut name = format!(
+        r"\\.\pipe\mcpmesh-{}-{}",
+        sanitize_pipe_component(domain.unwrap_or("local")),
+        sanitize_pipe_component(user)
+    );
+    if let Some(x) = xdg
+        && !x.is_empty()
+    {
+        name.push('-');
+        name.push_str(&fnv8(x));
+    }
+    Ok(PathBuf::from(name))
+}
+
+#[cfg(windows)]
+fn windows_pipe_name() -> std::io::Result<PathBuf> {
+    let domain = std::env::var("USERDOMAIN").ok();
+    let user = std::env::var("USERNAME").ok();
+    let xdg = std::env::var("XDG_RUNTIME_DIR").ok();
+    windows_pipe_name_from(domain.as_deref(), user.as_deref(), xdg.as_deref())
+}
+
 /// Per-platform config dir (spec §13): `$XDG_CONFIG_HOME/mcpmesh` when that var is set,
-/// non-empty, and absolute; otherwise `$HOME/.config/mcpmesh`.
+/// non-empty, and absolute; otherwise `$HOME/.config/mcpmesh` (unix). On Windows,
+/// `%APPDATA%\mcpmesh` (an absolute `XDG_CONFIG_HOME` override still wins, for test
+/// isolation).
 pub fn config_dir() -> std::io::Result<PathBuf> {
-    xdg_dir("XDG_CONFIG_HOME", &[".config"])
+    #[cfg(unix)]
+    return xdg_dir("XDG_CONFIG_HOME", &[".config"]);
+    #[cfg(windows)]
+    return win_dir("XDG_CONFIG_HOME", "APPDATA", &[]);
 }
 
 pub fn default_device_key_path() -> std::io::Result<PathBuf> {
@@ -98,16 +221,26 @@ fn runtime_dir_from(xdg: Option<&str>, tmp: PathBuf) -> std::io::Result<PathBuf>
     Ok(dir)
 }
 
+/// The local control endpoint (spec §13): a Unix socket at `<runtime_dir>/mcpmesh.sock` on
+/// unix. On Windows there is no per-user runtime dir with the right ACL semantics, so the
+/// control plane is a named pipe instead — see [`windows_pipe_name`].
 pub fn default_socket_path() -> std::io::Result<PathBuf> {
-    Ok(runtime_dir()?.join("mcpmesh.sock"))
+    #[cfg(unix)]
+    return Ok(runtime_dir()?.join("mcpmesh.sock"));
+    #[cfg(windows)]
+    return windows_pipe_name();
 }
 
 /// Per-platform data dir for durable state (spec §13/§15): `$XDG_DATA_HOME/mcpmesh` when that
-/// var is set, non-empty, and absolute; otherwise `$HOME/.local/share/mcpmesh`. `state.redb`
-/// (the peer allowlist) lives here. Unlike the runtime dir (ephemeral, per-boot), this is
-/// durable across reboots.
+/// var is set, non-empty, and absolute; otherwise `$HOME/.local/share/mcpmesh` (unix).
+/// `state.redb` (the peer allowlist) lives here. Unlike the runtime dir (ephemeral, per-boot),
+/// this is durable across reboots. On Windows, `%LOCALAPPDATA%\mcpmesh\data` (LOCALAPPDATA,
+/// not APPDATA — this data need not roam with the user profile).
 pub fn data_dir() -> std::io::Result<PathBuf> {
-    xdg_dir("XDG_DATA_HOME", &[".local", "share"])
+    #[cfg(unix)]
+    return xdg_dir("XDG_DATA_HOME", &[".local", "share"]);
+    #[cfg(windows)]
+    return win_dir("XDG_DATA_HOME", "LOCALAPPDATA", &["data"]);
 }
 
 /// The peer allowlist store path (`<data_dir>/state.redb`, spec §4.2/§15).
@@ -130,9 +263,13 @@ pub fn default_blob_scopes_path() -> std::io::Result<PathBuf> {
 /// when that var is set, non-empty, and absolute; otherwise `$HOME/.local/state/mcpmesh`. Distinct
 /// from `data_dir()` (`~/.local/share`, XDG_DATA_HOME): the XDG basedir spec places *state* data
 /// (logs, history — the audit JSONL here) under `~/.local/state`, separate from portable app data.
-/// Mirrors the `data_dir()` derivation exactly, swapping the var and the `.local/state` segment.
+/// Mirrors the `data_dir()` derivation exactly, swapping the var and the `.local/state` segment. On
+/// Windows, `%LOCALAPPDATA%\mcpmesh\state` (mirrors `data_dir()`'s Windows branch, `state` segment).
 pub fn state_dir() -> std::io::Result<PathBuf> {
-    xdg_dir("XDG_STATE_HOME", &[".local", "state"])
+    #[cfg(unix)]
+    return xdg_dir("XDG_STATE_HOME", &[".local", "state"]);
+    #[cfg(windows)]
+    return win_dir("XDG_STATE_HOME", "LOCALAPPDATA", &["state"]);
 }
 
 /// The append-only audit-log directory (`<state_dir>/audit/`, spec §11.3/§13). One monthly JSONL
@@ -205,6 +342,8 @@ mod path_tests {
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 
+    // Unix-only: the control endpoint is a filesystem socket path under the runtime dir.
+    #[cfg(unix)]
     #[test]
     fn socket_path_is_under_runtime_dir() {
         // Holds for any ambient env: the socket is <runtime_dir>/mcpmesh.sock, runtime_dir
@@ -212,6 +351,14 @@ mod path_tests {
         let sock = default_socket_path().unwrap();
         assert!(sock.ends_with("mcpmesh/mcpmesh.sock"));
         assert!(sock.is_absolute());
+    }
+
+    // Windows twin: the control endpoint is a per-user named pipe, not a filesystem socket.
+    #[cfg(windows)]
+    #[test]
+    fn socket_path_is_a_per_user_pipe_name() {
+        let sock = default_socket_path().unwrap();
+        assert!(sock.to_string_lossy().starts_with(r"\\.\pipe\mcpmesh-"));
     }
 
     #[test]
@@ -264,5 +411,48 @@ mod path_tests {
             let err = xdg_dir_from("XDG_CONFIG_HOME", None, home, &[".config"]).unwrap_err();
             assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
         }
+    }
+
+    #[test]
+    fn win_dir_prefers_xdg_override_else_base_env() {
+        // XDG override wins when absolute (test isolation on Windows too).
+        assert_eq!(
+            win_dir_from(Some("/xdg/cfg"), Some(r"C:\Users\u\AppData\Roaming"), &[]).unwrap(),
+            PathBuf::from("/xdg/cfg/mcpmesh")
+        );
+        // No override → <base>\mcpmesh\<segments…>.
+        assert_eq!(
+            win_dir_from(None, Some(r"C:\Users\u\AppData\Local"), &["data"]).unwrap(),
+            PathBuf::from(r"C:\Users\u\AppData\Local")
+                .join("mcpmesh")
+                .join("data")
+        );
+        // Missing/empty base env → typed NotFound error (parity with missing HOME).
+        for base in [None, Some("")] {
+            let err = win_dir_from(None, base, &[]).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        }
+    }
+
+    #[test]
+    fn windows_pipe_name_is_per_user_and_env_isolatable() {
+        // Stable per-user name from USERDOMAIN + USERNAME, sanitized + lowercased.
+        assert_eq!(
+            windows_pipe_name_from(Some("DESKTOP-AB12"), Some("Jo Hn"), None).unwrap(),
+            PathBuf::from(r"\\.\pipe\mcpmesh-desktop-ab12-jo-hn")
+        );
+        // XDG_RUNTIME_DIR set (the family's test-isolation var) → a deterministic
+        // suffix so hermetic tests get distinct pipes.
+        let a = windows_pipe_name_from(Some("D"), Some("u"), Some(r"C:\tmp\t1")).unwrap();
+        let b = windows_pipe_name_from(Some("D"), Some("u"), Some(r"C:\tmp\t2")).unwrap();
+        assert_ne!(a, b);
+        assert!(a.to_string_lossy().starts_with(r"\\.\pipe\mcpmesh-d-u-"));
+        // Same input → same name (deterministic across processes: FNV, not DefaultHasher).
+        assert_eq!(
+            windows_pipe_name_from(Some("D"), Some("u"), Some(r"C:\tmp\t1")).unwrap(),
+            a
+        );
+        // Missing USERNAME → typed error, never a shared anonymous pipe name.
+        assert!(windows_pipe_name_from(None, None, None).is_err());
     }
 }

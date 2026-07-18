@@ -25,6 +25,13 @@
 //! `install_roster_view_and_sever` path per scope — the SAME `sign`/`mint_signed` production path
 //! M3b's `org approve` will drive.) In-process localhost; the 3-node 60s-propagation timing test is
 //! M3c (M3a proves the sever MECHANISM here, not cross-node timing).
+// Unix-only: hand-binds the control endpoint in-process (`bind_control_socket`) at a
+// filesystem socket path and connects to it via `connect_control`, which a windows named
+// pipe cannot be. Windows coverage for the control path lives at the transport layer
+// (local-api transport::windows pipe tests) and the client protocol layer (local-api
+// client.rs seam tests); a windows daemon-subprocess round-trip is deferred — see the
+// plan's Task 6 "Windows coverage gap" note.
+#![cfg(unix)]
 use std::sync::Arc;
 use std::time::Duration;
 

@@ -19,6 +19,10 @@ pub use protocol::{
 pub mod client;
 #[cfg(feature = "client")]
 pub mod codec;
+
+/// The platform local-endpoint seam (design 2026-07-18): connect/bind/accept/authorize.
+#[cfg(feature = "client")]
+pub mod transport;
 #[cfg(feature = "client")]
 pub use client::{ControlClient, connect_control};
 

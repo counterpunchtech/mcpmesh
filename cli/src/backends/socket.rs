@@ -1,6 +1,7 @@
 //! The `socket` backend (spec §6.2/§6.3): the daemon dials a long-running local
-//! MCP server on a Unix socket per session and injects the resolved caller
-//! identity into the forwarded `initialize` as `_meta["mcpmesh/peer"]`.
+//! MCP server on its local endpoint (a UDS path on unix; a `\\.\pipe\…` name on
+//! windows) per session and injects the resolved caller identity into the forwarded
+//! `initialize` as `_meta["mcpmesh/peer"]`.
 //!
 //! The injection is AUTHORITATIVE — it REPLACES, never merges (§6.3). The value the
 //! backend writes is the daemon-authored one; a caller-forged `_meta["mcpmesh/peer"]`
@@ -19,12 +20,12 @@ use mcpmesh_net::transport::NdjsonTransport;
 use mcpmesh_net::{PeerIdentity, SessionBackend, SessionTransport};
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::UnixStream;
 
 use crate::audit::{AuditSink, RequestAuditor};
 
 /// The `socket` backend for one registered service. `path` is the long-running
-/// local MCP server's Unix-domain-socket path, dialed fresh per session. The caller
+/// local MCP server's endpoint (a UDS path on unix; a `\\.\pipe\…` name on windows),
+/// dialed fresh per session. The caller
 /// identity is NOT a field — it is threaded per-session through
 /// [`SessionBackend::run`] (`Some` iff the peer resolved through the trust gate,
 /// spec §6.3), because `serve` shares this backend across all callers (Task 9).
@@ -63,8 +64,9 @@ impl SessionBackend for SocketBackend {
 }
 
 impl SocketBackend {
-    /// The transport-generic core of [`SessionBackend::run`]: dial the server's UDS,
-    /// inject the daemon-authored identity into the `initialize` `_meta`
+    /// The transport-generic core of [`SessionBackend::run`]: dial the server's local
+    /// endpoint (UDS on unix; named pipe on windows), inject the daemon-authored identity
+    /// into the `initialize` `_meta`
     /// authoritatively (REPLACE-not-merge), then pump frames both ways until either
     /// side ends. Generic over the transport's byte substrate so the real path (iroh
     /// streams) and the test path (`tokio::io::duplex`) share one implementation.
@@ -78,7 +80,7 @@ impl SocketBackend {
         R: AsyncRead + Send + Unpin,
         W: AsyncWrite + Send + Unpin,
     {
-        let server = UnixStream::connect(&self.path)
+        let server = mcpmesh_local_api::transport::connect_local(std::path::Path::new(&self.path))
             .await
             .with_context(|| format!("dial socket backend at {}", self.path))?;
 
@@ -130,11 +132,11 @@ impl SocketBackend {
         // the response. Threaded into the shared pump.
         let auditor = RequestAuditor::new(self.audit.clone(), peer.clone(), self.service.clone());
 
-        // Split the UDS: the read half is consumed by the pump's outbound direction
+        // Split the endpoint: the read half is consumed by the pump's outbound direction
         // (its FrameReader), the write half by the inbound direction. Both are owned
         // by their respective concurrent loops; on EOF they drop here, closing the
         // connection to the server.
-        let (server_read, server_write) = server.into_split();
+        let (server_read, server_write) = mcpmesh_local_api::transport::split_local(server);
         let outcome = super::pump(
             initialize,
             &mut transport,
@@ -152,7 +154,11 @@ impl SocketBackend {
     }
 }
 
-#[cfg(test)]
+// Unix-only: every stub MCP server binds a raw `UnixListener` and uses `into_split()`.
+// Production `SocketBackend` dials through the cross-platform seam
+// (`transport::connect_local`); these fixtures exercise it against a UDS stub. On the
+// windows CI leg the seam's pipe path is covered by `transport::windows`' own tests.
+#[cfg(all(test, unix))]
 mod tests {
     use std::time::Duration;
 

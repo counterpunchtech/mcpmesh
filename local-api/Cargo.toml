@@ -7,8 +7,14 @@ rust-version.workspace = true
 repository.workspace = true
 description = "mcpmesh local control plane: UDS client/service seam and the shared *-local/1 vocabulary"
 
-[lints]
-workspace = true
+[lints.rust]
+# The workspace [lints.rust] table carries EXACTLY ONE lint: unsafe_code = "forbid"
+# (see mcpmesh/Cargo.toml). Overriding the whole table here therefore loses nothing
+# else — it only downgrades forbid → DENY so the single Windows FFI module in
+# src/transport/windows.rs (`winsec`) can scope-`#[allow(unsafe_code)]` the ~30 lines
+# that build the owner-only pipe DACL via Win32 calls. Every other line in this crate
+# is still denied unsafe. Keep this the ONLY divergence from [workspace.lints].
+unsafe_code = "deny"
 
 [features]
 # Types-only by default. `client` adds the tokio-backed UnixStream ControlClient + the
@@ -29,6 +35,20 @@ tokio = { workspace = true, optional = true }
 mcpmesh-codec = { workspace = true, optional = true }
 rustix = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+# Already transitively present on Windows via tokio/mio — matches the 0.61 already in
+# Cargo.lock, so it adds no new crate/version to the lockfile and nothing to Unix
+# builds. Feature list is the minimum the DACL FFI actually needs: LocalFree/HLOCAL/
+# HANDLE/CloseHandle live in Win32_Foundation, the SECURITY_ATTRIBUTES + token APIs in
+# Win32_Security, the SDDL conversions in Win32_Security_Authorization, and
+# OpenProcessToken/GetCurrentProcess in Win32_System_Threading.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 tokio = { workspace = true }

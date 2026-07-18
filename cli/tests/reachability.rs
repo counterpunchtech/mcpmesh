@@ -11,6 +11,13 @@
 //!  3. A probe from an UNPAIRED endpoint → NOT reachable — the responder's trust gate closes the
 //!     connection with NO pong (no presence leak; the SECURITY property of the probe).
 //!  4. After the target endpoint is taken down → NOT reachable (a dead dial times out to false).
+// Unix-only: hand-binds the control endpoint in-process (`bind_control_socket`) at a
+// filesystem socket path and connects to it via `connect_control`, which a windows named
+// pipe cannot be. Windows coverage for the control path lives at the transport layer
+// (local-api transport::windows pipe tests) and the client protocol layer (local-api
+// client.rs seam tests); a windows daemon-subprocess round-trip is deferred — see the
+// plan's Task 6 "Windows coverage gap" note.
+#![cfg(unix)]
 use std::sync::Arc;
 use std::time::Duration;
 

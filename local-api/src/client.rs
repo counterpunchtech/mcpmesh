@@ -6,11 +6,10 @@
 use std::path::Path;
 
 use serde_json::Value;
-use tokio::net::UnixStream;
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
 use crate::codec::{FrameReader, Inbound, MAX_FRAME_BYTES, write_frame};
 use crate::protocol::{BlobFetchResult, BlobPublishResult, Hello, Request};
+use crate::transport::{LocalReadHalf, LocalWriteHalf, connect_local, split_local};
 
 /// A connected mcpmesh-local/1 client: the framed UDS stream + the server's `Hello`.
 // DEVIATION (declared): `#[derive(Debug)]` added — the plan's `wrong_api_hello_is_rejected`
@@ -18,8 +17,8 @@ use crate::protocol::{BlobFetchResult, BlobPublishResult, Hello, Request};
 #[derive(Debug)]
 pub struct ControlClient {
     hello: Hello,
-    reader: FrameReader<OwnedReadHalf>,
-    writer: OwnedWriteHalf,
+    reader: FrameReader<LocalReadHalf>,
+    writer: LocalWriteHalf,
 }
 
 /// The error surface of the client — thin, so kb can `anyhow`-wrap it.
@@ -100,7 +99,7 @@ impl ControlClient {
         mut self,
         peer: String,
         service: String,
-    ) -> Result<(FrameReader<OwnedReadHalf>, OwnedWriteHalf), ClientError> {
+    ) -> Result<(FrameReader<LocalReadHalf>, LocalWriteHalf), ClientError> {
         let frame = serde_json::to_value(Request::OpenSession { peer, service })
             .expect("Request serializes");
         write_frame(&mut self.writer, &frame).await?;
@@ -117,7 +116,7 @@ impl ControlClient {
     pub async fn open_stream(
         mut self,
         method: &str,
-    ) -> Result<(FrameReader<OwnedReadHalf>, OwnedWriteHalf), ClientError> {
+    ) -> Result<(FrameReader<LocalReadHalf>, LocalWriteHalf), ClientError> {
         let frame = serde_json::json!({ "method": method });
         write_frame(&mut self.writer, &frame).await?;
         Ok((self.reader, self.writer))
@@ -171,8 +170,8 @@ impl ControlClient {
 
 /// Connect + complete the hello handshake, asserting the api name is `mcpmesh-local/1`.
 pub async fn connect_control(path: &Path) -> Result<ControlClient, ClientError> {
-    let stream = UnixStream::connect(path).await?;
-    let (read_half, writer) = stream.into_split();
+    let stream = connect_local(path).await?;
+    let (read_half, writer) = split_local(stream);
     let mut reader = FrameReader::new(read_half, MAX_FRAME_BYTES);
     let hello: Hello = match reader.next().await? {
         Some(Inbound::Frame(v)) => {
@@ -194,17 +193,46 @@ pub async fn connect_control(path: &Path) -> Result<ControlClient, ClientError> 
     })
 }
 
-#[cfg(test)]
+// Seam-ported (Task 6): every stub daemon binds via the platform seam
+// (`transport::bind_local` + `LocalListener::accept`) rather than a raw `UnixListener`,
+// so these exercise the platform-identical `ControlClient` on BOTH unix (UDS) and windows
+// (named pipe). Gated on `feature = "service"` (bind needs it) rather than `unix`: under
+// `cargo test --workspace` feature unification turns `service` on for this crate (cli
+// depends on local-api with features=["service"]), so the module compiles and RUNS on the
+// windows CI leg. `test_endpoint` yields a platform-appropriate unique endpoint.
+#[cfg(all(test, feature = "service"))]
 mod tests {
     use super::*;
     use crate::protocol::{API_NAME, API_VERSION, BackendKind, ServiceInfo, StatusResult};
+    use crate::transport::{LocalListener, bind_local, split_local};
     use tokio::io::AsyncWriteExt;
-    use tokio::net::UnixListener;
+
+    /// A unique local endpoint for a stub daemon, platform-appropriate: a tempdir socket
+    /// path on unix, a per-process-unique `\\.\pipe\…` name on windows. Returns the
+    /// endpoint plus a guard that MUST outlive the listener (the `TempDir` on unix; unit
+    /// on windows, whose pipe namespace needs no filesystem cleanup).
+    #[cfg(unix)]
+    fn test_endpoint(tag: &str) -> (std::path::PathBuf, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("{tag}.sock"));
+        (path, dir)
+    }
+    #[cfg(windows)]
+    fn test_endpoint(tag: &str) -> (std::path::PathBuf, ()) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = std::path::PathBuf::from(format!(
+            r"\\.\pipe\mcpmesh-client-test-{}-{tag}-{n}",
+            std::process::id()
+        ));
+        (path, ())
+    }
 
     /// A stub mcpmesh daemon: send Hello, then answer one `status` with a StatusResult.
-    async fn stub_daemon(listener: UnixListener) {
-        let (stream, _) = listener.accept().await.unwrap();
-        let (read_half, mut writer) = stream.into_split();
+    async fn stub_daemon(mut listener: LocalListener) {
+        let stream = listener.accept().await.unwrap();
+        let (read_half, mut writer) = split_local(stream);
         write_frame(
             &mut writer,
             &serde_json::to_value(Hello {
@@ -247,9 +275,8 @@ mod tests {
 
     #[tokio::test]
     async fn connect_reads_hello_asserts_api_and_requests() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock = dir.path().join("mcpmesh.sock");
-        let listener = UnixListener::bind(&sock).unwrap();
+        let (sock, _guard) = test_endpoint("status");
+        let listener = bind_local(&sock).unwrap();
         let server = tokio::spawn(stub_daemon(listener));
 
         let mut client = connect_control(&sock).await.unwrap();
@@ -262,12 +289,12 @@ mod tests {
 
     #[tokio::test]
     async fn wrong_api_hello_is_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock = dir.path().join("x.sock");
-        let listener = UnixListener::bind(&sock).unwrap();
+        let (sock, _guard) = test_endpoint("wrongapi");
+        let listener = bind_local(&sock).unwrap();
         tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let (_r, mut w) = stream.into_split();
+            let mut listener = listener;
+            let stream = listener.accept().await.unwrap();
+            let (_r, mut w) = split_local(stream);
             write_frame(
                 &mut w,
                 &serde_json::json!({"api":"other/1","api_version":"1.0","stack_version":"0"}),
@@ -288,12 +315,12 @@ mod tests {
     #[tokio::test]
     async fn blob_fetch_and_publish_deserialize_typed_results() {
         use crate::protocol::{BlobFetchResult, BlobPublishResult};
-        let dir = tempfile::tempdir().unwrap();
-        let sock = dir.path().join("m.sock");
-        let listener = UnixListener::bind(&sock).unwrap();
+        let (sock, _guard) = test_endpoint("blob");
+        let listener = bind_local(&sock).unwrap();
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let (read_half, mut writer) = stream.into_split();
+            let mut listener = listener;
+            let stream = listener.accept().await.unwrap();
+            let (read_half, mut writer) = split_local(stream);
             write_frame(
                 &mut writer,
                 &serde_json::to_value(Hello {
@@ -365,12 +392,12 @@ mod tests {
     async fn frame_pipelined_behind_hello_survives_open_session_rebox() {
         use tokio::io::AsyncRead;
 
-        let dir = tempfile::tempdir().unwrap();
-        let sock = dir.path().join("pipelined.sock");
-        let listener = UnixListener::bind(&sock).unwrap();
+        let (sock, _guard) = test_endpoint("pipelined");
+        let listener = bind_local(&sock).unwrap();
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let (read_half, mut writer) = stream.into_split();
+            let mut listener = listener;
+            let stream = listener.accept().await.unwrap();
+            let (read_half, mut writer) = split_local(stream);
             // ONE write carrying the Hello AND a session frame → both land in the
             // client's first BufReader fill (the read-ahead under test).
             let mut bytes = serde_json::to_vec(
@@ -412,12 +439,12 @@ mod tests {
 
     #[tokio::test]
     async fn blob_grant_issues_request_and_acks() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock = dir.path().join("g.sock");
-        let listener = UnixListener::bind(&sock).unwrap();
+        let (sock, _guard) = test_endpoint("grant");
+        let listener = bind_local(&sock).unwrap();
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let (read_half, mut writer) = stream.into_split();
+            let mut listener = listener;
+            let stream = listener.accept().await.unwrap();
+            let (read_half, mut writer) = split_local(stream);
             write_frame(
                 &mut writer,
                 &serde_json::to_value(Hello {

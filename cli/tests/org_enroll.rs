@@ -1,6 +1,16 @@
 //! Subprocess porcelain: `org create` mints an org root + installs a signed empty roster, and prints
 //! the org invite code + root fingerprint (spec §4.4 step 1). Hermetic (relay disabled, XDG-scoped
 //! tempdir). Mirrors `roster_install.rs`'s `launch_in`/`run_cmd`/`shutdown_daemon` harness verbatim.
+// Unix-only: the test process connects to the daemon's control endpoint at a hardcoded
+// filesystem socket path (`connect_control(<tmp>/mcpmesh/mcpmesh.sock)`), the path the
+// child computes on unix. On windows the endpoint is a hash-derived named pipe the test
+// cannot reconstruct without a forbidden windows twin. Windows coverage for the control
+// path lives at the transport layer (local-api transport::windows pipe tests) and the
+// client protocol layer (local-api client.rs seam tests); a windows daemon-subprocess
+// round-trip is deferred — see the plan's Task 6 "Windows coverage gap" note. (The
+// per-block `#[cfg(unix)]` key-mode asserts below are now redundant under this file gate
+// but kept for clarity.)
+#![cfg(unix)]
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};

@@ -38,6 +38,12 @@
 //! production dependency. (The invite ALSO carries Alice's addr, used for the PAIR dial, which
 //! needs no discovery; persisting that addr into the dial-back `PeerEntry` so the FIRST post-pair
 //! mesh dial also needs no discovery is a noted robustness follow-up — see the plan.)
+// Unix-only: hand-binds the control endpoint in-process (`bind_control_socket`) at a
+// filesystem socket path, which a windows named pipe cannot be. Windows coverage for the
+// control path lives at the transport layer (local-api transport::windows pipe tests) and
+// the client protocol layer (local-api client.rs seam tests); a windows daemon-subprocess
+// round-trip is deferred — see the plan's Task 6 "Windows coverage gap" note.
+#![cfg(unix)]
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;

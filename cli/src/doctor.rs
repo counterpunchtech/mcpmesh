@@ -11,9 +11,12 @@
 //! Every verdict is produced by a PURE `check_*` fn (unit-tested with literal inputs, no daemon); the
 //! only impure code is `gather`/`probe_daemon`/`run_doctor` (T4).
 
-/// The severity of one check.
+/// The severity of one check. `Info` is below `Ok` for exit purposes (purely advisory, never
+/// warns): it carries a platform note such as the Windows "permission lints don't apply here"
+/// line, and must never flip the process exit code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Level {
+    Info,
     Ok,
     Warn,
     Error,
@@ -27,6 +30,12 @@ pub struct Verdict {
 }
 
 impl Verdict {
+    pub fn info(message: impl Into<String>) -> Self {
+        Self {
+            level: Level::Info,
+            message: message.into(),
+        }
+    }
     pub fn ok(message: impl Into<String>) -> Self {
         Self {
             level: Level::Ok,
@@ -266,6 +275,7 @@ pub fn render_report(findings: &[(&str, Verdict)]) -> Vec<String> {
         .iter()
         .map(|(label, v)| {
             let tag = match v.level {
+                Level::Info => "INFO",
                 Level::Ok => "OK  ",
                 Level::Warn => "WARN",
                 Level::Error => "ERR ",
@@ -295,6 +305,9 @@ use crate::util::epoch_now_i64 as epoch_now;
 /// Stat a file's `(present, mode & 0o777)` WITHOUT following symlinks and WITHOUT mutating anything.
 /// A missing file (or any stat error) → `(false, 0)` — doctor degrades, never panics. `symlink_metadata`
 /// judges a symlinked key by the link itself (a symlinked private key is itself worth surfacing).
+/// Unix-only: the `mode` bits are a POSIX concept — on Windows `stat_present` supplies the
+/// presence half and the permission lints are skipped entirely (see the `findings` builder).
+#[cfg(unix)]
 fn stat_mode(path: &std::path::Path) -> (bool, u32) {
     use std::os::unix::fs::PermissionsExt;
     match std::fs::symlink_metadata(path) {
@@ -304,13 +317,22 @@ fn stat_mode(path: &std::path::Path) -> (bool, u32) {
 }
 
 /// Stat a dir's `(present, mode & 0o777, uid)` — the runtime-dir posture inputs. Missing/error →
-/// `(false, 0, 0)`.
+/// `(false, 0, 0)`. Unix-only for the same reason as [`stat_mode`].
+#[cfg(unix)]
 fn stat_dir(path: &std::path::Path) -> (bool, u32, u32) {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     match std::fs::symlink_metadata(path) {
         Ok(m) => (true, m.permissions().mode() & 0o777, m.uid()),
         Err(_) => (false, 0, 0),
     }
+}
+
+/// The Windows presence half of a stat: `true` iff the path exists (WITHOUT following symlinks).
+/// There is no mode/uid to report — user-profile ACLs, not POSIX bits, protect the key files —
+/// so doctor reports presence only and skips the permission lints (see the `findings` builder).
+#[cfg(windows)]
+fn stat_present(path: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
 }
 
 /// The plain inputs the pure checks run on — gathered once, read-only, from the local filesystem/config
@@ -327,6 +349,11 @@ struct DoctorInputs {
     org_root_key: (bool, u32),
     runtime_dir: (bool, u32, u32),
     our_uid: u32,
+    /// Whether POSIX file-permission lints (0600 key mode, 0700 runtime dir, owner uid) are
+    /// meaningful on this platform. `cfg!(unix)` — false on Windows, where user-profile ACLs
+    /// protect the key files and there is no mode/uid to check; the findings builder then emits
+    /// one Info line instead of the per-file/dir permission findings.
+    perm_lints_apply: bool,
     staleness_secs: Option<i64>,
     daemon_reachable: bool,
     daemon_roster_state: Option<String>,
@@ -366,7 +393,12 @@ fn probe_daemon() -> (bool, Option<String>) {
 fn gather() -> DoctorInputs {
     use mcpmesh_trust::paths;
 
+    // The euid is a POSIX concept — used only by the runtime-dir owner check, which is gated off
+    // on Windows (`perm_lints_apply` is false there), so the placeholder 0 is never read.
+    #[cfg(unix)]
     let our_uid = rustix::process::geteuid().as_raw();
+    #[cfg(windows)]
+    let our_uid = 0u32;
 
     let cfg_result = match paths::default_config_path() {
         Ok(p) => crate::config::Config::load(&p),
@@ -390,8 +422,33 @@ fn gather() -> DoctorInputs {
         .or_else(|| paths::default_user_key_path().ok())
         .unwrap_or_default();
 
+    // Key/dir permission inputs are POSIX (mode + uid) on unix; on Windows we can only report
+    // presence (the mode/uid halves are 0 placeholders the gated-off perm checks never read).
+    #[cfg(unix)]
+    let device_key = stat_mode(&device_key_path);
+    #[cfg(windows)]
+    let device_key = (stat_present(&device_key_path), 0u32);
+    #[cfg(unix)]
+    let user_key = stat_mode(&user_key_path);
+    #[cfg(windows)]
+    let user_key = (stat_present(&user_key_path), 0u32);
+    let org_root_key_path = paths::default_org_root_key_path().unwrap_or_default();
+    #[cfg(unix)]
+    let org_root_key = stat_mode(&org_root_key_path);
+    #[cfg(windows)]
+    let org_root_key = (stat_present(&org_root_key_path), 0u32);
+
     let runtime_dir = match paths::runtime_dir() {
-        Ok(d) => stat_dir(&d),
+        Ok(d) => {
+            #[cfg(unix)]
+            {
+                stat_dir(&d)
+            }
+            #[cfg(windows)]
+            {
+                (stat_present(&d), 0u32, 0u32)
+            }
+        }
         Err(_) => (false, 0, 0),
     };
 
@@ -413,11 +470,12 @@ fn gather() -> DoctorInputs {
         network: cfg.network.clone(),
         roster_url: cfg.roster.url.clone(),
         max_staleness_secs: cfg.roster.max_staleness_seconds(),
-        device_key: stat_mode(&device_key_path),
-        user_key: stat_mode(&user_key_path),
-        org_root_key: stat_mode(&paths::default_org_root_key_path().unwrap_or_default()),
+        device_key,
+        user_key,
+        org_root_key,
         runtime_dir,
         our_uid,
+        perm_lints_apply: cfg!(unix),
         staleness_secs,
         daemon_reachable,
         daemon_roster_state,
@@ -425,8 +483,16 @@ fn gather() -> DoctorInputs {
 }
 
 /// Assemble the ordered finding list from gathered inputs (the single place labels + check order live).
+///
+/// The platform-independent checks (config, daemon, network, roster) run everywhere. The trailing
+/// permission checks are POSIX-only: when `perm_lints_apply` is false (Windows), the four
+/// per-file/dir permission findings collapse to ONE Info line — user-profile ACLs, not 0600/0700
+/// bits, protect the key files there, so a mode/uid lint would be noise. Nothing diagnostic is
+/// lost: key ABSENCE was never a finding on any platform (`check_key_perms` reports a missing key
+/// as "absent (not yet created)"), and the daemon probe runs in the cross-platform checks above —
+/// the dropped checks carried only the POSIX mode/uid lint.
 fn findings(inp: &DoctorInputs) -> Vec<(&'static str, Verdict)> {
-    vec![
+    let mut out = vec![
         (
             "config",
             check_config(inp.parse_ok, inp.org_root_pinned, inp.has_org_id),
@@ -446,16 +512,18 @@ fn findings(inp: &DoctorInputs) -> Vec<(&'static str, Verdict)> {
                 inp.max_staleness_secs,
             ),
         ),
-        (
+    ];
+    if inp.perm_lints_apply {
+        out.push((
             "device.key",
             check_key_perms(inp.device_key.0, inp.device_key.1),
-        ),
-        ("user.key", check_key_perms(inp.user_key.0, inp.user_key.1)),
-        (
+        ));
+        out.push(("user.key", check_key_perms(inp.user_key.0, inp.user_key.1)));
+        out.push((
             "org-root.key",
             check_key_perms(inp.org_root_key.0, inp.org_root_key.1),
-        ),
-        (
+        ));
+        out.push((
             "runtime-dir",
             check_runtime_dir(
                 inp.runtime_dir.0,
@@ -463,8 +531,14 @@ fn findings(inp: &DoctorInputs) -> Vec<(&'static str, Verdict)> {
                 inp.runtime_dir.2,
                 inp.our_uid,
             ),
-        ),
-    ]
+        ));
+    } else {
+        out.push((
+            "file-permission lints",
+            Verdict::info("n/a on Windows (user-profile ACLs protect %APPDATA%/%LOCALAPPDATA%)"),
+        ));
+    }
+    out
 }
 
 /// `mcpmesh doctor` — gather local inputs (+ optionally ping the daemon), run every check, print the
@@ -773,5 +847,53 @@ mod tests {
                 "doctor leaked '{term}': {rendered}"
             );
         }
+    }
+
+    #[test]
+    fn windows_shaped_inputs_replace_perm_findings_with_one_info_line() {
+        // Windows: `perm_lints_apply = false`. The findings builder must drop ALL four
+        // per-file/dir permission findings and emit exactly one Info line in their place, while
+        // keeping the platform-independent checks (config, daemon, network, roster). Pure over
+        // `DoctorInputs`, so this runs on macOS/Linux CI unchanged (it does not touch the FS).
+        let inp = DoctorInputs {
+            parse_ok: true,
+            org_root_pinned: false,
+            has_org_id: false,
+            network: net("default", &[], "default", &[]),
+            roster_url: None,
+            max_staleness_secs: 86_400,
+            // Deliberately group/world-writable modes: on unix these would be ERROR findings, so a
+            // clean report here proves the perm checks were skipped, not merely passed.
+            device_key: (true, 0o666),
+            user_key: (true, 0o666),
+            org_root_key: (true, 0o666),
+            runtime_dir: (true, 0o777, 1000),
+            our_uid: 0,
+            perm_lints_apply: false,
+            staleness_secs: None,
+            // Reachable so the platform-independent checks are all green — proving the Info line
+            // (advisory) does not by itself flip the exit code below.
+            daemon_reachable: true,
+            daemon_roster_state: None,
+        };
+        let out = findings(&inp);
+
+        for label in ["device.key", "user.key", "org-root.key", "runtime-dir"] {
+            assert!(
+                !out.iter().any(|(l, _)| *l == label),
+                "windows report must not carry the '{label}' permission finding"
+            );
+        }
+        let info: Vec<_> = out.iter().filter(|(_, v)| v.level == Level::Info).collect();
+        assert_eq!(info.len(), 1, "expected exactly one Info line: {out:?}");
+        let (label, verdict) = info[0];
+        assert_eq!(*label, "file-permission lints");
+        assert!(
+            verdict.message.contains("n/a on Windows"),
+            "unexpected Info message: {}",
+            verdict.message
+        );
+        // The Info line is advisory only — with all real checks green it must not flip the exit.
+        assert_eq!(worst_level(&out), Level::Ok);
     }
 }

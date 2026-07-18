@@ -2,8 +2,9 @@
 
 This is the wire contract between the mcpmesh daemon and the programs on the **same machine** that
 drive it — the CLI, the desktop host, and plugin daemons like `kb` and `loc`. It is a small,
-line-delimited JSON protocol over a Unix-domain socket. Anything that can open a socket and parse
-JSON can speak it, in any language.
+line-delimited JSON protocol over a same-user local endpoint: a Unix domain socket on macOS/Linux, a
+named pipe on Windows. Anything that can open the endpoint and parse JSON can speak it, in any
+language.
 
 > **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.0`) and evolves
 > **additively** (see [Versioning](#versioning)), but until a stable release this document — like the
@@ -30,7 +31,8 @@ The rest of this document is the second row.
 
 ## Transport and framing
 
-- **Socket type:** Unix-domain stream socket. There is no TCP surface.
+- **Endpoint type:** a same-user local endpoint — a Unix-domain stream socket on macOS/Linux, a named
+  pipe on Windows. There is no TCP surface.
 - **Framing:** [newline-delimited JSON](https://jsonlines.org/). One JSON value per frame, terminated
   by a single `\n` (`0x0A`). The value is compact (no embedded newlines) and UTF-8.
 - **Frame cap:** 16 MiB per frame (`MAX_FRAME_BYTES`). A frame that exceeds the cap, or that is not
@@ -39,13 +41,12 @@ The rest of this document is the second row.
 This is the whole codec. It is deliberately trivial so that both ends — and any third-party client —
 share one implementation that cannot drift. Reference: [`codec/src/lib.rs`](../codec/src/lib.rs).
 
-## Finding the socket
+## Finding the local endpoint
 
-The daemon binds its control socket at:
+The daemon binds its control endpoint at:
 
-```
-<runtime-dir>/mcpmesh/mcpmesh.sock
-```
+- **macOS/Linux:** `<runtime-dir>/mcpmesh/mcpmesh.sock`
+- **Windows:** `\\.\pipe\mcpmesh-<domain>-<user>`
 
 `<runtime-dir>` resolves the same way the daemon and CLI resolve it, so a client lands on the same
 path:
@@ -54,14 +55,19 @@ path:
 2. Otherwise `$TMPDIR/mcpmesh/`, or the platform temp dir when `TMPDIR` is unset (macOS, whose
    per-user `$TMPDIR` is already private).
 
-The socket is `0600` inside a `0700` directory the daemon owns, and the daemon verifies the
-**connecting process's uid matches its own** before serving. This is the security boundary: only the
-same user can connect (see [Security model](#security-model)). Reference:
-[`trust/src/paths.rs`](../trust/src/paths.rs).
+Windows has no per-user runtime dir with the right ACL semantics, so the pipe name itself carries the
+identity instead: `<domain>` and `<user>` come from the owning account, sanitized and lowercased, so a
+client resolves the same name the daemon bound.
 
-If no daemon is running, the socket will not exist. The CLI auto-starts one on demand; an embedding
-client either spawns `mcpmesh` (any porcelain verb starts the daemon) or runs `mcpmesh internal
-daemon` itself.
+On macOS/Linux the socket is `0600` inside a `0700` directory the daemon owns, and the daemon verifies
+the **connecting process's uid matches its own** before serving. On Windows the pipe carries an
+**owner-only DACL** that grants access only to the current user's SID, so the kernel refuses a
+cross-user connect before the daemon ever sees it. Either way, only the same user can connect (see
+[Security model](#security-model)). Reference: [`trust/src/paths.rs`](../trust/src/paths.rs).
+
+If no daemon is running, the endpoint will not exist (no socket file on macOS/Linux; no bound pipe
+name on Windows). The CLI auto-starts one on demand; an embedding client either spawns `mcpmesh` (any
+porcelain verb starts the daemon) or runs `mcpmesh internal daemon` itself.
 
 ## Handshake
 
@@ -380,10 +386,12 @@ not recognize, and do not assume an optional field is present. A breaking change
 
 ## Security model
 
-- **Same-user only.** The socket lives in a `0700` directory the daemon owns, is itself `0600`, and
-  the daemon checks the connecting process's uid against its own before serving. There is no network
-  listener and no authentication token because there is no cross-user or cross-machine access to this
-  socket — the boundary is the OS user account.
+- **Same-user only.** On macOS/Linux the socket lives in a `0700` directory the daemon owns, is
+  itself `0600`, and the daemon checks the connecting process's uid against its own before serving.
+  On Windows the pipe carries an owner-only DACL, so the kernel enforces the same restriction before
+  the daemon ever sees the connection. Either way there is no network listener and no authentication
+  token because there is no cross-user or cross-machine access to this endpoint — the boundary is the
+  OS user account.
 - **Local paths are trusted.** Methods that take a `path`/`dest_path` have the daemon read or write
   that file directly. That is safe precisely because only the same user can issue the call.
 - **Keys never cross the socket.** `org_join` passes a *path* to the user key, not the key bytes; the

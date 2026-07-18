@@ -56,6 +56,12 @@ fn mcp_servers_entry(peer: &str, service: &str) -> String {
 /// known so the line is copy-pasteable as-is; it degrades to `~` rather than failing (this is a
 /// display string in an instruction block, never a path we write).
 fn claude_desktop_config_path() -> String {
+    if cfg!(windows) {
+        // Claude Desktop on Windows stores its config under %APPDATA%\Claude. Degrade to the
+        // literal `%APPDATA%` (which a Windows shell still expands on paste) rather than failing.
+        let base = std::env::var("APPDATA").unwrap_or_else(|_| r"%APPDATA%".to_string());
+        return format!(r"{base}\Claude\claude_desktop_config.json");
+    }
     let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
     if cfg!(target_os = "macos") {
         format!("{home}/Library/Application Support/Claude/claude_desktop_config.json")

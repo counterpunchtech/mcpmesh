@@ -15,6 +15,13 @@
 //! addresses via a `MemoryLookup` on `endpoint.address_lookup()` — the runtime equivalent of
 //! iroh's (absent in 1.0.1) addressbook-add, so the SAME id-only dial resolves locally and
 //! the production `dial_service` code is unchanged.
+// Unix-only: this suite hand-binds the control endpoint in-process
+// (`bind_control_socket`) at a filesystem socket path a child resolves, which a windows
+// named pipe cannot be. Windows coverage for the control path lives at the transport layer
+// (local-api transport::windows pipe tests) and the client protocol layer (local-api
+// client.rs seam tests); a windows daemon-subprocess round-trip is deferred — see the
+// plan's Task 6 "Windows coverage gap" note.
+#![cfg(unix)]
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;

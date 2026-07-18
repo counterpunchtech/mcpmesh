@@ -27,7 +27,7 @@ Code, or anything that speaks MCP) mounts it as if it were local. 🪄
 One minute, two machines — call them `you` and `friend`:
 
 ```sh
-cargo install mcpmesh    # on both machines (macOS/Linux)
+cargo install mcpmesh    # on both machines (macOS, Linux, or Windows)
 
 # 🖥️  you — share a folder of notes as an MCP server, under a name you pick:
 mcpmesh serve notes -- npx -y @modelcontextprotocol/server-filesystem ~/notes
@@ -58,7 +58,7 @@ encrypted peer-to-peer link, and it works both ways whenever they want to share 
 ## 👥 The full walkthrough: Alice and Bob
 
 Two people, two machines. Alice shares an MCP server with Bob; then Bob shares one back. Install on
-both machines first — `cargo install mcpmesh`, or via Homebrew:
+both machines first — `cargo install mcpmesh`, or via Homebrew on macOS/Linux:
 
 ```sh
 brew tap counterpunchtech/mcpmesh https://github.com/counterpunchtech/mcpmesh
@@ -234,8 +234,9 @@ per call (an env var for a spawned server, an `initialize` `_meta` field for a w
 scope what you disclose to *who* is asking.
 
 To **drive the mesh** — a GUI, a launcher, a plugin daemon — talk to the per-user daemon over
-`mcpmesh-local/1`: newline-delimited JSON over a same-user Unix socket, simple enough to implement in
-any language. The [**`mcpmesh-local/1` protocol spec**](docs/local-protocol.md) documents the
+`mcpmesh-local/1`: newline-delimited JSON over a same-user local endpoint (a Unix socket on
+macOS/Linux, a named pipe on Windows), simple enough to implement in any language. The
+[**`mcpmesh-local/1` protocol spec**](docs/local-protocol.md) documents the
 framing, the handshake, every method, and the identity contract. Rust clients can depend on the
 [`mcpmesh-local-api`](https://crates.io/crates/mcpmesh-local-api) crate directly instead.
 
@@ -248,8 +249,9 @@ shapes.
 
 ## 💻 Platform support
 
-macOS and Linux (x86_64 / aarch64). Rust ≥ 1.95 to build from source. Windows is not supported (the
-local-socket security model is built on Unix peer credentials) and is not planned for v1.
+macOS, Linux, and Windows 10+ (x86_64 / aarch64). Rust ≥ 1.95 to build from source. On Windows, the
+local control plane uses a per-user named pipe with an owner-only DACL instead of a Unix socket —
+same-user-only access, enforced by the kernel either way.
 
 ## 🚦 Status
 

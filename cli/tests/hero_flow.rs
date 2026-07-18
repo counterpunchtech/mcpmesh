@@ -30,6 +30,12 @@
 //! `MemoryLookup` on `address_lookup()` (the runtime stand-in for DNS/pkarr — the SAME
 //! id-only `dial_service` path production runs, unchanged). Real two-machine NAT validation
 //! is M1's `#[ignore]` runbook (`net/tests/session.rs`), not needed here.
+// Unix-only: hand-binds the control endpoint in-process (`bind_control_socket`) at a
+// filesystem socket path, which a windows named pipe cannot be. Windows coverage for the
+// control path lives at the transport layer (local-api transport::windows pipe tests) and
+// the client protocol layer (local-api client.rs seam tests); a windows daemon-subprocess
+// round-trip is deferred — see the plan's Task 6 "Windows coverage gap" note.
+#![cfg(unix)]
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;

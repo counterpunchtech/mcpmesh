@@ -18,12 +18,15 @@
 //! models, Paths structs, tool dispatch/specs, fan-out policy, and each plugin's MCP
 //! session skeleton in `remote.rs`.
 use std::io;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 use tokio::io::AsyncWrite;
-use tokio::net::{UnixListener, UnixStream};
+// The §1 UDS-face check is exercised by the unix test module below (`UnixStream::connect`);
+// non-test code reaches these faces through `crate::transport`, so the import is test-only
+// and unix-only (the windows transport has no UDS fixtures).
+#[cfg(all(test, unix))]
+use tokio::net::UnixStream;
 
 use crate::client::{ClientError, connect_control};
 use crate::codec::write_frame;
@@ -33,75 +36,16 @@ use crate::protocol::{BackendSpec, Hello, Request};
 // §1 UDS faces
 // ---------------------------------------------------------------------------------------
 
-/// Create + security-check a private runtime dir (mcpmesh §13 — ONE hardened rule for every
-/// UDS face in the family; the daemon control socket and the plugin seam both bind through
-/// it): `create_dir_all`, refuse a symlink, chmod 0700, verify we own it. Idempotent.
-///
-/// The checks are load-bearing, not decorative: `create_dir_all` is a no-op when the dir
-/// already exists, so a pre-existing dir planted by another user — or a symlink redirecting
-/// to one we own (or one we don't) — must be refused before we trust it to hold a socket.
-/// `symlink_metadata` does not follow the link, and it runs BEFORE the chmod so a planted
-/// symlink can never make us chmod its target.
-pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::create_dir_all(dir)?;
-    let is_symlink = std::fs::symlink_metadata(dir)?.file_type().is_symlink();
-    if is_symlink {
-        return Err(io::Error::other(format!(
-            "runtime dir {} is a symlink; refusing",
-            dir.display()
-        )));
-    }
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-    let meta = std::fs::metadata(dir)?;
-    if meta.uid() != rustix::process::geteuid().as_raw() {
-        return Err(io::Error::other(format!(
-            "runtime dir {} is not owned by us",
-            dir.display()
-        )));
-    }
-    Ok(())
-}
-
-/// Bind a listener at `path`: harden the parent runtime dir ([`ensure_private_dir`] —
-/// create, refuse-symlink, chmod 0700, verify ownership), remove any stale socket, bind,
-/// and chmod the socket 0600.
-///
-/// §hardening (loc-L6): the parent dir is forced private because the `XDG_RUNTIME_DIR`
-/// fallback is `std::env::temp_dir()`, whose subdirs are NOT otherwise guaranteed private.
-/// The 0700 dir + 0600 socket are defense in depth only — [`check_peer_uid`] remains the
-/// real gate on every accepted connection.
-pub fn bind_uds(path: &Path) -> io::Result<UnixListener> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        ensure_private_dir(parent)?;
-    }
-    // A leftover socket file from a crashed daemon blocks bind with EADDRINUSE.
-    let _ = std::fs::remove_file(path);
-    let listener = UnixListener::bind(path)
-        .map_err(|e| io::Error::new(e.kind(), format!("bind {path:?}: {e}")))?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| io::Error::new(e.kind(), format!("chmod 0600 {path:?}: {e}")))?;
-    Ok(listener)
-}
-
-/// Is this connection's peer the same uid as us? `false` (refuse) on a different uid OR an
-/// unreadable peer credential — default-deny, defense in depth beyond the 0600 socket.
-/// [RECONCILE-PEERUID]: `UnixStream::peer_cred()` -> `UCred::uid()`; `rustix::process::geteuid()`.
-pub fn check_peer_uid(stream: &UnixStream) -> bool {
-    let Ok(cred) = stream.peer_cred() else {
-        tracing::warn!("peer_cred unreadable: refusing local connection");
-        return false;
-    };
-    let peer = cred.uid();
-    let me = rustix::process::geteuid().as_raw();
-    if peer != me {
-        tracing::warn!(peer, me, "refusing cross-uid local connection");
-        return false;
-    }
-    true
-}
+// The implementation now lives in `crate::transport` (the platform local-endpoint seam):
+// on unix it is the SAME hardened UDS rule, moved verbatim. These unix-native names remain
+// the plugin API on unix — the private monorepo consumes
+// `mcpmesh_local_api::service::{ensure_private_dir, bind_uds, check_peer_uid}`, so they are
+// re-exported here with identical signatures. Unix-only: `bind_uds`/`check_peer_uid`/
+// `ensure_private_dir` are the UDS hardening rule (0700 dir, 0600 socket, peer-euid
+// gate) and have no meaning on Windows, where the pipe's owner-only DACL is the whole
+// gate (see `transport::windows`). The plugin consumers (kb, loc) are unix today.
+#[cfg(unix)]
+pub use crate::transport::{bind_uds, check_peer_uid, ensure_private_dir};
 
 // ---------------------------------------------------------------------------------------
 // §2 THE audience-authz expansion (default-deny)
@@ -304,6 +248,8 @@ pub async fn send_hello<W: AsyncWrite + Unpin>(
 mod tests {
     use super::*;
     use crate::codec::{FrameReader, Inbound, MAX_FRAME_BYTES};
+    // Only the unix-gated `register_service` stub below uses these Hello constants.
+    #[cfg(unix)]
     use crate::protocol::{API_NAME, API_VERSION};
     use serde_json::json;
 
@@ -405,6 +351,10 @@ mod tests {
         );
     }
 
+    // Unix-only: exercises the UDS hardening rule (0600/0700 bits, symlink refusal,
+    // peer-euid gate). The windows transport's equivalent guarantee is the owner-only
+    // DACL, covered by tests in `transport::windows`.
+    #[cfg(unix)]
     #[tokio::test]
     async fn bind_uds_forces_0600_socket_and_0700_parent() {
         use std::os::unix::fs::PermissionsExt;
@@ -427,6 +377,7 @@ mod tests {
     /// D3 hardening parity: a SYMLINKED runtime dir is refused before any chmod/bind — a
     /// planted `link -> dir` must never redirect the socket (mcpmesh §13, same rule as the
     /// daemon control socket).
+    #[cfg(unix)]
     #[tokio::test]
     async fn bind_uds_refuses_a_symlinked_runtime_dir() {
         let dir = tempfile::tempdir().unwrap();
@@ -445,6 +396,7 @@ mod tests {
         let _ok = bind_uds(&real.join("plug.sock")).unwrap();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn check_peer_uid_accepts_a_same_uid_peer() {
         let dir = tempfile::tempdir().unwrap();
@@ -475,6 +427,9 @@ mod tests {
     }
 
     /// A stub mcpmesh daemon that answers one `register_service`, asserting the wire shape.
+    /// Unix-only for now: the stub daemon binds a raw `UnixListener`; Task 6 may port it
+    /// to the seam so it runs on windows too.
+    #[cfg(unix)]
     #[tokio::test]
     async fn register_service_registers_a_socket_backend_with_empty_allow() {
         let dir = tempfile::tempdir().unwrap();

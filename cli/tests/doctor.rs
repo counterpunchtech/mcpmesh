@@ -2,8 +2,6 @@
 //! check against a HERMETIC env (every mcpmesh path resolves under a tempdir) — no daemon is started,
 //! no network is touched, the real HOME is never read. Mirrors the `first_run.rs` subprocess idiom
 //! (assert_cmd + XDG env; no `predicates` dep).
-use std::os::unix::fs::PermissionsExt;
-
 use assert_cmd::Command;
 
 /// A `mcpmesh` invocation whose every path resolves under `dir` (config/data/state/runtime + HOME).
@@ -47,8 +45,12 @@ fn half_config_self_hosting_warns_but_exits_zero() {
     }
 }
 
+// Unix-only: drives doctor's world-writable-key check via POSIX 0o666 mode bits, which
+// windows key files do not carry (they rely on user-profile ACLs instead).
+#[cfg(unix)]
 #[test]
 fn world_writable_device_key_is_an_error_exit_1() {
+    use std::os::unix::fs::PermissionsExt;
     let tmp = tempfile::tempdir().unwrap();
     let cfgdir = tmp.path().join("config").join("mcpmesh");
     std::fs::create_dir_all(&cfgdir).unwrap();

@@ -9,6 +9,14 @@
 //!  1. The FIRST frame the daemon pushes is a `snapshot` (mirrors `open_session`'s upgrade).
 //!  2. As a REAL session opens and closes on S's backend, `session_open` then `session_close`
 //!     AuditRecords arrive as `event` frames on the live stream.
+//!
+//! Unix-only: `SubClient` dials the control endpoint as a raw `UnixStream` (with hardcoded
+//! `OwnedReadHalf`/`OwnedWriteHalf` halves) rather than through the platform seam, so the
+//! whole binary is gated to unix. Windows coverage for the control path lives at the
+//! transport layer (local-api transport::windows pipe tests) and the client protocol layer
+//! (local-api client.rs seam tests); a windows daemon-subprocess round-trip is deferred —
+//! see the plan's Task 6 "Windows coverage gap" note.
+#![cfg(unix)]
 use std::sync::Arc;
 use std::time::Duration;
 
