@@ -315,6 +315,10 @@ mod path_tests {
     // unit-test it directly with explicit inputs. `default_socket_path()` is still
     // exercised against the real env, asserting the shape that holds for any env.
 
+    // The next three tests feed the pure cores POSIX literals like `/run/user/1000`,
+    // which `Path::is_absolute` only treats as absolute on unix — and the xdg/runtime
+    // rules they exercise are wired only on the unix arm anyway, so they run there.
+    #[cfg(unix)]
     #[test]
     fn runtime_dir_prefers_xdg_when_set() {
         assert_eq!(
@@ -323,6 +327,7 @@ mod path_tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn runtime_dir_falls_back_to_tmp_when_xdg_absent_empty_or_relative() {
         let tmp = PathBuf::from("/var/folders/xx");
@@ -363,10 +368,11 @@ mod path_tests {
 
     #[test]
     fn audit_dir_is_state_dir_slash_audit() {
-        // Holds for any ambient env: the audit dir is <state_dir>/audit, state_dir always ends
-        // in `mcpmesh`, and the resolved path is absolute (spec §13 `~/.local/state/mcpmesh/audit`).
+        // Holds for any ambient env ON EITHER PLATFORM: the audit dir is <state_dir>/audit
+        // and absolute (spec §13; unix `~/.local/state/mcpmesh/audit`, windows
+        // `%LOCALAPPDATA%\mcpmesh\state\audit` — different tails, same parent relation).
         let audit = default_audit_dir().unwrap();
-        assert!(audit.ends_with("mcpmesh/audit"));
+        assert_eq!(audit.file_name().unwrap(), "audit");
         assert!(audit.is_absolute());
         // The audit dir is a child of the state dir (durable, distinct from data_dir()).
         assert_eq!(audit.parent().unwrap(), state_dir().unwrap());
@@ -375,12 +381,14 @@ mod path_tests {
     #[test]
     fn state_dir_prefers_xdg_state_home_when_absolute() {
         // Mirror of the data_dir rule for XDG_STATE_HOME (spec §13). Exercised against the
-        // real env like the socket test: state_dir always ends in `mcpmesh` and is absolute.
+        // real env: absolute, with a `mcpmesh` path component on either platform (unix ends
+        // in `mcpmesh`; windows default is `%LOCALAPPDATA%\mcpmesh\state`).
         let sd = state_dir().unwrap();
-        assert!(sd.ends_with("mcpmesh"));
+        assert!(sd.components().any(|c| c.as_os_str() == "mcpmesh"));
         assert!(sd.is_absolute());
     }
 
+    #[cfg(unix)]
     #[test]
     fn xdg_dir_prefers_the_var_when_absolute_else_home_segments() {
         // The var wins when set + non-empty + absolute (§13).
@@ -415,10 +423,17 @@ mod path_tests {
 
     #[test]
     fn win_dir_prefers_xdg_override_else_base_env() {
-        // XDG override wins when absolute (test isolation on Windows too).
+        // XDG override wins when absolute (test isolation on Windows too). The literal is
+        // platform-selected because `is_absolute` is platform-semantic: `/xdg/cfg` is not
+        // absolute on windows, `C:\xdg\cfg` is not absolute on unix.
+        let abs_override = if cfg!(windows) {
+            r"C:\xdg\cfg"
+        } else {
+            "/xdg/cfg"
+        };
         assert_eq!(
-            win_dir_from(Some("/xdg/cfg"), Some(r"C:\Users\u\AppData\Roaming"), &[]).unwrap(),
-            PathBuf::from("/xdg/cfg/mcpmesh")
+            win_dir_from(Some(abs_override), Some(r"C:\Users\u\AppData\Roaming"), &[]).unwrap(),
+            PathBuf::from(abs_override).join("mcpmesh")
         );
         // No override → <base>\mcpmesh\<segments…>.
         assert_eq!(
