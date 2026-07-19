@@ -94,8 +94,8 @@ pub(crate) fn spawn_concurrency(cfg: &Config) -> usize {
 ///
 /// It is `Arc<MeshState>` (not owned) because the accept loop and every long-lived roster loop
 /// share it. The subsystem modules deliberately never see this struct: the pair rendezvous runs
-/// against the narrow [`InviterCtx`] ([`inviter_ctx`](Self::inviter_ctx)), the presence loops
-/// against [`PresenceCtx`] ([`presence_ctx`](Self::presence_ctx)), and the roster distribution
+/// against the narrow [`InviterCtx`] (`inviter_ctx`), the presence loops
+/// against [`PresenceCtx`] (`presence_ctx`), and the roster distribution
 /// channels against the [`DistributionHost`] seam this struct implements — `MeshState` is the
 /// COMPOSER that hands out those contexts, not a parameter the modules take.
 ///
@@ -159,7 +159,7 @@ pub struct MeshState {
     pub(crate) roster_topic: tokio::sync::Mutex<Option<crate::roster::transport::RosterGossip>>,
     /// The presence-topic subscription: the publish loop clones the sender to broadcast
     /// heartbeats; the track loop moves the receiver out ONCE. `None`/empty in a pure-pairing
-    /// daemon. Behind an `Arc` because [`presence_ctx`](Self::presence_ctx) shares the SAME
+    /// daemon. Behind an `Arc` because `presence_ctx` shares the SAME
     /// handle with the presence loops (which own the sender/receiver access).
     pub(crate) presence_topic:
         Arc<tokio::sync::Mutex<Option<crate::roster::transport::RosterGossip>>>,

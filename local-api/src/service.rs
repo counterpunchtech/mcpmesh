@@ -420,8 +420,8 @@ mod tests {
     }
 
     /// A stub mcpmesh daemon that answers one `register_service`, asserting the wire shape.
-    /// Unix-only for now: the stub daemon binds a raw `UnixListener`; Task 6 may port it
-    /// to the seam so it runs on windows too.
+    /// Unix-only for now: the stub daemon binds a raw `UnixListener`; porting it to the
+    /// transport seam would let it run on windows too.
     #[cfg(unix)]
     #[tokio::test]
     async fn register_service_registers_a_socket_backend_with_empty_allow() {

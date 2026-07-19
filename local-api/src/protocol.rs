@@ -666,15 +666,15 @@ pub enum StreamFrame {
 }
 
 /// Extract the `method` tag from a raw request value without deserializing the whole
-/// message. Task 3's dispatcher uses this: match on the method string, then deserialize
+/// message. The daemon's dispatcher uses this: match on the method string, then deserialize
 /// `params` per-method — which tolerates omitted / null / `{}` params for parameterless
 /// methods (adjacent tagging rejects `params:{}` on unit variants).
 pub fn method_of(v: &serde_json::Value) -> Option<&str> {
     v.get("method").and_then(serde_json::Value::as_str)
 }
 
-/// How a service is answered (spec §6.2). Mirrors the config `[services.*]` *kinds*;
-/// Config→BackendSpec is a hand-written match (Task 4/9), not a serde passthrough.
+/// How a service is answered. Mirrors the config `[services.*]` *kinds*;
+/// Config→BackendSpec is a hand-written match, not a serde passthrough.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendSpec {

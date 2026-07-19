@@ -27,13 +27,12 @@ pub struct ControlClient {
     writer: LocalWriteHalf,
 }
 
-/// The error surface of the client — thin, so kb can `anyhow`-wrap it.
+/// The error surface of the client — thin, so callers can `anyhow`-wrap it.
 ///
-/// DEVIATION (declared): the plan derives `thiserror::Error`, but T2 Step 1's manifest adds
-/// no `thiserror` dep and the §7.1 invariant requires the `client` feature to pull ONLY
-/// tokio. The `Display`/`Error`/`From` impls below are hand-rolled to be behavior-identical
-/// (same messages, same `?`-conversion from `io::Error`) with zero extra dependencies.
-/// [source: plan T2 client.rs `ClientError` vs §7.1 "client adds ONLY tokio"]
+/// The `Display`/`Error`/`From` impls below are hand-rolled rather than derived: the
+/// `client` feature deliberately pulls ONLY tokio (no `thiserror`), and the hand-rolled
+/// impls are behavior-identical (same messages, same `?`-conversion from `io::Error`)
+/// with zero extra dependencies.
 #[derive(Debug)]
 pub enum ClientError {
     Io(std::io::Error),
@@ -308,11 +307,11 @@ impl ControlClient {
         .await
     }
 
-    /// Grant a scope to a principal — any §5 flat-namespace entry: a group name, a user_id,
-    /// or a petname (the shared `principal_set` expansion, D1).
-    /// [RECONCILE-BLOBGRANT]: the daemon acks; the ack body is discarded (a JSON-RPC error
-    /// surfaces as `ClientError::Api`). kb uses this to grant a per-mirror sync scope to the
-    /// owner's own user_id (all owner devices, incl. the mirror).
+    /// Grant a scope to a principal — any flat-namespace entry: a group name, a user_id,
+    /// or a petname (the shared `principal_set` expansion).
+    /// The daemon acks; the ack body is discarded (a JSON-RPC error surfaces as
+    /// `ClientError::Api`). Granting a scope to your own user_id reaches ALL of that
+    /// person's devices.
     pub async fn blob_grant(&mut self, scope: &str, principal: &str) -> Result<(), ClientError> {
         self.request_ack(Request::BlobGrant(BlobGrantParams {
             scope: scope.to_string(),

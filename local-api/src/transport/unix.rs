@@ -83,7 +83,7 @@ mod server {
 
     /// Is this connection's peer the same uid as us? `false` (refuse) on a different uid OR an
     /// unreadable peer credential — default-deny, defense in depth beyond the 0600 socket.
-    /// [RECONCILE-PEERUID]: `UnixStream::peer_cred()` -> `UCred::uid()`; `rustix::process::geteuid()`.
+    // Implementation: `UnixStream::peer_cred()` -> `UCred::uid()`; `rustix::process::geteuid()`.
     pub fn check_peer_uid(stream: &UnixStream) -> bool {
         let Ok(cred) = stream.peer_cred() else {
             tracing::warn!("peer_cred unreadable: refusing local connection");

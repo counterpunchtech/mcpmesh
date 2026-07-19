@@ -296,7 +296,7 @@ pub fn default_roster_path() -> std::io::Result<PathBuf> {
 /// integer: the last instant this node validated the installed roster as current via an authenticated
 /// channel (a TLS URL poll ≥ installed, a gossip-delivered roster passing validation, or a manual
 /// install). Per-node LIVENESS state, NOT a roster-document field — keeps roster.json a pure
-/// re-serialization ([RECONCILE-C]).
+/// re-serialization.
 pub fn default_roster_confirmed_path() -> std::io::Result<PathBuf> {
     Ok(config_dir()?.join("roster.confirmed"))
 }

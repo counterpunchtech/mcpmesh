@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use mcpmesh::config::LimitsCfg;
 use mcpmesh::limits::{MeshLimiters, RateLimiter};
+use mcpmesh_net::identity::EndpointId;
 
 /// (a) LIMITER ENGAGES + (b) NO UNBOUNDED MEMORY, scaled. 20 endpoints each burst 300 requests at a
 /// 120/min limit (burst 120): each endpoint is admitted ~120 then throttled — the limiter engages —
@@ -26,7 +27,7 @@ fn scaled_ac_limiter_engages_and_memory_is_bounded() {
     });
     let t0 = Instant::now();
     for peer in 0u8..20 {
-        let eid = [peer; 32];
+        let eid = EndpointId::from_bytes([peer; 32]);
         let mut admitted = 0;
         let mut throttled = 0;
         for _ in 0..300 {
@@ -53,7 +54,11 @@ fn scaled_ac_limiter_engages_and_memory_is_bounded() {
     // Idle eviction proves the map SELF-PRUNES (no leak under churn): a much-later check on a fresh
     // endpoint evicts all 20 idle buckets.
     let later = t0 + Duration::from_secs(601);
-    assert!(ml.requests.check(&[99u8; 32], later).is_ok());
+    assert!(
+        ml.requests
+            .check(&EndpointId::from_bytes([99u8; 32]), later)
+            .is_ok()
+    );
     assert_eq!(
         ml.requests.tracked(),
         1,
@@ -76,7 +81,9 @@ fn cheap_rejection_allocates_no_buckets_for_strangers() {
         0,
         "no bucket exists before any authorized request"
     );
-    limiter.check(&[1u8; 32], Instant::now()).ok(); // one authorized peer
+    limiter
+        .check(&EndpointId::from_bytes([1u8; 32]), Instant::now())
+        .ok(); // one authorized peer
     assert_eq!(
         limiter.tracked(),
         1,
@@ -101,7 +108,7 @@ fn literal_20x120_10min() {
     while start.elapsed() < Duration::from_secs(600) {
         let now = Instant::now();
         for peer in 0u8..20 {
-            match ml.requests.check(&[peer; 32], now) {
+            match ml.requests.check(&EndpointId::from_bytes([peer; 32]), now) {
                 Ok(()) => served += 1,
                 Err(_) => throttled += 1,
             }
