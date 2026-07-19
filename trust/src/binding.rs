@@ -7,8 +7,9 @@
 //! to the SAME `user_id` and kb audiences can key on the user rather than the per-device petname.
 //!
 //! The idea is adopted from an earlier internal device-cert design; the crypto is mcpmesh's OWN — this is a thin
-//! wrapper over [`roster::sign::sign_device_binding`]/[`verify_device_binding`] (domain
-//! `mcpmesh/join/device-binding/1`) and [`roster::encode_b64u`], not a second cert implementation.
+//! wrapper over [`crate::roster::sign::sign_device_binding`]/[`verify_device_binding`] (domain
+//! `mcpmesh/join/device-binding/1`) and [`crate::roster::encode_b64u`], not a second cert
+//! implementation.
 use crate::keys::UserKey;
 use crate::roster::RosterError;
 use crate::roster::sign::{sign_device_binding, verify_device_binding};

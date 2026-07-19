@@ -3,7 +3,7 @@
 //! OWN accept loop ([`spawn_accept_loop`]) that dispatches each inbound connection by its
 //! negotiated ALPN (spec §7.1) — `mcpmesh/mcp/1` flows through M1's gated per-connection handler
 //! [`mcpmesh_net::run_mesh_connection`], where `gate` is an
-//! [`AllowlistGate`](crate::allowlist::AllowlistGate) over the `state.redb` peer allowlist and
+//! [`AllowlistGate`] over the `state.redb` peer allowlist and
 //! `services` are backends built from config, while `mcpmesh/pair/1` flows to the pairing
 //! rendezvous, GATE-EXEMPT (D8 exception) and authenticated by the invite secret rather than
 //! the trust gate; and (2) it serves the `mcpmesh-local/1` control API on
@@ -436,7 +436,7 @@ impl MeshState {
     /// (completes the construction chicken-egg). Also used to seed the handle a later
     /// hot-reload aborts.
     ///
-    /// Take-and-abort any prior handle first (mirroring [`reload_accept_loop`]): a stray second
+    /// Take-and-abort any prior handle first (mirroring `reload_accept_loop`): a stray second
     /// call would otherwise DROP the previous `JoinHandle` — detaching, not stopping, its loop —
     /// leaving two loops accepting on one endpoint. Latent today (each caller invokes once), but
     /// this keeps the invariant self-healing rather than silently doubling the accept loop.
@@ -1690,7 +1690,7 @@ fn gate_and_register(
 /// gate (that is precisely why the mesh-only `serve` is not enough). An unknown ALPN is closed
 /// cleanly.
 ///
-/// Both the initial start ([`serve_forever`]) and the hot-reload swap ([`reload_accept_loop`],
+/// Both the initial start (`serve_forever`) and the hot-reload swap (`reload_accept_loop`,
 /// shared by `register_service` and the pairing `grant_service_access`) call this ONE function,
 /// so the loop is defined in exactly one place; the reload path aborts the returned handle and
 /// spawns a fresh loop carrying the rebuilt `services`.
@@ -1883,7 +1883,7 @@ async fn reload_accept_loop(mesh: &Arc<MeshState>, services: Services) {
 // ───────────────────────────── reachability probe (pairing-mode liveness) ─────────────────────
 
 /// One cached reachability probe result (spec: pairing-mode liveness). Ephemeral, in-memory —
-/// stored in [`MeshState::reachability`], keyed by endpoint-id. `probed_at` is epoch seconds.
+/// stored in `MeshState::reachability`, keyed by endpoint-id. `probed_at` is epoch seconds.
 #[derive(Clone)]
 pub struct ReachEntry {
     pub reachable: bool,
@@ -1903,8 +1903,8 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 /// [`iroh::EndpointAddr`], exactly like `dial::dial_service`'s §10.2 fallback — discovery resolves
 /// the address from the id; hermetic localhost tests seed a `MemoryLookup`), sends one ping frame,
 /// reads the pong, and measures RTT (dial + round-trip). Writes the outcome into the in-memory
-/// [`MeshState::reachability`] cache and returns it. Reachable ⇔ a pong arrived within
-/// [`PROBE_TIMEOUT`]; a gate refusal (no pong) or any dial/IO failure is a clean `reachable:false`.
+/// `MeshState::reachability` cache and returns it. Reachable ⇔ a pong arrived within
+/// `PROBE_TIMEOUT`; a gate refusal (no pong) or any dial/IO failure is a clean `reachable:false`.
 pub async fn probe_peer(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> ReachEntry {
     let started = std::time::Instant::now();
     let outcome = tokio::time::timeout(PROBE_TIMEOUT, probe_once(mesh, endpoint_id)).await;
@@ -2242,7 +2242,7 @@ pub(crate) async fn add_peer(state: &DaemonState, params: PeerAddParams) -> Resu
 /// **Fail-safe teardown order (DECLARED).** The pairing grant writes, in order, (1) the
 /// [`PeerEntry`] (identity — who the peer is) then (2) the config `allow` append (authorization —
 /// what it may open). Removal is that grant's LIFO inverse: undo (2) FIRST via
-/// [`revoke_service_access`] (strip the petname from every `[services.*].allow`, the
+/// `revoke_service_access` (strip the petname from every `[services.*].allow`, the
 /// security-relevant half), THEN undo (1) via [`PeerStore::remove`] (drop the identity row). This
 /// leaves the peer MORE restricted, never less, at every partial-failure point:
 ///  - revoke fails → we abort BEFORE touching the store: the peer is unchanged (still fully
@@ -2545,15 +2545,15 @@ pub(crate) async fn redeem(state: &DaemonState, invite_line: String) -> Result<P
 /// hot-reload so the running registry admits it. This is the load-bearing half of pairing.
 ///
 /// Why it is separate from (and necessary alongside) the [`PeerEntry`] the rendezvous writes:
-/// the [`AllowlistGate`](crate::allowlist::AllowlistGate) only RESOLVES an inbound endpoint to
+/// the [`AllowlistGate`] only RESOLVES an inbound endpoint to
 /// a petname (identity); `select_service` (spec §5) then ADMITS that petname only if the
 /// service's config `allow` names it — and that allow is baked into the [`Services`] snapshot
 /// at [`build_services`] time. So a PeerEntry makes the peer KNOWN; only appending to `allow`
 /// + reloading makes it AUTHORIZED. Without this the peer is known-but-forbidden.
 ///
-/// Serialized against [`register_service`] via `mesh.reload_lock` (SAME lock — a concurrent
+/// Serialized against `register_service` via `mesh.reload_lock` (SAME lock — a concurrent
 /// register and a pairing-grant must not read the same base config and clobber each other's
-/// write). Reuses [`append_allow_to_config`]'s atomic write and [`reload_accept_loop`]'s
+/// write). Reuses `append_allow_to_config`'s atomic write and `reload_accept_loop`'s
 /// abort/respawn (DRY). A service not present in config is logged + skipped (a pairing grant
 /// never CREATES a service). Reloads ONLY when the append actually changed the config — an
 /// idempotent re-pair or an all-missing grant is a no-op with no serving blip. (The cached
@@ -2699,7 +2699,7 @@ where
 /// the Task 10 proxy round-trip binds a control socket over this and runs `mcpmesh connect` as
 /// a subprocess against it, so the actual `open_session` dial-by-id + pipe are exercised. The
 /// mesh's serve loop is inert here (`open_session` reads only the endpoint + store to DIAL
-/// outbound); production assembles its own `MeshState` inline in [`serve_forever`].
+/// outbound); production assembles its own `MeshState` inline in `serve_forever`.
 pub fn serving_state(endpoint: iroh::Endpoint, store: Arc<PeerStore>) -> Arc<DaemonState> {
     let gate: Arc<dyn TrustGate> = Arc::new(AllowlistGate::new(store.clone()));
     let self_petname = short_fingerprint(&endpoint.id());

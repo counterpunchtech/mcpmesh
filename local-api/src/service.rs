@@ -21,6 +21,19 @@
 //! Deliberately NOT extracted (KISS until a third plugin proves the abstraction): state
 //! models, Paths structs, tool dispatch/specs, fan-out policy, and each plugin's MCP
 //! session skeleton in `remote.rs`.
+//!
+//! [`ensure_private_dir`]: crate::service::ensure_private_dir
+//! [`bind_uds`]: crate::service::bind_uds
+//! [`check_peer_uid`]: crate::service::check_peer_uid
+//! [`peer_audiences`]: crate::service::peer_audiences
+//! [`register_service`]: crate::service::register_service
+//! [`ok`]: crate::service::ok
+//! [`err`]: crate::service::err
+//! [`reply`]: crate::service::reply
+//! [`internal`]: crate::service::internal
+//! [`required_string_array`]: crate::service::required_string_array
+//! [`people_from_status`]: crate::service::people_from_status
+//! [`send_hello`]: crate::service::send_hello
 use std::io;
 use std::path::Path;
 

@@ -6,7 +6,7 @@
 //! attach the selected backend, or refuse.
 //!
 //! It is also THE single site that synthesizes framing-violation errors and
-//! registers strikes (Task 8 seam note). [`recv_frame`] answers each
+//! registers strikes (Task 8 seam note). `recv_frame` answers each
 //! oversized/malformed frame with a synthesized error (-32051 for `TooLarge`,
 //! -32700 for `InvalidJson`, both `id: null` with `data.source: "mcpmesh"`),
 //! registers a strike, and finishes the stream on the third strike (spec §7.3).

@@ -227,8 +227,8 @@ fn runtime_dir_from(xdg: Option<&str>, tmp: PathBuf) -> std::io::Result<PathBuf>
 
 /// The local control endpoint (spec §13), resolved for THIS platform: a Unix socket at
 /// `<runtime_dir>/mcpmesh.sock` on unix. On Windows there is no per-user runtime dir with
-/// the right ACL semantics, so the control plane is a named pipe instead — see
-/// [`windows_pipe_name`]; the returned `PathBuf` is the pipe name (`\\.\pipe\…`), which is
+/// the right ACL semantics, so the control plane is a named pipe instead — see the private
+/// `windows_pipe_name` helper; the returned `PathBuf` is the pipe name (`\\.\pipe\…`), which is
 /// what `transport::connect_local`/`bind_local` dial. The ONE resolver both wire ends
 /// share: the daemon binds exactly what this returns, so clients rendezvous by
 /// construction, never by copied formula.

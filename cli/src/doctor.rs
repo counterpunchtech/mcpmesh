@@ -100,7 +100,7 @@ pub fn check_network(net: &crate::config::NetworkCfg) -> Verdict {
     }
 }
 
-/// §16 M4 candidate / [Minor] 7: WARN when the node is roster-mode (`org_root_pinned`) but has no
+/// §16 M4 candidate / \[Minor\] 7: WARN when the node is roster-mode (`org_root_pinned`) but has no
 /// `[roster].url` — it degrades to stale after `max_staleness` with no authenticated channel to
 /// re-confirm currency (§4.3/P13). The full-diagnostic version of the one-liner `status` already
 /// surfaces. Pairing mode (no org root) → OK; roster mode with a URL → OK.

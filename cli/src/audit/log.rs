@@ -69,7 +69,7 @@ pub struct AuditLog {
 
 impl AuditLog {
     /// Spawn the single writer task over `dir` and return the handle. The task drains a bounded
-    /// channel and appends each record via [`append_record`] on `spawn_blocking` (keeping fs off the
+    /// channel and appends each record via `append_record` on `spawn_blocking` (keeping fs off the
     /// runtime workers, the repo's fs house rule). An append error is logged and the record dropped —
     /// the task never exits on an IO error, so a transient full disk does not disable auditing.
     pub fn spawn(dir: PathBuf) -> Arc<Self> {

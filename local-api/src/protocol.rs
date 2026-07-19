@@ -272,20 +272,20 @@ pub enum Request {
     Invite(InviteParams),
     /// Redeem a pairing invite (spec §4.2). The daemon dials the inviter named by
     /// `invite_line` on `mcpmesh/pair/1`, proves the secret, writes the mutual
-    /// (dial-back) [`PeerEntry`], and answers a [`PairResult`]. Tag `"pair"`
+    /// (dial-back) `PeerEntry`, and answers a [`PairResult`]. Tag `"pair"`
     /// (snake_case); `method_of` reads the `method` string generically.
     ///
-    /// [`PeerEntry`]: crate — the durable allowlist row lives in the daemon crate.
+    /// `PeerEntry` — the durable allowlist row — lives in the daemon crate.
     Pair(PairParams),
     /// Remove a paired peer by petname (spec §4.2, `mcpmesh pair --remove`). The daemon drops the
-    /// peer's [`PeerEntry`] (identity) AND revokes its access by removing the petname from every
+    /// peer's `PeerEntry` (identity) AND revokes its access by removing the petname from every
     /// `[services.*].allow` (authorization) — the inverse of the pairing grant. Idempotent: a
     /// petname with no entry / no allow membership is a clean no-op. Live in-flight sessions are
     /// NOT severed here (M3/D8): existing sessions run to completion; the peer only loses the
     /// ability to establish NEW authorized sessions. Tag `"peer_remove"` (snake_case);
     /// `method_of` reads the `method` string generically (no per-variant arm).
     ///
-    /// [`PeerEntry`]: crate — the durable allowlist row lives in the daemon crate.
+    /// `PeerEntry` — the durable allowlist row — lives in the daemon crate.
     PeerRemove(PeerRemoveParams),
     /// Rename a contact's nickname (petname) authoritatively (Contacts rename spec). Renames the
     /// PERSON — every `PeerEntry` sharing `user_id` when given (one op for all their devices), else the

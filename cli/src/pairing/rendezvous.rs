@@ -145,7 +145,7 @@ fn verified_user_id(
 }
 
 /// Inviter-side handler for one inbound pair connection (spec §4.2). The redeemer opens a
-/// bi-stream and sends a [`RedeemerHello`]; we verify the P3 EndpointId binding, redeem the
+/// bi-stream and sends a `RedeemerHello`; we verify the P3 EndpointId binding, redeem the
 /// secret against the live registry, and on success write the [`PeerEntry`] trust grant, GRANT
 /// service authorization ([`grant_service_access`]), reply with our identity, and log the short
 /// authentication code (SAS). Every attempt is logged (§4.2 "each attempt logged"); no peer

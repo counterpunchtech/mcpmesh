@@ -49,7 +49,7 @@ pub struct SpawnBackend {
     /// The audit sink (spec §11.3). `AuditSink::disabled()` in tests / a non-audited build.
     pub audit: crate::audit::AuditSink,
     /// The per-authenticated-endpoint request limiter (spec §11.2 P7), shared across all backends.
-    /// Consulted per proxied request line in [`pump`](super::pump). Keyed on `identity.endpoint`.
+    /// Consulted per proxied request line in `super::pump`. Keyed on `identity.endpoint`.
     pub limiter: std::sync::Arc<crate::limits::RateLimiter>,
 }
 
