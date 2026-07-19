@@ -1,0 +1,734 @@
+//! The roster install pipeline and its enforcement: the swap-before-sever choke point ALL
+//! three convergence channels funnel through (the manual `roster_install` verb, gossip, the
+//! URL poll), the freshness/staleness sweep, the org join/URL-pin verbs, the per-node
+//! roster/sidecar paths, and the tracked poll-loop respawn.
+
+use std::fs::File;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use mcpmesh_local_api::{OrgJoinResult, RosterInstallResult};
+use mcpmesh_trust::paths;
+use mcpmesh_trust::roster::validate::RosterState;
+use tokio::task::JoinHandle;
+
+use crate::audit::{AuditRecord, now_ts};
+use crate::config::Config;
+use crate::control::DaemonState;
+use crate::roster::RosterStore;
+use crate::roster::gate::RosterGate;
+use crate::util::{TempPathGuard, blocking, epoch_now_i64, unique_temp_path};
+
+use super::MeshState;
+use super::config_write::{
+    write_identity_pin, write_identity_user_id, write_join_pin, write_roster_url,
+};
+
+/// Warn — once, at install/load time — when the just-installed roster is serving in DEGRADED-GRACE
+/// (past `expires_at` but within the grace window), so serving continues with reduced confidence
+/// (spec §4.3 "continues … with warnings"). Rate-limited to once per swap/load by construction: it
+/// fires only from the two install/load sites ([`install_roster_view_and_sever`] + the startup load),
+/// never per session. DegradedStopped is intentionally NOT warned here — the gate already refuses
+/// roster identity outright (a hard stop the operator sees as refusals), whereas DegradedGrace is the
+/// silent-degradation case this warning exists to surface. Reads the state against the gate's OWN
+/// grace window so the warning and the `resolve` path agree on when a roster is degraded.
+pub(crate) fn warn_if_degraded_grace(roster: &RosterGate) {
+    // Route through the gate's EFFECTIVE state (expiry OR staleness, spec §4.3 P13) so a roster that is
+    // degraded-grace because it is STALE (not just expired) is warned identically. DegradedStopped is
+    // intentionally NOT warned here — the gate already refuses roster identity outright.
+    if roster.effective_state(epoch_now_i64()) == Some(RosterState::DegradedGrace) {
+        tracing::warn!(
+            "roster degraded (expired or stale); serving continues for the grace period — \
+             re-confirm currency or install a fresh roster"
+        );
+    }
+}
+
+/// Hot-swap the installed roster view into the live gate AND sever the live mesh connections the
+/// new roster invalidates (spec §4.3 rule 6, §4.5 D8). Delegates the per-connection decision to the
+/// pure [`mcpmesh_net::should_sever`]: an endpoint is severed iff it is REVOKED (revocation wins, all
+/// ALPNs — this cuts a device even when it also holds a stale pair entry, the §16 M3 AC clause), OR
+/// it was ROSTER-resolved (`roster_user.is_some()`) and is ABSENT from the new roster's active
+/// device set. A pairing-only peer (`roster_user == None`, not revoked) is NEVER severed by a roster
+/// install.
+///
+/// **Ordering — swap-before-sever (the TOCTOU close, T8).** The sever sets are computed from the
+/// NEW `view` handle DIRECTLY (never by locking the gate), then the gate view is hot-swapped FIRST,
+/// THEN `sever_matching` runs. Swapping first means (a) no NEW session admits the revoked peer, and
+/// (b) any connection CHECK-REGISTERING concurrently reads the new view and self-closes; a
+/// registration that lands across the swap is caught by the registry's lock-serialized recheck (see
+/// the `registry` module doc's three-case argument). Computing the sets from `view` — not the gate —
+/// keeps the registry lock in `sever_matching` from ever nesting inside the gate's `RwLock`, so
+/// there is no registry↔gate lock cycle. Returns the number of connections severed.
+///
+/// `pub` so the T9 integration test (`cli/tests/roster_sever.rs`) and the T10 install control both
+/// drive the SAME persist→swap→sever pipeline.
+pub fn install_roster_view_and_sever(
+    mesh: &Arc<MeshState>,
+    view: mcpmesh_trust::roster::validate::RosterView,
+) -> usize {
+    use std::collections::HashSet;
+    // Capture the audit fields BEFORE the swap CONSUMES `view` (surface-clean §1.5 target: org/serial
+    // only). This is the SINGLE choke point ALL three convergence channels funnel through (manual
+    // install_roster + gossip on_announce + URL poll), and it is reached ONLY on a real serial-bumping
+    // install — `install_from_file` (and the manual path) return a view ONLY when serial > installed;
+    // a stale/equal serial errors BEFORE any swap — so the trust event below fires EXACTLY once per
+    // real swap (incl. a joiner's first serial-1 install, a legit trust event).
+    let (org_id, serial) = (view.org_id().to_string(), view.serial());
+    // Compute the sever sets from the NEW view (no gate lock → no registry↔gate lock cycle).
+    let revoked: HashSet<[u8; 32]> = view.revoked_endpoints().copied().collect();
+    let active_devices: HashSet<[u8; 32]> = view.device_endpoints().copied().collect();
+    // (a) SWAP FIRST: hot-swap the RosterGate view so the composed gate + any concurrent
+    //     check-register immediately see the new roster (the other half of the TOCTOU invariant).
+    mesh.roster.install(view);
+    // Warn (once, on this swap) if the newly-installed roster is already in degraded-grace (spec
+    // §4.3): serving continues within the grace window, but the operator should install a fresh one.
+    warn_if_degraded_grace(&mesh.roster);
+    // (b) THEN sever the already-registered live connections the new roster invalidates.
+    let severed = mesh.conn_registry.sever_matching(
+        mcpmesh_net::CLOSE_UNAUTHORIZED, // 401 — "no longer authorized"
+        b"roster revoked",
+        |eid, roster_user| mcpmesh_net::should_sever(eid, roster_user, &revoked, &active_devices),
+    );
+    // Trust event (spec §11.3 / P14): a roster install/swap — recorded HERE, the shared choke point,
+    // so EVERY swap is audited, including the AUTOMATIC gossip/URL convergences a rostered node lives
+    // on (which never touch the manual verb). The terminus of org approve/revoke funnels through here
+    // too, so the manual path stays audited — once. Surface-clean: org/serial only, NO keys/EndpointIds.
+    mesh.audit().record(AuditRecord::trust(
+        now_ts(),
+        "roster_install".into(),
+        Some(format!("{org_id}/{serial}")),
+    ));
+    severed
+}
+
+/// How often the staleness sweep runs (spec §4.3 P13). 60 s mirrors the §14 revocation-propagation
+/// target — an existing roster-authorized session is cut within a minute of the node crossing the
+/// staleness bound.
+const STALENESS_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The sweep DECISION (pure): sweep iff the gate is effectively `DegradedStopped` (spec §4.3 P13 —
+/// expiry OR staleness past grace). `None` (no roster) → never sweep. `Approved`/`DegradedGrace`
+/// keep serving. [RECONCILE R3]: this is the time-triggered complement to the register-time gate.
+/// `pub` (not `pub(crate)`) so the `staleness_sweep.rs` integration test — a separate crate — drives it.
+pub fn should_staleness_sever(state: Option<mcpmesh_trust::roster::validate::RosterState>) -> bool {
+    state == Some(mcpmesh_trust::roster::validate::RosterState::DegradedStopped)
+}
+
+/// One sweep tick (spec §4.3 P13): when the gate is `DegradedStopped`, sever EXISTING roster-
+/// authorized live sessions (`roster_user.is_some()`) — the time-triggered cut the register-time
+/// `should_sever_now` cannot make. NEVER severs pairing-only sessions (`roster_user == None`, whose
+/// authorization is independent of the org roster) and never runs when the roster is fresh/absent.
+/// Returns the number severed. `pub` so the `staleness_sweep.rs` integration test (a separate crate)
+/// drives one tick directly.
+pub fn staleness_sweep_once(mesh: &Arc<MeshState>, now: i64) -> usize {
+    if !should_staleness_sever(mesh.roster.effective_state(now)) {
+        return 0;
+    }
+    mesh.conn_registry.sever_matching(
+        mcpmesh_net::CLOSE_UNAUTHORIZED, // 401 — the roster no longer authorizes this session
+        b"roster stale",
+        |_eid, roster_user| roster_user.is_some(),
+    )
+}
+
+/// Spawn the periodic staleness sweep (roster mode). Runs for the daemon lifetime; each tick calls
+/// [`staleness_sweep_once`] at the current clock.
+pub(crate) fn spawn_staleness_sweep(mesh: Arc<MeshState>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(STALENESS_SWEEP_INTERVAL).await;
+            let severed = staleness_sweep_once(&mesh, epoch_now_i64());
+            if severed > 0 {
+                tracing::warn!(
+                    severed,
+                    "staleness sweep cut roster-authorized sessions (degraded-stopped)"
+                );
+            }
+        }
+    })
+}
+
+/// Handle a `roster_install` control request (spec §4.3 manual path): resolve the org-root trust
+/// anchor, read + FULLY validate the roster file (rules 1–6), persist it atomically, hot-swap the
+/// gate, and sever the live sessions it invalidates (D8, via [`install_roster_view_and_sever`]).
+///
+/// **Pin flow (DECLARED — pin AFTER validation).** An explicit `org_root_pk` is the trust anchor for
+/// a FIRST install (or an operator re-pin); once pinned it lives in config, so a subsequent install
+/// OMITS it and reads the pinned value. The pin is persisted (`[identity] org_root_pk` + `org_id`)
+/// only AFTER `install_from_file` accepts the roster — so a failed install (wrong pk, rollback, an
+/// unparseable file) NEVER corrupts the pinned anchor or the on-disk roster. This is a deliberate
+/// improvement over the plan's pin-before-validate sketch: the plan's `pin_org_root_pk(mesh, &s)`
+/// had no `org_id` to write at pin time (org_id is only known after validation), and re-pinning
+/// before a validation that then fails would leave the anchor pointing at a pk the installed roster
+/// no longer verifies against. A mismatched pk simply fails validation (the sig won't verify) and
+/// leaves everything untouched.
+///
+/// Path-not-bytes (P12/P14): the same-uid daemon reads the LOCAL file itself — passing a path, not
+/// the bytes, is within the trust boundary (the operator obtains the roster + the pk out-of-band,
+/// spec §4.4).
+pub(crate) async fn install_roster(
+    state: &DaemonState,
+    path: String,
+    org_root_pk: Option<String>,
+) -> Result<RosterInstallResult> {
+    let mesh = state.mesh_required()?;
+    // Serialize the ENTIRE install critical section — installed-serial read → validate → persist →
+    // pin → gate hot-swap → sever — under the SAME `reload_lock` that register_service /
+    // grant_service_access / revoke_service_access hold around their whole read→write→swap sections
+    // (M2b discipline). Without it, two concurrent same-uid `roster_install`s could BOTH read
+    // installed_serial = N, BOTH validate N+1 / N+2, and race their writes+swaps → roster.json + the
+    // live gate left at the LOWER serial (a non-monotonic lost update). Held until this fn returns.
+    //
+    // Lock ordering stays acyclic: `reload_lock` is only ever a SOURCE (nothing acquires it while
+    // holding another lock). Under it we touch the config write (spawn_blocking), the RosterGate
+    // RwLock (`gate.install`, released before the sever), and the ConnRegistry mutex
+    // (`sever_matching`, whose sets come from the VIEW — not by reading the gate). `register_checked`
+    // takes registry→gate but NEVER `reload_lock`, so there is no back-edge and no cycle. Holding it
+    // across the spawn_blocking / sever awaits is fine (tokio Mutex, exactly as register_service).
+    let _reload = mesh.reload_lock.lock().await;
+
+    // Resolve the trust anchor: an explicit `org_root_pk` (first install / re-pin), else the pinned
+    // config value; error if neither. The pin itself is written AFTER validation succeeds (below).
+    let pk_str = match &org_root_pk {
+        Some(s) => s.clone(),
+        None => mesh_config_org_root_pk(mesh)?
+            .context("no org root pinned; pass --org-root-pk on first install")?,
+    };
+    let pk = crate::roster::parse_org_root_pk(&pk_str)?;
+    let rstore = RosterStore::new(paths::default_roster_path()?);
+    let now = epoch_now_i64();
+    let file = PathBuf::from(path);
+    // Read + validate + persist on a blocking thread (fs + verify); returns the resolvable view.
+    // A FAILED validation returns Err BEFORE the write, so the on-disk roster is left untouched.
+    let view = blocking("join roster install", move || {
+        rstore.install_from_file(&file, &pk, now)
+    })
+    .await??;
+    let (org_id, serial) = (view.org_id().to_string(), view.serial());
+    // Pin the trust anchor + org_id to config now that the roster validated — only when an explicit
+    // pk was provided (a first install or an operator re-pin). Call the lock-free `write_identity_pin`
+    // DIRECTLY under the `reload_lock` we ALREADY hold — a nested `reload_lock.lock()` on the
+    // non-reentrant tokio Mutex would deadlock. Same order as before: pin AFTER validation, using the
+    // validated org_id; a subsequent install that reused the already-pinned value does not rewrite it.
+    if org_root_pk.is_some() {
+        let config_path = mesh.config_path.clone();
+        let (pk_w, oid_w) = (pk_str.clone(), org_id.clone());
+        blocking("join org-root pin config write", move || {
+            write_identity_pin(&config_path, &pk_w, &oid_w)
+        })
+        .await??;
+        tracing::info!(org_id = %org_id, "pinned org root");
+    }
+    // Freshness (T9): a manual install is proof of currency — CONFIRM so the live gate's future
+    // resolve/should_sever_now decisions treat this node as fresh (arms `last_confirmed` + persists).
+    mesh.confirm_roster_current(now).await;
+    // Hot-swap the live gate + sever (D8). Runs on the runtime (no blocking; close is non-blocking).
+    let severed = install_roster_view_and_sever(mesh, view) as u32;
+    // Reconcile config's proposed user_id against the roster's AUTHORITATIVE value ([RECONCILE-D],
+    // §4.6) — the SAME shared post-install step the gossip/URL channels run. LOCK-FREE under the
+    // `reload_lock` we ALREADY hold (no deadlock — see `reconcile_user_id_from_roster`).
+    reconcile_user_id_from_roster(mesh).await;
+    tracing::info!(org_id = %org_id, serial, severed, "roster installed");
+    // NOTE: the `roster_install` trust event (spec §11.3) is recorded INSIDE
+    // `install_roster_view_and_sever` (the shared choke point called above), so the manual path is
+    // audited there — once — alongside the gossip/URL convergence paths. No record here.
+    // Announce-on-publish (spec §4.3): the operator's serial bump (org approve/revoke terminate here)
+    // seeds the new roster into the local blob store + broadcasts a `RosterAnnounce` on the roster
+    // topic, so rostered peers converge without waiting for their URL poll. Best-effort — a gossip
+    // failure must NOT fail the install (the roster is already persisted + hot-swapped); a
+    // pure-pairing daemon (no gossip) no-ops. Runs under the held `reload_lock` (announce does not
+    // take it, so no deadlock).
+    if let Err(e) = crate::roster::distribute::announce_roster(mesh).await {
+        tracing::warn!(%e, "roster announce-on-publish failed (install still applied)");
+    }
+    Ok(RosterInstallResult {
+        org_id,
+        serial,
+        severed,
+    })
+}
+
+/// Read the currently-pinned org-root pubkey (`[identity] org_root_pk`) from config, or `None` when
+/// none is pinned. A plain read (no `reload_lock`): `atomic_write` publishes config by rename, so a
+/// read can never observe a torn file. Used by [`install_roster`] to resolve the anchor on a
+/// subsequent install that OMITS `--org-root-pk`.
+pub(crate) fn mesh_config_org_root_pk(mesh: &Arc<MeshState>) -> Result<Option<String>> {
+    let cfg = Config::load(&mesh.config_path)
+        .map_err(|e| anyhow::anyhow!("read config for org_root_pk: {e}"))?;
+    Ok(cfg.identity.org_root_pk)
+}
+
+/// The installed-roster path for THIS daemon, derived from `mesh.config_path` (its parent + the
+/// canonical `roster.json` name). Production-identical to [`paths::default_roster_path`] — the daemon
+/// always runs with `config_path = config_dir()/config.toml`, so the parent is `config_dir()` and
+/// this equals `config_dir()/roster.json`. Deriving it from `config_path` (rather than the global
+/// path) keeps the gossip/URL install paths per-node in the in-process multi-node integration tests,
+/// where two daemons in ONE process must NOT share a single global `roster.json` — and the config
+/// read that resolves the trust anchor (`mesh_config_org_root_pk`) already uses the same per-node
+/// `config_path`, so the anchor and the roster file always co-locate. **DECLARED** as the one
+/// deviation from the plan's literal `paths::default_roster_path()` in `distribute.rs`.
+pub(crate) fn installed_roster_path(mesh: &Arc<MeshState>) -> PathBuf {
+    mesh.config_path
+        .parent()
+        .map(|dir| dir.join("roster.json"))
+        .unwrap_or_else(|| PathBuf::from("roster.json")) // parentless config_path: never in practice
+}
+
+/// The per-node freshness sidecar path (spec §4.3 P13), derived from `config_path` (sibling
+/// `roster.confirmed`) exactly as [`installed_roster_path`] derives `roster.json` — so the sidecar
+/// co-locates with the installed roster and stays per-node in the in-process multi-daemon integration
+/// tests. Production-identical to [`paths::default_roster_confirmed_path`] (the daemon runs with
+/// `config_path = config_dir()/config.toml`). Takes `&Path` (not `&Arc<MeshState>`) so the `&self`
+/// [`MeshState::confirm_roster_current`] and the startup bootstrap can both call it.
+pub(crate) fn roster_confirmed_path(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .map(|dir| dir.join("roster.confirmed"))
+        .unwrap_or_else(|| PathBuf::from("roster.confirmed")) // parentless: never in practice
+}
+
+/// Reconcile the daemon's config `[identity].user_id` against the just-installed roster
+/// ([RECONCILE-D], spec §4.6). **The roster is AUTHORITATIVE for a device's user_id:** config's
+/// `[identity].user_id` was a best-effort join-time PROPOSAL, and the roster's assignment for THIS
+/// device's endpoint WINS. Resolve our own endpoint id in `mesh.roster.view()`; if the roster
+/// assigns it a user_id that DIFFERS from config's, surgically rewrite config to the roster value —
+/// NEVER the reverse (config never overwrites the roster). Two no-op cases: the roster resolves our
+/// endpoint to the SAME user_id (nothing to change), OR this device is ABSENT from the roster (the
+/// view is `None`, or `resolve` returns `None`) — config is left untouched (still pending), no write.
+///
+/// **Own endpoint id.** `mesh.endpoint.id()` is the ed25519 pubkey the endpoint is seeded from — the
+/// SAME value a roster device record names (the daemon's own `our_id`; reused rather than recomputed
+/// from the device key). We look it up directly in the installed view.
+///
+/// **Locking (DECLARED — LOCK-FREE under the held `reload_lock`).** Every caller runs this UNDER the
+/// `mesh.reload_lock` it already holds — the manual [`install_roster`] and the gossip
+/// [`on_announce`](crate::roster::distribute) / URL [`poll_roster_url_once`](crate::roster::distribute)
+/// install paths — the SAME single-writer critical section the install itself uses. So it calls the
+/// LOCK-FREE [`write_identity_user_id`] DIRECTLY (a nested `reload_lock.lock()` on the non-reentrant
+/// tokio Mutex would DEADLOCK), EXACTLY as `install_roster` calls the lock-free `write_identity_pin`
+/// under the same held lock. The config write runs on a blocking worker (the fs house rule).
+///
+/// Runs on EVERY roster install (all three channels share this post-install helper), so a roster
+/// arriving by ANY channel reconciles + (via the live `roster_status`) flips pending → approved.
+pub(crate) async fn reconcile_user_id_from_roster(mesh: &Arc<MeshState>) {
+    // Resolve OUR own endpoint in the just-installed view. Absent (view None, or not in the roster) →
+    // leave config untouched (still pending): no write.
+    let our_id = mesh.endpoint.id();
+    let Some(roster_user_id) = mesh
+        .roster
+        .view()
+        .and_then(|v| v.resolve(our_id.as_bytes()).map(|d| d.user_id.clone()))
+    else {
+        return;
+    };
+    // The roster is authoritative: only WRITE when its value DIFFERS from config's proposal (a match
+    // — or an unreadable config, treated as no proposal to overwrite — is a no-op).
+    let config_path = mesh.config_path.clone();
+    let proposed = Config::load(&config_path)
+        .ok()
+        .and_then(|c| c.identity.user_id);
+    if proposed.as_deref() == Some(roster_user_id.as_str()) {
+        return;
+    }
+    // Rewrite config to the ROSTER's authoritative value. LOCK-FREE writer under the caller's HELD
+    // `reload_lock` (see the doc note — a nested lock would deadlock); on a blocking worker.
+    let uid = roster_user_id.clone();
+    match blocking("join reconcile config user_id write", move || {
+        write_identity_user_id(&config_path, &uid)
+    })
+    .await
+    {
+        Ok(Ok(())) => {
+            tracing::info!(user_id = %roster_user_id, "reconciled config user_id from the authoritative roster")
+        }
+        Ok(Err(e)) | Err(e) => tracing::warn!(%e, "reconcile config user_id write failed"),
+    }
+}
+
+/// Write roster BYTES to a unique temp file so [`RosterStore::install_from_file`] — the SINGLE
+/// convergence path (validate rules 1–6 → persist) — can judge them. The gossip/URL channels fetch
+/// bytes, but the install path takes a PATH (P12/P14: the same-uid daemon reads its own local file);
+/// this bridges the two. The returned [`TempPathGuard`] removes the temp file on drop — the caller
+/// holds it across the install. A per-call-unique name ([`unique_temp_path`]: pid + seq — §13 "no
+/// fixed temp name"); the file is only ever READ by `install_from_file`.
+pub(crate) fn write_temp_roster(bytes: &[u8]) -> Result<TempPathGuard> {
+    let tmp = TempPathGuard::new(unique_temp_path(&std::env::temp_dir(), "mcpmesh-roster-in"));
+    let mut f = File::create(tmp.path())
+        .with_context(|| format!("create temp roster {}", tmp.path().display()))?;
+    f.write_all(bytes).context("write temp roster")?;
+    f.sync_all().context("sync temp roster")?;
+    Ok(tmp)
+}
+
+/// Handle an `org_join` control request (spec §4.4 step 2): pin the org root + user key in config so
+/// `status` shows the pinned fingerprint and the eventual roster install (M3c) has its trust anchor.
+/// No roster is installed (D5); the gate stays empty until serial N+1 arrives. Serialized under
+/// `mesh.reload_lock` (the same config-write discipline as `register_service` / `install_roster`).
+///
+/// The pinned pk is parse-validated BEFORE the write (a garbage anchor must NOT land in config);
+/// `user_key` is a LOCAL path (the key never crosses the API).
+pub(crate) async fn org_join(
+    state: &DaemonState,
+    org_id: String,
+    org_root_pk: String,
+    user_id: String,
+    user_key: String,
+) -> Result<OrgJoinResult> {
+    // Validate the pinned pk parses BEFORE writing (a garbage anchor must not land in config).
+    crate::roster::parse_org_root_pk(&org_root_pk)?;
+    let mesh = state.mesh_required()?;
+    let _reload = mesh.reload_lock.lock().await;
+    let config_path = mesh.config_path.clone();
+    let (oid, pk, uid, uk) = (org_id.clone(), org_root_pk, user_id, user_key);
+    blocking("join org-root pin config write", move || {
+        write_join_pin(&config_path, &oid, &pk, &uid, &uk)
+    })
+    .await??;
+    tracing::info!(org_id = %org_id, "pinned org root (join)");
+    Ok(OrgJoinResult { org_id })
+}
+
+/// Handle a `set_roster_url` control request (spec §4.3 M3c): pin `[roster].url` in config AND, when
+/// this node is in roster mode, (re)start the HTTPS poll loop AT RUNTIME so polling begins WITHOUT a
+/// daemon restart. Written by `org create --roster-url` (the operator keeps the URL current) and by
+/// `join` when the org invite carries one — the joiner's FIRST-roster bootstrap (D5).
+///
+/// **Runtime poll (re)start — the D5 fix (DECLARED).** `join` runs against an ALREADY-RUNNING daemon
+/// that started pure-pairing (its step-5c poll spawn keyed on the STARTUP `roster_mode` snapshot).
+/// The preceding `OrgJoin` pins `org_root_pk`, so once THIS write lands the LIVE config is in roster
+/// mode. `poll_roster_url_once` reads the org anchor from config LIVE and is pure outbound HTTPS +
+/// gate hot-swap (no endpoint/ALPN changes), so a runtime [`respawn_poll_loop`] genuinely starts
+/// fetching — a fresh joiner installs its first roster autonomously (no human restart). The respawn
+/// aborts+replaces any prior loop, so this is idempotent (repeated calls / a URL change never stack
+/// loops). The operator's self-poll of its own URL is benign (equal-serial → confirm; a not-yet-hosted
+/// URL → a logged Err retried next interval; a stale serial → `StaleSerial` skip — never a downgrade).
+///
+/// The config write is serialized under `mesh.reload_lock` (the SAME single-writer discipline as
+/// `org_join` / `install_roster` / `register_service`); the respawn runs AFTER the write is durable and
+/// takes only the short-lived `poll_loop` lock. The URL value is NOT logged (out of the trace surface).
+pub(crate) async fn set_roster_url(state: &DaemonState, url: String) -> Result<()> {
+    let mesh = state.mesh_required()?;
+    let _reload = mesh.reload_lock.lock().await;
+    let config_path = mesh.config_path.clone();
+    let url_w = url.clone();
+    blocking("roster-url config write", move || {
+        write_roster_url(&config_path, &url_w)
+    })
+    .await??;
+    tracing::info!("pinned roster url");
+    // Roster mode (an org root is pinned in the LIVE config — the `OrgJoin` before this write set it
+    // on a joiner, or `org create` on an operator): (re)start the poll loop NOW so a runtime join
+    // bootstraps its first roster without a restart (D5). Read live: a transient config-read error
+    // just skips the runtime start (the next daemon start's step 5c picks it up), never fails the write.
+    if Config::load(&mesh.config_path)
+        .map(|c| c.identity.org_root_pk.is_some())
+        .unwrap_or(false)
+    {
+        respawn_poll_loop(mesh, url).await;
+        tracing::info!("roster URL poll loop (re)started");
+    }
+    Ok(())
+}
+
+/// (Re)start the HTTPS roster-poll loop (spec §4.3 M3c), ABORTING any prior one first so repeated
+/// calls never STACK duplicate loops (the idempotency guard) and a URL CHANGE cleanly replaces the
+/// old loop. Called from TWO sites onto the SAME tracked `mesh.poll_loop` handle: (1) `serve_forever`
+/// step 5c at startup (roster mode with a pinned URL), and (2) `set_roster_url` at RUNTIME — so a
+/// joiner that pins `[roster].url` on an already-running daemon starts polling IMMEDIATELY (its D5
+/// first-roster bootstrap) rather than waiting for a restart. Reads the poll interval from the LIVE
+/// config (default hourly on any read/parse error). The freshly spawned loop does an immediate startup
+/// poll (so the first roster arrives at once) then loops on the interval. Takes only the short-lived
+/// `poll_loop` lock for the swap (never `reload_lock`, so no lock-order coupling with the config write
+/// that precedes it in `set_roster_url`).
+pub(crate) async fn respawn_poll_loop(mesh: &Arc<MeshState>, url: String) {
+    let interval = Config::load(&mesh.config_path)
+        .map(|c| c.roster.poll_interval_seconds())
+        .unwrap_or(3600);
+    let mut guard = mesh.poll_loop.lock().await;
+    if let Some(old) = guard.take() {
+        old.abort();
+    }
+    *guard = Some(crate::roster::distribute::spawn_poll_loop(
+        mesh.clone(),
+        url,
+        interval,
+    ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::daemon::roster_status;
+    use crate::daemon::testutil::hermetic_mesh;
+    use crate::pairing;
+    use ed25519_dalek::SigningKey;
+    use mcpmesh_trust::roster::encode_b64u;
+
+    /// `org_join` validates the pk BEFORE writing (garbage never lands), pins the four identity keys
+    /// (preserving `petname`), and flips `roster_status` from `None` (pure-pairing) to `"pending"`
+    /// with serial 0 + the pinned org-root fingerprint (spec §4.4 step 2, D5 — no roster installed).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn org_join_pins_and_status_reports_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[network]\nrelay_mode = \"disabled\"\n\n[identity]\npetname = \"mydev\"\n",
+        )
+        .unwrap();
+        let mesh = hermetic_mesh(config_path.clone()).await;
+        let state = DaemonState::with_mesh("0.0.0", mesh.clone());
+        // `roster_status` takes the caller's already-loaded config (L6: status loads it once);
+        // the test mirrors control.rs `status_result` by loading fresh at each check.
+        let live_status =
+            |mesh: &Arc<MeshState>| roster_status(mesh, Config::load(&config_path).ok().as_ref());
+
+        // Pure-pairing (no org pinned) → no roster block.
+        assert!(
+            live_status(&mesh).is_none(),
+            "an unpinned daemon must surface no roster status"
+        );
+
+        // A GARBAGE anchor is rejected BEFORE the write — nothing lands in config.
+        assert!(
+            org_join(
+                &state,
+                "acme".into(),
+                "not-a-real-key".into(),
+                "alice".into(),
+                "/home/alice/user.key".into(),
+            )
+            .await
+            .is_err(),
+            "a garbage org_root_pk must be rejected"
+        );
+        assert!(
+            Config::load(&config_path)
+                .unwrap()
+                .identity
+                .org_root_pk
+                .is_none(),
+            "a rejected join must NOT pin a garbage anchor"
+        );
+        assert!(
+            live_status(&mesh).is_none(),
+            "a rejected join leaves status unpinned"
+        );
+
+        // A VALID anchor pins the four keys + surfaces "pending".
+        let root = SigningKey::from_bytes(&[9u8; 32]);
+        let pk_str = encode_b64u(root.verifying_key().as_bytes());
+        let res = org_join(
+            &state,
+            "acme".into(),
+            pk_str.clone(),
+            "alice".into(),
+            "/home/alice/user.key".into(),
+        )
+        .await
+        .expect("valid join pins");
+        assert_eq!(
+            res,
+            OrgJoinResult {
+                org_id: "acme".into()
+            }
+        );
+
+        // The four identity keys are pinned; the pre-existing petname is preserved.
+        let cfg = Config::load(&config_path).unwrap();
+        assert_eq!(cfg.identity.org_id.as_deref(), Some("acme"));
+        assert_eq!(cfg.identity.org_root_pk.as_deref(), Some(pk_str.as_str()));
+        assert_eq!(cfg.identity.user_id.as_deref(), Some("alice"));
+        assert_eq!(
+            cfg.identity.user_key.as_deref(),
+            Some(Path::new("/home/alice/user.key"))
+        );
+        assert_eq!(cfg.identity.petname.as_deref(), Some("mydev"));
+
+        // Status is now "pending": org pinned, NO roster installed (D5) → serial 0 + the fingerprint.
+        let status = live_status(&mesh).expect("pinned org surfaces a pending status");
+        assert_eq!(status.state, "pending");
+        assert_eq!(status.serial, 0);
+        assert_eq!(status.org_id, "acme");
+        let expected_fp = pairing::sas::fingerprint_words(&root.verifying_key().to_bytes());
+        assert!(!expected_fp.is_empty());
+        assert_eq!(status.org_root_fingerprint, expected_fp);
+    }
+
+    /// [CRITICAL — M3c T7] The URL poll must NOT panic. reqwest 0.13.4 (`rustls-no-provider`) resolves
+    /// the rustls `CryptoProvider` at client-build time and PANICS if none is installed; iroh installs
+    /// no process-default. This test installs the ring provider EXACTLY as `serve_forever` does, then
+    /// drives `poll_roster_url_once` against an unreachable URL: it must return an `Err` (the failed
+    /// GET), NOT panic. A panic (a missing provider) would ABORT the test — so a clean `Err` PROVES the
+    /// `install_default` call is what keeps the poll alive. (Also exercises the fail-toward-degraded
+    /// path, D5: a blocked/unreachable poll is a plain error the loop logs + retries.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn url_poll_does_not_panic_when_the_ring_provider_is_installed() {
+        // The SAME install `serve_forever` step 0 performs (idempotent — safe if another test ran it).
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "[network]\nrelay_mode = \"disabled\"\n").unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+
+        // An unreachable URL (loopback port 1 — nothing listens → immediate connection refused). The
+        // reqwest client BUILDS (the panic point) before the connection fails, so reaching this `Err`
+        // proves the provider is installed. `reqwest::get` panics here WITHOUT the install.
+        let result = crate::roster::distribute::poll_roster_url_once(
+            &mesh,
+            "http://127.0.0.1:1/roster.json",
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "an unreachable poll must return Err (not panic, not a silent Ok): {result:?}"
+        );
+    }
+
+    /// A std-only localhost HTTP/1.1 server that serves `body` for EVERY request until stopped.
+    /// Returns `(url, stop_flag, join_handle)` — set the flag + join to shut it down. Non-blocking
+    /// accept + poll so a clean shutdown never wedges the thread.
+    fn serve_roster_http(
+        body: Vec<u8>,
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind http server");
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let handle = std::thread::spawn(move || {
+            while !stop_thread.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                        let mut buf = [0u8; 2048];
+                        let _ = stream.read(&mut buf);
+                        let header = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(header.as_bytes());
+                        let _ = stream.write_all(&body);
+                        let _ = stream.flush();
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (format!("http://127.0.0.1:{port}/roster.json"), stop, handle)
+    }
+
+    /// **The D5 fix (M3c T7).** A `set_roster_url` on an ALREADY-RUNNING daemon whose config has the
+    /// org anchor pinned but NO roster yet (the pending joiner, exactly the post-`OrgJoin` state) must
+    /// (re)start the poll loop AT RUNTIME so the FIRST roster installs WITHOUT a daemon restart. Serve a
+    /// valid signed serial-1 roster, call `set_roster_url`, and poll-assert (timeout + interval, NOT a
+    /// fixed sleep) that the gate hot-swaps to serial 1 — proving the runtime respawn autonomously
+    /// bootstraps the joiner (the no-human-restart directive). Idempotency: a SECOND `set_roster_url`
+    /// aborts+replaces the loop (no stacking) and the roster stays installed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn runtime_set_roster_url_bootstraps_the_first_roster_without_a_restart() {
+        use mcpmesh_trust::roster::mutate;
+        use mcpmesh_trust::roster::sign::mint_signed;
+        use std::sync::atomic::Ordering;
+        // The SAME provider install `serve_forever` step 0 performs (idempotent).
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let root = SigningKey::from_bytes(&[9u8; 32]);
+        let pk_str = encode_b64u(&root.verifying_key().to_bytes());
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        // A pending joiner's config: the org anchor is pinned (as `OrgJoin` sets it) but no roster.
+        std::fs::write(
+            &config_path,
+            format!(
+                "[network]\nrelay_mode = \"disabled\"\n[identity]\norg_root_pk = \"{pk_str}\"\norg_id = \"acme\"\n"
+            ),
+        )
+        .unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        assert!(
+            mesh.roster.view().is_none(),
+            "pending joiner: no roster installed yet (D5)"
+        );
+        let state = DaemonState::with_mesh("0.0.0", mesh.clone());
+
+        // A valid signed serial-1 roster hosted over HTTP (what the operator publishes to the URL).
+        let now = epoch_now_i64();
+        let roster = mint_signed(
+            &root,
+            mutate::empty_roster("acme", 1, now - 3600, now + 86_400),
+        );
+        let (url, stop, handle) = serve_roster_http(serde_json::to_vec(&roster).unwrap());
+
+        // The RUNTIME trigger — no restart: pin the URL → `set_roster_url` respawns the poll loop →
+        // the loop's immediate startup poll GETs + converges the first roster through install_from_file.
+        set_roster_url(&state, url.clone())
+            .await
+            .expect("set_roster_url pins the URL and (re)starts polling");
+
+        // Poll-assert the first roster installs autonomously (timeout + interval, never a fixed sleep).
+        // Deadline widened for full-workspace parallelism AND cold CI runners: convergence is fast in
+        // isolation, but CPU starvation — many concurrent test binaries, or a cold windows runner still
+        // warming up — can slow the real HTTP/mesh path well past a tight bound. The wide bound
+        // tolerates that starvation without masking a real hang: a genuine hang still fails at the bound.
+        let deadline = std::time::Instant::now() + Duration::from_secs(180);
+        loop {
+            if mesh.roster.view().map(|v| v.serial()).unwrap_or(0) >= 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the first roster must install at RUNTIME (no daemon restart) after set_roster_url"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            mesh.roster.view().expect("roster installed").serial(),
+            1,
+            "the runtime poll bootstrapped the joiner's first roster (D5) — gate hot-swapped to serial 1"
+        );
+
+        // Idempotency: a SECOND set_roster_url aborts+replaces the loop (no stacking) — still serial 1.
+        set_roster_url(&state, url)
+            .await
+            .expect("a repeat set_roster_url is idempotent (abort+replace, no stacking)");
+        assert_eq!(
+            mesh.roster.view().unwrap().serial(),
+            1,
+            "a repeat set_roster_url does not regress or double-install the roster"
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn staleness_sweep_fires_only_when_degraded_stopped() {
+        use mcpmesh_trust::roster::validate::RosterState;
+        assert!(super::should_staleness_sever(Some(
+            RosterState::DegradedStopped
+        )));
+        assert!(!super::should_staleness_sever(Some(
+            RosterState::DegradedGrace
+        )));
+        assert!(!super::should_staleness_sever(Some(RosterState::Approved)));
+        assert!(
+            !super::should_staleness_sever(None),
+            "no roster → never sweep"
+        );
+    }
+}

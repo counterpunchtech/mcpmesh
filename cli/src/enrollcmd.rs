@@ -401,20 +401,10 @@ pub fn run_devices_add(device_code: String) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Removes its path on Drop — so the staged roster temp is cleaned up on EVERY exit from
-/// [`install_signed_roster`], including an early `?`-return (`rt.build()` / `fs::write` failure)
-/// that a trailing explicit `remove_file` would skip. Best-effort (a failed unlink is ignored).
-struct TempFile(std::path::PathBuf);
-impl Drop for TempFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
 /// Sign+persist a roster to a per-call-unique temp under `config_dir()` (same-uid; the daemon reads
 /// it — path-not-bytes, P12/P14), install it via the existing `RosterInstall` control method
 /// ([RECONCILE-C], the single-writer discipline), and return the result. The temp is removed on every
-/// exit — success, install error, or an early `?`-return — by the [`TempFile`] RAII guard (leak-proof
+/// exit — success, install error, or an early `?`-return — by the [`util::TempPathGuard`] RAII guard (leak-proof
 /// for the T9/T10 reuse). `org_root_pk` is `Some` only on the FIRST install (`org create`) to pin the
 /// anchor; `None` afterwards (the pinned config value is reused). Shared by org create / approve / revoke.
 fn install_signed_roster(
@@ -430,7 +420,7 @@ fn install_signed_roster(
         seq
     ));
     // The guard removes `temp` on ANY return below (including the `?` early-exits that follow).
-    let _guard = TempFile(temp.clone());
+    let _guard = util::TempPathGuard::new(temp.clone());
     if let Some(parent) = temp.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -523,16 +513,5 @@ mod tests {
             err.to_string().contains("mcpmesh-device:"),
             "the decode error names the expected scheme: {err}"
         );
-    }
-
-    #[test]
-    fn temp_file_guard_removes_its_path_on_drop() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("roster.staging.test.json");
-        std::fs::write(&path, b"{}").unwrap();
-        drop(TempFile(path.clone()));
-        assert!(!path.exists(), "the guard unlinks its path on drop");
-        // Best-effort by design: a guard for an already-gone path drops without panicking.
-        drop(TempFile(path));
     }
 }
