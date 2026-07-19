@@ -530,10 +530,10 @@ pub(crate) async fn redeem(state: &DaemonState, invite_line: String) -> Result<P
 /// hot-reload so the running registry admits it. This is the load-bearing half of pairing.
 ///
 /// Why it is separate from (and necessary alongside) the [`PeerEntry`] the rendezvous writes:
-/// the [`AllowlistGate`] only RESOLVES an inbound endpoint to
+/// the [`AllowlistGate`](crate::allowlist::AllowlistGate) only RESOLVES an inbound endpoint to
 /// a petname (identity); `select_service` (spec §5) then ADMITS that petname only if the
-/// service's config `allow` names it — and that allow is baked into the [`Services`] snapshot
-/// at [`build_services`] time. So a PeerEntry makes the peer KNOWN; only appending to `allow`
+/// service's config `allow` names it — and that allow is baked into the [`Services`](mcpmesh_net::Services) snapshot
+/// at [`build_services`](crate::daemon::build_services) time. So a PeerEntry makes the peer KNOWN; only appending to `allow`
 /// + reloading makes it AUTHORIZED. Without this the peer is known-but-forbidden.
 ///
 /// Serialized against `register_service` via `mesh.reload_lock` (SAME lock — a concurrent

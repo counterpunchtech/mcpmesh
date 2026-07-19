@@ -76,7 +76,7 @@ fn gate_and_register(
 /// the paired peer (M2b T6). Only `services` is passed alongside because a hot-reload swaps the
 /// registry without rebuilding the rest of the mesh.
 ///
-/// `pub` (like [`build_services`]) so integration tests can drive the SAME accept loop the daemon
+/// `pub` (like [`build_services`](crate::daemon::build_services)) so integration tests can drive the SAME accept loop the daemon
 /// runs against in-process endpoints, proving mesh vs. pair ALPN routing.
 pub fn spawn_accept_loop(mesh: Arc<MeshState>, services: Arc<Services>) -> JoinHandle<()> {
     tokio::spawn(async move {
