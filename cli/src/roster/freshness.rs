@@ -1,7 +1,7 @@
-//! Freshness persistence (spec §4.3, [RECONCILE-FRESHNESS]): `last_confirmed` — the last instant this
+//! Freshness persistence: `last_confirmed` — the last instant this
 //! node validated the installed roster as current via an authenticated channel — lives in a tiny
 //! sidecar `<config_dir>/roster.confirmed` (one epoch-seconds integer, atomic). Per-node liveness
-//! state, NOT a roster-document field (keeps roster.json a pure re-serialization, M3a [RECONCILE-C]).
+//! state, NOT a roster-document field (keeps roster.json a pure re-serialization).
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 
@@ -14,7 +14,7 @@ impl FreshnessStore {
         Self { path }
     }
     /// Load the persisted `last_confirmed`, or `None` when the sidecar is absent (a fresh node, or an
-    /// M3a/M3b-installed roster pre-dating freshness — the daemon applies the one-time upgrade grace).
+    /// roster installed by a build pre-dating freshness — the daemon applies the one-time upgrade grace).
     pub fn load(&self) -> Result<Option<i64>> {
         match std::fs::read_to_string(&self.path) {
             Ok(s) => Ok(s.trim().parse::<i64>().ok()),

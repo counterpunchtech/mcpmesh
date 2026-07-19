@@ -1,13 +1,21 @@
-//! Presence (spec §10.1, roster mode only): a device-key-signed heartbeat gossiped on
+//! Presence (roster mode only): a device-key-signed heartbeat gossiped on
 //! `blake3("mcpmesh/presence/"+org_id)`. ADVISORY — it feeds `status` + the person→device dial
 //! ordering; no security decision derives from it (absence never blocks a dial). Message-level
 //! verify: sig against the sender's endpoint_id (which IS its device ed25519 pubkey) + `|now-ts|<120s`.
 //! The TRACK loop ADDITIONALLY binds the claimed user_id to the roster's AUTHORITATIVE user for that
-//! endpoint_id (a rostered device cannot advertise under a peer's user_id). Entries expire after 180s.
-//! ≤ 512 B (P9). [RECONCILE-PRESENCE].
+//! endpoint_id (a rostered device cannot advertise under a peer's user_id). Entries expire after
+//! 180s; a heartbeat stays under 512 bytes.
+//!
+//! The publish/track loops run against a narrow [`PresenceCtx`] (the presence table, the topic
+//! handle, and the roster gate for the user_id binding) — never the daemon's state.
+use std::sync::Arc;
+
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use mcpmesh_trust::roster::validate::RosterView;
 use serde::{Deserialize, Serialize};
+
+use crate::roster::gate::RosterGate;
+use crate::roster::transport::{self, RosterGossip};
 
 const PRESENCE_DOMAIN: &[u8] = b"mcpmesh/presence/1";
 pub const PRESENCE_SKEW_SECS: i64 = 120;
@@ -19,7 +27,7 @@ pub struct Presence {
     pub endpoint_id: String, // b64u: (the device ed25519 pubkey = the endpoint id)
     pub user_id: String,
     pub ts: i64,            // epoch seconds
-    pub roster_serial: u64, // doubles as roster-update discovery (spec §10.1)
+    pub roster_serial: u64, // doubles as roster-update discovery
     pub sig: String,        // b64u:
 }
 
@@ -74,12 +82,12 @@ impl Presence {
         .ok()?;
         Some(eid)
     }
-    /// Full track-side acceptance (\[Minor\] 5): message-valid AND the claimed `user_id` matches the
-    /// roster's AUTHORITATIVE user for this endpoint (an active rostered device). Returns the verified
+    /// Full track-side acceptance: message-valid AND the claimed `user_id` matches the roster's
+    /// AUTHORITATIVE user for this endpoint (an active rostered device). Returns the verified
     /// endpoint on success — a rostered device advertising under a PEER's user_id is REJECTED here.
     pub fn accept(&self, now: i64, view: &RosterView) -> Option<[u8; 32]> {
         let eid = self.verify(now)?;
-        let resolved = view.resolve(&eid)?; // endpoint_id ∈ roster (active) — else drop (P9)
+        let resolved = view.resolve(&eid)?; // endpoint_id ∈ roster (active) — else drop
         if resolved.user_id == self.user_id {
             Some(eid)
         } else {
@@ -87,7 +95,7 @@ impl Presence {
         } // user_id binding
     }
 
-    /// The compact JSON gossip payload (the ≤512B heartbeat, P9). Infallible for this fixed shape
+    /// The compact JSON gossip payload (the ≤512B heartbeat). Infallible for this fixed shape
     /// (Strings + integers always encode), so an `expect` here signals a serde-internal bug.
     pub fn to_bytes(&self) -> Vec<u8> {
         serde_json::to_vec(self).expect("Presence serializes")
@@ -109,12 +117,12 @@ pub struct PresenceEntry {
     pub ts: i64,
 }
 
-/// The advisory presence table (spec §10.1): the freshest verified heartbeat per endpoint. Records
-/// are ADVISORY-ONLY — NOTHING here feeds a gate, an authz check, or a sever decision. Absence of an
-/// entry NEVER blocks or denies anything; T11's dial reads it purely for candidate ORDERING/recency
-/// (a peer with no entry is still dialed). Entries older than [`PRESENCE_TTL_SECS`] (180s) are
-/// filtered out by [`active`](PresenceTable::active). A plain `std::sync::Mutex` (no await under the
-/// lock — every critical section is a quick map op), mirroring the plan's `Mutex<HashMap<..>>`.
+/// The advisory presence table: the freshest verified heartbeat per endpoint. Records are
+/// ADVISORY-ONLY — NOTHING here feeds a gate, an authz check, or a sever decision. Absence of an
+/// entry NEVER blocks or denies anything; the person→device dial reads it purely for candidate
+/// ORDERING/recency (a peer with no entry is still dialed). Entries older than
+/// [`PRESENCE_TTL_SECS`] (180s) are filtered out by [`active`](PresenceTable::active). A plain
+/// `std::sync::Mutex` (no await under the lock — every critical section is a quick map op).
 #[derive(Debug, Default)]
 pub struct PresenceTable {
     inner: std::sync::Mutex<std::collections::HashMap<[u8; 32], PresenceEntry>>,
@@ -138,7 +146,7 @@ impl PresenceTable {
     }
 
     /// The active (non-expired) entries at `now` — `now - ts < 180` ([`PRESENCE_TTL_SECS`]). Advisory
-    /// read (status + T11 dial ordering); no security decision consults it.
+    /// read (status + dial ordering); no security decision consults it.
     pub fn active(&self, now: i64) -> Vec<([u8; 32], PresenceEntry)> {
         let g = self.inner.lock().expect("presence table mutex poisoned");
         g.iter()
@@ -147,8 +155,8 @@ impl PresenceTable {
             .collect()
     }
 
-    /// The endpoints currently advertising `user_id`, MOST-RECENT FIRST (the T11 person→device dial
-    /// ordering, spec §10.1). Advisory ONLY — this orders dial candidates; it never authorizes a dial.
+    /// The endpoints currently advertising `user_id`, MOST-RECENT FIRST (the person→device dial
+    /// ordering). Advisory ONLY — this orders dial candidates; it never authorizes a dial.
     pub fn endpoints_for_user_by_recency(&self, user_id: &str) -> Vec<[u8; 32]> {
         let g = self.inner.lock().expect("presence table mutex poisoned");
         let mut hits: Vec<(&[u8; 32], &PresenceEntry)> =
@@ -158,29 +166,61 @@ impl PresenceTable {
     }
 }
 
-/// Presence publish loop (spec §10.1, roster mode only): every `60s ± jitter`, build + sign a
-/// heartbeat with this device's key (whose public half IS the endpoint id) and broadcast it on the
-/// presence topic. `roster_serial` is read FRESH each beat from the installed view (it doubles as the
-/// roster-update discovery hint, §10.1). ADVISORY — a beat authorizes nothing; peers RECORD it only
-/// after binding its user_id to their roster. Mirrors [`distribute::spawn_receive_loop`]'s structure
-/// (own the sender from `MeshState`); a `None` presence-topic sender (pure-pairing, or subscribe
-/// failed) returns immediately.
-///
-/// [`distribute::spawn_receive_loop`]: crate::roster::distribute::spawn_receive_loop
+/// The narrow seam the presence loops run against — the presence table, the presence-topic
+/// handle, and the roster gate (for the beat serial + the user_id-to-roster binding). Assembled
+/// by the daemon (`MeshState::presence_ctx`); this module never sees the daemon's state. Holds
+/// the same `Arc`s the daemon holds, so the loops observe live roster hot-swaps.
+pub struct PresenceCtx {
+    /// The live roster gate: the beat serial is read fresh from it, and the track loop binds
+    /// each claimed user_id to its installed view.
+    pub roster: Arc<RosterGate>,
+    /// The advisory table verified heartbeats are recorded into.
+    pub table: Arc<PresenceTable>,
+    /// The presence-topic subscription: the publish loop clones the sender per beat; the track
+    /// loop moves the receiver out ONCE. `None`/empty in a pure-pairing daemon or when the
+    /// subscribe failed — both loops then return immediately.
+    pub topic: Arc<tokio::sync::Mutex<Option<RosterGossip>>>,
+}
+
+impl PresenceCtx {
+    /// A clone of the presence-topic gossip SENDER, or `None` (no topic / subscribe failed).
+    /// Cloned under the mutex so the publish loop can broadcast while the receiver has been
+    /// moved out by the track loop — the sender stays live in the topic handle.
+    async fn sender(&self) -> Option<iroh_gossip::api::GossipSender> {
+        self.topic.lock().await.as_ref().map(|g| g.sender.clone())
+    }
+
+    /// Move the presence-topic gossip RECEIVER out — EXACTLY ONCE, for the track loop (a
+    /// `GossipReceiver` is a single-consumer stream). Leaves the sender in place so the publish
+    /// loop keeps broadcasting. `None` if there is no topic or it was already taken.
+    async fn take_receiver(&self) -> Option<iroh_gossip::api::GossipReceiver> {
+        self.topic
+            .lock()
+            .await
+            .as_mut()
+            .and_then(|g| g.receiver.take())
+    }
+}
+
+/// Presence publish loop (roster mode only): every `60s ± jitter`, build + sign a heartbeat with
+/// this device's key (whose public half IS the endpoint id) and broadcast it on the presence
+/// topic. `roster_serial` is read FRESH each beat from the installed view (it doubles as the
+/// roster-update discovery hint). ADVISORY — a beat authorizes nothing; peers RECORD it only
+/// after binding its user_id to their roster. A `None` presence-topic sender (pure-pairing, or
+/// subscribe failed) returns immediately.
 pub fn publish_loop(
-    mesh: std::sync::Arc<crate::daemon::MeshState>,
+    ctx: PresenceCtx,
     device_key: SigningKey,
     user_id: String,
 ) -> tokio::task::JoinHandle<()> {
-    use crate::roster::transport;
     tokio::spawn(async move {
         let endpoint_id = device_key.verifying_key().to_bytes();
-        let Some(sender) = mesh.presence_topic_sender().await else {
+        let Some(sender) = ctx.sender().await else {
             return; // pure-pairing daemon, or the presence-topic subscribe failed — no heartbeat
         };
         loop {
             let now = crate::util::epoch_now_i64();
-            let serial = mesh.roster.view().map(|v| v.serial()).unwrap_or(0);
+            let serial = ctx.roster.view().map(|v| v.serial()).unwrap_or(0);
             let beat = Presence::signed(&device_key, &endpoint_id, &user_id, now, serial);
             if let Err(e) = transport::broadcast(&sender, beat.to_bytes()).await {
                 tracing::debug!(%e, "presence heartbeat broadcast failed; will retry next beat");
@@ -190,19 +230,18 @@ pub fn publish_loop(
     })
 }
 
-/// Presence track loop (spec §10.1, roster mode only): pull heartbeats off the presence topic, accept
-/// each against the INSTALLED roster ([`Presence::accept`] — the message sig AND the user_id-to-roster
-/// binding, \[Minor\] 5), and RECORD the verified beat into the advisory [`PresenceTable`]. This is the
+/// Presence track loop (roster mode only): pull heartbeats off the presence topic, accept each
+/// against the INSTALLED roster ([`Presence::accept`] — the message sig AND the user_id-to-roster
+/// binding), and RECORD the verified beat into the advisory [`PresenceTable`]. This is the
 /// ONLY thing the track loop does — it touches NO gate, authz check, or sever decision; a dropped or
 /// unrostered beat simply never becomes an entry (and absence never blocks a dial). Malformed peer
 /// bytes are dropped without a panic. Mirrors [`distribute::spawn_receive_loop`] (take the receiver
 /// once); a `None` receiver (pure-pairing, already taken, or subscribe failed) returns immediately.
 ///
 /// [`distribute::spawn_receive_loop`]: crate::roster::distribute::spawn_receive_loop
-pub fn track_loop(mesh: std::sync::Arc<crate::daemon::MeshState>) -> tokio::task::JoinHandle<()> {
-    use crate::roster::transport;
+pub fn track_loop(ctx: PresenceCtx) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let Some(mut receiver) = mesh.take_presence_topic_receiver().await else {
+        let Some(mut receiver) = ctx.take_receiver().await else {
             return;
         };
         while let Some(content) = transport::next_message(&mut receiver).await {
@@ -214,17 +253,17 @@ pub fn track_loop(mesh: std::sync::Arc<crate::daemon::MeshState>) -> tokio::task
             // ADVISORY: bind the claimed user_id to the roster-AUTHORITATIVE user for this endpoint,
             // then RECORD only. No gate/authz/sever consults presence — a peer with no installed
             // roster, or whose beat fails the binding, simply produces no entry (never a denial).
-            let Some(view) = mesh.roster.view() else {
+            let Some(view) = ctx.roster.view() else {
                 continue; // no roster installed yet: nothing to bind against — drop (advisory)
             };
             if let Some(eid) = p.accept(now, &view) {
-                mesh.presence_table.record(eid, p.user_id, p.ts);
+                ctx.table.record(eid, p.user_id, p.ts);
             }
         }
     })
 }
 
-/// The next beat interval: `60s ± jitter` (spec §10.1) to de-synchronize the swarm (no thundering
+/// The next beat interval: `60s ± jitter` to de-synchronize the swarm (no thundering
 /// herd), always ≥ 1s and well within the 180s TTL. Jitter is drawn from the OS CSPRNG — the SAME
 /// `rand::rngs::OsRng` source the crate's device-key / pairing-secret mint uses.
 fn next_beat_secs() -> u64 {
@@ -236,7 +275,7 @@ fn next_beat_secs() -> u64 {
     (PRESENCE_PERIOD_SECS + jitter).max(1) as u64
 }
 
-/// The presence heartbeat base period (spec §10.1 "≈60s"); the actual sleep is `± PRESENCE_JITTER_SECS`.
+/// The presence heartbeat base period (≈60s); the actual sleep is `± PRESENCE_JITTER_SECS`.
 const PRESENCE_PERIOD_SECS: i64 = 60;
 /// The heartbeat jitter magnitude (± this many seconds around the 60s base). Keeps beats de-correlated
 /// while staying far inside the 180s TTL (worst case 75s ≪ 180s → no false expiry).
@@ -321,7 +360,7 @@ mod tests {
             Presence::signed(&dk, &eid, "alice", now, 5).accept(now, &view),
             Some(eid)
         );
-        // FORGERY ([Minor] 5): alice's device (validly signed) advertises under "bob" → REJECTED,
+        // FORGERY: alice's device (validly signed) advertises under "bob" → REJECTED,
         // even though the sig verifies and the endpoint is in the roster.
         assert!(
             Presence::signed(&dk, &eid, "bob", now, 5)

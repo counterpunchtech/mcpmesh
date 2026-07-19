@@ -1,7 +1,7 @@
-//! Roster/presence gossip + blob transport (spec §4.3 distribution, §10.1 presence). Thin wrappers
+//! Roster/presence gossip + blob transport. Thin wrappers
 //! over iroh-gossip (=0.101.0) + iroh-blobs (=0.103.0) sharing the daemon's ONE endpoint
-//! ([RECONCILE-COMPOSE]). The gossip TOPICS are deterministic blake3 derivations of the org id
-//! (§4.3/§10.1) — pure + unit-testable here; the network wrappers land in T2/T3.
+//! (). The gossip TOPICS are deterministic blake3 derivations of the org id
+//! — pure + unit-testable here.
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -15,23 +15,23 @@ use iroh_gossip::proto::TopicId;
 use n0_future::StreamExt;
 use serde::{Deserialize, Serialize};
 
-/// The roster-distribution gossip topic bytes: `blake3("mcpmesh/roster/" + org_id)` (spec §4.3).
-/// Pure — returns the 32 bytes a `TopicId::from_bytes` wraps (T2), so the derivation is testable
+/// The roster-distribution gossip topic bytes: `blake3("mcpmesh/roster/" + org_id)`.
+/// Pure — returns the 32 bytes a `TopicId::from_bytes` wraps, so the derivation is testable
 /// without any gossip runtime.
 pub fn roster_topic_bytes(org_id: &str) -> [u8; 32] {
     *blake3::hash(format!("mcpmesh/roster/{org_id}").as_bytes()).as_bytes()
 }
 
-/// The presence gossip topic bytes: `blake3("mcpmesh/presence/" + org_id)` (spec §10.1).
+/// The presence gossip topic bytes: `blake3("mcpmesh/presence/" + org_id)`.
 pub fn presence_topic_bytes(org_id: &str) -> [u8; 32] {
     *blake3::hash(format!("mcpmesh/presence/{org_id}").as_bytes()).as_bytes()
 }
 
-/// The roster-distribution gossip announcement (spec §4.3): a higher `serial` tells receivers a
+/// The roster-distribution gossip announcement: a higher `serial` tells receivers a
 /// newer roster exists; `roster_hash` (blake3, `"blake3:<hex>"`) binds the announce to the exact
 /// document; `blob_ticket` is the iroh-blobs fetch handle. Content-addressed + org-root-SIGNED, so
 /// this announce is not itself a trust input — it only triggers a fetch that `validate_for_install`
-/// then judges (the SINGLE convergence point). Kept ≤ 512 B (P9-style discipline for gossip).
+/// then judges (the SINGLE convergence point). Kept ≤ 512 B (small-payload gossip discipline).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RosterAnnounce {
     pub serial: u64,
@@ -63,8 +63,8 @@ pub struct RosterGossip {
     pub receiver: Option<GossipReceiver>,
 }
 
-/// Spawn iroh-gossip on the daemon's SHARED endpoint ([RECONCILE-COMPOSE]). Returns the `Gossip`
-/// handle: the caller registers `GOSSIP_ALPN` dispatch in the accept loop (T5) and subscribes to
+/// Spawn iroh-gossip on the daemon's SHARED endpoint (). Returns the `Gossip`
+/// handle: the caller registers `GOSSIP_ALPN` dispatch in the accept loop and subscribes to
 /// topics (below). One `Gossip` per daemon serves BOTH the roster and presence topics.
 ///
 /// `Gossip::builder().spawn(endpoint)` returns the handle directly (not a `Result`) — a closed
@@ -75,7 +75,7 @@ pub fn spawn_gossip(endpoint: &Endpoint) -> Gossip {
 
 /// Subscribe to a topic (roster or presence), bootstrapping from the roster-listed peers. Uses
 /// `subscribe` (NOT `subscribe_and_join`) so the FIRST node does not block awaiting a neighbor
-/// ([RECONCILE-GOSSIP-API]); the swarm forms as peers come online. An empty `bootstrap` is fine.
+/// (); the swarm forms as peers come online. An empty `bootstrap` is fine.
 pub async fn subscribe(
     gossip: &Gossip,
     topic: [u8; 32],
@@ -113,22 +113,23 @@ pub async fn next_message(receiver: &mut GossipReceiver) -> Option<Bytes> {
     None
 }
 
-/// Re-export the gossip ALPN so the accept-loop dispatch (T5) matches it without importing the crate
-/// at the daemon site — one vocabulary home ([RECONCILE-D] cli-plumbing precedent).
+/// Re-export the gossip ALPN so the accept-loop dispatch matches it without importing the crate
+/// at the daemon site — one vocabulary home (cli-plumbing precedent).
 pub const GOSSIP_ALPN: &[u8] = iroh_gossip::ALPN;
 
-/// The iroh-blobs ALPN (`b"/iroh-bytes/4"`) — re-exported so the accept-loop dispatch (T5) matches
+/// The iroh-blobs ALPN (`b"/iroh-bytes/4"`) — re-exported so the accept-loop dispatch matches
 /// it without importing the crate at the daemon site (the same one-vocabulary-home discipline as
 /// `GOSSIP_ALPN`).
 pub const BLOB_ALPN: &[u8] = iroh_blobs::ALPN;
 
-/// The roster-blob transport (spec §4.3/§9): a `MemStore`-backed provider+fetcher for the SIGNED
+/// The roster-blob transport: a `MemStore`-backed provider+fetcher for the SIGNED
 /// roster document ONLY. iroh-blobs is content-addressed and BLAKE3-verifies every transfer against
-/// the ticket's hash; M3c adds a SECOND explicit blake3 check tying the fetched doc to the gossip
-/// announce's `roster_hash` (the announce-to-document binding). NO gated per-scope provider (that is
-/// M4, spec §9/Q2 — hence `BlobsProtocol::new(store, None)`, no `EventSender`). `MemStore` (not an
+/// the ticket's hash; `fetch` adds a SECOND explicit blake3 check tying the fetched doc to the
+/// gossip announce's `roster_hash` (the announce-to-document binding). NO gated per-scope provider
+/// here (the app-blob provider is separate — hence `BlobsProtocol::new(store, None)`, no
+/// `EventSender`). `MemStore` (not an
 /// `FsStore`): the roster blob is small + re-seeded from the installed `roster.json` on every
-/// restart, so no durable blob store is needed here ([RECONCILE-BLOB-API]).
+/// restart, so no durable blob store is needed here ().
 #[derive(Clone)]
 pub struct RosterBlobs {
     store: MemStore,
@@ -136,15 +137,15 @@ pub struct RosterBlobs {
 
 impl RosterBlobs {
     /// A fresh `MemStore`-backed transport. The endpoint is threaded through `publish`/`fetch`/
-    /// `spawn_accept` (not stored) so this shares the daemon's ONE endpoint ([RECONCILE-COMPOSE]).
+    /// `spawn_accept` (not stored) so this shares the daemon's ONE endpoint ().
     pub fn new(_endpoint: &Endpoint) -> Self {
         Self {
             store: MemStore::new(),
         }
     }
 
-    /// The `BlobsProtocol` handler the accept loop dispatches the blob ALPN to (T5). Ungated
-    /// (`None` events) — the D8 identity gate on the accept-loop arm is the access boundary, not the
+    /// The `BlobsProtocol` handler the accept loop dispatches the blob ALPN to. Ungated
+    /// (`None` events) — the identity gate on the accept-loop arm is the access boundary, not the
     /// blob provider. `&self.store` (a `&MemStore`) deref-coerces to the `&Store` `new` expects.
     pub fn protocol(&self) -> BlobsProtocol {
         BlobsProtocol::new(&self.store, None)
@@ -152,7 +153,7 @@ impl RosterBlobs {
 
     /// TEST-ONLY: register a blob ALPN accept handler directly on `endpoint`, BYPASSING the trust
     /// gate. Production accept ALWAYS goes through the gated daemon loop (`spawn_accept_loop`'s
-    /// `BLOB_ALPN` arm: D8 resolve → 401 + check-register); this exists only so same-file unit
+    /// `BLOB_ALPN` arm: resolve → 401 + check-register); this exists only so same-file unit
     /// tests can serve a blob without assembling a daemon. `#[cfg(test)]` so it can never leak
     /// into a production accept path.
     #[cfg(test)]
@@ -171,8 +172,8 @@ impl RosterBlobs {
     }
 
     /// Add the signed roster bytes to the store, returning `(ticket_string, "blake3:<hex>")`. The
-    /// operator (on publish) + every accepting node (re-seed, T6) call this so the blob is servable
-    /// onward independent of the operator staying online (spec §4.3 publication). `add_bytes(..)
+    /// operator (on publish) + every accepting node (re-seed) call this so the blob is servable
+    /// onward independent of the operator staying online. `add_bytes(..)
     /// .await` yields a `TagInfo` (a PERSISTENT named tag — the blob is NOT GC-eligible, so the
     /// provider keeps serving it), whose `.hash` field is the blake3 root the ticket pins.
     pub async fn publish(&self, doc: &[u8], endpoint: &Endpoint) -> Result<(String, String)> {
@@ -192,8 +193,8 @@ impl RosterBlobs {
     /// iroh-blobs is content-addressed — the `Downloader` BLAKE3-verifies the transferred data
     /// against the ticket's pinned hash, so a corrupt/substituted transfer fails the download.
     /// SECOND, this method recomputes `blake3(bytes)` and REJECTS a mismatch against the announce's
-    /// `roster_hash`, binding the fetched document to what the signed-announce chain named (spec
-    /// §4.3) — a distributor never `validate_for_install`s a doc the announce did not name.
+    /// `roster_hash`, binding the fetched document to what the signed-announce chain named
+    /// — a distributor never `validate_for_install`s a doc the announce did not name.
     ///
     /// The roster's OWN org-root signature is judged later by `validate_for_install` — this returns
     /// bytes, not trust.
@@ -204,7 +205,7 @@ impl RosterBlobs {
         endpoint: &Endpoint,
     ) -> Result<Vec<u8>> {
         let ticket: BlobTicket = ticket_str.parse().context("parse blob ticket")?;
-        // [RECONCILE-BLOB-API]: the `Downloader`'s `ContentDiscovery` bound maps providers to
+        // the `Downloader`'s `ContentDiscovery` bound maps providers to
         // `EndpointId` (NOT `EndpointAddr` — `EndpointAddr: !Into<EndpointId>`), so pass the ticket
         // addr's `.id`; the transport address is resolved via the endpoint's address lookup
         // (MemoryLookup in tests, DNS/pkarr in prod), matching the id-only dial the codebase uses.
@@ -231,12 +232,12 @@ impl RosterBlobs {
     }
 }
 
-/// A BOUNDED provider address book for roster-blob fetches (spec §11.2 P7; the AC's "no unbounded
-/// memory"). Wraps ONE `MemoryLookup` registered on the endpoint at startup; `note` records a
+/// A BOUNDED provider address book for roster-blob fetches (no unbounded memory from
+/// announces). Wraps ONE `MemoryLookup` registered on the endpoint at startup; `note` records a
 /// provider's addr, but only for a NEW id and only up to `cap` distinct ids — so the address book
 /// (and the `known` set) is bounded by distinct providers (≈ roster size), never per-announce.
 ///
-/// [RECONCILE R2]: rests on `MemoryLookup` being `Clone` (shared inner state, so the registered clone
+/// rests on `MemoryLookup` being `Clone` (shared inner state, so the registered clone
 /// sees later `add_endpoint_info`) and de-duplicating by endpoint id. Verify vs the pinned iroh; if
 /// `MemoryLookup` is not `Clone`, hold the sole instance here and register it lazily on first `note`.
 pub struct RosterAddrBook {
@@ -300,7 +301,7 @@ mod tests {
 
     #[test]
     fn roster_announce_round_trips_json() {
-        // The gossip payload (spec §4.3): serial + roster_hash (blake3 hex) + blob_ticket (opaque).
+        // The gossip payload: serial + roster_hash (blake3 hex) + blob_ticket (opaque).
         let a = RosterAnnounce {
             serial: 42,
             roster_hash: "blake3:deadbeef".into(),
@@ -336,7 +337,7 @@ mod tests {
             let (ticket, hash_hex) = provider.publish(&doc, &provider_ep).await.unwrap();
 
             // Fetcher endpoint seeded with the provider's addr (localhost has no discovery).
-            // [RECONCILE-BLOB-API]: the settled iroh 1.0.1 names are `add_endpoint_info`
+            // the settled iroh 1.0.1 names are `add_endpoint_info`
             // (NOT `add_address`) + `address_lookup() -> Result<_>` with a synchronous `add`
             // (NOT an async `.add(..).await`) — mirrors `cli/tests/hero_flow.rs`.
             let fetcher_ep = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
@@ -358,7 +359,7 @@ mod tests {
                 .unwrap();
             assert_eq!(fetched, doc, "blob fetch returns the exact bytes");
 
-            // A hash MISMATCH is rejected (the announce-to-document binding, spec §4.3).
+            // A hash MISMATCH is rejected (the announce-to-document binding).
             assert!(
                 fetcher
                     .fetch(&ticket, "blake3:0000", &fetcher_ep)

@@ -1,18 +1,17 @@
-//! Server-side mcpmesh-local/1 dispatch (spec §6.1). On each accepted connection the SERVER
+//! Server-side mcpmesh-local/1 dispatch. On each accepted connection the SERVER
 //! writes a `Hello` frame FIRST ("the first exchange ... identifies the api"), then reads
 //! request frames, dispatches on the `method` string, and writes JSON-RPC-shaped response
 //! frames back. Same-uid peers only (the seam's platform gate — peer-euid on unix, owner-only
 //! pipe DACL on windows) — the gate runs before the hello.
 //!
-//! Dispatch discipline (Task 1 carry-forward): the method is extracted with
+//! Dispatch discipline: the method is extracted with
 //! [`mcpmesh_local_api::method_of`] and params are deserialized PER-METHOD into the typed
 //! param structs local-api defines (`protocol.rs` — the one wire truth, so daemon/client
 //! shape drift is a compile error) — never by deserializing the whole message into
 //! `Request` (adjacent tagging rejects `params:{}` for parameterless methods, which a
-//! conforming third-party client may send). M2a answers `status`,
-//! `register_service`/`peer_add` (Task 9), and an internal `shutdown`.
-//! `open_session` (Task 10) is special: after that request the connection stops being
-//! JSON-RPC and becomes a raw MCP byte pipe the daemon dials + pumps (spec §8).
+//! conforming third-party client may send). Most verbs are plain request/response;
+//! `open_session` and `subscribe` are special: after those requests the connection stops
+//! being JSON-RPC and becomes a raw MCP byte pipe / a one-way event stream.
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,7 +31,7 @@ use crate::daemon::MeshState;
 use crate::ipc::{self, MAX_FRAME_BYTES};
 
 /// Live daemon state behind the control API. `mesh` is the endpoint + gate + serve handle
-/// the real daemon owns (Task 9); it is `None` in control-only construction (unit tests),
+/// the real daemon owns; it is `None` in control-only construction (unit tests),
 /// in which case `register_service`/`peer_add` fail gracefully. The `status` service/peer
 /// lists are read LIVE from the mesh's config + store on each call — there is no cached
 /// snapshot here. `shutdown` is the internal signal a `shutdown` request raises so the
@@ -54,11 +53,11 @@ impl DaemonState {
         }
     }
 
-    /// The full daemon state: the control server over the mesh half (Task 9).
+    /// The full daemon state: the control server over the mesh half.
     ///
     /// `pub` (like [`MeshState::new`](crate::daemon::MeshState::new)) so integration tests can
     /// assemble a serving `DaemonState` around a HERMETIC `MeshState` (temp config + store +
-    /// endpoint) and drive the real control handlers — e.g. the M2b `pair --remove` test calls
+    /// endpoint) and drive the real control handlers — e.g. the `pair --remove` test calls
     /// `daemon::remove_peer` over a state built this way, asserting on the store + config truth.
     pub fn with_mesh(stack_version: impl Into<String>, mesh: Arc<MeshState>) -> Self {
         Self {
@@ -117,7 +116,7 @@ pub async fn serve_control(mut listener: LocalListener, state: Arc<DaemonState>)
 }
 
 async fn handle_conn(stream: LocalStream, state: Arc<DaemonState>) -> Result<()> {
-    // Same-user gate BEFORE any frame (spec §11.2 P12): refuse other users pre-hello (peer-euid
+    // Same-user gate BEFORE any frame: refuse other users pre-hello (peer-euid
     // on unix; on windows the pipe DACL already enforced this at connect). A cross-user
     // connection attempt is security-relevant, so it is logged at `warn!` here (returning Ok
     // keeps the normal clean-close path at `debug!` in `serve_control`).
@@ -127,7 +126,7 @@ async fn handle_conn(stream: LocalStream, state: Arc<DaemonState>) -> Result<()>
     }
     let (read_half, mut write_half) = mcpmesh_local_api::transport::split_local(stream);
 
-    // The server speaks first: a `Hello` frame identifies the api (spec §6.1).
+    // The server speaks first: a `Hello` frame identifies the api.
     let hello = Hello {
         api: API_NAME.into(),
         api_version: API_VERSION.into(),
@@ -136,9 +135,9 @@ async fn handle_conn(stream: LocalStream, state: Arc<DaemonState>) -> Result<()>
     write_frame(&mut write_half, &serde_json::to_value(&hello)?).await?;
 
     let mut reader = FrameReader::new(tokio::io::BufReader::new(read_half), MAX_FRAME_BYTES);
-    // M2a note: control connections carry no framing-violation strike bound (unlike the
-    // mesh path in net::endpoint). Acceptable for M2a — the peer is same-uid, already
-    // trusted under P12/P14; a strike/close budget lands if/when this surface widens.
+    // NOTE: control connections carry no framing-violation strike bound (unlike the
+    // mesh path in net::endpoint). Acceptable — the peer is same-uid, already inside
+    // the trust boundary; a strike/close budget lands if/when this surface widens.
     loop {
         match reader.next().await? {
             None => return Ok(()), // client closed the connection
@@ -149,8 +148,8 @@ async fn handle_conn(stream: LocalStream, state: Arc<DaemonState>) -> Result<()>
                 write_frame(&mut write_half, &resp).await?;
             }
             Some(Inbound::Frame(req)) => {
-                // M2a note: the "shutdown" method string is matched here and in `dispatch`;
-                // the small duplication is acceptable for M2a.
+                // NOTE: the "shutdown" method string is matched here and in `dispatch`;
+                // the small duplication is deliberate (the ack shape stays in `dispatch`).
                 if method_of(&req) == Some("shutdown") {
                     // An explicit stop must ALWAYS stop: raise the shutdown signal FIRST
                     // (unconditionally), THEN best-effort ack. A client that sends `shutdown`
@@ -196,7 +195,7 @@ async fn handle_conn(stream: LocalStream, state: Arc<DaemonState>) -> Result<()>
     }
 }
 
-/// Drive a live event stream over a subscribed control connection (Task 6). Mirrors
+/// Drive a live event stream over a subscribed control connection. Mirrors
 /// [`open_session`](crate::daemon::open_session)'s upgrade: it consumes the write half for the
 /// subscription's lifetime. Sends the initial [`Snapshot`](crate::stream::StreamFrame::Snapshot)
 /// FIRST, then forwards every broadcast [`AuditRecord`](crate::audit::AuditRecord) as an
@@ -278,7 +277,7 @@ async fn handle_request(req: &Value, state: &DaemonState) -> Value {
                 .await
                 .map(unit),
         ),
-        // Unpair a peer (spec §4.2, `mcpmesh pair --remove`): the petname to drop.
+        // Unpair a peer: the petname to drop.
         // `remove_peer` revokes the peer's service authorization AND drops its identity row
         // (the inverse of the pairing grant) — see its fail-safe ordering.
         Some("peer_remove") => respond(
@@ -299,7 +298,7 @@ async fn handle_request(req: &Value, state: &DaemonState) -> Value {
                 .map(unit),
         ),
         Some("invite") => {
-            // Mint a pairing invite (spec §4.2) granting a service list ([`InviteParams`]
+            // Mint a pairing invite granting a service list ([`InviteParams`]
             // tolerates an absent list).
             let mesh = match state.mesh_required() {
                 Ok(mesh) => mesh,
@@ -314,7 +313,7 @@ async fn handle_request(req: &Value, state: &DaemonState) -> Value {
                 .await,
             )
         }
-        // Redeem a pairing invite (spec §4.2): the copyable `mcpmesh-invite:` line
+        // Redeem a pairing invite: the copyable `mcpmesh-invite:` line
         // ([`PairParams`] tolerates an absent field — an empty line simply fails to decode
         // → a clean pair error).
         Some("pair") => respond(
@@ -325,10 +324,10 @@ async fn handle_request(req: &Value, state: &DaemonState) -> Value {
             })
             .await,
         ),
-        // Install a signed roster from a local file (spec §4.3 manual path): the file `path`
-        // (a local file the same-uid daemon reads, P12/P14) and an OPTIONAL `org_root_pk`
+        // Install a signed roster from a local file: the file `path`
+        // (a local file the same-uid daemon reads) and an OPTIONAL `org_root_pk`
         // that pins the org root on first install. `install_roster` validates (rules 1–6),
-        // persists, hot-swaps the gate, and severs revoked sessions (D8).
+        // persists, hot-swaps the gate, and severs revoked sessions.
         Some("roster_install") => respond(
             id,
             "roster_install",
@@ -337,7 +336,7 @@ async fn handle_request(req: &Value, state: &DaemonState) -> Value {
             })
             .await,
         ),
-        // Pin the org root on a JOINER without a roster (spec §4.4 step 2, D5). `user_key` is
+        // Pin the org root on a JOINER without a roster. `user_key` is
         // a LOCAL path (the key never crosses the API). `org_join` validates the pk BEFORE
         // writing, then surgically pins the four `[identity]` keys under `reload_lock`. No
         // roster is installed.
@@ -349,9 +348,9 @@ async fn handle_request(req: &Value, state: &DaemonState) -> Value {
             })
             .await,
         ),
-        // Pin the HTTPS roster URL (`[roster].url`) in config (spec §4.3 M3c). Written by
+        // Pin the HTTPS roster URL (`[roster].url`) in config. Written by
         // `org create --roster-url` (operator) and by `join` when the org invite carries one
-        // (the joiner's FIRST-roster bootstrap, D5). `set_roster_url` writes it atomically
+        // (the joiner's FIRST-roster bootstrap). `set_roster_url` writes it atomically
         // under `reload_lock` (single-writer).
         Some("set_roster_url") => respond(
             id,
@@ -389,7 +388,7 @@ async fn handle_request(req: &Value, state: &DaemonState) -> Value {
             .await,
         ),
         Some("audit_summary") => {
-            // Summarize THIS node's LOCAL audit log (spec §11.3 local-only): read the daemon's OWN
+            // Summarize THIS node's LOCAL audit log: read the daemon's OWN
             // audit dir off the runtime (spawn_blocking — the fs house rule) and aggregate to
             // per-peer / per-service session counts. Never touches the network; params are ignored
             // (parameterless, like `status`). Works in control-only mode (an empty/absent dir → an
@@ -432,7 +431,7 @@ fn unit((): ()) -> Value {
 
 /// Dispatch one control request on its `method` string (never `from_value::<Request>` on
 /// the whole message — that rejects `params:{}` for parameterless methods). Returns a
-/// JSON-RPC-shaped response frame. Params are read per-method; M2a's implemented methods
+/// JSON-RPC-shaped response frame. Params are read per-method; the methods dispatched here
 /// are parameterless, so `status` ignores whatever `params` shape the client sent (omitted
 /// / null / `{}` all answered) — the tolerance a third-party client depends on.
 fn dispatch(req: &Value, state: &DaemonState) -> Value {
@@ -474,7 +473,7 @@ pub(crate) fn status_result(state: &DaemonState) -> Result<StatusResult> {
         }
         None => (Vec::new(), Vec::new(), None),
     };
-    // Advisory presence read (spec §10.1): the installed roster's devices joined with the live
+    // Advisory presence read: the installed roster's devices joined with the live
     // presence table (online = a non-expired heartbeat). ADVISORY — a display convenience; a device
     // with no heartbeat is `online: false` yet still a dial candidate. Empty (→ omitted) without a
     // roster. Surface-clean: flat vocabulary only (user_id/device_label/role/online).
@@ -489,7 +488,7 @@ pub(crate) fn status_result(state: &DaemonState) -> Result<StatusResult> {
         .mesh()
         .and_then(|mesh| mesh.self_binding())
         .map(|binding| binding.user_pk);
-    // Recent inviter-side pairing completions (display-only §4.2 ceremony aids, newest first):
+    // Recent inviter-side pairing completions (display-only ceremony aids, newest first):
     // a snapshot of the mesh's in-memory ring. Empty in a control-only daemon and after a
     // restart (in-memory by design — not trust data).
     let recent_pairings = state
@@ -499,7 +498,7 @@ pub(crate) fn status_result(state: &DaemonState) -> Result<StatusResult> {
     // Advisory reachability of paired peers, from the on-demand probe cache (spec: pairing-mode
     // liveness). Mirrors the `presence` read above: cached values returned immediately, with any
     // stale/missing entry refreshed on a background probe `reachability_of` spawns — status stays a
-    // non-blocking hot path. Surface-clean (§1.5): petnames + numbers only.
+    // non-blocking hot path. Surface-clean: petnames + numbers only.
     let reachability = state
         .mesh()
         .map(crate::daemon::reachability_of)
@@ -572,7 +571,7 @@ mod tests {
     }
 
     /// `status` tolerates whatever `params` shape a third-party client sends (omitted / null / {}) —
-    /// the parameterless-method leniency the spec guarantees (§6.1).
+    /// the parameterless-method leniency the spec guarantees.
     #[test]
     fn dispatch_status_tolerates_any_params_shape() {
         let st = control_only();

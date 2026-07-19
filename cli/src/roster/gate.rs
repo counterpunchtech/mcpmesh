@@ -1,6 +1,6 @@
-//! The roster-mode gate ([RECONCILE-D], spec §4.1). [`RosterGate`] resolves an endpoint via the
+//! The roster-mode gate. [`RosterGate`] resolves an endpoint via the
 //! installed [`RosterView`] (hot-swappable on install), degraded-aware. [`ComposedGate`] layers it
-//! over the pairing [`AllowlistGate`] with the §4.1 precedence (revocation → roster → pairing).
+//! over the pairing [`AllowlistGate`] with explicit precedence (revocation → roster → pairing).
 use std::sync::{Arc, RwLock};
 
 use mcpmesh_net::{EndpointId, PeerIdentity, TrustGate};
@@ -9,8 +9,8 @@ use mcpmesh_trust::roster::validate::{RosterState, RosterView};
 use crate::allowlist::AllowlistGate;
 use crate::util::epoch_now_i64 as now_epoch;
 
-/// Default degraded grace window (spec §4.3 `[roster].grace_period` default "72h"). Config
-/// override is threaded in T12; the gate takes the effective seconds at construction.
+/// Default degraded grace window. Config can
+/// override it; the gate takes the effective seconds at construction.
 pub const DEFAULT_GRACE_SECS: i64 = 72 * 3600;
 
 /// Roster-mode [`TrustGate`]: resolves an inbound endpoint to its user/device/group identity via
@@ -18,24 +18,24 @@ pub const DEFAULT_GRACE_SECS: i64 = 72 * 3600;
 /// view is behind an `RwLock<Option<Arc<..>>>` so [`install`](Self::install) HOT-SWAPS it live
 /// (the resolve path takes a cheap read lock, dropped before returning and NEVER held across an
 /// await — `TrustGate::resolve`/`is_revoked` are sync). An empty gate (no roster) resolves nothing
-/// — a pure-pairing daemon composes exactly like M2b.
+/// — a pure-pairing daemon composes exactly like a pairing-only build.
 pub struct RosterGate {
     view: RwLock<Option<Arc<RosterView>>>,
     grace_secs: i64,
     /// The last instant this node validated the installed roster as current via an authenticated
-    /// channel (spec §4.3 P13) — bumped by [`set_last_confirmed`](Self::set_last_confirmed) on every
-    /// confirmation event. `None` imposes NO freshness constraint (M3a back-compat: `empty`/`with_grace`
+    /// channel — bumped by [`set_last_confirmed`](Self::set_last_confirmed) on every
+    /// confirmation event. `None` imposes NO freshness constraint (`empty`/`with_grace`
     /// leave it `None`). Behind its own `RwLock` so a confirmation hot-updates it live, exactly like
     /// [`install`](Self::install) hot-swaps the view — the resolve/sever paths take a cheap read.
     last_confirmed: RwLock<Option<i64>>,
-    /// The freshness bound in seconds (spec §4.3 P13 `[roster].max_staleness`). `i64::MAX` in the M3a
+    /// The freshness bound in seconds. `i64::MAX` in the freshness-less
     /// constructors (`empty`/`with_grace`) → the staleness fold is never reached → expiry-governed only.
     max_staleness: i64,
 }
 
 impl RosterGate {
     /// A gate with no roster installed (pure-pairing default; also the startup state before load).
-    /// M3a back-compat: `last_confirmed = None`, `max_staleness = i64::MAX` → NO freshness constraint
+    /// `last_confirmed = None`, `max_staleness = i64::MAX` → NO freshness constraint
     /// (the effective state collapses to the expiry-only `state`).
     pub fn empty() -> Self {
         Self {
@@ -46,8 +46,8 @@ impl RosterGate {
         }
     }
 
-    /// A gate with a configured grace window but NO freshness constraint (M3a back-compat:
-    /// `last_confirmed = None`, `max_staleness = i64::MAX`). Retained for callers that want the
+    /// A gate with a configured grace window but NO freshness constraint
+    /// (`last_confirmed = None`, `max_staleness = i64::MAX`). Retained for callers that want the
     /// expiry-only degraded machine; the roster daemon uses [`with_freshness`](Self::with_freshness).
     pub fn with_grace(grace_secs: i64) -> Self {
         Self {
@@ -58,7 +58,7 @@ impl RosterGate {
         }
     }
 
-    /// The roster-daemon constructor (spec §4.3 P13): a configured grace window AND a freshness bound.
+    /// The roster-daemon constructor: a configured grace window AND a freshness bound.
     /// `last_confirmed` starts `None` (no constraint until the daemon loads/bootstraps it — the one-time
     /// upgrade grace) and is armed by [`set_last_confirmed`](Self::set_last_confirmed) on every
     /// confirmation event (URL poll ≥ installed, gossip install, manual install).
@@ -84,11 +84,11 @@ impl RosterGate {
     }
 
     /// The gate's EFFECTIVE roster state at `now_epoch` — the MORE-degraded of expiry and staleness
-    /// (spec §4.3, folding `last_confirmed`/`max_staleness` onto the expiry machine) — or `None` when
+    /// — or `None` when
     /// no roster is installed. Consulted by `resolve`: a DegradedStopped gate denies NEW inbound
     /// (`resolve → None → 401`), bounding NEW-connection adversarial staleness at `max_staleness +
     /// grace`. It is NOT consulted by `should_sever_now` (register-time only; cutting EXISTING
-    /// staleness-degraded sessions needs a periodic sweep — deferred to M4, see `serve_forever`).
+    /// staleness-degraded sessions needs the periodic sweep — see `serve_forever`).
     pub fn effective_state(&self, now_epoch: i64) -> Option<RosterState> {
         let view = self.view()?;
         Some(view.effective_state(
@@ -101,12 +101,12 @@ impl RosterGate {
 
     /// Hot-swap the installed roster view (install path / startup load). The very next `resolve`
     /// sees it — no gate rebuild. Called by the daemon after `RosterStore::install_from_file`
-    /// (T9/T10).
+    /// (the install path).
     pub fn install(&self, view: RosterView) {
         *self.view.write().expect("roster gate lock not poisoned") = Some(Arc::new(view));
     }
 
-    /// A snapshot of the installed view (for the D8 sever set + status), or `None`. The read lock
+    /// A snapshot of the installed view (for the sever set + status), or `None`. The read lock
     /// is released as the `Arc` clone returns — never held across an await.
     pub fn view(&self) -> Option<Arc<RosterView>> {
         self.view
@@ -119,13 +119,13 @@ impl RosterGate {
 impl TrustGate for RosterGate {
     /// Resolve a rostered device to `PeerIdentity{ name: user_id, user_id: Some, groups }`, or
     /// `None` (absent / revoked / degraded-STOPPED). In degraded-GRACE the roster still resolves
-    /// (existing behavior continues, spec §4.3) — the warning is surfaced daemon-side (T12).
+    /// (existing behavior continues) — the warning is surfaced daemon-side.
     fn resolve(&self, endpoint: &EndpointId) -> Option<PeerIdentity> {
         let view = self.view()?;
-        // Effective degraded-stopped (expiry OR staleness past grace, spec §4.3 P13) → roster
+        // Effective degraded-stopped (expiry OR staleness past grace) → roster
         // authorizes nothing: a stale/expired roster must not admit NEW connections. This is the
         // freshness bound for NEW inbound (existing sessions are re-evaluated only on install/restart;
-        // a time-triggered staleness sweep is M4 — see `serve_forever`).
+        // the time-triggered staleness sweep runs separately — see `serve_forever`).
         if self.effective_state(now_epoch()) == Some(RosterState::DegradedStopped) {
             return None;
         }
@@ -144,14 +144,14 @@ impl TrustGate for RosterGate {
 
     /// Is this endpoint revoked by the installed roster? Honored regardless of degraded state
     /// (fail-closed) — even a degraded-STOPPED roster still enforces its last-known revocations.
-    /// The composed gate consults this FIRST (spec §4.1 precedence 1); an empty gate → `false`.
+    /// The composed gate consults this FIRST; an empty gate → `false`.
     fn is_revoked(&self, endpoint: &EndpointId) -> bool {
         self.view()
             .map(|v| v.is_revoked(endpoint.as_bytes()))
             .unwrap_or(false)
     }
 
-    /// The roster-resolved user_id for the D8 sever discriminator: `Some` IFF this endpoint would
+    /// The roster-resolved user_id for the sever discriminator: `Some` IFF this endpoint would
     /// resolve via the ROSTER right now (absent/revoked/degraded-stopped → `None`), reusing the exact
     /// `resolve` precedence. A purely-paired endpoint (not in the roster) is `None`, so it is never
     /// severed by a roster install even though its `PeerEntry` may carry a verified binding user_id.
@@ -160,15 +160,15 @@ impl TrustGate for RosterGate {
     }
 }
 
-/// The daemon's composed trust gate (spec §4.1): pairing ∪ roster with explicit precedence.
+/// The daemon's composed trust gate: pairing ∪ roster with explicit precedence.
 ///  1. the installed roster's `revoked_endpoints` are consulted FIRST — a revoked endpoint is
 ///     refused even if a pair entry exists (revocation wins over pairing, across all ALPNs);
 ///  2. an endpoint present (active) in the roster resolves to its ROSTER identity even if a pair
 ///     entry exists (roster masks the pair petname);
 ///  3. otherwise fall through to the pair entry (pairing mode continues untouched).
 ///
-/// With an empty roster this is exactly the M2b `AllowlistGate` behavior (falls through for
-/// everything) — so every M2b pairing test/flow is preserved.
+/// With an empty roster this is exactly the plain `AllowlistGate` behavior (falls through for
+/// everything) — so every pairing test/flow is preserved.
 pub struct ComposedGate {
     roster: Arc<RosterGate>,
     pairs: Arc<AllowlistGate>,
@@ -178,14 +178,14 @@ impl ComposedGate {
     pub fn new(roster: Arc<RosterGate>, pairs: Arc<AllowlistGate>) -> Self {
         Self { roster, pairs }
     }
-    /// The roster gate handle — the daemon keeps it to hot-swap on install + compute the D8 sever set.
+    /// The roster gate handle — the daemon keeps it to hot-swap on install + compute the sever set.
     pub fn roster(&self) -> &Arc<RosterGate> {
         &self.roster
     }
 }
 
 impl TrustGate for ComposedGate {
-    /// The D8 sever discriminator (§4.3 rule 6): roster-resolved IFF the endpoint is in the roster
+    /// The sever discriminator: roster-resolved IFF the endpoint is in the roster
     /// (delegates to `RosterGate::roster_user`). Deliberately NOT `resolve(endpoint).user_id`: a
     /// paired-only peer resolves to its PAIR identity which — since the self-sovereign-binding
     /// feature — carries a `user_id`, so keying the sever on `identity.user_id` would sever
@@ -195,11 +195,11 @@ impl TrustGate for ComposedGate {
     }
 
     fn resolve(&self, endpoint: &EndpointId) -> Option<PeerIdentity> {
-        // (1) revocation wins, all ALPNs (§4.1 precedence 1).
+        // (1) revocation wins, all ALPNs.
         if self.roster.is_revoked(endpoint) {
             return None;
         }
-        // (2) roster masks the pair entry (§4.1 precedence 2).
+        // (2) roster masks the pair entry.
         if let Some(id) = self.roster.resolve(endpoint) {
             return Some(id);
         }
@@ -209,7 +209,7 @@ impl TrustGate for ComposedGate {
         self.pairs.resolve(endpoint)
     }
 
-    /// The D8 check-register recheck (T8) asks the LIVE gate whether an endpoint is currently
+    /// The check-register recheck asks the LIVE gate whether an endpoint is currently
     /// revoked. Delegate to the installed roster's revoked set — honored regardless of degraded
     /// state (fail-closed). This is what closes the TOCTOU race: a connection registering after a
     /// revoking install sees `true` here and self-closes.
@@ -217,9 +217,9 @@ impl TrustGate for ComposedGate {
         self.roster.is_revoked(endpoint)
     }
 
-    /// The register-time D8 recheck (T4): sever iff the endpoint is REVOKED (revocation wins, all
+    /// The register-time recheck: sever iff the endpoint is REVOKED (revocation wins, all
     /// ALPNs), OR it was roster-resolved (`roster_user.is_some()`) AND is now ABSENT from the
-    /// installed roster (the dropped-from-roster half M3a left open). CRITICAL: the absence test
+    /// installed roster (the dropped-from-roster half). CRITICAL: the absence test
     /// consults the ROSTER gate's own `view().resolve` (NOT the composed resolve) — a dropped
     /// endpoint that ALSO holds a pair entry must still be caught (`roster.resolve → None` even when
     /// `pairs.resolve → Some`). Mirrors `mcpmesh_net::should_sever` for one endpoint against the
@@ -229,7 +229,7 @@ impl TrustGate for ComposedGate {
     /// connection), and staleness is time-triggered with no event, so it cannot re-evaluate an
     /// already-established session as the clock crosses `last_confirmed + max_staleness + grace`. The
     /// freshness bound is enforced at `resolve` (NEW inbound → `None` → 401); cutting EXISTING
-    /// roster-authorized sessions on staleness needs a periodic sweep, deferred to M4 (see
+    /// roster-authorized sessions on staleness needs the periodic sweep (see
     /// `serve_forever`). An `effective_state == DegradedStopped` arm here would also over-reach
     /// (severing purely-paired peers, `roster_user == None`, whose authorization is independent of the
     /// org roster) while delivering nothing for roster peers (already denied at `resolve`).
@@ -255,7 +255,7 @@ mod tests {
     // Build a RosterView for GATE tests via `load_installed` (verifies the sig + structural rules
     // but NOT expiry/serial) — so an intentionally-EXPIRED `expires` (the degraded tests) still
     // yields a view; degraded state is then computed at resolve-time from the real clock. (The
-    // install-time rule-3 rejection is exercised in T3, not here.)
+    // install-time expiry rejection is exercised in the trust crate's tests, not here.)
     fn view(
         serial: u64,
         expires: &str,
@@ -325,7 +325,7 @@ mod tests {
     #[test]
     fn is_revoked_and_resolve_honored_through_dyn_dispatch() {
         // Regression pin: production touches the gate ONLY through `Arc<dyn TrustGate>`
-        // (ComposedGate T6, the accept loop). A concrete-receiver call would hit an inherent
+        // (ComposedGate, the accept loop). A concrete-receiver call would hit an inherent
         // `is_revoked` if one existed, masking a regression; the dyn path goes through the vtable,
         // so it FAILS loudly if `is_revoked` ever moves back off the trait impl (fail-OPEN).
         let gate = RosterGate::empty();
@@ -394,7 +394,7 @@ mod tests {
         assert_eq!(id.user_id.as_deref(), Some("alice"));
         assert_eq!(id.name, "alice"); // NOT "p-2"
 
-        // (b) revoked + paired → REFUSED (revocation wins over the pair entry, spec §4.1(1)).
+        // (b) revoked + paired → REFUSED (revocation wins over the pair entry).
         assert!(composed.resolve(&[3u8; 32].into()).is_none());
 
         // (c) paired only (not in roster) → the PAIR identity.
@@ -438,7 +438,7 @@ mod tests {
             .resolve(&[7u8; 32].into())
             .expect("paired peer resolves");
         assert_eq!(id.user_id.as_deref(), Some("b64u:BOB"));
-        // …but it is NOT roster-resolved, so the D8 sever discriminator is None.
+        // …but it is NOT roster-resolved, so the sever discriminator is None.
         assert_eq!(
             composed.roster_user(&[7u8; 32].into()),
             None,
@@ -508,7 +508,7 @@ mod tests {
         use std::sync::Arc;
         // [3;32] is revoked+paired (the exhaustive test's arm (b) setup). We consult the gate ONLY
         // through `&dyn TrustGate` — the PRODUCTION path: the daemon holds `Arc<dyn TrustGate>` and
-        // T8's D8 check-register recheck calls `is_revoked` through the vtable to close the
+        // The check-register recheck calls `is_revoked` through the vtable to close the
         // register-after-revoke TOCTOU race. The other two ComposedGate tests only call `resolve()`,
         // so `ComposedGate::is_revoked` itself is otherwise untested; without this pin an inherent
         // regression would silently hit the trait default `false` = revocation fail-OPEN on the recheck.
@@ -554,7 +554,7 @@ mod tests {
         // Roster-resolved AND still active → KEEP.
         assert!(!g.should_sever_now(&[2u8; 32].into(), Some("alice")));
         // Was roster-resolved (roster_user Some) but now ABSENT from the roster → SEVER (the dropped
-        // half M3a left open; [4;32] is in NO user entry).
+        // half; [4;32] is in NO user entry).
         assert!(g.should_sever_now(&[4u8; 32].into(), Some("bob")));
         // Pairing-only (roster_user None), not revoked, not in roster → KEEP (never severed by roster).
         assert!(!g.should_sever_now(&[4u8; 32].into(), None));

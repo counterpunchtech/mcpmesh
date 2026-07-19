@@ -1,7 +1,7 @@
-//! The daemon's OUTBOUND dial machinery (spec §8/§10) plus the session pipe: petname/person →
+//! The daemon's OUTBOUND dial machinery plus the session pipe: petname/person →
 //! endpoint resolution, the staggered person→device race, the explicit dial timeout, and the
-//! control↔mesh byte pipe with its §6.3 service injection. Split out of `daemon.rs` mechanically
-//! (M4 hygiene) — no API change; `daemon` re-exports the public entry points.
+//! control↔mesh byte pipe with its service-name injection. Split out of `daemon.rs`
+//! mechanically — no API change; `daemon` re-exports the public entry points.
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,8 +13,8 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use super::MeshState;
 
-/// Resolve `peer` to a session over the mesh, preferring the roster PERSON→DEVICE path (spec §10.1)
-/// and falling back to the M1/M2 single-petname path (spec §10.2).
+/// Resolve `peer` to a session over the mesh, preferring the roster PERSON→DEVICE path
+/// and falling back to the single-petname path.
 ///
 /// **Person→device (roster mode).** When `peer` names a roster USER that has active devices
 /// (`mesh.roster.view().devices_for_user(peer)` non-empty), its devices are dialed as a STAGGERED
@@ -33,7 +33,7 @@ use super::MeshState;
 ///    own gate still authorizes us on their side; racing adds NO new trust decision on our side beyond
 ///    "this endpoint is an active roster device of the named user."
 ///
-/// **Single-petname fallback (spec §10.2).** Otherwise resolve the petname to its endpoint_id via the
+/// **Single-petname fallback.** Otherwise resolve the petname to its endpoint_id via the
 /// allowlist store, build an id-only [`iroh::EndpointAddr`], and dial — iroh's discovery (DNS/pkarr
 /// under the N0 preset) resolves addresses FROM the id. On LOCALHOST tests the connecting endpoint is
 /// seeded via a `MemoryLookup` on `endpoint.address_lookup()`, so the SAME id-only dial resolves
@@ -43,7 +43,7 @@ pub async fn dial_service(
     peer: &str,
     service: &str,
 ) -> Result<SessionTransport> {
-    // Person→device (spec §10.1): `peer` names a roster user with active devices → staggered race.
+    // Person→device: `peer` names a roster user with active devices → staggered race.
     if let Some(view) = mesh.roster.view() {
         let devices = view.devices_for_user(peer);
         if !devices.is_empty() {
@@ -53,7 +53,7 @@ pub async fn dial_service(
                 .with_context(|| format!("dial {peer}/{service}"));
         }
     }
-    // Single-petname fallback (spec §10.2): resolve the allowlist petname → endpoint_id → dial-by-id.
+    // Single-petname fallback: resolve the allowlist petname → endpoint_id → dial-by-id.
     let peer_owned = peer.to_string();
     let store = mesh.store.clone();
     let id_bytes = tokio::task::spawn_blocking(move || store.endpoint_id_for(&peer_owned))
@@ -62,18 +62,18 @@ pub async fn dial_service(
         .with_context(|| format!("peer '{peer}' is not in the allowlist"))?;
     let endpoint_id = iroh::EndpointId::from_bytes(&id_bytes)
         .map_err(|e| anyhow::anyhow!("stored endpoint id for '{peer}' is invalid: {e}"))?;
-    // Dial by id: an address-less EndpointAddr that discovery resolves (spec §10.2).
+    // Dial by id: an address-less EndpointAddr that discovery resolves.
     let addr = iroh::EndpointAddr::from(endpoint_id);
     connect_with_timeout(&mesh.endpoint, addr, service, DIAL_TIMEOUT)
         .await
         .with_context(|| format!("dial {peer}/{service}"))
 }
 
-/// The person→device dial STAGGER (spec §10.1): a live candidate is not blocked waiting on a
+/// The person→device dial STAGGER: a live candidate is not blocked waiting on a
 /// dead/stalling one — the next candidate joins the race this long after the previous.
 const DIAL_STAGGER: Duration = Duration::from_millis(500);
 
-/// The explicit application-level dial timeout (spec §16 M4 hardening). Defense-in-depth over iroh's
+/// The explicit application-level dial timeout. Defense-in-depth over iroh's
 /// transport idle timeouts — SYMMETRIC across both dial paths (the person→device race AND the
 /// single-petname fallback) so a dead/stalling peer fails a dial in a bounded, asserted window.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(20);
@@ -93,7 +93,7 @@ pub(crate) async fn connect_with_timeout(
     }
 }
 
-/// Order a person's active devices into the dial-candidate sequence (spec §10.1). `devices` is the
+/// Order a person's active devices into the dial-candidate sequence. `devices` is the
 /// roster order from [`RosterView::devices_for_user`] (primary→mirror, deterministic within role);
 /// this RE-ORDERS candidates WITHIN each role by presence recency (most-recent first). Presence is
 /// ADVISORY: a device with NO presence entry keeps its roster position AFTER the present ones in its
@@ -137,7 +137,7 @@ pub(crate) fn dial_role_rank(role: &str) -> u8 {
     }
 }
 
-/// Staggered-race dial (spec §10.1). Dials `candidates` in order, launching the next one
+/// Staggered-race dial. Dials `candidates` in order, launching the next one
 /// `DIAL_STAGGER` (500 ms) after the previous if no session has won yet — OR immediately if the
 /// in-flight dials have all already failed (a fast-failing candidate doesn't impose the full 500 ms
 /// wait). The FIRST [`connect`] success WINS: its transport is returned and the in-flight losing
@@ -220,7 +220,7 @@ pub async fn race_dial(
     }
 }
 
-/// Dial ONE roster device endpoint over the mesh (spec §10.2 dial-by-id, one racer of [`race_dial`]).
+/// Dial ONE roster device endpoint over the mesh.
 /// The endpoint_id IS the device's ed25519 pubkey, so `connect` reaches the holder of that key or
 /// fails — no MITM among racers. An id-only [`iroh::EndpointAddr`] lets discovery (or the localhost
 /// `MemoryLookup`) resolve the address.
@@ -235,10 +235,10 @@ async fn dial_one(
     connect_with_timeout(endpoint, addr, service, DIAL_TIMEOUT).await
 }
 
-/// Pipe an established mesh session to/from the control connection (spec §8). The FIRST
+/// Pipe an established mesh session to/from the control connection. The FIRST
 /// control frame — the AI client's `initialize` — is augmented with the reserved
-/// `_meta["mcpmesh/service"]` naming the service (§7.2; the SINGLE enumerated exception to
-/// verbatim pass-through, §6.3/D6) before it is forwarded to the peer, so the far side's
+/// `_meta["mcpmesh/service"]` naming the service (the SINGLE enumerated exception to
+/// verbatim pass-through) before it is forwarded to the peer, so the far side's
 /// `select_service` can route it. Then frames flow both directions verbatim until either
 /// side ends. The two directions run as independent concurrent loops (one codec) — the same
 /// anti-deadlock discipline as `backends::pump`; this is a sibling
@@ -285,7 +285,7 @@ where
         }
     };
     // Direction B: mesh peer -> control. Carries the peer's responses AND any synthesized
-    // -32054 refusal, verbatim (spec §8). The `while let` exits on peer EOF / a severed
+    // -32054 refusal, verbatim. The `while let` exits on peer EOF / a severed
     // session / a framing violation (all `recv_value` non-`Ok(Some)` outcomes).
     let to_control = async {
         while let Ok(Some(frame)) = transport.recv_value().await {
@@ -308,8 +308,8 @@ where
 
 /// Set `params._meta["mcpmesh/service"] = service` on the `initialize` frame, creating `params`
 /// and `_meta` as objects if absent and REPLACING a non-object `_meta` (never merging — the
-/// §6.3 seam-note rule for the reserved-key injector). This is the one edit the otherwise
-/// verbatim proxy path makes to a frame (§8/D6). A non-object frame is forwarded untouched —
+/// rule for the reserved-key injector). This is the one edit the otherwise
+/// verbatim proxy path makes to a frame. A non-object frame is forwarded untouched —
 /// the platform does not interpret MCP semantics; the far side rejects it.
 fn inject_service(mut frame: Value, service: &str) -> Value {
     let Some(obj) = frame.as_object_mut() else {
@@ -339,7 +339,7 @@ mod tests {
     use super::*;
 
     /// `inject_service` sets `params._meta["mcpmesh/service"]`, creating/replacing a non-object
-    /// `params`/`_meta` and leaving a non-object frame untouched (§6.3 service injection).
+    /// `params`/`_meta` and leaving a non-object frame untouched.
     #[test]
     fn inject_service_sets_meta_across_shapes() {
         use serde_json::json;

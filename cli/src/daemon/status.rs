@@ -1,5 +1,5 @@
 //! The `status`-facing projections: live roster-mode status, the advisory presence read, and
-//! the surface-clean (§1.5) service/peer views — all computed LIVE from the config, store,
+//! the surface-clean service/peer views — all computed LIVE from the config, store,
 //! and gate on each call, never from a cached snapshot.
 
 use std::sync::Arc;
@@ -14,20 +14,20 @@ use crate::util::epoch_now_i64;
 
 use super::{MeshState, dial};
 
-/// Live roster-mode status for `status` (spec §4.4). **Computed LIVE from `mesh.roster.view()` on
+/// Live roster-mode status for `status`. **Computed LIVE from `mesh.roster.view()` on
 /// each call — NOT a cached snapshot (DECLARED):** the roster view is already hot-swapped into the
 /// gate on install, so a live read is cheap AND always-current, avoiding the display-only staleness
-/// the pairing-grant snapshot path carries. Surface-clean (§1.5): only org_id, serial, a plain state
+/// the pairing-grant snapshot path carries. Surface-clean: only org_id, serial, a plain state
 /// word, and the org-root FINGERPRINT in short words — never raw keys/EndpointIds/roster path.
 ///
 /// Three cases (DECLARED): (1) a roster is installed → the live `state` word. (2) NO roster installed
-/// but an org root is PINNED (post-`join`, pre-approval — D5) → `"pending"` with serial 0 + the
+/// but an org root is PINNED (post-`join`, pre-approval) → `"pending"` with serial 0 + the
 /// pinned org-root fingerprint, so `status` shows the anchor immediately after `join`. (3) a
-/// pure-pairing daemon (no `org_root_pk` pin at all) → `None`, no roster block (byte-identical to M2b).
+/// pure-pairing daemon (no `org_root_pk` pin at all) → `None`, no roster block.
 ///
 /// State mapping (DECLARED): `Approved → "approved"`, `DegradedGrace → "degraded"`,
 /// `DegradedStopped → "stopped"`; no roster + pinned org → `"pending"`. The word is the gate's OWN
-/// [`RosterGate::effective_state`] (expiry ∨ staleness, spec §4.3 P13) — the SAME computation `resolve`
+/// [`RosterGate::effective_state`] (expiry ∨ staleness) — the SAME computation `resolve`
 /// decides on — so `status` reflects STALENESS, not just expiry.
 ///
 /// Missing/unparseable pin (DECLARED): the org-root FINGERPRINT is derived from the pinned config
@@ -40,7 +40,7 @@ pub(crate) fn roster_status(mesh: &Arc<MeshState>, cfg: Option<&Config>) -> Opti
     // `None` models a transient read error, which must not fail `status`: fall back to an empty
     // fingerprint (and the "pending"/None cases below). Only the pinned org-root pk / org_id are
     // read from it — the state word comes from the gate's own `effective_state`.
-    // The pinned org-root FINGERPRINT in short words (§4.4 carve-out). Decode the config b64u
+    // The pinned org-root FINGERPRINT in short words. Decode the config b64u
     // `org_root_pk` → 32 bytes → fingerprint_words; a missing/unparseable pin → empty (no panic).
     let org_root_fingerprint = cfg
         .and_then(|c| c.identity.org_root_pk.as_deref())
@@ -49,7 +49,7 @@ pub(crate) fn roster_status(mesh: &Arc<MeshState>, cfg: Option<&Config>) -> Opti
         .unwrap_or_default();
     match mesh.roster.view() {
         Some(view) => {
-            // The state word from the gate's OWN `effective_state` (expiry ∨ staleness, spec §4.3 P13)
+            // The state word from the gate's OWN `effective_state` (expiry ∨ staleness)
             // — the SAME computation `resolve` decides on, so `status` reflects staleness, not just
             // expiry. `view` is Some here, so `effective_state` is Some (the `unwrap_or` never fires).
             let state = match mesh
@@ -69,7 +69,7 @@ pub(crate) fn roster_status(mesh: &Arc<MeshState>, cfg: Option<&Config>) -> Opti
             })
         }
         None => {
-            // Post-`join`, pre-approval: a pinned org root but no roster yet (D5) → "pending". A
+            // Post-`join`, pre-approval: a pinned org root but no roster yet → "pending". A
             // pure-pairing daemon (no `org_root_pk` pin) has nothing to surface → None → no block.
             let cfg = cfg?;
             cfg.identity.org_root_pk.as_deref()?;
@@ -83,13 +83,13 @@ pub(crate) fn roster_status(mesh: &Arc<MeshState>, cfg: Option<&Config>) -> Opti
     }
 }
 
-/// The advisory presence read for `status` (spec §10.1). Enumerates every ACTIVE roster device and
+/// The advisory presence read for `status`. Enumerates every ACTIVE roster device and
 /// joins it with the presence table: display fields (user_id, device_label, role) come from the
 /// installed roster; `online` is whether the table holds a LIVE (non-expired) heartbeat for that
 /// endpoint (`PresenceTable::active`). ADVISORY-ONLY — a display convenience; NOTHING here authorizes
 /// a dial. A device with no heartbeat reports `online: false` yet remains a full dial candidate
 /// (absence never removes one). Empty in a pure-pairing daemon / before any roster is installed (the
-/// field then serializes away). **Surface-clean (§1.5/§17):** the endpoint_id is used ONLY to join the
+/// field then serializes away). **Surface-clean:** the endpoint_id is used ONLY to join the
 /// roster and presence tables — the output carries FLAT vocabulary alone (user_id/device_label/role/
 /// online), never an EndpointId/pubkey/hash. Stable display order: by user, primary before mirror,
 /// then label.
@@ -123,7 +123,7 @@ pub(crate) fn presence_peers(mesh: &Arc<MeshState>) -> Vec<PresencePeer> {
 }
 
 /// The `status`-facing view of the configured services (name, allow, backend KIND only — no
-/// command/path, §17). Malformed entries are omitted (they are not served either).
+/// command/path). Malformed entries are omitted (they are not served either).
 pub(crate) fn service_infos(cfg: &Config) -> Vec<ServiceInfo> {
     cfg.services
         .iter()
@@ -143,7 +143,7 @@ pub(crate) fn service_infos(cfg: &Config) -> Vec<ServiceInfo> {
 }
 
 /// The `status`-facing view of known peers (petname + granted services — never the
-/// EndpointId, §1.5). Fails open on a corrupt store row (see [`PeerStore::list`]).
+/// EndpointId). Fails open on a corrupt store row (see [`PeerStore::list`]).
 pub(crate) fn peer_infos(store: &PeerStore) -> Vec<PeerInfo> {
     store
         .list()
@@ -153,7 +153,7 @@ pub(crate) fn peer_infos(store: &PeerStore) -> Vec<PeerInfo> {
             name: e.petname,
             services: e.services,
             // The peer's proven self-sovereign user_id (from a verified pairing binding), or `None`
-            // for a petname-only / `internal peer add` peer. A §1.5-clean opaque id, not a key.
+            // for a petname-only / `internal peer add` peer. A surface-clean opaque id, not a key.
             user_id: e.user_id,
         })
         .collect()
@@ -282,7 +282,7 @@ mod tests {
     }
 
     /// The recent-pairings ring is BOUNDED (cap 8, oldest dropped), snapshots NEWEST FIRST, and
-    /// `status_result` surfaces it (display-only §4.2 ceremony state; empty in a control-only
+    /// `status_result` surfaces it (display-only ceremony state; empty in a control-only
     /// daemon — covered by control.rs's snapshot tests, whose StatusResult omits the field).
     #[tokio::test]
     async fn recent_pairings_ring_is_bounded_newest_first_and_surfaced_by_status() {

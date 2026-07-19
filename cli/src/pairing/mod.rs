@@ -1,10 +1,10 @@
-//! Pairing invites (spec §4.2). An invite is a one-time bearer credential the inviter
+//! Pairing invites. An invite is a one-time bearer credential the inviter
 //! mints and hands out-of-band; the redeemer dials the inviter's addr on ALPN
 //! `mcpmesh/pair/1`, proves the secret, and both write mutual [`PeerEntry`] rows.
 //!
 //! This module is pure types + logic (no iroh, no daemon): the [`Invite`] wire type + its
 //! `mcpmesh-invite:` line codec, and [`LiveInvites`] — the daemon's in-RAM registry of
-//! outstanding invites. The rendezvous handler (T5/T6) mints into and redeems out of it.
+//! outstanding invites. The rendezvous handler mints into and redeems out of it.
 //!
 //! [`PeerEntry`]: crate::allowlist::PeerEntry
 pub mod rendezvous;
@@ -15,16 +15,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
 
-/// The scheme prefix of the single copyable pairing artifact (spec §1.5 surface #2).
+/// The scheme prefix of the single copyable pairing artifact.
 const INVITE_SCHEME: &str = "mcpmesh-invite:";
 
-/// A one-time pairing invite (spec §4.2). Serialized to the `mcpmesh-invite:` line, carried
+/// A one-time pairing invite. Serialized to the `mcpmesh-invite:` line, carried
 /// out-of-band, and redeemed once over `mcpmesh/pair/1`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Invite {
-    /// Single-use bearer credential (32 CSPRNG bytes — minted in T5).
+    /// Single-use bearer credential (32 CSPRNG bytes).
     pub secret: [u8; 32],
-    /// The redeemer verifies the TLS peer id == this (P3 address-swap defense, T6).
+    /// The redeemer verifies the TLS peer id == this (the address-swap defense).
     pub inviter_id: [u8; 32],
     /// The inviter's iroh `EndpointAddr` as `serde_json` — dialable, so pairing needs NO
     /// discovery (works on localhost).
@@ -33,13 +33,13 @@ pub struct Invite {
     pub petname: String,
     /// Services the redeemer is granted (may dial on the inviter).
     pub services: Vec<String>,
-    /// Absolute expiry, epoch seconds; `≤ now + 24h`. The daemon enforces (T5/T6).
+    /// Absolute expiry, epoch seconds; `≤ now + 24h`. The daemon enforces it.
     pub expires_at_epoch: u64,
 }
 
 impl Invite {
     /// One `mcpmesh-invite:<payload>` line. Payload = base32(no-pad) of the JSON-serialized
-    /// invite (opaque to humans; the only artifact copied out-of-band — spec §1.5 surface
+    /// invite (opaque to humans; the only artifact copied out-of-band — surface
     /// #2). Base32-nopad keeps the line to `[A-Z2-7]` — copy/paste-safe, case-forgiving,
     /// no `=` padding.
     pub fn encode(&self) -> String {
@@ -79,7 +79,7 @@ pub enum Redeem {
     Unknown,
 }
 
-/// The daemon's in-RAM registry of outstanding invites (spec §4.2), keyed by secret.
+/// The daemon's in-RAM registry of outstanding invites, keyed by secret.
 ///
 /// **Model.** The redeemer SENDS a secret; the daemon LOOKS IT UP. A wrong/absent secret is
 /// simply not in the map → [`Redeem::Unknown`], NO state change — so probing random secrets can
@@ -90,7 +90,7 @@ pub enum Redeem {
 /// invites would let a stranger invalidate every live invite), so there is none. Map growth is
 /// bounded by expiry — [`remove_expired`](Self::remove_expired) is reaped before each production
 /// mint (`daemon::mint_invite`). Stranger-flood hardening of the by-design-open pair ALPN (rate
-/// limit / read timeout / accept-gate) is an M4 item (spec §4.2/P7), not a per-invite cap.
+/// limit / read timeout / accept-gate) lives in the accept loop, not in a per-invite cap.
 #[derive(Default)]
 pub struct LiveInvites {
     inner: Mutex<HashMap<[u8; 32], Invite>>,
@@ -134,8 +134,8 @@ impl LiveInvites {
         }
     }
 
-    /// Number of outstanding invites — the pair rendezvous's live-invite ACCEPT-GATE check
-    /// (spec §7.1/§4.2/D8 "the rendezvous is only open while an invite is live"). The daemon's
+    /// Number of outstanding invites — the live-invite ACCEPT-GATE check: the pair
+    /// rendezvous is only "open" while an invite is live. The daemon's
     /// `spawn_accept_loop` `ALPN_PAIR` branch calls this BEFORE `handle_inviter_side`: `count() == 0`
     /// → the pair dial is closed immediately (no bi-stream, no hello, no handler task). Advisory /
     /// coarse (any-invite-live): a racing burn of the last invite is caught authoritatively by

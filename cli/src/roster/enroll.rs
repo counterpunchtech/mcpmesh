@@ -1,7 +1,7 @@
-//! The three roster-enrollment codes (spec §4.4) — the opaque one-line strings a human copies:
+//! The three roster-enrollment codes — the opaque one-line strings a human copies:
 //! `mcpmesh-org:` (from `org create`, to a joiner), `mcpmesh-join:` (from `join`, to the operator),
 //! `mcpmesh-device:` (from a new machine, for `devices add` on an enrolled device). Each is
-//! `scheme + base32-nopad(JSON)`, EXACTLY the pairing `mcpmesh-invite:` codec ([RECONCILE-A]) —
+//! `scheme + base32-nopad(JSON)`, EXACTLY the pairing `mcpmesh-invite:` codec () —
 //! copy/paste-safe `[A-Z2-7]`, opaque to humans. Key/id/sig FIELDS inside stay `b64u:` so they copy
 //! verbatim into a roster. Pure types + codec; the device-binding CRYPTO is `mcpmesh_trust::roster::sign`.
 use anyhow::Context;
@@ -12,8 +12,8 @@ const ORG_SCHEME: &str = "mcpmesh-org:";
 const JOIN_SCHEME: &str = "mcpmesh-join:";
 const DEVICE_SCHEME: &str = "mcpmesh-device:";
 
-/// From `org create`, handed to a joiner (spec §4.4 step 1): the org id, the org-root PUBLIC key
-/// the joiner pins, and an optional roster URL (M3c distribution; `None` in M3b).
+/// From `org create`, handed to a joiner: the org id, the org-root PUBLIC key
+/// the joiner pins, and an optional roster URL (`None` when the org serves none).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrgInviteCode {
     pub org_id: String,
@@ -22,12 +22,12 @@ pub struct OrgInviteCode {
     pub roster_url: Option<String>,
 }
 
-/// From `join`, handed to the operator (spec §4.4 step 2): the display name, a requested stable
-/// user_id ([RECONCILE-D]), the joiner's user PUBLIC key, this device's endpoint id + label, and the
-/// user-key device-binding signature the operator verifies ([RECONCILE-E]). The `user_pk` +
+/// From `join`, handed to the operator: the display name, a requested stable
+/// user_id (), the joiner's user PUBLIC key, this device's endpoint id + label, and the
+/// user-key device-binding signature the operator verifies (). The `user_pk` +
 /// `device_endpoint_id` are additionally cross-checked out-of-band via a **join-code fingerprint**
-/// read back on BOTH sides (T8/T9) — the enrollment analog of the pairing SAS, closing the join-code
-/// substitution MITM (nothing else binds person→user_pk; see the T8/T9 DECLAREs).
+/// read back on BOTH sides — the enrollment analog of the pairing SAS, closing the join-code
+/// substitution MITM (nothing else binds person→user_pk).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinCode {
     pub display_name: String,
@@ -38,7 +38,7 @@ pub struct JoinCode {
     pub binding_sig: String, // b64u: Ed25519_userkey(domain ∥ user_pk ∥ endpoint_id)
 }
 
-/// From a NEW machine, for `devices add` on an already-enrolled device (spec §4.4): only the new
+/// From a NEW machine, for `devices add` on an already-enrolled device: only the new
 /// device's endpoint id + a label — NO keys (the enrolled device signs the binding with the shared
 /// user key it already holds).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,7 +47,7 @@ pub struct DeviceCode {
     pub device_label: String,
 }
 
-/// `scheme + base32-nopad(JSON)` — the pairing-invite codec ([RECONCILE-A]).
+/// `scheme + base32-nopad(JSON)` — the pairing-invite codec ().
 fn encode_code<T: Serialize>(scheme: &str, value: &T) -> String {
     let json = serde_json::to_vec(value).expect("enrollment code serializes");
     format!("{scheme}{}", data_encoding::BASE32_NOPAD.encode(&json))
