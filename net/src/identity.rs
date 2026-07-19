@@ -48,7 +48,7 @@ pub trait TrustGate: Send + Sync + 'static {
     }
 
     /// The register-time D8 gate (spec §4.3 rule 6): should a connection from `endpoint` (resolved
-    /// with `roster_user`) be severed AS OF the live roster? The generalization of [`is_revoked`] —
+    /// with `roster_user`) be severed AS OF the live roster? The generalization of [`Self::is_revoked`] —
     /// it also catches a previously-roster-resolved endpoint now ABSENT from the roster (a benign
     /// departure), closing the dropped-from-roster register-after-sever race symmetrically with the
     /// revoked half. Default `false` (pairing-only gates never sever on a roster). Consulted by

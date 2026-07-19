@@ -46,4 +46,4 @@ url = "2"  # pkarr relay URLs (spec §10.3): iroh's Pkarr builders take `url::Ur
 mcpmesh-codec = { path = "codec", version = "0.4.0" }
 mcpmesh-net = { path = "net", version = "0.4.0" }
 mcpmesh-trust = { path = "trust", version = "0.4.0" }
-mcpmesh-local-api = { path = "local-api", version = "0.4.0" }
+mcpmesh-local-api = { path = "local-api", version = "0.4.0", default-features = false }

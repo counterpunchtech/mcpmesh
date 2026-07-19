@@ -19,7 +19,7 @@ use super::MeshState;
 /// **Person→device (roster mode).** When `peer` names a roster USER that has active devices
 /// (`mesh.roster.view().devices_for_user(peer)` non-empty), its devices are dialed as a STAGGERED
 /// RACE ([`race_dial`]) ordered primary→mirror, then re-ordered WITHIN each role by presence recency
-/// — see [`order_dial_candidates`]. Three safety invariants hold here (DECLARED):
+/// — see `order_dial_candidates`. Three safety invariants hold here (DECLARED):
 ///  - **Presence is ADVISORY — absence NEVER removes a candidate.** Recency only RE-ORDERS candidates
 ///    within a role; a device with NO presence entry is still dialed (just later in its role group).
 ///    If the person publishes no presence at all, ALL its devices are dialed in primary→mirror order.
@@ -240,7 +240,7 @@ async fn dial_one(
 /// verbatim pass-through, §6.3/D6) before it is forwarded to the peer, so the far side's
 /// `select_service` can route it. Then frames flow both directions verbatim until either
 /// side ends. The two directions run as independent concurrent loops (one codec) — the same
-/// anti-deadlock discipline as [`backends::pump`](crate::backends::pump); this is a sibling
+/// anti-deadlock discipline as `backends::pump`; this is a sibling
 /// of that pump, not a reuse, because the mesh side here is an owned [`SessionTransport`]
 /// (not raw streams) and the service-name injection has no analogue there.
 pub async fn pipe_session<CR, CW>(

@@ -11,7 +11,7 @@
 //!
 //! Both backends drive the same session shape once their local MCP server's byte
 //! stream exists: forward the `initialize`, then pump frames both directions over
-//! [`pump`] with one codec ([`mcpmesh_net::framing`]) on the server side too. The only
+//! `pump` with one codec ([`mcpmesh_net::framing`]) on the server side too. The only
 //! thing that differs is HOW the server stream is obtained (fork+stdio vs. dial+UDS)
 //! and HOW identity is injected (env vars vs. `_meta`).
 //!

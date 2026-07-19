@@ -20,7 +20,7 @@ use assert_cmd::cargo::cargo_bin;
 use mcpmesh::client::{ControlClient, DaemonLaunch, connect_control, ensure_daemon_with};
 use mcpmesh::daemon::STACK_VERSION;
 use mcpmesh::{Request, StatusResult};
-use mcpmesh_local_api::BackendSpec;
+use mcpmesh_local_api::{BackendSpec, RegisterServiceParams};
 use serde_json::json;
 
 const STUB: &str = env!("CARGO_BIN_EXE_echo_mcp_stub");
@@ -218,13 +218,13 @@ async fn register_service_and_peer_add_reflect_in_status() {
 
         // Register a `run` service (persisted + hot-reloaded into the live serve loop).
         client
-            .request(Request::RegisterService {
+            .request(Request::RegisterService(RegisterServiceParams {
                 name: "echo".into(),
                 backend: BackendSpec::Run {
                     cmd: vec![STUB.to_string()],
                 },
                 allow: vec!["tester".into()],
-            })
+            }))
             .await
             .expect("register_service");
 
@@ -290,20 +290,20 @@ async fn concurrent_register_service_calls_all_persist() {
         let mut b = ensure_daemon_with(&launch).await.expect("client b");
 
         // Fire both registrations concurrently on distinct connections.
-        let reg_a = a.request(Request::RegisterService {
+        let reg_a = a.request(Request::RegisterService(RegisterServiceParams {
             name: "alpha".into(),
             backend: BackendSpec::Run {
                 cmd: vec![STUB.to_string()],
             },
             allow: vec!["x".into()],
-        });
-        let reg_b = b.request(Request::RegisterService {
+        }));
+        let reg_b = b.request(Request::RegisterService(RegisterServiceParams {
             name: "beta".into(),
             backend: BackendSpec::Run {
                 cmd: vec![STUB.to_string()],
             },
             allow: vec!["y".into()],
-        });
+        }));
         let (ra, rb) = tokio::join!(reg_a, reg_b);
         ra.expect("register alpha");
         rb.expect("register beta");
@@ -476,13 +476,13 @@ async fn status_output_leaks_no_transport_vocabulary() {
 
         // A `run` service whose backend command is the stub binary path — must NOT leak.
         client
-            .request(Request::RegisterService {
+            .request(Request::RegisterService(RegisterServiceParams {
                 name: "files".into(),
                 backend: BackendSpec::Run {
                     cmd: vec![STUB.to_string()],
                 },
                 allow: vec!["bob".into()],
-            })
+            }))
             .await
             .expect("register_service");
 

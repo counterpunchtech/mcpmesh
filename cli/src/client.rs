@@ -29,7 +29,7 @@ impl DaemonLaunch {
     pub fn ambient() -> Result<Self> {
         Ok(Self {
             exe: std::env::current_exe().context("resolve current executable")?,
-            socket: paths::default_socket_path()?,
+            socket: paths::default_endpoint()?,
             env: Vec::new(),
         })
     }

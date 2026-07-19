@@ -74,7 +74,7 @@ impl Presence {
         .ok()?;
         Some(eid)
     }
-    /// Full track-side acceptance ([Minor] 5): message-valid AND the claimed `user_id` matches the
+    /// Full track-side acceptance (\[Minor\] 5): message-valid AND the claimed `user_id` matches the
     /// roster's AUTHORITATIVE user for this endpoint (an active rostered device). Returns the verified
     /// endpoint on success — a rostered device advertising under a PEER's user_id is REJECTED here.
     pub fn accept(&self, now: i64, view: &RosterView) -> Option<[u8; 32]> {
@@ -95,7 +95,7 @@ impl Presence {
 
     /// Parse a received presence payload. NEVER panics on hostile/garbage peer bytes (the gossip
     /// receive path is fed arbitrary input) — a malformed payload is `None`, which the track loop
-    /// drops. (The signature + user_id binding are checked afterward by [`verify`]/[`accept`].)
+    /// drops. (The signature + user_id binding are checked afterward by [`Self::verify`]/[`Self::accept`].)
     pub fn from_bytes(b: &[u8]) -> Option<Self> {
         serde_json::from_slice(b).ok()
     }
@@ -192,7 +192,7 @@ pub fn publish_loop(
 
 /// Presence track loop (spec §10.1, roster mode only): pull heartbeats off the presence topic, accept
 /// each against the INSTALLED roster ([`Presence::accept`] — the message sig AND the user_id-to-roster
-/// binding, [Minor] 5), and RECORD the verified beat into the advisory [`PresenceTable`]. This is the
+/// binding, \[Minor\] 5), and RECORD the verified beat into the advisory [`PresenceTable`]. This is the
 /// ONLY thing the track loop does — it touches NO gate, authz check, or sever decision; a dropped or
 /// unrostered beat simply never becomes an entry (and absence never blocks a dial). Malformed peer
 /// bytes are dropped without a panic. Mirrors [`distribute::spawn_receive_loop`] (take the receiver

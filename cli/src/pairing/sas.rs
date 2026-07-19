@@ -84,7 +84,7 @@ pub fn short_auth_code(id_a: &[u8; 32], id_b: &[u8; 32], secret: &[u8; 32]) -> S
 }
 
 /// A short-word fingerprint of a public key, for the pinned org-root trust-ceremony display
-/// (spec §4.4/§1.5 carve-out). Reuses the SAS [`WORDS`] (same read-aloud property). Domain-separated
+/// (spec §4.4/§1.5 carve-out). Reuses the SAS `WORDS` (same read-aloud property). Domain-separated
 /// from the pairing SAS so the two never collide. Four words (~32-bit) — a human cross-check value,
 /// NEVER the raw key.
 pub fn fingerprint_words(pk_bytes: &[u8]) -> String {

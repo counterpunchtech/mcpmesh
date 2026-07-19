@@ -107,7 +107,7 @@ async fn connect_proxy_round_trips_an_echo_service_over_the_mesh() {
             .unwrap();
 
         // Bind the control socket at the path a subprocess with XDG_RUNTIME_DIR=<tmp> resolves
-        // (default_socket_path = <XDG_RUNTIME_DIR>/mcpmesh/mcpmesh.sock), and run the REAL control
+        // (paths::default_endpoint = <XDG_RUNTIME_DIR>/mcpmesh/mcpmesh.sock), and run the REAL control
         // server over the composed serving state.
         let socket = dir.path().join("mcpmesh").join("mcpmesh.sock");
         let listener = mcpmesh::ipc::bind_control_socket(&socket).await.unwrap();

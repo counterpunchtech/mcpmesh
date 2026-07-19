@@ -3,7 +3,7 @@
 //! OWN accept loop ([`spawn_accept_loop`]) that dispatches each inbound connection by its
 //! negotiated ALPN (spec §7.1) — `mcpmesh/mcp/1` flows through M1's gated per-connection handler
 //! [`mcpmesh_net::run_mesh_connection`], where `gate` is an
-//! [`AllowlistGate`](crate::allowlist::AllowlistGate) over the `state.redb` peer allowlist and
+//! [`AllowlistGate`] over the `state.redb` peer allowlist and
 //! `services` are backends built from config, while `mcpmesh/pair/1` flows to the pairing
 //! rendezvous, GATE-EXEMPT (D8 exception) and authenticated by the invite secret rather than
 //! the trust gate; and (2) it serves the `mcpmesh-local/1` control API on
@@ -33,9 +33,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use mcpmesh_local_api::{
-    BackendKind, BackendSpec, BlobFetchResult, BlobPublishResult, BlobScopeList, InviteResult,
-    OrgJoinResult, PairResult, PeerInfo, PresencePeer, RosterInstallResult, RosterStatus,
-    ScopeInfo, ServiceInfo,
+    BackendKind, BlobFetchResult, BlobPublishResult, BlobScopeList, InviteResult, OrgJoinResult,
+    PairResult, PeerAddParams, PeerInfo, PeerRemoveParams, PeerRenameParams, PresencePeer,
+    RegisterServiceParams, RosterInstallResult, RosterStatus, ScopeInfo, ServiceInfo,
 };
 use mcpmesh_net::errors::{ERR_UNREACHABLE, synthesized};
 use mcpmesh_net::framing::{FrameReader, Inbound, write_frame};
@@ -436,7 +436,7 @@ impl MeshState {
     /// (completes the construction chicken-egg). Also used to seed the handle a later
     /// hot-reload aborts.
     ///
-    /// Take-and-abort any prior handle first (mirroring [`reload_accept_loop`]): a stray second
+    /// Take-and-abort any prior handle first (mirroring `reload_accept_loop`): a stray second
     /// call would otherwise DROP the previous `JoinHandle` — detaching, not stopping, its loop —
     /// leaving two loops accepting on one endpoint. Latent today (each caller invokes once), but
     /// this keeps the invariant self-healing rather than silently doubling the accept loop.
@@ -475,7 +475,7 @@ pub fn run() -> Result<()> {
             }
         }
     };
-    let socket = paths::default_socket_path()?;
+    let socket = paths::default_endpoint()?;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -1690,7 +1690,7 @@ fn gate_and_register(
 /// gate (that is precisely why the mesh-only `serve` is not enough). An unknown ALPN is closed
 /// cleanly.
 ///
-/// Both the initial start ([`serve_forever`]) and the hot-reload swap ([`reload_accept_loop`],
+/// Both the initial start (`serve_forever`) and the hot-reload swap (`reload_accept_loop`,
 /// shared by `register_service` and the pairing `grant_service_access`) call this ONE function,
 /// so the loop is defined in exactly one place; the reload path aborts the returned handle and
 /// spawns a fresh loop carrying the rebuilt `services`.
@@ -1883,7 +1883,7 @@ async fn reload_accept_loop(mesh: &Arc<MeshState>, services: Services) {
 // ───────────────────────────── reachability probe (pairing-mode liveness) ─────────────────────
 
 /// One cached reachability probe result (spec: pairing-mode liveness). Ephemeral, in-memory —
-/// stored in [`MeshState::reachability`], keyed by endpoint-id. `probed_at` is epoch seconds.
+/// stored in `MeshState::reachability`, keyed by endpoint-id. `probed_at` is epoch seconds.
 #[derive(Clone)]
 pub struct ReachEntry {
     pub reachable: bool,
@@ -1903,8 +1903,8 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 /// [`iroh::EndpointAddr`], exactly like `dial::dial_service`'s §10.2 fallback — discovery resolves
 /// the address from the id; hermetic localhost tests seed a `MemoryLookup`), sends one ping frame,
 /// reads the pong, and measures RTT (dial + round-trip). Writes the outcome into the in-memory
-/// [`MeshState::reachability`] cache and returns it. Reachable ⇔ a pong arrived within
-/// [`PROBE_TIMEOUT`]; a gate refusal (no pong) or any dial/IO failure is a clean `reachable:false`.
+/// `MeshState::reachability` cache and returns it. Reachable ⇔ a pong arrived within
+/// `PROBE_TIMEOUT`; a gate refusal (no pong) or any dial/IO failure is a clean `reachable:false`.
 pub async fn probe_peer(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> ReachEntry {
     let started = std::time::Instant::now();
     let outcome = tokio::time::timeout(PROBE_TIMEOUT, probe_once(mesh, endpoint_id)).await;
@@ -2152,12 +2152,13 @@ pub(crate) fn peer_infos(store: &PeerStore) -> Vec<PeerInfo> {
 /// Handle a `register_service` control request: write/update the `[services.*]` config entry
 /// (atomic), reload the registry, and hot-reload the mesh serve loop. Config writes block, so
 /// they run on `spawn_blocking` (Task 4 seam note).
-pub(crate) async fn register_service(state: &DaemonState, params: &Value) -> Result<()> {
+pub(crate) async fn register_service(
+    state: &DaemonState,
+    params: RegisterServiceParams,
+) -> Result<()> {
     let mesh = state
         .mesh()
         .context("daemon has no mesh (control-only mode)")?;
-    let parsed: RegisterParams =
-        serde_json::from_value(params.clone()).context("register_service params")?;
 
     // Serialize the ENTIRE critical section (read → upsert → write → reload → rebuild → serve
     // swap → status). Two concurrent registrations must not read the same base config and
@@ -2166,7 +2167,11 @@ pub(crate) async fn register_service(state: &DaemonState, params: &Value) -> Res
 
     // 1. Atomic config write on a blocking thread.
     let config_path = mesh.config_path.clone();
-    let (name, backend, allow) = (parsed.name, parsed.backend, parsed.allow);
+    let RegisterServiceParams {
+        name,
+        backend,
+        allow,
+    } = params;
     let (name_w, backend_w, allow_w) = (name.clone(), backend.clone(), allow.clone());
     tokio::task::spawn_blocking(move || {
         write_service_to_config(&config_path, &name_w, &backend_w, &allow_w)
@@ -2191,33 +2196,20 @@ pub(crate) async fn register_service(state: &DaemonState, params: &Value) -> Res
 /// through the daemon), then refresh the `status` peer snapshot. The live
 /// [`AllowlistGate`](crate::allowlist::AllowlistGate) reads the same database, so the new
 /// peer is resolvable on the very next accept — no gate rebuild needed.
-pub(crate) async fn add_peer(state: &DaemonState, params: &Value) -> Result<()> {
+pub(crate) async fn add_peer(state: &DaemonState, params: PeerAddParams) -> Result<()> {
     let mesh = state
         .mesh()
         .context("daemon has no mesh (control-only mode)")?;
-    let petname = params
-        .get("petname")
-        .and_then(Value::as_str)
-        .context("peer_add: missing petname")?
-        .to_string();
-    let eid_str = params
-        .get("endpoint_id")
-        .and_then(Value::as_str)
-        .context("peer_add: missing endpoint_id")?;
+    let PeerAddParams {
+        petname,
+        endpoint_id,
+        allow,
+    } = params;
     // endpoint_id encoding = iroh's native base32 (`EndpointId`/`PublicKey` Display/FromStr,
     // `decode_base32_hex`); round-trips the 32 bytes and matches what pairing/status show.
-    let endpoint_id = eid_str
+    let endpoint_id = endpoint_id
         .parse::<iroh::EndpointId>()
         .map_err(|e| anyhow::anyhow!("peer_add: endpoint_id is not a valid EndpointId: {e}"))?;
-    let allow = params
-        .get("allow")
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
     let entry = PeerEntry {
         endpoint_id: *endpoint_id.as_bytes(),
         petname: petname.clone(),
@@ -2250,7 +2242,7 @@ pub(crate) async fn add_peer(state: &DaemonState, params: &Value) -> Result<()> 
 /// **Fail-safe teardown order (DECLARED).** The pairing grant writes, in order, (1) the
 /// [`PeerEntry`] (identity — who the peer is) then (2) the config `allow` append (authorization —
 /// what it may open). Removal is that grant's LIFO inverse: undo (2) FIRST via
-/// [`revoke_service_access`] (strip the petname from every `[services.*].allow`, the
+/// `revoke_service_access` (strip the petname from every `[services.*].allow`, the
 /// security-relevant half), THEN undo (1) via [`PeerStore::remove`] (drop the identity row). This
 /// leaves the peer MORE restricted, never less, at every partial-failure point:
 ///  - revoke fails → we abort BEFORE touching the store: the peer is unchanged (still fully
@@ -2270,15 +2262,11 @@ pub(crate) async fn add_peer(state: &DaemonState, params: &Value) -> Result<()> 
 /// config + store LIVE (control.rs `status_result`), so a revoke is reflected immediately even
 /// though this detached handler holds no `DaemonState`. The functional truth is the store +
 /// config (which the `pair --remove` tests assert on), and `status` now reads exactly that.
-pub async fn remove_peer(state: &DaemonState, params: &Value) -> Result<()> {
+pub async fn remove_peer(state: &DaemonState, params: PeerRemoveParams) -> Result<()> {
     let mesh = state
         .mesh()
         .context("daemon has no mesh (control-only mode)")?;
-    let petname = params
-        .get("petname")
-        .and_then(Value::as_str)
-        .context("peer_remove: missing petname")?
-        .to_string();
+    let petname = params.petname;
 
     // (2)⁻¹ AUTHORIZATION: revoke first (the security-relevant half). Propagate its error so a
     // failure aborts before we touch the identity row (see the fail-safe reasoning above). Capture
@@ -2373,27 +2361,17 @@ fn rename_plan(
 /// petname → `to` in every `[services.*].allow` so grants follow — then reloads so the new name
 /// admits. Guarded against renaming onto another identity's name/grant. Held entirely under
 /// `reload_lock` (like grant/revoke/register) so guard→mutate→reload is one atomic critical section.
-pub async fn rename_peer(state: &DaemonState, params: &Value) -> Result<()> {
+pub async fn rename_peer(state: &DaemonState, params: PeerRenameParams) -> Result<()> {
     let mesh = state
         .mesh()
         .context("daemon has no mesh (control-only mode)")?;
-    let to = params
-        .get("to")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .to_string();
+    let to = params.to.trim().to_string();
     if to.is_empty() {
         anyhow::bail!("peer_rename: the new nickname is empty");
     }
-    let user_id = params
-        .get("user_id")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let petname = params
-        .get("petname")
-        .and_then(Value::as_str)
-        .map(str::to_string);
+    let PeerRenameParams {
+        user_id, petname, ..
+    } = params;
     if user_id.is_none() && petname.is_none() {
         anyhow::bail!("peer_rename: no contact identified");
     }
@@ -2567,15 +2545,15 @@ pub(crate) async fn redeem(state: &DaemonState, invite_line: String) -> Result<P
 /// hot-reload so the running registry admits it. This is the load-bearing half of pairing.
 ///
 /// Why it is separate from (and necessary alongside) the [`PeerEntry`] the rendezvous writes:
-/// the [`AllowlistGate`](crate::allowlist::AllowlistGate) only RESOLVES an inbound endpoint to
+/// the [`AllowlistGate`] only RESOLVES an inbound endpoint to
 /// a petname (identity); `select_service` (spec §5) then ADMITS that petname only if the
 /// service's config `allow` names it — and that allow is baked into the [`Services`] snapshot
 /// at [`build_services`] time. So a PeerEntry makes the peer KNOWN; only appending to `allow`
 /// + reloading makes it AUTHORIZED. Without this the peer is known-but-forbidden.
 ///
-/// Serialized against [`register_service`] via `mesh.reload_lock` (SAME lock — a concurrent
+/// Serialized against `register_service` via `mesh.reload_lock` (SAME lock — a concurrent
 /// register and a pairing-grant must not read the same base config and clobber each other's
-/// write). Reuses [`append_allow_to_config`]'s atomic write and [`reload_accept_loop`]'s
+/// write). Reuses `append_allow_to_config`'s atomic write and `reload_accept_loop`'s
 /// abort/respawn (DRY). A service not present in config is logged + skipped (a pairing grant
 /// never CREATES a service). Reloads ONLY when the append actually changed the config — an
 /// idempotent re-pair or an all-missing grant is a no-op with no serving blip. (The cached
@@ -2721,7 +2699,7 @@ where
 /// the Task 10 proxy round-trip binds a control socket over this and runs `mcpmesh connect` as
 /// a subprocess against it, so the actual `open_session` dial-by-id + pipe are exercised. The
 /// mesh's serve loop is inert here (`open_session` reads only the endpoint + store to DIAL
-/// outbound); production assembles its own `MeshState` inline in [`serve_forever`].
+/// outbound); production assembles its own `MeshState` inline in `serve_forever`.
 pub fn serving_state(endpoint: iroh::Endpoint, store: Arc<PeerStore>) -> Arc<DaemonState> {
     let gate: Arc<dyn TrustGate> = Arc::new(AllowlistGate::new(store.clone()));
     let self_petname = short_fingerprint(&endpoint.id());
@@ -2749,14 +2727,6 @@ pub fn serving_state(endpoint: iroh::Endpoint, store: Arc<PeerStore>) -> Arc<Dae
         Vec::new(),
         Vec::new(),
     ))
-}
-
-/// Params of a `register_service` request (the `params` object of the JSON-RPC frame).
-#[derive(serde::Deserialize)]
-struct RegisterParams {
-    name: String,
-    backend: BackendSpec,
-    allow: Vec<String>,
 }
 
 /// Acquire the per-uid singleton lock (spec §13 single-daemon). Returns `Some(file)` when we
@@ -2983,9 +2953,17 @@ mod tests {
     /// `rename_peer` renames ALL of a person's devices (matched by user_id) to the new nickname AND
     /// rewrites the old petname → new in every service allow, so grants FOLLOW the rename. The happy
     /// path also drives `build_services_audited` + `reload_accept_loop` under `reload_lock`.
+    /// The typed `peer_rename` params, as the control dispatcher hands them to `rename_peer`.
+    fn rename_params(user_id: Option<&str>, to: &str) -> PeerRenameParams {
+        PeerRenameParams {
+            user_id: user_id.map(str::to_string),
+            petname: None,
+            to: to.into(),
+        }
+    }
+
     #[tokio::test]
     async fn rename_peer_renames_all_devices_and_carries_grants() {
-        use serde_json::json;
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
         std::fs::write(
@@ -3004,7 +2982,7 @@ mod tests {
         let state =
             crate::control::DaemonState::with_mesh("test", mesh.clone(), Vec::new(), Vec::new());
 
-        rename_peer(&state, &json!({ "user_id": "b64u:ALICE", "to": "Alice" }))
+        rename_peer(&state, rename_params(Some("b64u:ALICE"), "Alice"))
             .await
             .unwrap();
 
@@ -3033,7 +3011,6 @@ mod tests {
     /// rejected rename nothing changes.
     #[tokio::test]
     async fn rename_peer_guards_bad_requests_and_collisions() {
-        use serde_json::json;
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
         std::fs::write(
@@ -3053,21 +3030,21 @@ mod tests {
 
         // Empty `to` (whitespace trims to empty).
         assert!(
-            rename_peer(&state, &json!({ "user_id": "b64u:ALICE", "to": "  " }))
+            rename_peer(&state, rename_params(Some("b64u:ALICE"), "  "))
                 .await
                 .is_err()
         );
         // Neither user_id nor petname identifies a contact.
-        assert!(rename_peer(&state, &json!({ "to": "X" })).await.is_err());
+        assert!(rename_peer(&state, rename_params(None, "X")).await.is_err());
         // No matching contact.
         assert!(
-            rename_peer(&state, &json!({ "user_id": "b64u:NOBODY", "to": "X" }))
+            rename_peer(&state, rename_params(Some("b64u:NOBODY"), "X"))
                 .await
                 .is_err()
         );
         // Collision: renaming alice onto bob's nickname would steal bob's identity/grants.
         assert!(
-            rename_peer(&state, &json!({ "user_id": "b64u:ALICE", "to": "bob" }))
+            rename_peer(&state, rename_params(Some("b64u:ALICE"), "bob"))
                 .await
                 .is_err()
         );

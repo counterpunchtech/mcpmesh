@@ -6,6 +6,12 @@ license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 description = "mcpmesh local control plane: UDS client/service seam and the shared *-local/1 vocabulary"
+readme = "README.md"
+
+[package.metadata.docs.rs]
+# `client` and `service` are off by default, so a default-features docs.rs build would
+# render only the vocabulary types. Build the whole surface for the hosted docs.
+all-features = true
 
 [lints.rust]
 # The workspace [lints.rust] table carries EXACTLY ONE lint: unsafe_code = "forbid"

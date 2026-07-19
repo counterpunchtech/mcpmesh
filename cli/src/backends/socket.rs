@@ -14,7 +14,7 @@
 //! daemon in M2+), so identity cannot travel as per-process env vars; it rides in
 //! the MCP `initialize` `_meta` instead (§6.3). Once the socket is dialed and the
 //! augmented `initialize` sent, the session is the SAME bidirectional frame pump the
-//! spawn backend uses ([`super::pump`], one codec).
+//! spawn backend uses (`super::pump`, one codec).
 use anyhow::{Context, Result};
 use mcpmesh_net::transport::NdjsonTransport;
 use mcpmesh_net::{PeerIdentity, SessionBackend, SessionTransport};
@@ -43,7 +43,7 @@ pub struct SocketBackend {
     /// The audit sink (spec §11.3). `AuditSink::disabled()` in tests / a non-audited build.
     pub audit: AuditSink,
     /// The per-authenticated-endpoint request limiter (spec §11.2 P7), shared across all backends.
-    /// Consulted per proxied request line in [`pump`](super::pump). Keyed on `identity.endpoint`.
+    /// Consulted per proxied request line in `super::pump`. Keyed on `identity.endpoint`.
     pub limiter: std::sync::Arc<crate::limits::RateLimiter>,
 }
 

@@ -211,10 +211,10 @@ pub(crate) async fn fetch_capped(url: &str, max: usize, timeout: Duration) -> Re
 /// parse the served roster's serial. If it is NEWER than installed, CONVERGE through the SAME single
 /// install path [`on_announce`] uses — `RosterStore::install_from_file` → `install_roster_view_and_sever`
 /// (validate rules 1–6 incl. the org-root SIG → persist → hot-swap → D8 sever); no second validator.
-/// On an EQUAL served serial (no new roster) CONFIRM currency ([`MeshState::confirm_roster_current`],
+/// On an EQUAL served serial (no new roster) CONFIRM currency (`MeshState::confirm_roster_current`,
 /// the freshness bump, T9) — the URL poll is the ONLY channel that confirms freshness without a serial
 /// bump — but ONLY when the served body is genuinely the operator's org-root-SIGNED roster (rule 1
-/// re-verified against the pinned pk, [`equal_serial_body_is_authentic`]): the HTTPS host is UNTRUSTED,
+/// re-verified against the pinned pk, `equal_serial_body_is_authentic`): the HTTPS host is UNTRUSTED,
 /// so an unsigned / wrong-org body at the installed serial is logged and IGNORED (invariant #1 — the
 /// org-root sig is the sole trust input across ALL channels, uniform with the gossip + newer-serial
 /// paths, so an unauthenticated body can never forge currency, P13 fail-safe). A blocked / failed poll
@@ -225,7 +225,7 @@ pub(crate) async fn fetch_capped(url: &str, max: usize, timeout: Duration) -> Re
 /// Serialized under `mesh.reload_lock` (the SAME single-writer discipline as the manual + gossip
 /// installs). The convergence re-checks `serial > installed` INSIDE the lock (idempotent against a
 /// racing gossip announce), and `install_from_file`'s own `StaleSerial` is the on-disk backstop. The
-/// roster path is derived from `config_path` via [`installed_roster_path`] (the DECLARED T6 deviation),
+/// roster path is derived from `config_path` via `installed_roster_path` (the DECLARED T6 deviation),
 /// so this install path is per-node in the multi-daemon integration tests — consistent with `on_announce`.
 pub async fn poll_roster_url_once(mesh: &Arc<MeshState>, url: &str) -> Result<()> {
     let body = fetch_capped(url, MAX_ROSTER_BYTES, POLL_TIMEOUT)

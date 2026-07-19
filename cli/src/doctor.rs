@@ -100,7 +100,7 @@ pub fn check_network(net: &crate::config::NetworkCfg) -> Verdict {
     }
 }
 
-/// §16 M4 candidate / [Minor] 7: WARN when the node is roster-mode (`org_root_pinned`) but has no
+/// §16 M4 candidate / \[Minor\] 7: WARN when the node is roster-mode (`org_root_pinned`) but has no
 /// `[roster].url` — it degrades to stale after `max_staleness` with no authenticated channel to
 /// re-confirm currency (§4.3/P13). The full-diagnostic version of the one-liner `status` already
 /// surfaces. Pairing mode (no org root) → OK; roster mode with a URL → OK.
@@ -362,7 +362,7 @@ struct DoctorInputs {
 /// Ping the local daemon over the control socket WITHOUT auto-starting it (read-only, local-only).
 /// Returns `(reachable, roster_state_word)`. A dead socket / any error → `(false, None)`.
 fn probe_daemon() -> (bool, Option<String>) {
-    let Ok(socket) = mcpmesh_trust::paths::default_socket_path() else {
+    let Ok(socket) = mcpmesh_trust::paths::default_endpoint() else {
         return (false, None);
     };
     let Ok(rt) = tokio::runtime::Builder::new_multi_thread()
@@ -375,10 +375,9 @@ fn probe_daemon() -> (bool, Option<String>) {
         match crate::client::connect_control(&socket).await {
             Ok(mut client) => {
                 let state = client
-                    .request(mcpmesh_local_api::Request::Status)
+                    .status()
                     .await
                     .ok()
-                    .and_then(|v| serde_json::from_value::<mcpmesh_local_api::StatusResult>(v).ok())
                     .and_then(|s| s.roster.map(|r| r.state));
                 (true, state)
             }

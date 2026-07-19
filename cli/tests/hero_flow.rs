@@ -124,7 +124,7 @@ async fn hero_flow_minus_pairing() {
             .unwrap();
 
         // Bind Bob's control socket where a subprocess with XDG_RUNTIME_DIR=<tmp> resolves it
-        // (default_socket_path = <XDG_RUNTIME_DIR>/mcpmesh/mcpmesh.sock), and run the REAL control
+        // (paths::default_endpoint = <XDG_RUNTIME_DIR>/mcpmesh/mcpmesh.sock), and run the REAL control
         // server over the composed serving state.
         let socket = dir.path().join("mcpmesh").join("mcpmesh.sock");
         let listener = mcpmesh::ipc::bind_control_socket(&socket).await.unwrap();
