@@ -34,7 +34,7 @@ use tokio::net::UnixStream;
 
 use crate::client::{ClientError, connect_control};
 use crate::codec::write_frame;
-use crate::protocol::{BackendSpec, Hello, Request};
+use crate::protocol::{BackendSpec, Hello, RegisterServiceParams, Request};
 
 // ---------------------------------------------------------------------------------------
 // §1 UDS faces
@@ -114,13 +114,13 @@ pub async fn register_service(
     let result = async {
         let mut client = connect_control(control_sock).await?;
         client
-            .request(Request::RegisterService {
+            .request(Request::RegisterService(RegisterServiceParams {
                 name: service_name.to_string(),
                 backend: BackendSpec::Socket {
                     path: backend_sock.to_string_lossy().into_owned(),
                 },
                 allow: vec![],
-            })
+            }))
             .await?;
         Ok(())
     }
@@ -140,7 +140,8 @@ pub async fn register_service(
 // §4 *-local/1 JSON-RPC conventions
 // ---------------------------------------------------------------------------------------
 
-/// JSON-RPC error code: invalid params (also the shared "unknown method" code).
+/// JSON-RPC error code: invalid params. (An unknown method answers `-32601`, the standard
+/// JSON-RPC code — see `docs/local-protocol.md` "Error codes".)
 pub const ERR_PARAMS: i64 = -32602;
 /// JSON-RPC error code: internal error.
 pub const ERR_INTERNAL: i64 = -32603;

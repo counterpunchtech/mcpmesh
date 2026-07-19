@@ -43,10 +43,12 @@ pub mod protocol;
 pub use principals::principal_set;
 pub use protocol::{
     API_NAME, API_VERSION, ActiveSession, AuditKind, AuditRecord, AuditSummaryResult, BackendKind,
-    BackendSpec, BlobFetchResult, BlobPublishResult, BlobScopeList, Hello, InviteResult,
-    OrgJoinResult, PairResult, PeerInfo, PeerReachability, PresencePeer, RecentPairing, Request,
-    RosterInstallResult, RosterStatus, ScopeInfo, ServiceInfo, StatusResult, StreamFrame,
-    method_of,
+    BackendSpec, BlobFetchParams, BlobFetchResult, BlobGrantParams, BlobPublishParams,
+    BlobPublishResult, BlobScopeList, Hello, InviteParams, InviteResult, OpenSessionParams,
+    OrgJoinParams, OrgJoinResult, PairParams, PairResult, PeerAddParams, PeerInfo,
+    PeerReachability, PeerRemoveParams, PeerRenameParams, PresencePeer, RecentPairing,
+    RegisterServiceParams, Request, RosterInstallParams, RosterInstallResult, RosterStatus,
+    ScopeInfo, ServiceInfo, SetRosterUrlParams, StatusResult, StreamFrame, method_of,
 };
 
 #[cfg(feature = "client")]

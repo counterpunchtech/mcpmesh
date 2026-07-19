@@ -5,19 +5,24 @@
 //! pipe DACL on windows) — the gate runs before the hello.
 //!
 //! Dispatch discipline (Task 1 carry-forward): the method is extracted with
-//! [`mcpmesh_local_api::method_of`] and params are read PER-METHOD — never by deserializing
-//! the whole message into `Request` (adjacent tagging rejects `params:{}` for
-//! parameterless methods, which a conforming third-party client may send). M2a answers
-//! `status`, `register_service`/`peer_add` (Task 9), and an internal `shutdown`.
+//! [`mcpmesh_local_api::method_of`] and params are deserialized PER-METHOD into the typed
+//! param structs local-api defines (`protocol.rs` — the one wire truth, so daemon/client
+//! shape drift is a compile error) — never by deserializing the whole message into
+//! `Request` (adjacent tagging rejects `params:{}` for parameterless methods, which a
+//! conforming third-party client may send). M2a answers `status`,
+//! `register_service`/`peer_add` (Task 9), and an internal `shutdown`.
 //! `open_session` (Task 10) is special: after that request the connection stops being
 //! JSON-RPC and becomes a raw MCP byte pipe the daemon dials + pumps (spec §8).
+use std::future::Future;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::Result;
 use mcpmesh_local_api::transport::{LocalListener, LocalStream};
 use mcpmesh_local_api::{
-    API_NAME, API_VERSION, Hello, PeerInfo, ServiceInfo, StatusResult, method_of,
+    API_NAME, API_VERSION, BlobFetchParams, BlobGrantParams, BlobPublishParams, Hello,
+    InviteParams, OpenSessionParams, OrgJoinParams, PairParams, PeerInfo, RosterInstallParams,
+    ServiceInfo, SetRosterUrlParams, StatusResult, method_of,
 };
 use mcpmesh_net::framing::{FrameReader, Inbound, write_frame};
 use serde_json::{Value, json};
@@ -163,11 +168,20 @@ async fn handle_conn(stream: LocalStream, state: Arc<DaemonState>) -> Result<()>
                     // MCP byte pipe (protocol.rs `OpenSession`): hand the framed halves to the
                     // daemon's dial + pipe, which consumes the connection for the session's
                     // lifetime. The loop cannot continue — `reader`/`write_half` move away.
+                    // (A malformed params SHAPE — not merely absent fields, which default —
+                    // answers an error frame and keeps the connection JSON-RPC.)
                     let params = req.get("params").cloned().unwrap_or(Value::Null);
-                    let peer = str_param(&params, "peer");
-                    let service = str_param(&params, "service");
+                    let p: OpenSessionParams = match params_of(&params) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            let id = req.get("id").cloned().unwrap_or(Value::Null);
+                            let resp = error(id, -32000, format!("open_session failed: {e}"));
+                            write_frame(&mut write_half, &resp).await?;
+                            continue;
+                        }
+                    };
                     return crate::daemon::open_session(
-                        &state, &peer, &service, reader, write_half,
+                        &state, &p.peer, &p.service, reader, write_half,
                     )
                     .await;
                 }
@@ -246,8 +260,9 @@ async fn run_subscription(
 
 /// Dispatch one request, handling the async control methods (`register_service`, `peer_add`)
 /// that touch the config file / redb store, and delegating the parameterless synchronous
-/// methods (`status`, `shutdown`) to [`dispatch`]. Params are read per-method (never
-/// `from_value::<Request>` on the whole message).
+/// methods (`status`, `shutdown`) to [`dispatch`]. Params are deserialized per-method into
+/// the local-api param structs via [`with_params`] (never `from_value::<Request>` on the
+/// whole message).
 async fn handle_request(req: &Value, state: &DaemonState) -> Value {
     let id = req.get("id").cloned().unwrap_or(Value::Null);
     let params = req.get("params").cloned().unwrap_or(Value::Null);
@@ -255,120 +270,114 @@ async fn handle_request(req: &Value, state: &DaemonState) -> Value {
         Some("register_service") => respond(
             id,
             "register_service",
-            crate::daemon::register_service(state, &params)
+            with_params(&params, |p| crate::daemon::register_service(state, p))
                 .await
                 .map(unit),
         ),
         Some("peer_add") => respond(
             id,
             "peer_add",
-            crate::daemon::add_peer(state, &params).await.map(unit),
+            with_params(&params, |p| crate::daemon::add_peer(state, p))
+                .await
+                .map(unit),
         ),
-        // Unpair a peer (spec §4.2, `mcpmesh pair --remove`). Params read per-method: the
-        // petname to drop. `remove_peer` revokes the peer's service authorization AND drops
-        // its identity row (the inverse of the pairing grant) — see its fail-safe ordering.
+        // Unpair a peer (spec §4.2, `mcpmesh pair --remove`): the petname to drop.
+        // `remove_peer` revokes the peer's service authorization AND drops its identity row
+        // (the inverse of the pairing grant) — see its fail-safe ordering.
         Some("peer_remove") => respond(
             id,
             "peer_remove",
-            crate::daemon::remove_peer(state, &params).await.map(unit),
+            with_params(&params, |p| crate::daemon::remove_peer(state, p))
+                .await
+                .map(unit),
         ),
-        // Rename a contact's nickname (Contacts rename). Params read per-method: the person's
-        // `user_id` (or a provisional `petname`) + the new nickname `to`. `rename_peer` guards the
-        // collision (no inheriting another identity's grants), rewrites allow lists, and reloads.
+        // Rename a contact's nickname (Contacts rename): the person's `user_id` (or a
+        // provisional `petname`) + the new nickname `to`. `rename_peer` guards the collision
+        // (no inheriting another identity's grants), rewrites allow lists, and reloads.
         Some("peer_rename") => respond(
             id,
             "peer_rename",
-            crate::daemon::rename_peer(state, &params).await.map(unit),
+            with_params(&params, |p| crate::daemon::rename_peer(state, p))
+                .await
+                .map(unit),
         ),
         Some("invite") => {
-            // Mint a pairing invite (spec §4.2). Params read per-method (never
-            // `from_value::<Request>`): the granted service list, tolerating an absent list.
-            let services: Vec<String> = params
-                .get("services")
-                .and_then(Value::as_array)
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default();
+            // Mint a pairing invite (spec §4.2) granting a service list ([`InviteParams`]
+            // tolerates an absent list).
             let Some(mesh) = state.mesh() else {
                 return error(id, -32000, "daemon has no mesh (control-only mode)");
             };
             respond(
                 id,
                 "invite",
-                crate::daemon::mint_invite(services, mesh).await,
+                with_params(&params, |p: InviteParams| {
+                    crate::daemon::mint_invite(p.services, mesh)
+                })
+                .await,
             )
         }
-        Some("pair") => {
-            // Redeem a pairing invite (spec §4.2). Params read per-method: the copyable
-            // `mcpmesh-invite:` line, tolerating an absent/non-string field (an empty line simply
-            // fails to decode → a clean pair error).
-            let invite_line = str_param(&params, "invite_line");
-            respond(id, "pair", crate::daemon::redeem(state, invite_line).await)
-        }
-        Some("roster_install") => {
-            // Install a signed roster from a local file (spec §4.3 manual path). Params read
-            // per-method: the file `path` (a local file the same-uid daemon reads, P12/P14) and an
-            // OPTIONAL `org_root_pk` that pins the org root on first install. `install_roster`
-            // validates (rules 1–6), persists, hot-swaps the gate, and severs revoked sessions (D8).
-            let path = str_param(&params, "path");
-            let org_root_pk = params
-                .get("org_root_pk")
-                .and_then(Value::as_str)
-                .map(String::from);
-            respond(
-                id,
-                "roster_install",
-                crate::daemon::install_roster(state, path, org_root_pk).await,
-            )
-        }
-        // Pin the org root on a JOINER without a roster (spec §4.4 step 2, D5). Params read
-        // per-method: org_id / org_root_pk / user_id / user_key. `user_key` is a LOCAL path (the
-        // key never crosses the API). `org_join` validates the pk BEFORE writing, then surgically
-        // pins the four `[identity]` keys under `reload_lock`. No roster is installed.
+        // Redeem a pairing invite (spec §4.2): the copyable `mcpmesh-invite:` line
+        // ([`PairParams`] tolerates an absent field — an empty line simply fails to decode
+        // → a clean pair error).
+        Some("pair") => respond(
+            id,
+            "pair",
+            with_params(&params, |p: PairParams| {
+                crate::daemon::redeem(state, p.invite_line)
+            })
+            .await,
+        ),
+        // Install a signed roster from a local file (spec §4.3 manual path): the file `path`
+        // (a local file the same-uid daemon reads, P12/P14) and an OPTIONAL `org_root_pk`
+        // that pins the org root on first install. `install_roster` validates (rules 1–6),
+        // persists, hot-swaps the gate, and severs revoked sessions (D8).
+        Some("roster_install") => respond(
+            id,
+            "roster_install",
+            with_params(&params, |p: RosterInstallParams| {
+                crate::daemon::install_roster(state, p.path, p.org_root_pk)
+            })
+            .await,
+        ),
+        // Pin the org root on a JOINER without a roster (spec §4.4 step 2, D5). `user_key` is
+        // a LOCAL path (the key never crosses the API). `org_join` validates the pk BEFORE
+        // writing, then surgically pins the four `[identity]` keys under `reload_lock`. No
+        // roster is installed.
         Some("org_join") => respond(
             id,
             "org_join",
-            crate::daemon::org_join(
-                state,
-                str_param(&params, "org_id"),
-                str_param(&params, "org_root_pk"),
-                str_param(&params, "user_id"),
-                str_param(&params, "user_key"),
-            )
+            with_params(&params, |p: OrgJoinParams| {
+                crate::daemon::org_join(state, p.org_id, p.org_root_pk, p.user_id, p.user_key)
+            })
             .await,
         ),
-        // Pin the HTTPS roster URL (`[roster].url`) in config (spec §4.3 M3c). Params read
-        // per-method: the `url` string. Written by `org create --roster-url` (operator) and by
-        // `join` when the org invite carries one (the joiner's FIRST-roster bootstrap, D5).
-        // `set_roster_url` writes it atomically under `reload_lock` (single-writer).
+        // Pin the HTTPS roster URL (`[roster].url`) in config (spec §4.3 M3c). Written by
+        // `org create --roster-url` (operator) and by `join` when the org invite carries one
+        // (the joiner's FIRST-roster bootstrap, D5). `set_roster_url` writes it atomically
+        // under `reload_lock` (single-writer).
         Some("set_roster_url") => respond(
             id,
             "set_roster_url",
-            crate::daemon::set_roster_url(state, str_param(&params, "url"))
-                .await
-                .map(unit),
+            with_params(&params, |p: SetRosterUrlParams| {
+                crate::daemon::set_roster_url(state, p.url)
+            })
+            .await
+            .map(unit),
         ),
         Some("blob_publish") => respond(
             id,
             "blob_publish",
-            crate::daemon::blob_publish(
-                state,
-                str_param(&params, "scope"),
-                str_param(&params, "path"),
-            )
+            with_params(&params, |p: BlobPublishParams| {
+                crate::daemon::blob_publish(state, p.scope, p.path)
+            })
             .await,
         ),
         Some("blob_grant") => respond(
             id,
             "blob_grant",
-            crate::daemon::blob_grant(
-                state,
-                str_param(&params, "scope"),
-                str_param(&params, "principal"),
-            )
+            with_params(&params, |p: BlobGrantParams| {
+                crate::daemon::blob_grant(state, p.scope, p.principal)
+            })
             .await
             .map(unit),
         ),
@@ -376,11 +385,9 @@ async fn handle_request(req: &Value, state: &DaemonState) -> Value {
         Some("blob_fetch") => respond(
             id,
             "blob_fetch",
-            crate::daemon::blob_fetch(
-                state,
-                str_param(&params, "ticket"),
-                str_param(&params, "dest_path"),
-            )
+            with_params(&params, |p: BlobFetchParams| {
+                crate::daemon::blob_fetch(state, p.ticket, p.dest_path)
+            })
             .await,
         ),
         Some("audit_summary") => {
@@ -528,14 +535,28 @@ pub(crate) fn status_result(state: &DaemonState) -> StatusResult {
     }
 }
 
-/// Extract a string field from a request's `params` object, defaulting to `""` when absent
-/// or non-string (an empty peer/service simply fails the dial → a clean -32055, spec §8).
-fn str_param(params: &Value, key: &str) -> String {
-    params
-        .get(key)
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string()
+/// Deserialize a request's `params` into a method's typed param struct — the local-api wire
+/// truth (`protocol.rs`), so param-shape drift between the daemon and its clients is a compile
+/// error, not silent divergence. Omitted/`null` params read as `{}`, preserving the leniency
+/// for methods whose params are all defaultable (`invite`, `pair`, `open_session`).
+fn params_of<T: serde::de::DeserializeOwned>(params: &Value) -> anyhow::Result<T> {
+    let v = match params {
+        Value::Null => json!({}),
+        p => p.clone(),
+    };
+    serde_json::from_value(v).map_err(|e| anyhow::anyhow!("invalid params: {e}"))
+}
+
+/// The shared parse-then-handle shape of every param-carrying dispatch arm: deserialize
+/// `params` into the method's typed struct ([`params_of`]) and run the handler on it. A parse
+/// failure folds into the same anyhow error surface as a handler failure (→ `-32000` via
+/// [`respond`]).
+async fn with_params<P, R, F>(params: &Value, f: impl FnOnce(P) -> F) -> anyhow::Result<R>
+where
+    P: serde::de::DeserializeOwned,
+    F: Future<Output = anyhow::Result<R>>,
+{
+    f(params_of(params)?).await
 }
 
 fn ok(id: Value, result: Value) -> Value {
@@ -625,6 +646,27 @@ mod tests {
                 "method {method} should error in control-only mode, got {r}"
             );
         }
+    }
+
+    /// A param-carrying method with a malformed `params` shape answers a `-32000` error whose
+    /// message carries the invalid-params detail — the typed per-method deserialization into the
+    /// local-api param structs (never a panic, and the connection-level envelope stays lenient).
+    #[tokio::test]
+    async fn malformed_params_answer_an_invalid_params_error() {
+        let st = control_only();
+        // Wrong field type (petname must be a string).
+        let r = handle_request(&req("peer_remove", json!({ "petname": 42 })), &st).await;
+        assert_eq!(r["error"]["code"], -32000);
+        assert!(
+            r["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("invalid params"),
+            "message names the params problem: {r}"
+        );
+        // Missing required field.
+        let r = handle_request(&req("peer_rename", json!({ "user_id": "u" })), &st).await;
+        assert_eq!(r["error"]["code"], -32000);
     }
 
     /// `audit_summary` works WITHOUT a mesh (a local-only read; an empty/absent audit dir yields an

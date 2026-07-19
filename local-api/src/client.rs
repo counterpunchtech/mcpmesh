@@ -9,9 +9,11 @@ use serde_json::Value;
 
 use crate::codec::{FrameReader, Inbound, MAX_FRAME_BYTES, write_frame};
 use crate::protocol::{
-    AuditSummaryResult, BackendSpec, BlobFetchResult, BlobPublishResult, BlobScopeList, Hello,
-    InviteResult, OrgJoinResult, PairResult, Request, RosterInstallResult, StatusResult,
-    StreamFrame,
+    AuditSummaryResult, BackendSpec, BlobFetchParams, BlobFetchResult, BlobGrantParams,
+    BlobPublishParams, BlobPublishResult, BlobScopeList, Hello, InviteParams, InviteResult,
+    OpenSessionParams, OrgJoinParams, OrgJoinResult, PairParams, PairResult, PeerRemoveParams,
+    PeerRenameParams, RegisterServiceParams, Request, RosterInstallParams, RosterInstallResult,
+    SetRosterUrlParams, StatusResult, StreamFrame,
 };
 use crate::transport::{LocalReadHalf, LocalWriteHalf, connect_local, split_local};
 
@@ -104,7 +106,7 @@ impl ControlClient {
         peer: String,
         service: String,
     ) -> Result<(FrameReader<LocalReadHalf>, LocalWriteHalf), ClientError> {
-        let frame = serde_json::to_value(Request::OpenSession { peer, service })
+        let frame = serde_json::to_value(Request::OpenSession(OpenSessionParams { peer, service }))
             .expect("Request serializes");
         write_frame(&mut self.writer, &frame).await?;
         Ok((self.reader, self.writer))
@@ -159,18 +161,18 @@ impl ControlClient {
         backend: BackendSpec,
         allow: Vec<String>,
     ) -> Result<(), ClientError> {
-        self.request_ack(Request::RegisterService {
+        self.request_ack(Request::RegisterService(RegisterServiceParams {
             name: name.to_string(),
             backend,
             allow,
-        })
+        }))
         .await
     }
 
     /// Mint a one-time pairing invite granting `services`; return the copyable
     /// `mcpmesh-invite:` line + its expiry.
     pub async fn invite(&mut self, services: Vec<String>) -> Result<InviteResult, ClientError> {
-        self.request_typed(Request::Invite { services }, "invite result")
+        self.request_typed(Request::Invite(InviteParams { services }), "invite result")
             .await
     }
 
@@ -178,9 +180,9 @@ impl ControlClient {
     /// code, and the granted services.
     pub async fn pair(&mut self, invite_line: &str) -> Result<PairResult, ClientError> {
         self.request_typed(
-            Request::Pair {
+            Request::Pair(PairParams {
                 invite_line: invite_line.to_string(),
-            },
+            }),
             "pair result",
         )
         .await
@@ -189,9 +191,9 @@ impl ControlClient {
     /// Unpair a peer by petname: drops its identity row AND its every-`allow` membership
     /// (idempotent; live sessions are not severed). The daemon acks; the ack body is discarded.
     pub async fn peer_remove(&mut self, petname: &str) -> Result<(), ClientError> {
-        self.request_ack(Request::PeerRemove {
+        self.request_ack(Request::PeerRemove(PeerRemoveParams {
             petname: petname.to_string(),
-        })
+        }))
         .await
     }
 
@@ -205,11 +207,11 @@ impl ControlClient {
         petname: Option<String>,
         to: &str,
     ) -> Result<(), ClientError> {
-        self.request_ack(Request::PeerRename {
+        self.request_ack(Request::PeerRename(PeerRenameParams {
             user_id,
             petname,
             to: to.to_string(),
-        })
+        }))
         .await
     }
 
@@ -221,10 +223,10 @@ impl ControlClient {
         org_root_pk: Option<String>,
     ) -> Result<RosterInstallResult, ClientError> {
         self.request_typed(
-            Request::RosterInstall {
+            Request::RosterInstall(RosterInstallParams {
                 path: path.to_string(),
                 org_root_pk,
-            },
+            }),
             "roster_install result",
         )
         .await
@@ -240,12 +242,12 @@ impl ControlClient {
         user_key: &str,
     ) -> Result<OrgJoinResult, ClientError> {
         self.request_typed(
-            Request::OrgJoin {
+            Request::OrgJoin(OrgJoinParams {
                 org_id: org_id.to_string(),
                 org_root_pk: org_root_pk.to_string(),
                 user_id: user_id.to_string(),
                 user_key: user_key.to_string(),
-            },
+            }),
             "org_join result",
         )
         .await
@@ -254,9 +256,9 @@ impl ControlClient {
     /// Pin the HTTPS roster URL (`[roster].url`) in the daemon's config. The daemon acks; the
     /// ack body is discarded.
     pub async fn set_roster_url(&mut self, url: &str) -> Result<(), ClientError> {
-        self.request_ack(Request::SetRosterUrl {
+        self.request_ack(Request::SetRosterUrl(SetRosterUrlParams {
             url: url.to_string(),
-        })
+        }))
         .await
     }
 
@@ -274,10 +276,10 @@ impl ControlClient {
         path: &str,
     ) -> Result<BlobPublishResult, ClientError> {
         self.request_typed(
-            Request::BlobPublish {
+            Request::BlobPublish(BlobPublishParams {
                 scope: scope.to_string(),
                 path: path.to_string(),
-            },
+            }),
             "blob_publish result",
         )
         .await
@@ -297,10 +299,10 @@ impl ControlClient {
         dest_path: &str,
     ) -> Result<BlobFetchResult, ClientError> {
         self.request_typed(
-            Request::BlobFetch {
+            Request::BlobFetch(BlobFetchParams {
                 ticket: ticket.to_string(),
                 dest_path: dest_path.to_string(),
-            },
+            }),
             "blob_fetch result",
         )
         .await
@@ -312,10 +314,10 @@ impl ControlClient {
     /// surfaces as `ClientError::Api`). kb uses this to grant a per-mirror sync scope to the
     /// owner's own user_id (all owner devices, incl. the mirror).
     pub async fn blob_grant(&mut self, scope: &str, principal: &str) -> Result<(), ClientError> {
-        self.request_ack(Request::BlobGrant {
+        self.request_ack(Request::BlobGrant(BlobGrantParams {
             scope: scope.to_string(),
             principal: principal.to_string(),
-        })
+        }))
         .await
     }
 

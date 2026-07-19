@@ -4,11 +4,10 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use mcpmesh::{client, config, daemon, doctor, pairing, proxy, roster, util};
 use mcpmesh_local_api::{
-    AuditKind, BackendKind, BackendSpec, Hello, InviteResult, PairResult, PresencePeer,
-    RecentPairing, RosterInstallResult, RosterStatus, StatusResult, StreamFrame,
+    AuditKind, BackendKind, BackendSpec, Hello, InviteResult, PairResult, PeerAddParams,
+    PresencePeer, RecentPairing, RosterInstallResult, RosterStatus, StatusResult, StreamFrame,
 };
 use mcpmesh_trust::{DeviceKey, paths};
-use serde_json::json;
 
 /// The one worked `serve` example the CLI shows, as a macro so the runtime constant
 /// ([`SERVE_EXAMPLE`], for `status`'s next-steps footer) and clap's compile-time `after_help`
@@ -579,9 +578,10 @@ fn run_peer_add(petname: String, endpoint_id: String, allow: Option<String>) -> 
     let allow = split_csv(allow);
     with_daemon(async move |mut client| {
         client
-            .request_value(&json!({
-                "method": "peer_add",
-                "params": { "petname": petname, "endpoint_id": endpoint_id, "allow": allow }
+            .request(mcpmesh::Request::PeerAdd(PeerAddParams {
+                petname: petname.clone(),
+                endpoint_id,
+                allow,
             }))
             .await?;
         println!("added peer '{petname}'");
@@ -1518,6 +1518,7 @@ fn load_device_key() -> anyhow::Result<DeviceKey> {
 #[cfg(test)]
 mod tests {
     use mcpmesh_local_api::{PeerInfo, ServiceInfo};
+    use serde_json::json;
 
     use super::*;
 

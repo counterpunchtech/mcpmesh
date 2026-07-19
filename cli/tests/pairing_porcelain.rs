@@ -37,11 +37,19 @@ use mcpmesh::control::DaemonState;
 use mcpmesh::daemon::{self, MeshState, STACK_VERSION};
 use mcpmesh::pairing::LiveInvites;
 use mcpmesh::roster::gate::RosterGate;
+use mcpmesh_local_api::PeerRemoveParams;
 use mcpmesh_net::registry::ConnRegistry;
 use mcpmesh_net::{ALPN_MCP, ALPN_PAIR, TrustGate};
 use serde_json::json;
 
 const STUB: &str = env!("CARGO_BIN_EXE_echo_mcp_stub");
+
+/// The typed `peer_remove` params, as the control dispatcher hands them to `daemon::remove_peer`.
+fn unpair(petname: &str) -> PeerRemoveParams {
+    PeerRemoveParams {
+        petname: petname.into(),
+    }
+}
 
 // ───────────────────────────── invite porcelain (subprocess) ─────────────────────────────
 
@@ -237,7 +245,7 @@ async fn pair_remove_drops_the_peer_and_revokes_every_service_allow() {
         let state = DaemonState::with_mesh(STACK_VERSION, mesh, Vec::new(), Vec::new());
 
         // ── Unpair bob ──
-        daemon::remove_peer(&state, &json!({ "petname": "bob" }))
+        daemon::remove_peer(&state, unpair("bob"))
             .await
             .expect("peer_remove bob");
 
@@ -265,11 +273,11 @@ async fn pair_remove_drops_the_peer_and_revokes_every_service_allow() {
         );
 
         // ── Idempotent: re-removing bob is a clean no-op (revoke changed=false, store no-op) ──
-        daemon::remove_peer(&state, &json!({ "petname": "bob" }))
+        daemon::remove_peer(&state, unpair("bob"))
             .await
             .expect("re-removing bob is a clean no-op");
         // ── Idempotent: removing a never-present peer is a clean no-op ──
-        daemon::remove_peer(&state, &json!({ "petname": "ghost" }))
+        daemon::remove_peer(&state, unpair("ghost"))
             .await
             .expect("removing an absent peer is a clean no-op");
 
@@ -327,7 +335,7 @@ async fn pair_remove_drops_a_peer_with_no_service_allow() {
         );
         let state = DaemonState::with_mesh(STACK_VERSION, mesh, Vec::new(), Vec::new());
 
-        daemon::remove_peer(&state, &json!({ "petname": "dave" }))
+        daemon::remove_peer(&state, unpair("dave"))
             .await
             .expect("peer_remove dave (no allow membership)");
 
@@ -391,7 +399,7 @@ async fn pair_remove_audits_a_real_unpair_but_not_a_no_op() {
         let file = audit_dir.join(format!("{month}.jsonl"));
 
         // ── A NO-OP remove of a never-paired petname must write NO unpair record ──
-        daemon::remove_peer(&state, &json!({ "petname": "ghost" }))
+        daemon::remove_peer(&state, unpair("ghost"))
             .await
             .expect("removing an absent peer is a clean no-op");
         // Give the async audit writer ample time to have flushed a record IF one were emitted.
@@ -405,7 +413,7 @@ async fn pair_remove_audits_a_real_unpair_but_not_a_no_op() {
         );
 
         // ── A REAL unpair of bob writes EXACTLY one unpair record targeted at "bob" ──
-        daemon::remove_peer(&state, &json!({ "petname": "bob" }))
+        daemon::remove_peer(&state, unpair("bob"))
             .await
             .expect("peer_remove bob");
         let mut unpairs = 0;

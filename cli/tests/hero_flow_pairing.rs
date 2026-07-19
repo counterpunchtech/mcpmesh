@@ -58,7 +58,7 @@ use mcpmesh::daemon::{self, MeshState, build_services, spawn_accept_loop};
 use mcpmesh::pairing::sas::short_auth_code;
 use mcpmesh::pairing::{Invite, LiveInvites};
 use mcpmesh::roster::gate::RosterGate;
-use mcpmesh_local_api::{InviteResult, PairResult, StatusResult};
+use mcpmesh_local_api::{InviteParams, InviteResult, PairParams, PairResult, StatusResult};
 use mcpmesh_net::framing::{FrameReader, Inbound, write_frame};
 use mcpmesh_net::registry::ConnRegistry;
 use mcpmesh_net::{TrustGate, connect};
@@ -220,9 +220,9 @@ async fn four_command_hero_flow() {
         assert_eq!(status["stack_version"], daemon::STACK_VERSION);
 
         let invite_value = alice_client
-            .request(Request::Invite {
+            .request(Request::Invite(InviteParams {
                 services: vec!["notes".into()],
-            })
+            }))
             .await
             .expect("invite over mcpmesh-local/1");
         let invite: InviteResult =
@@ -245,9 +245,9 @@ async fn four_command_hero_flow() {
             .expect("raw connect_control to Bob");
         assert_eq!(bob_client.hello().api, "mcpmesh-local/1");
         let pair_value = bob_client
-            .request(Request::Pair {
+            .request(Request::Pair(PairParams {
                 invite_line: invite.invite_line.clone(),
-            })
+            }))
             .await
             .expect("pair over mcpmesh-local/1");
         let paired: PairResult =

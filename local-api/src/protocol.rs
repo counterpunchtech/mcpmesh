@@ -138,41 +138,145 @@ pub struct StatusResult {
     pub reachability: Vec<PeerReachability>,
 }
 
+/// Params of [`Request::RegisterService`]: the `[services.*]` entry to write/update.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegisterServiceParams {
+    pub name: String,
+    pub backend: BackendSpec,
+    pub allow: Vec<String>,
+}
+
+/// Params of [`Request::Invite`]: the services the minted invite grants. `services` is
+/// defaultable — an absent list grants nothing (the documented server-side tolerance).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InviteParams {
+    #[serde(default)]
+    pub services: Vec<String>,
+}
+
+/// Params of [`Request::Pair`]: the copyable `mcpmesh-invite:` line. Defaultable — an
+/// absent field reads as an empty line, which simply fails to decode (a clean pair error).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairParams {
+    #[serde(default)]
+    pub invite_line: String,
+}
+
+/// Params of [`Request::PeerRemove`]: the petname to unpair.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerRemoveParams {
+    pub petname: String,
+}
+
+/// Params of [`Request::PeerRename`]: the contact to rename — every device sharing `user_id`
+/// when given, else the single provisional `petname` entry — and the new nickname `to`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerRenameParams {
+    #[serde(default)]
+    pub user_id: Option<String>,
+    #[serde(default)]
+    pub petname: Option<String>,
+    pub to: String,
+}
+
+/// Params of [`Request::PeerAdd`] (reserved/internal — see the variant): a raw `endpoint_id`
+/// (iroh base32) plus the petname and service allow list to install it under.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerAddParams {
+    pub petname: String,
+    pub endpoint_id: String,
+    #[serde(default)]
+    pub allow: Vec<String>,
+}
+
+/// Params of [`Request::OpenSession`]: the `peer/service` target to dial. Both fields are
+/// defaultable — an empty target simply fails the dial (a clean `-32055`, spec §8).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenSessionParams {
+    #[serde(default)]
+    pub peer: String,
+    #[serde(default)]
+    pub service: String,
+}
+
+/// Params of [`Request::RosterInstall`]: the LOCAL roster file `path`, plus the org-root pin
+/// on FIRST install (`b64u:`; omit once pinned — config carries it).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RosterInstallParams {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_root_pk: Option<String>,
+}
+
+/// Params of [`Request::OrgJoin`]: the `[identity]` pin. `user_key` is a LOCAL path — the key
+/// never crosses the API.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrgJoinParams {
+    pub org_id: String,
+    pub org_root_pk: String,
+    pub user_id: String,
+    pub user_key: String,
+}
+
+/// Params of [`Request::SetRosterUrl`]: the HTTPS roster URL to pin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetRosterUrlParams {
+    pub url: String,
+}
+
+/// Params of [`Request::BlobPublish`]: the scope to publish into and the LOCAL file to add.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobPublishParams {
+    pub scope: String,
+    pub path: String,
+}
+
+/// Params of [`Request::BlobGrant`]: the scope and the §5 flat-namespace principal to grant it to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobGrantParams {
+    pub scope: String,
+    pub principal: String,
+}
+
+/// Params of [`Request::BlobFetch`]: the `mcpmesh/blob/1` ticket and the LOCAL export path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobFetchParams {
+    pub ticket: String,
+    pub dest_path: String,
+}
+
 /// Control-API requests. Serialized as `{ "method": "...", "params": {...} }`
 /// (JSON-RPC-shaped; the id/jsonrpc envelope is added by the transport layer).
 ///
-/// Clients construct and serialize requests via this enum. **Servers dispatch on the
-/// `method` string and deserialize `params` per-method** — tolerating omitted / null /
-/// empty-object params for parameterless methods — rather than deserializing a whole
-/// message into `Request` (adjacent tagging rejects `params:{}` for unit variants).
+/// Each param-carrying variant wraps its named `*Params` struct — the ONE wire truth for that
+/// method's params, shared by clients (which serialize whole `Request`s) and the daemon (which
+/// deserializes `params` into the same struct after its method-string dispatch). Adjacent
+/// tagging serializes a newtype variant's content as the struct's fields, so the wire shape is
+/// identical to inline variant bodies.
+///
+/// **Servers dispatch on the `method` string and deserialize `params` per-method** — tolerating
+/// omitted / null / empty-object params for parameterless methods — rather than deserializing a
+/// whole message into `Request` (adjacent tagging rejects `params:{}` for unit variants).
 /// This keeps the wire tolerant for third-party clients (§6.1 versioned surface).
 /// Use [`method_of`] to extract the tag, then match + deserialize `params` per-method.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum Request {
     /// Register/update a `[services.*]` entry idempotently (spec §6.1).
-    RegisterService {
-        name: String,
-        backend: BackendSpec,
-        allow: Vec<String>,
-    },
+    RegisterService(RegisterServiceParams),
     Status,
     /// Mint a one-time pairing invite granting `services` (spec §4.2). The daemon
     /// answers an [`InviteResult`] carrying the copyable `mcpmesh-invite:` line. Tag
     /// `"invite"` (snake_case). `method_of` needs no per-variant arm — it reads the
     /// `method` string generically; the tag comes from `rename_all`.
-    Invite {
-        services: Vec<String>,
-    },
+    Invite(InviteParams),
     /// Redeem a pairing invite (spec §4.2). The daemon dials the inviter named by
     /// `invite_line` on `mcpmesh/pair/1`, proves the secret, writes the mutual
     /// (dial-back) [`PeerEntry`], and answers a [`PairResult`]. Tag `"pair"`
     /// (snake_case); `method_of` reads the `method` string generically.
     ///
     /// [`PeerEntry`]: crate — the durable allowlist row lives in the daemon crate.
-    Pair {
-        invite_line: String,
-    },
+    Pair(PairParams),
     /// Remove a paired peer by petname (spec §4.2, `mcpmesh pair --remove`). The daemon drops the
     /// peer's [`PeerEntry`] (identity) AND revokes its access by removing the petname from every
     /// `[services.*].allow` (authorization) — the inverse of the pairing grant. Idempotent: a
@@ -182,9 +286,7 @@ pub enum Request {
     /// `method_of` reads the `method` string generically (no per-variant arm).
     ///
     /// [`PeerEntry`]: crate — the durable allowlist row lives in the daemon crate.
-    PeerRemove {
-        petname: String,
-    },
+    PeerRemove(PeerRemoveParams),
     /// Rename a contact's nickname (petname) authoritatively (Contacts rename spec). Renames the
     /// PERSON — every `PeerEntry` sharing `user_id` when given (one op for all their devices), else the
     /// single `petname` entry (a provisional, no-`user_id` contact) — to `to`, AND rewrites the old
@@ -192,71 +294,48 @@ pub enum Request {
     /// when `to` is empty or already names/grants a DIFFERENT identity — the same collision guard the
     /// pairing rendezvous uses, so a rename can't inherit another peer's access. Tag `"peer_rename"`;
     /// host-privileged like the other pair ops.
-    PeerRename {
-        #[serde(default)]
-        user_id: Option<String>,
-        #[serde(default)]
-        petname: Option<String>,
-        to: String,
-    },
+    PeerRename(PeerRenameParams),
+    /// RESERVED / INTERNAL (`docs/local-protocol.md` "Reserved / internal methods"): install a
+    /// peer directly from a raw `endpoint_id` — the trust-population stand-in for pairing behind
+    /// `mcpmesh internal peer add`. A deliberate, documented exception to the surface discipline
+    /// (raw endpoint identifiers otherwise never cross this socket); NOT part of the stable
+    /// vocabulary — do not build on it. Tag `"peer_add"`.
+    PeerAdd(PeerAddParams),
     /// Open a mesh session to `peer/service`; the daemon dials and pipes.
     /// Distinct from the proxy's job: this returns a session the client streams.
     /// Spec §6.1's `connect(peer[,device],service)` — renamed to avoid colliding
     /// with the `connect` porcelain.
-    OpenSession {
-        peer: String,
-        service: String,
-    },
+    OpenSession(OpenSessionParams),
     /// Install a signed roster from a local file (spec §4.3 manual `internal roster install`).
     /// `path` is a LOCAL file the same-uid daemon reads (P12/P14 trust boundary — passing a path
     /// not the bytes is fine). `org_root_pk` pins the org root on FIRST install (`b64u:`); omit it
     /// once pinned (config carries it). Tag `"roster_install"`.
-    RosterInstall {
-        path: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        org_root_pk: Option<String>,
-    },
+    RosterInstall(RosterInstallParams),
     /// Pin the org root on a JOINER (spec §4.4 step 2) — WITHOUT a roster (the joiner has none yet,
     /// D5). Records `[identity]` org_id / org_root_pk / user_id / user_key. `user_key` is a LOCAL path
     /// (the key never crosses the API). Tag `"org_join"`.
-    OrgJoin {
-        org_id: String,
-        org_root_pk: String,
-        user_id: String,
-        user_key: String,
-    },
+    OrgJoin(OrgJoinParams),
     /// Pin the HTTPS roster URL (`[roster].url`) in config (spec §4.3 M3c). Written by `org create
     /// --roster-url` (the operator keeps it current) AND by `join` when the org invite carries one —
     /// so the joiner's poll loop bootstraps its FIRST roster (D5). The daemon writes it under
     /// `reload_lock` (single-writer), then the poll loop picks it up on the next daemon start. Tag
     /// `"set_roster_url"`.
-    SetRosterUrl {
-        url: String,
-    },
+    SetRosterUrl(SetRosterUrlParams),
     /// Publish a LOCAL file INTO a scope (spec §9, M4a): the daemon adds the bytes to its gated
     /// app-blob store and records the hash in `scope`. `path` is a local file the same-uid daemon
     /// reads (P12/P14). Answers a [`BlobPublishResult`] carrying the `mcpmesh/blob/1` ticket + hash.
     /// Tag `"blob_publish"`.
-    BlobPublish {
-        scope: String,
-        path: String,
-    },
+    BlobPublish(BlobPublishParams),
     /// Grant a scope to a principal — any §5 flat-namespace entry: a group name, a user_id, or a
     /// petname (the shared `principal_set` expansion). Tag
     /// `"blob_grant"`.
-    BlobGrant {
-        scope: String,
-        principal: String,
-    },
+    BlobGrant(BlobGrantParams),
     /// List the daemon's blob scopes (name → hashes + grants). Tag `"blob_list"`.
     BlobList,
     /// Fetch a `mcpmesh/blob/1` ticket THROUGH the daemon (BLAKE3-verified streaming) and export the
     /// verified blob to `dest_path` (a local file the same-uid daemon writes). Answers a
     /// [`BlobFetchResult`] with the verified hash + byte length. Tag `"blob_fetch"`.
-    BlobFetch {
-        ticket: String,
-        dest_path: String,
-    },
+    BlobFetch(BlobFetchParams),
     /// Summarize this node's LOCAL audit log into per-peer / per-service SESSION counts (spec §11.3
     /// local-only — the daemon reads its OWN audit dir, nothing is transmitted). The host Mesh surface
     /// renders these as "who serves me / whom I serve / session counts". Parameterless (like `Status`);
@@ -661,10 +740,10 @@ mod tests {
     fn request_tagged_by_method() {
         let r = Request::Status;
         assert_eq!(serde_json::to_value(&r).unwrap()["method"], "status");
-        let r = Request::OpenSession {
+        let r = Request::OpenSession(OpenSessionParams {
             peer: "alice".into(),
             service: "notes".into(),
-        };
+        });
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["method"], "open_session");
         assert_eq!(v["params"]["peer"], "alice");
@@ -711,13 +790,13 @@ mod tests {
 
     #[test]
     fn register_service_wire_shape() {
-        let r = Request::RegisterService {
+        let r = Request::RegisterService(RegisterServiceParams {
             name: "notes".into(),
             backend: BackendSpec::Run {
                 cmd: vec!["notes-mcp".into()],
             },
             allow: vec!["alice".into()],
-        };
+        });
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(
             v,
@@ -736,9 +815,9 @@ mod tests {
     #[test]
     fn invite_request_and_result_roundtrip() {
         // Request::Invite → `{ "method": "invite", "params": { "services": [...] } }`.
-        let r = Request::Invite {
+        let r = Request::Invite(InviteParams {
             services: vec!["notes".into(), "kb".into()],
-        };
+        });
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["method"], "invite");
         assert_eq!(v["params"]["services"][0], "notes");
@@ -764,9 +843,9 @@ mod tests {
     #[test]
     fn pair_request_and_result_roundtrip() {
         // Request::Pair → `{ "method": "pair", "params": { "invite_line": "..." } }`.
-        let r = Request::Pair {
+        let r = Request::Pair(PairParams {
             invite_line: "mcpmesh-invite:ABCDEF".into(),
-        };
+        });
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["method"], "pair");
         assert_eq!(v["params"]["invite_line"], "mcpmesh-invite:ABCDEF");
@@ -806,10 +885,10 @@ mod tests {
     fn roster_install_request_and_result_roundtrip() {
         // Request::RosterInstall → `{ "method": "roster_install", "params": { "path": ...,
         // "org_root_pk": ... } }`. The optional pk is present on the first-install shape.
-        let r = Request::RosterInstall {
+        let r = Request::RosterInstall(RosterInstallParams {
             path: "/tmp/roster.json".into(),
             org_root_pk: Some("b64u:AAAA".into()),
-        };
+        });
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["method"], "roster_install");
         assert_eq!(v["params"]["path"], "/tmp/roster.json");
@@ -823,10 +902,10 @@ mod tests {
 
         // When the pk is omitted (a subsequent install using the pinned value), it is
         // `skip_serializing_if`-dropped from the wire and deserializes back to `None`.
-        let omit = Request::RosterInstall {
+        let omit = Request::RosterInstall(RosterInstallParams {
             path: "/tmp/roster.json".into(),
             org_root_pk: None,
-        };
+        });
         let v = serde_json::to_value(&omit).unwrap();
         assert!(
             v["params"].get("org_root_pk").is_none(),
@@ -861,12 +940,12 @@ mod tests {
     fn org_join_request_and_result_roundtrip() {
         // Request::OrgJoin → `{ "method": "org_join", "params": { org_id, org_root_pk, user_id,
         // user_key } }`. `user_key` is a LOCAL path string (the key never crosses the API).
-        let r = Request::OrgJoin {
+        let r = Request::OrgJoin(OrgJoinParams {
             org_id: "acme".into(),
             org_root_pk: "b64u:AAAA".into(),
             user_id: "alice".into(),
             user_key: "/home/alice/.config/mcpmesh/user.key".into(),
-        };
+        });
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["method"], "org_join");
         assert_eq!(v["params"]["org_id"], "acme");
@@ -895,9 +974,9 @@ mod tests {
     #[test]
     fn set_roster_url_request_roundtrip() {
         // Request::SetRosterUrl → `{ "method": "set_roster_url", "params": { "url": "..." } }`.
-        let r = Request::SetRosterUrl {
+        let r = Request::SetRosterUrl(SetRosterUrlParams {
             url: "https://intranet.acme.com/roster.json".into(),
-        };
+        });
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["method"], "set_roster_url");
         assert_eq!(v["params"]["url"], "https://intranet.acme.com/roster.json");
@@ -911,9 +990,9 @@ mod tests {
     #[test]
     fn peer_remove_request_roundtrip() {
         // Request::PeerRemove → `{ "method": "peer_remove", "params": { "petname": "..." } }`.
-        let r = Request::PeerRemove {
+        let r = Request::PeerRemove(PeerRemoveParams {
             petname: "bob".into(),
-        };
+        });
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["method"], "peer_remove");
         assert_eq!(v["params"]["petname"], "bob");
@@ -925,14 +1004,37 @@ mod tests {
         );
     }
 
+    /// The reserved/internal `peer_add` rides the SAME typed vocabulary as every other method —
+    /// `{ "method": "peer_add", "params": { petname, endpoint_id, allow } }` — with `allow`
+    /// defaulting to empty when absent.
+    #[test]
+    fn peer_add_request_roundtrip() {
+        let r = Request::PeerAdd(PeerAddParams {
+            petname: "bob".into(),
+            endpoint_id: "96246d3f".into(),
+            allow: vec!["notes".into()],
+        });
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["method"], "peer_add");
+        assert_eq!(v["params"]["petname"], "bob");
+        assert_eq!(v["params"]["endpoint_id"], "96246d3f");
+        assert_eq!(v["params"]["allow"][0], "notes");
+        assert_eq!(serde_json::from_value::<Request>(v).unwrap(), r);
+        // An absent allow list deserializes to empty (the server-side tolerance).
+        let p: PeerAddParams =
+            serde_json::from_value(serde_json::json!({"petname": "bob", "endpoint_id": "x"}))
+                .unwrap();
+        assert!(p.allow.is_empty());
+    }
+
     #[test]
     fn peer_rename_request_roundtrip() {
         // By user_id (renames all of a person's devices in one op).
-        let r = Request::PeerRename {
+        let r = Request::PeerRename(PeerRenameParams {
             user_id: Some("b64u:BOB".into()),
             petname: None,
             to: "Bobby".into(),
-        };
+        });
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["method"], "peer_rename");
         assert_eq!(v["params"]["user_id"], "b64u:BOB");
@@ -1089,10 +1191,10 @@ mod tests {
     #[test]
     fn blob_requests_and_results_roundtrip() {
         // BlobPublish → { method, params: { scope, path } }.
-        let r = Request::BlobPublish {
+        let r = Request::BlobPublish(BlobPublishParams {
             scope: "docs".into(),
             path: "/tmp/a.bin".into(),
-        };
+        });
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["method"], "blob_publish");
         assert_eq!(v["params"]["scope"], "docs");
@@ -1100,10 +1202,10 @@ mod tests {
         assert_eq!(serde_json::from_value::<Request>(v).unwrap(), r);
 
         // BlobGrant → { method, params: { scope, principal } }.
-        let r = Request::BlobGrant {
+        let r = Request::BlobGrant(BlobGrantParams {
             scope: "docs".into(),
             principal: "alice".into(),
-        };
+        });
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["method"], "blob_grant");
         assert_eq!(v["params"]["principal"], "alice");
@@ -1116,10 +1218,10 @@ mod tests {
         );
 
         // BlobFetch → { method, params: { ticket, dest_path } }.
-        let r = Request::BlobFetch {
+        let r = Request::BlobFetch(BlobFetchParams {
             ticket: "blobAAA".into(),
             dest_path: "/tmp/out.bin".into(),
-        };
+        });
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["method"], "blob_fetch");
         assert_eq!(v["params"]["ticket"], "blobAAA");
