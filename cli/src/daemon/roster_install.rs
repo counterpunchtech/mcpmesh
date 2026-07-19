@@ -652,10 +652,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
         // A pending joiner's config: the org anchor is pinned (as `OrgJoin` sets it) but no roster.
+        // `poll_interval` is pinned short: the assertion below must survive a transient failure of
+        // the loop's immediate startup poll (the default interval is 1h — one flaky GET on a cold
+        // CI runner would otherwise exhaust any reasonable deadline before the first retry).
         std::fs::write(
             &config_path,
             format!(
-                "[network]\nrelay_mode = \"disabled\"\n[identity]\norg_root_pk = \"{pk_str}\"\norg_id = \"acme\"\n"
+                "[network]\nrelay_mode = \"disabled\"\n[identity]\norg_root_pk = \"{pk_str}\"\norg_id = \"acme\"\n[roster]\npoll_interval = \"2s\"\n"
             ),
         )
         .unwrap();
