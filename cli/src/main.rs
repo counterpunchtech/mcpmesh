@@ -352,8 +352,8 @@ fn error_lines(err: &anyhow::Error) -> Vec<String> {
 
 /// Render a control-API (JSON-RPC) error object for a human: unwrap `error.message`, mapping
 /// the known daemon failure shapes to user language (issue #10). The daemon's failed-dial
-/// pair message carries transport vocabulary ("dial the inviter on the pairing ALPN") that
-/// SECURITY.md bars from user-facing surfaces — this porcelain seam owns the translation.
+/// pair message ("could not dial the inviter's machine") is mechanism-flavored and misses the
+/// common self-redeem cause — this porcelain seam owns the human explanation.
 /// The wire's `"{method} failed: "` framing (the shape every control arm answers with) is
 /// stripped first: `peer_remove` is a method name, not a command the user typed — the
 /// remainder is the daemon's own user-facing sentence.
@@ -2309,11 +2309,11 @@ mod tests {
 
     #[test]
     fn failed_pair_dial_renders_in_user_language() {
-        // The daemon-side message (its exact shape at v0.4.0) carries transport vocabulary;
-        // the porcelain seam maps it to the human explanation (issue #10).
+        // The daemon-side message (its exact shape in pairing/rendezvous.rs) is terse; the
+        // porcelain seam maps it to the human explanation (issue #10).
         let err = api_error(json!({
             "code": -32000,
-            "message": "pair failed: dial the inviter on the pairing ALPN"
+            "message": "pair failed: could not dial the inviter's machine"
         }));
         let rendered = error_lines(&err).join("\n");
         assert!(
