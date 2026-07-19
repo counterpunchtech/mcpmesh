@@ -1,6 +1,6 @@
-//! mcpmesh-local/1 protocol types (spec §6.1). Shared vocabulary between the daemon
+//! mcpmesh-local/1 protocol types. Shared vocabulary between the daemon
 //! and its clients (porcelain, connect proxy, later the host shell). Wire framing
-//! is the family NDJSON codec — carried by the caller, not defined here (D-A).
+//! is the family NDJSON codec — carried by the caller, not defined here.
 //!
 //! Request/response asymmetry: requests are one typed, closed enum (`Request`);
 //! responses are per-method typed structs deserialized from the JSON-RPC `result`
@@ -8,12 +8,12 @@
 //! no JSON-RPC result at all: the socket STOPS being JSON-RPC and becomes a raw
 //! byte pipe.
 //!
-//! Additive-only (§6.1): new fields (capabilities on `Hello`, groups/user_id on
-//! `PeerInfo`, device on `OpenSession` — M3+) MUST land as
+//! Additive-only: new fields (capabilities on `Hello`, groups/user_id on
+//! `PeerInfo`, device on `OpenSession`) MUST land as
 //! `#[serde(default, skip_serializing_if = ...)]` so older payloads still deserialize.
 use serde::{Deserialize, Serialize};
 
-/// The first exchange on any `*-local/N` socket (spec §6.1 "hello convention").
+/// The first exchange on any `*-local/N` socket (the family's hello convention).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hello {
     pub api: String,         // "mcpmesh-local/1"
@@ -23,7 +23,7 @@ pub struct Hello {
 
 /// The kind of backend answering a service — the two valid values, enforced at the
 /// type level and kept in lockstep with `BackendSpec`'s variants. Status reports the
-/// kind only, never the command/path (§17 no transport vocabulary).
+/// kind only, never the command/path (no transport vocabulary).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendKind {
@@ -31,7 +31,7 @@ pub enum BackendKind {
     Socket,
 }
 
-/// A registered service as reported by `status` (no transport vocabulary — §17).
+/// A registered service as reported by `status` (no transport vocabulary).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceInfo {
     pub name: String,
@@ -39,20 +39,20 @@ pub struct ServiceInfo {
     pub backend: BackendKind, // "run" | "socket" (kind only, never the command/path)
 }
 
-/// A known peer as reported by `status` (petname only — never the EndpointId, §1.5).
+/// A known peer as reported by `status` (petname only — never the EndpointId).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerInfo {
     pub name: String,
     pub services: Vec<String>,
     /// The peer's PROVEN self-sovereign `user_id` (`b64u:<user_pk>`) if it presented a verified
     /// device->user binding at pairing (roster peers carry it too), else `None` (petname-only). This
-    /// is a §1.5-clean identity (an opaque user id, NOT an EndpointId). Additive (§6.1):
+    /// is a surface-clean identity (an opaque user id, NOT an EndpointId). Additive:
     /// `#[serde(default, skip_serializing_if = "Option::is_none")]` so older payloads round-trip.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_id: Option<String>,
 }
 
-/// Advisory reachability of a paired peer (spec: pairing-mode liveness). Surface-clean (§1.5):
+/// Advisory reachability of a paired peer (pairing-mode liveness). Surface-clean:
 /// a petname + a bool + latency/age NUMBERS — never an endpoint-id, key, or transport path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerReachability {
@@ -64,19 +64,19 @@ pub struct PeerReachability {
     pub age_secs: Option<u64>, // None = never probed (consumer shows "checking…")
 }
 
-/// Roster-mode status (spec §4.4). Surface-clean roster VOCABULARY only: org_id, serial, a plain
+/// Roster-mode status. Surface-clean roster VOCABULARY only: org_id, serial, a plain
 /// state word, and the pinned org-root FINGERPRINT in short words — never raw keys/EndpointIds/serials-
-/// as-transport-vocab (§1.5). Absent in a pure-pairing daemon.
+/// as-transport-vocab. Absent in a pure-pairing daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RosterStatus {
     pub org_id: String,
     pub serial: u64,
     pub state: String, // "pending" | "approved" | "degraded" | "stopped"
-    pub org_root_fingerprint: String, // short-word form (§4.4)
+    pub org_root_fingerprint: String, // short-word form
 }
 
-/// One reachable roster peer device as reported by `status` (spec §10.1 advisory presence read).
-/// ADVISORY — this is a display convenience, never an authorization surface. Surface-clean (§1.5/§17):
+/// One reachable roster peer device as reported by `status` (the advisory presence read).
+/// ADVISORY — this is a display convenience, never an authorization surface. Surface-clean:
 /// FLAT vocabulary ONLY — a `user_id`, a human `device_label`, its `role` word, and an `online`
 /// boolean. It carries NO EndpointId / pubkey / hash / ALPN or any transport vocabulary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,10 +90,10 @@ pub struct PresencePeer {
 
 /// One recently completed INVITER-side pairing, surfaced by `status` so the inviter's human can
 /// read the short authentication code (SAS) and compare it with the redeemer's out-of-band —
-/// spec §4.2's ceremony is "both humans compare the code": the redeemer sees it in its
+/// the pairing ceremony is "both humans compare the code": the redeemer sees it in its
 /// [`PairResult`]; this is the inviter's porcelain surface for the same words. DISPLAY-ONLY
 /// ceremony state: held in-memory by the daemon (a small ring), lost on restart, NEVER an
-/// authorization input or trust data. Surface-clean (§1.5): a petname + the SAS wordlist words +
+/// authorization input or trust data. Surface-clean: a petname + the SAS wordlist words +
 /// an epoch — never an EndpointId.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecentPairing {
@@ -111,29 +111,29 @@ pub struct StatusResult {
     pub stack_version: String,
     pub services: Vec<ServiceInfo>,
     pub peers: Vec<PeerInfo>,
-    /// Roster-mode status (§4.4), absent in a pure-pairing daemon. Additive (§6.1):
+    /// Roster-mode status, absent in a pure-pairing daemon. Additive:
     /// `#[serde(default, skip_serializing_if = ...)]` so a daemon/client without it round-trips.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roster: Option<RosterStatus>,
-    /// The reachable roster peer devices (spec §10.1 advisory presence read), each with an `online`
-    /// flag. Empty in a pure-pairing daemon / when no roster is installed. Additive (§6.1):
+    /// The reachable roster peer devices (the advisory presence read), each with an `online`
+    /// flag. Empty in a pure-pairing daemon / when no roster is installed. Additive:
     /// `#[serde(default, skip_serializing_if = "Vec::is_empty")]` so an older payload round-trips.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub presence: Vec<PresencePeer>,
     /// THIS daemon's own self-sovereign `user_id` (`b64u:<user_pk>`), if it has a user key (auto-
     /// minted at boot; shared by pairing AND roster mode). Lets the operator see + share their stable
-    /// identity that multiple devices resolve to. `None` only when no user key exists. Additive (§6.1):
+    /// identity that multiple devices resolve to. `None` only when no user key exists. Additive:
     /// `#[serde(default, skip_serializing_if = "Option::is_none")]` so an older payload round-trips.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_user_id: Option<String>,
-    /// Recent INVITER-side pairing completions, newest first (display-only §4.2 ceremony aids —
+    /// Recent INVITER-side pairing completions, newest first (display-only pairing-ceremony aids —
     /// see [`RecentPairing`]; in-memory on the daemon, cleared by a restart). Empty on a daemon
-    /// that has accepted no pairing since it started. Additive (§6.1):
+    /// that has accepted no pairing since it started. Additive:
     /// `#[serde(default, skip_serializing_if = "Vec::is_empty")]` so an older payload round-trips.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recent_pairings: Vec<RecentPairing>,
     /// Advisory reachability of paired peers, from the on-demand probe cache. Empty until the
-    /// first probe completes. Additive (§6.1): default + skip-if-empty.
+    /// first probe completes. Additive: default + skip-if-empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reachability: Vec<PeerReachability>,
 }
@@ -190,7 +190,7 @@ pub struct PeerAddParams {
 }
 
 /// Params of [`Request::OpenSession`]: the `peer/service` target to dial. Both fields are
-/// defaultable — an empty target simply fails the dial (a clean `-32055`, spec §8).
+/// defaultable — an empty target simply fails the dial (a clean `-32055` error).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenSessionParams {
     #[serde(default)]
@@ -231,7 +231,7 @@ pub struct BlobPublishParams {
     pub path: String,
 }
 
-/// Params of [`Request::BlobGrant`]: the scope and the §5 flat-namespace principal to grant it to.
+/// Params of [`Request::BlobGrant`]: the scope and the flat-namespace principal to grant it to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobGrantParams {
     pub scope: String,
@@ -257,37 +257,37 @@ pub struct BlobFetchParams {
 /// **Servers dispatch on the `method` string and deserialize `params` per-method** — tolerating
 /// omitted / null / empty-object params for parameterless methods — rather than deserializing a
 /// whole message into `Request` (adjacent tagging rejects `params:{}` for unit variants).
-/// This keeps the wire tolerant for third-party clients (§6.1 versioned surface).
+/// This keeps the wire tolerant for third-party clients (the versioned, additive-only surface).
 /// Use [`method_of`] to extract the tag, then match + deserialize `params` per-method.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum Request {
-    /// Register/update a `[services.*]` entry idempotently (spec §6.1).
+    /// Register/update a `[services.*]` entry idempotently.
     RegisterService(RegisterServiceParams),
     Status,
-    /// Mint a one-time pairing invite granting `services` (spec §4.2). The daemon
+    /// Mint a one-time pairing invite granting `services`. The daemon
     /// answers an [`InviteResult`] carrying the copyable `mcpmesh-invite:` line. Tag
     /// `"invite"` (snake_case). `method_of` needs no per-variant arm — it reads the
     /// `method` string generically; the tag comes from `rename_all`.
     Invite(InviteParams),
-    /// Redeem a pairing invite (spec §4.2). The daemon dials the inviter named by
+    /// Redeem a pairing invite. The daemon dials the inviter named by
     /// `invite_line` on `mcpmesh/pair/1`, proves the secret, writes the mutual
     /// (dial-back) `PeerEntry`, and answers a [`PairResult`]. Tag `"pair"`
     /// (snake_case); `method_of` reads the `method` string generically.
     ///
     /// `PeerEntry` — the durable allowlist row — lives in the daemon crate.
     Pair(PairParams),
-    /// Remove a paired peer by petname (spec §4.2, `mcpmesh pair --remove`). The daemon drops the
+    /// Remove a paired peer by petname (`mcpmesh pair --remove`). The daemon drops the
     /// peer's `PeerEntry` (identity) AND revokes its access by removing the petname from every
     /// `[services.*].allow` (authorization) — the inverse of the pairing grant. Idempotent: a
     /// petname with no entry / no allow membership is a clean no-op. Live in-flight sessions are
-    /// NOT severed here (M3/D8): existing sessions run to completion; the peer only loses the
+    /// NOT severed here: existing sessions run to completion; the peer only loses the
     /// ability to establish NEW authorized sessions. Tag `"peer_remove"` (snake_case);
     /// `method_of` reads the `method` string generically (no per-variant arm).
     ///
     /// `PeerEntry` — the durable allowlist row — lives in the daemon crate.
     PeerRemove(PeerRemoveParams),
-    /// Rename a contact's nickname (petname) authoritatively (Contacts rename spec). Renames the
+    /// Rename a contact's nickname (petname) authoritatively. Renames the
     /// PERSON — every `PeerEntry` sharing `user_id` when given (one op for all their devices), else the
     /// single `petname` entry (a provisional, no-`user_id` contact) — to `to`, AND rewrites the old
     /// petname → `to` in every `[services.*].allow` so grants follow the rename. Refuses (error frame)
@@ -303,30 +303,32 @@ pub enum Request {
     PeerAdd(PeerAddParams),
     /// Open a mesh session to `peer/service`; the daemon dials and pipes.
     /// Distinct from the proxy's job: this returns a session the client streams.
-    /// Spec §6.1's `connect(peer[,device],service)` — renamed to avoid colliding
+    /// Named `open_session` rather than `connect` to avoid colliding
     /// with the `connect` porcelain.
     OpenSession(OpenSessionParams),
-    /// Install a signed roster from a local file (spec §4.3 manual `internal roster install`).
-    /// `path` is a LOCAL file the same-uid daemon reads (P12/P14 trust boundary — passing a path
-    /// not the bytes is fine). `org_root_pk` pins the org root on FIRST install (`b64u:`); omit it
+    /// Install a signed roster from a local file (the manual `internal roster install` path).
+    /// `path` is a LOCAL file the same-uid daemon reads (the daemon runs as the caller's own
+    /// uid, so passing a path rather than the bytes crosses no trust boundary). `org_root_pk`
+    /// pins the org root on FIRST install (`b64u:`); omit it
     /// once pinned (config carries it). Tag `"roster_install"`.
     RosterInstall(RosterInstallParams),
-    /// Pin the org root on a JOINER (spec §4.4 step 2) — WITHOUT a roster (the joiner has none yet,
-    /// D5). Records `[identity]` org_id / org_root_pk / user_id / user_key. `user_key` is a LOCAL path
+    /// Pin the org root on a JOINER — WITHOUT a roster (the joiner has none yet; its poll loop
+    /// fetches the first one). Records `[identity]` org_id / org_root_pk / user_id / user_key.
+    /// `user_key` is a LOCAL path
     /// (the key never crosses the API). Tag `"org_join"`.
     OrgJoin(OrgJoinParams),
-    /// Pin the HTTPS roster URL (`[roster].url`) in config (spec §4.3 M3c). Written by `org create
+    /// Pin the HTTPS roster URL (`[roster].url`) in config. Written by `org create
     /// --roster-url` (the operator keeps it current) AND by `join` when the org invite carries one —
-    /// so the joiner's poll loop bootstraps its FIRST roster (D5). The daemon writes it under
+    /// so the joiner's poll loop bootstraps its FIRST roster. The daemon writes it under
     /// `reload_lock` (single-writer), then the poll loop picks it up on the next daemon start. Tag
     /// `"set_roster_url"`.
     SetRosterUrl(SetRosterUrlParams),
-    /// Publish a LOCAL file INTO a scope (spec §9, M4a): the daemon adds the bytes to its gated
+    /// Publish a LOCAL file INTO a scope: the daemon adds the bytes to its gated
     /// app-blob store and records the hash in `scope`. `path` is a local file the same-uid daemon
-    /// reads (P12/P14). Answers a [`BlobPublishResult`] carrying the `mcpmesh/blob/1` ticket + hash.
+    /// reads. Answers a [`BlobPublishResult`] carrying the `mcpmesh/blob/1` ticket + hash.
     /// Tag `"blob_publish"`.
     BlobPublish(BlobPublishParams),
-    /// Grant a scope to a principal — any §5 flat-namespace entry: a group name, a user_id, or a
+    /// Grant a scope to a principal — any flat-namespace entry: a group name, a user_id, or a
     /// petname (the shared `principal_set` expansion). Tag
     /// `"blob_grant"`.
     BlobGrant(BlobGrantParams),
@@ -336,8 +338,8 @@ pub enum Request {
     /// verified blob to `dest_path` (a local file the same-uid daemon writes). Answers a
     /// [`BlobFetchResult`] with the verified hash + byte length. Tag `"blob_fetch"`.
     BlobFetch(BlobFetchParams),
-    /// Summarize this node's LOCAL audit log into per-peer / per-service SESSION counts (spec §11.3
-    /// local-only — the daemon reads its OWN audit dir, nothing is transmitted). The host Mesh surface
+    /// Summarize this node's LOCAL audit log into per-peer / per-service SESSION counts
+    /// (local-only — the daemon reads its OWN audit dir, nothing is transmitted). The host Mesh surface
     /// renders these as "who serves me / whom I serve / session counts". Parameterless (like `Status`);
     /// the server dispatches on the `method` string. Tag `"audit_summary"` (snake_case);
     /// `method_of` reads the `method` string generically (no per-variant arm).
@@ -349,38 +351,38 @@ pub enum Request {
 }
 
 /// Result of [`Request::OrgJoin`] — the pinned org id echoed back (surface-clean; the fingerprint is
-/// computed porcelain-side from the invite's org_root_pk). Additive-only (§6.1).
+/// computed porcelain-side from the invite's org_root_pk). Additive-only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrgJoinResult {
     pub org_id: String,
 }
 
-/// Result of a [`Request::RosterInstall`] request (spec §4.3 manual path): the installed roster's
+/// Result of a [`Request::RosterInstall`] request (the manual install path): the installed roster's
 /// org id + serial (roster-status vocabulary the confirmation line is permitted to render) plus how
-/// many live sessions the install severed (D8). Surface-clean: NO keys / EndpointIds / paths.
+/// many live sessions the install severed. Surface-clean: NO keys / EndpointIds / paths.
 ///
-/// Additive-only (§6.1): any future field MUST land as
+/// Additive-only: any future field MUST land as
 /// `#[serde(default, skip_serializing_if = ...)]` so older payloads still deserialize.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RosterInstallResult {
     pub org_id: String,
     pub serial: u64,
-    /// How many live sessions were severed (D8), for the porcelain's confirmation line.
+    /// How many live sessions were severed, for the porcelain's confirmation line.
     #[serde(default)]
     pub severed: u32,
 }
 
 /// Result of [`Request::BlobPublish`]: the copyable `mcpmesh/blob/1` ticket + the blob's blake3 hash.
-/// A ticket/hash here is the §9 blob-reference vocabulary (NOT a §1.5 transport-vocab leak — the same
-/// carve-out as the pairing invite line). Additive-only (§6.1).
+/// A ticket/hash here is blob-reference vocabulary (NOT a transport-vocab leak — the same
+/// carve-out as the pairing invite line). Additive-only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobPublishResult {
     pub ticket: String,
     pub hash: String, // bare blake3 hex
 }
 
-/// One scope in a [`BlobScopeList`] (spec §9): its name + the hashes it contains + the principals it
-/// grants. Flat vocabulary ONLY (§1.5) — no EndpointId/pubkey/ALPN. Additive-only (§6.1).
+/// One scope in a [`BlobScopeList`]: its name + the hashes it contains + the principals it
+/// grants. Flat vocabulary ONLY — no EndpointId/pubkey/ALPN. Additive-only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScopeInfo {
     pub name: String,
@@ -388,28 +390,28 @@ pub struct ScopeInfo {
     pub grants: Vec<String>,
 }
 
-/// Result of [`Request::BlobList`]: the daemon's scopes. Additive-only (§6.1).
+/// Result of [`Request::BlobList`]: the daemon's scopes. Additive-only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobScopeList {
     pub scopes: Vec<ScopeInfo>,
 }
 
 /// Result of [`Request::BlobFetch`]: the verified hash + byte length written to `dest_path`.
-/// Additive-only (§6.1).
+/// Additive-only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobFetchResult {
     pub hash: String,
     pub bytes_len: u64,
 }
 
-/// Result of [`Request::AuditSummary`] (spec §11.3): LOCAL per-peer / per-service session counts
-/// aggregated from this node's OWN audit log — NEVER transmitted (§11.3 local-only). Surface-clean
-/// (§1.5): peer names are petnames / user_ids (NEVER EndpointIds), service names are the registered
+/// Result of [`Request::AuditSummary`]: LOCAL per-peer / per-service session counts
+/// aggregated from this node's OWN audit log — NEVER transmitted (local-only). Surface-clean:
+/// peer names are petnames / user_ids (NEVER EndpointIds), service names are the registered
 /// service names (NEVER transport vocabulary). A "session" is one `SessionOpen` record. `per_peer` /
 /// `per_service` are sorted ascending by name (deterministic). Tuples mirror kb's
 /// `InsightResponse::per_peer_contribution` — `["bob", 2]` on the wire.
 ///
-/// Additive-only (§6.1): any future field MUST land as
+/// Additive-only: any future field MUST land as
 /// `#[serde(default, skip_serializing_if = ...)]` so older payloads still deserialize.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditSummaryResult {
@@ -424,11 +426,11 @@ pub struct AuditSummaryResult {
 }
 
 /// Result of an [`Request::Invite`] request: the copyable `mcpmesh-invite:` artifact
-/// (spec §1.5 surface #2 — the ONE pairing artifact deliberately carved out of the
+/// (the ONE pairing artifact deliberately carved out of the
 /// transport-vocabulary blocklist, so this is NOT a transport-vocab leak) plus its
 /// absolute expiry in epoch seconds (≤ now + 24h).
 ///
-/// Additive-only (§6.1): any future field (e.g. the computed SAS, once the inviter side
+/// Additive-only: any future field (e.g. the computed SAS, once the inviter side
 /// surfaces it) MUST land as `#[serde(default, skip_serializing_if = ...)]` so older
 /// payloads still deserialize.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -441,11 +443,11 @@ pub struct InviteResult {
 
 /// Result of a [`Request::Pair`] request: the inviter's suggested petname (the
 /// redeemer's local name for the new peer) plus the display-only short authentication
-/// code (SAS, spec §4.2) — a few words the human reads aloud to a second channel to
+/// code (SAS) — a few words the human reads aloud to a second channel to
 /// catch a whole-invite forgery / address-swap MITM. The SAS is a pairing-ceremony
-/// artifact (like the invite line), NOT a §1.5 transport-vocabulary leak.
+/// artifact (like the invite line), NOT a transport-vocabulary leak.
 ///
-/// Additive-only (§6.1): any future field MUST land as
+/// Additive-only: any future field MUST land as
 /// `#[serde(default, skip_serializing_if = ...)]` so older payloads still deserialize.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairResult {
@@ -458,14 +460,14 @@ pub struct PairResult {
     /// The services this pairing granted the redeemer — each mountable as `<peer>/<service>`.
     /// Populated from the invite (`invite.services`) by the redeemer-side `redeem_invite`, so
     /// the porcelain can print the "You can mount: alice/notes" line without re-decoding the
-    /// invite. Additive (§6.1): `#[serde(default, skip_serializing_if = ...)]` so a `PairResult`
+    /// invite. Additive: `#[serde(default, skip_serializing_if = ...)]` so a `PairResult`
     /// minted by an older daemon (which omits `services`) still deserializes — to an empty list.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub services: Vec<String>,
 }
 
-/// The event class of an [`AuditRecord`] (spec §11.3's four classes). An additive discriminant on
-/// top of the §11.3 example schema: it removes no spec field and makes the JSONL self-describing so
+/// The event class of an [`AuditRecord`] (the four audit event classes). An additive discriminant on
+/// top of the base record schema: it removes no field and makes the JSONL self-describing so
 /// a consumer can filter by class without guessing from which optional fields are present.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -484,13 +486,13 @@ pub enum AuditKind {
     Trust,
 }
 
-/// One audit record — the union of the §11.3 event classes, and the `record` payload of a
+/// One audit record — the union of the event classes, and the `record` payload of a
 /// [`StreamFrame::Event`]. ONE schema for the on-disk JSONL log and the live stream. Every field
 /// beyond `ts`/`kind` is optional and elided when absent (`skip_serializing_if`), so each class
 /// serializes to just its relevant keys (a session record has no `method`; a trust record has no
 /// `bytes_out`).
 ///
-/// PRIVACY (spec §11.3): the proxied-request record carries `method` + `tool` (NAME only) +
+/// PRIVACY: the proxied-request record carries `method` + `tool` (NAME only) +
 /// `args_hash` (`"blake3:<hex>"`), and NEVER the raw arguments, the request/response content, or
 /// any tool-output bytes — only a `bytes_out` COUNT and a `status`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -499,7 +501,7 @@ pub struct AuditRecord {
     /// prefix also selects the monthly file (the rotation boundary), so it is always present.
     pub ts: String,
     pub kind: AuditKind,
-    /// The gate-resolved authenticated peer (spec §11.3 attribution; endpoint_id-keyed). Absent on
+    /// The gate-resolved authenticated peer (attributed by the endpoint_id-keyed trust gate). Absent on
     /// local-only events with no remote peer (a manual roster install).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peer: Option<String>,
@@ -510,7 +512,7 @@ pub struct AuditRecord {
     /// The tool NAME only (never its arguments or output) — e.g. `"read_file"` for a `tools/call`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
-    /// `"blake3:<hex>"` of the request arguments. The raw arguments are NEVER stored (spec §11.3).
+    /// `"blake3:<hex>"` of the request arguments. The raw arguments are NEVER stored.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub args_hash: Option<String>,
     /// Byte COUNT of the response sent back to the peer — a count, never the content.
@@ -599,7 +601,7 @@ impl AuditRecord {
     }
 
     /// A proxied NOTIFICATION line (no `id`, so no response correlates): method + tool + args_hash,
-    /// no `bytes_out`/`status`/`latency_ms`. Still records the line per spec §11.3.
+    /// no `bytes_out`/`status`/`latency_ms`. The line is still recorded — every proxied request is audited.
     pub fn proxied_notification(
         ts: String,
         peer: Option<String>,
@@ -661,7 +663,7 @@ pub enum StreamFrame {
     /// `Box`, so the wire shape is the record's fields verbatim.
     Event { record: Box<AuditRecord> },
     /// The subscriber fell `dropped` records behind the broadcast ring; the stream continues (a
-    /// fresh reconnect would re-`Snapshot`). Never drops the subscriber (spec: backpressure).
+    /// fresh reconnect would re-`Snapshot`). Never drops the subscriber — lag is reported, never fatal.
     Lagged { dropped: u64 },
 }
 
@@ -762,7 +764,7 @@ mod tests {
 
         // Known limitation: adjacent tagging rejects `params:{}` for a unit variant, so
         // the server MUST dispatch on the method string rather than deserialize the whole
-        // message into `Request`. This is the pattern the Task 3 dispatcher uses.
+        // message into `Request`. This is the pattern the daemon's dispatcher uses.
         let empty = serde_json::json!({"method": "status", "params": {}});
         assert!(serde_json::from_value::<Request>(empty.clone()).is_err());
         match method_of(&empty) {
@@ -1063,7 +1065,7 @@ mod tests {
             peers: vec![PeerInfo {
                 name: "alice".into(),
                 services: vec!["notes".into()],
-                // A paired peer that proved a self-sovereign user_id at pairing (§1.5-clean id).
+                // A paired peer that proved a self-sovereign user_id at pairing (surface-clean id).
                 user_id: Some("b64u:alicepk".into()),
             }],
             roster: None,
@@ -1151,7 +1153,7 @@ mod tests {
         assert_eq!(serde_json::from_value::<StatusResult>(v).unwrap(), s);
     }
 
-    /// The `recent_pairings` status field is ADDITIVE (§6.1): a populated list round-trips with
+    /// The `recent_pairings` status field is ADDITIVE: a populated list round-trips with
     /// the flat `{peer_petname, sas_code, paired_at_epoch}` shape (petname + SAS words + epoch —
     /// never an EndpointId), an empty list is dropped from the wire, and a payload minted by an
     /// older daemon (no key at all) still deserializes to empty.
@@ -1228,7 +1230,7 @@ mod tests {
         assert_eq!(v["params"]["dest_path"], "/tmp/out.bin");
         assert_eq!(serde_json::from_value::<Request>(v).unwrap(), r);
 
-        // BlobPublishResult carries the ticket + hash (blob-reference vocabulary, §9).
+        // BlobPublishResult carries the ticket + hash (blob-reference vocabulary).
         let res = BlobPublishResult {
             ticket: "blobAAA".into(),
             hash: "ab".repeat(32),
@@ -1345,7 +1347,7 @@ mod tests {
             res
         );
 
-        // Additive-only (§6.1): a result minted by an older daemon (no `total_sessions` key) still
+        // Additive-only: a result minted by an older daemon (no `total_sessions` key) still
         // deserializes — the `#[serde(default)]` fills it with 0.
         let old_shape = serde_json::json!({ "per_peer": [], "per_service": [] });
         let back: AuditSummaryResult = serde_json::from_value(old_shape).unwrap();

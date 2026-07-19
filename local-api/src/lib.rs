@@ -35,7 +35,7 @@
 //! | *(none)*  | The wire vocabulary ([`protocol`]) + endpoint resolution ([`paths`])    | serde only   |
 //! | `client`  | [`ControlClient`]: connect, typed request helpers, the typed [`client::StreamSubscription`] live stream | + tokio |
 //! | `service` | The plugin seam ([`service`]): local endpoint bind + same-user gate, `[services.*]` self-registration | + rustix, tracing |
-/// Platform paths + endpoint resolution (spec §13) — featureless/std-only, so any consumer
+/// Platform paths + endpoint resolution — featureless/std-only, so any consumer
 /// resolves the daemon endpoint from the ONE rule.
 pub mod paths;
 pub mod principals;

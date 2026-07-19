@@ -2,16 +2,16 @@
 //! (kb, loc, …) needs to face the platform, extracted from the kb/loc byte-duplicates so
 //! each rule has ONE home:
 //!
-//! - §1 UDS faces: [`ensure_private_dir`] + [`bind_uds`] + [`check_peer_uid`] (0700
+//! - UDS faces: [`ensure_private_dir`] + [`bind_uds`] + [`check_peer_uid`] (0700
 //!   symlink-refused owned runtime dir, 0600 socket, same-uid gate). The mcpmesh daemon's
 //!   own control socket (`cli/src/ipc.rs`) binds through the SAME rule.
-//! - §2 THE audience-authz expansion: [`peer_audiences`] — `groups ∪ {name} ∪ {user_id}`,
+//! - THE audience-authz expansion: [`peer_audiences`] — `groups ∪ {name} ∪ {user_id}`,
 //!   default-deny. The single implementation both kb and loc gate on.
-//! - §3 `[services.*]` self-registration: [`register_service`] (empty allowlist; failures
+//! - `[services.*]` self-registration: [`register_service`] (empty allowlist; failures
 //!   logged, never silently swallowed).
-//! - §4 `*-local/1` JSON-RPC conventions: [`ok`]/[`err`]/[`reply`]/[`internal`], the strict
+//! - `*-local/1` JSON-RPC conventions: [`ok`]/[`err`]/[`reply`]/[`internal`], the strict
 //!   [`required_string_array`] param parse, and [`people_from_status`].
-//! - §5 the `*-local/1` Hello first frame: [`send_hello`].
+//! - the `*-local/1` Hello first frame: [`send_hello`].
 //!
 //! Deliberately NOT here: mcpmesh control-endpoint resolution. That is the featureless
 //! [`crate::paths`] rule ([`crate::paths::default_endpoint`]) — ONE home for daemon, CLI,
@@ -39,7 +39,7 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 use tokio::io::AsyncWrite;
-// The §1 UDS-face check is exercised by the unix test module below (`UnixStream::connect`);
+// The UDS-face check is exercised by the unix test module below (`UnixStream::connect`);
 // non-test code reaches these faces through `crate::transport`, so the import is test-only
 // and unix-only (the windows transport has no UDS fixtures).
 #[cfg(all(test, unix))]
@@ -50,7 +50,7 @@ use crate::codec::write_frame;
 use crate::protocol::{BackendSpec, Hello, RegisterServiceParams, Request};
 
 // ---------------------------------------------------------------------------------------
-// §1 UDS faces
+// UDS faces
 // ---------------------------------------------------------------------------------------
 
 // The implementation now lives in `crate::transport` (the platform local-endpoint seam):
@@ -65,10 +65,10 @@ use crate::protocol::{BackendSpec, Hello, RegisterServiceParams, Request};
 pub use crate::transport::{bind_uds, check_peer_uid, ensure_private_dir};
 
 // ---------------------------------------------------------------------------------------
-// §2 THE audience-authz expansion (default-deny)
+// THE audience-authz expansion (default-deny)
 // ---------------------------------------------------------------------------------------
 
-/// `peer_audiences = peer.groups ∪ {peer.name} ∪ {peer.user_id}` (kb-mesh §4) — THE ONE
+/// `peer_audiences = peer.groups ∪ {peer.name} ∪ {peer.user_id}` — THE ONE
 /// implementation of the caller-audience expansion every plugin gates on (kb re-exports it
 /// as `effective_audiences`). An absent/empty peer yields an EMPTY set — default deny.
 ///
@@ -82,10 +82,10 @@ pub use crate::transport::{bind_uds, check_peer_uid, ensure_private_dir};
 /// petname), whereas `name` (the petname) scopes to one device and `groups` to a roster set —
 /// three legitimate granularities.
 ///
-/// M3 (identity hardening): re-keying authz on `endpoint_id` instead of the display petname
-/// lands HERE, once, when it lands.
+/// If authz is ever re-keyed on `endpoint_id` instead of the display petname (a planned
+/// identity hardening), that change lands HERE, once.
 pub fn peer_audiences(peer: &Value) -> Vec<String> {
-    // The expansion itself is THE shared `principal_set` (crate::principals — the §5 flat
+    // The expansion itself is THE shared `principal_set` (crate::principals — the flat
     // namespace, one implementation for the mesh allow check, this seam, and the blob-scope
     // gate); this fn only adapts the platform-injected peer JSON onto it.
     let groups: Vec<String> = peer
@@ -108,15 +108,15 @@ pub fn peer_audiences(peer: &Value) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------------------
-// §3 [services.*] self-registration
+// [services.*] self-registration
 // ---------------------------------------------------------------------------------------
 
 /// Register (or idempotently update) `[services.<service_name>]` on the running mcpmesh
 /// daemon: a SOCKET backend pointing at `backend_sock`, with an EMPTY allowlist — local-only
-/// until the user explicitly grants a peer (platform D5: reachability is a user grant; the
+/// until the user explicitly grants a peer (reachability is a user grant; the
 /// content itself is gated per-audience inside each plugin's service).
 ///
-/// §loc-L2: a failure is ALWAYS logged here (`tracing::warn`) before being returned, so a
+/// A failure is ALWAYS logged here (`tracing::warn`) before being returned, so a
 /// daemon treating registration as best-effort (`let _ =` — the mcpmesh daemon may not be up
 /// in a headless test) can never silently swallow it.
 pub async fn register_service(
@@ -150,7 +150,7 @@ pub async fn register_service(
 }
 
 // ---------------------------------------------------------------------------------------
-// §4 *-local/1 JSON-RPC conventions
+// *-local/1 JSON-RPC conventions
 // ---------------------------------------------------------------------------------------
 
 /// JSON-RPC error code: invalid params. (An unknown method answers `-32601`, the standard
@@ -190,7 +190,7 @@ pub fn internal(e: impl std::fmt::Display) -> (i64, String) {
 /// STRICT `params[key]` string-array parse: the key must be present, an array, and every
 /// element a string — anything else is `ERR_PARAMS`. Destructive setters (share lists) MUST
 /// use this: a lenient `unwrap_or_default()` would read a malformed request as "share with
-/// NOBODY" and persist `[]` (loc-L5 — an accidental unshare-everyone).
+/// NOBODY" and persist `[]` — an accidental unshare-everyone.
 pub fn required_string_array(params: &Value, key: &str) -> Result<Vec<String>, (i64, String)> {
     let arr = params
         .get(key)
@@ -225,7 +225,7 @@ pub fn people_from_status(status: &Value) -> Vec<Value> {
 }
 
 // ---------------------------------------------------------------------------------------
-// §5 the *-local/1 Hello first frame
+// The *-local/1 Hello first frame
 // ---------------------------------------------------------------------------------------
 
 /// Write the `*-local/N` Hello first frame (the shared handshake convention: every owner-face
@@ -367,8 +367,8 @@ mod tests {
         let _again = bind_uds(&sock).unwrap();
     }
 
-    /// D3 hardening parity: a SYMLINKED runtime dir is refused before any chmod/bind — a
-    /// planted `link -> dir` must never redirect the socket (mcpmesh §13, same rule as the
+    /// Hardening parity: a SYMLINKED runtime dir is refused before any chmod/bind — a
+    /// planted `link -> dir` must never redirect the socket (same rule as the
     /// daemon control socket).
     #[cfg(unix)]
     #[tokio::test]

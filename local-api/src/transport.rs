@@ -1,4 +1,4 @@
-//! The platform local-endpoint seam (design §1): ONE narrow API — `connect_local`,
+//! The platform local-endpoint seam: ONE narrow API — `connect_local`,
 //! `bind_local`, `LocalListener::accept`, `authorize_local_peer`, `split_local` — with
 //! per-platform impls. Unix: the family's hardened UDS rule (0700 symlink-refused dir,
 //! 0600 socket, same-euid peer gate). Windows: an owner-only-DACL named pipe (the
