@@ -1,4 +1,8 @@
-//! Shared paths rule (spec §13): resolved per-platform in one place (XDG on unix; APPDATA/LOCALAPPDATA + named-pipe names on windows).
+//! Shared paths rule (spec §13): resolved per-platform in ONE place (XDG on unix;
+//! APPDATA/LOCALAPPDATA + named-pipe names on windows). Featureless and std-only —
+//! it lives on the vocabulary crate precisely so EVERY consumer (the daemon, the CLI,
+//! and plugins, which are barred from `mcpmesh-trust`) resolves the same endpoint from
+//! the same rule instead of a per-crate replica. `mcpmesh_trust::paths` re-exports it.
 use std::path::PathBuf;
 
 /// The ONE XDG-basedir rule shared by [`config_dir`]/[`data_dir`]/[`state_dir`]:
@@ -221,10 +225,14 @@ fn runtime_dir_from(xdg: Option<&str>, tmp: PathBuf) -> std::io::Result<PathBuf>
     Ok(dir)
 }
 
-/// The local control endpoint (spec §13): a Unix socket at `<runtime_dir>/mcpmesh.sock` on
-/// unix. On Windows there is no per-user runtime dir with the right ACL semantics, so the
-/// control plane is a named pipe instead — see [`windows_pipe_name`].
-pub fn default_socket_path() -> std::io::Result<PathBuf> {
+/// The local control endpoint (spec §13), resolved for THIS platform: a Unix socket at
+/// `<runtime_dir>/mcpmesh.sock` on unix. On Windows there is no per-user runtime dir with
+/// the right ACL semantics, so the control plane is a named pipe instead — see
+/// [`windows_pipe_name`]; the returned `PathBuf` is the pipe name (`\\.\pipe\…`), which is
+/// what `transport::connect_local`/`bind_local` dial. The ONE resolver both wire ends
+/// share: the daemon binds exactly what this returns, so clients rendezvous by
+/// construction, never by copied formula.
+pub fn default_endpoint() -> std::io::Result<PathBuf> {
     #[cfg(unix)]
     return Ok(runtime_dir()?.join("mcpmesh.sock"));
     #[cfg(windows)]
@@ -312,7 +320,7 @@ mod path_tests {
     // Env-scoping approach (declared delta from the plan's `temp_env` suggestion):
     // rather than mutate process env in tests (which would need the `temp_env` dev-dep
     // plus test serialization), the §13 rule lives in the pure `runtime_dir_from`; we
-    // unit-test it directly with explicit inputs. `default_socket_path()` is still
+    // unit-test it directly with explicit inputs. `default_endpoint()` is still
     // exercised against the real env, asserting the shape that holds for any env.
 
     // The next three tests feed the pure cores POSIX literals like `/run/user/1000`,
@@ -350,10 +358,10 @@ mod path_tests {
     // Unix-only: the control endpoint is a filesystem socket path under the runtime dir.
     #[cfg(unix)]
     #[test]
-    fn socket_path_is_under_runtime_dir() {
+    fn default_endpoint_is_under_runtime_dir() {
         // Holds for any ambient env: the socket is <runtime_dir>/mcpmesh.sock, runtime_dir
         // always ends in `mcpmesh`, and the resolved path is absolute (§13).
-        let sock = default_socket_path().unwrap();
+        let sock = default_endpoint().unwrap();
         assert!(sock.ends_with("mcpmesh/mcpmesh.sock"));
         assert!(sock.is_absolute());
     }
@@ -361,8 +369,8 @@ mod path_tests {
     // Windows twin: the control endpoint is a per-user named pipe, not a filesystem socket.
     #[cfg(windows)]
     #[test]
-    fn socket_path_is_a_per_user_pipe_name() {
-        let sock = default_socket_path().unwrap();
+    fn default_endpoint_is_a_per_user_pipe_name() {
+        let sock = default_endpoint().unwrap();
         assert!(sock.to_string_lossy().starts_with(r"\\.\pipe\mcpmesh-"));
     }
 

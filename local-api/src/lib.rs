@@ -2,6 +2,9 @@
 //! behind the `client` feature, the family NDJSON codec + a no-iroh UnixStream client.
 //! The `client` feature is the D-A extraction: a non-net mcpmesh-local/1 client (kb's
 //! self-registration, the host shell) links this WITHOUT pulling iroh via mcpmesh-net.
+/// Platform paths + endpoint resolution (spec §13) — featureless/std-only, so plugins
+/// (barred from `mcpmesh-trust`) resolve the daemon endpoint from the ONE rule.
+pub mod paths;
 pub mod principals;
 pub mod protocol;
 pub use principals::principal_set;
@@ -24,7 +27,7 @@ pub mod codec;
 #[cfg(feature = "client")]
 pub mod transport;
 #[cfg(feature = "client")]
-pub use client::{ControlClient, connect_control};
+pub use client::{ControlClient, connect_control, connect_control_default};
 
 /// The shared plugin-platform seam (kb, loc, …): UDS faces, THE audience-authz expansion,
 /// `[services.*]` self-registration, and the `*-local/1` JSON-RPC conventions.

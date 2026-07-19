@@ -11,6 +11,11 @@ description = "mcpmesh trust kernel: Ed25519 device identity, signed rosters, in
 workspace = true
 
 [dependencies]
+# Featureless (`paths` only): the §13 paths/endpoint rule lives on the vocabulary crate so
+# plugins (which must not link trust) share it; trust re-exports it. No client/service
+# features here — keeps this edge types-only and the crate graph acyclic (local-api never
+# depends on trust).
+mcpmesh-local-api = { workspace = true, default-features = false }
 ed25519-dalek.workspace = true
 rand.workspace = true
 thiserror.workspace = true

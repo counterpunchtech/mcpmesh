@@ -9,16 +9,20 @@
 //!   default-deny. The single implementation both kb and loc gate on.
 //! - §3 `[services.*]` self-registration: [`register_service`] (empty allowlist; failures
 //!   logged, never silently swallowed).
-//! - §4 the control-socket sibling rule: [`mcpmesh_control_socket_from`].
-//! - §5 `*-local/1` JSON-RPC conventions: [`ok`]/[`err`]/[`reply`]/[`internal`], the strict
+//! - §4 `*-local/1` JSON-RPC conventions: [`ok`]/[`err`]/[`reply`]/[`internal`], the strict
 //!   [`required_string_array`] param parse, and [`people_from_status`].
-//! - §6 the `*-local/1` Hello first frame: [`send_hello`].
+//! - §5 the `*-local/1` Hello first frame: [`send_hello`].
+//!
+//! Deliberately NOT here: mcpmesh control-endpoint resolution. That is the featureless
+//! [`crate::paths`] rule ([`crate::paths::default_endpoint`]) — ONE home for daemon, CLI,
+//! and plugins, correct on both platforms (a named pipe on windows, never a joined
+//! filesystem path).
 //!
 //! Deliberately NOT extracted (KISS until a third plugin proves the abstraction): state
 //! models, Paths structs, tool dispatch/specs, fan-out policy, and each plugin's MCP
 //! session skeleton in `remote.rs`.
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde_json::{Value, json};
 use tokio::io::AsyncWrite;
@@ -133,24 +137,7 @@ pub async fn register_service(
 }
 
 // ---------------------------------------------------------------------------------------
-// §4 the control-socket sibling rule
-// ---------------------------------------------------------------------------------------
-
-/// The running mcpmesh daemon's control socket under a runtime `base`: `<base>/mcpmesh/mcpmesh.sock`
-/// (mcpmesh §13). A plugin's own runtime dir is `<base>/<plugin>`, so pass its PARENT — both
-/// daemons place their per-daemon subdir under the same base. Mirrors mcpmesh's
-/// `default_socket_path()`; plugins cannot depend on `mcpmesh-trust` (host §7.1), so the formula
-/// is replicated, not imported.
-///
-/// NOTE residual duplication: `kb-core::paths` keeps a private copy of this one-liner for its
-/// own `Paths` (kb-core is a lower layer that must not depend on mcpmesh-local-api's `service`
-/// feature) — a cross-reference comment there points back here. loc uses THIS copy.
-pub fn mcpmesh_control_socket_from(base: &Path) -> PathBuf {
-    base.join("mcpmesh").join("mcpmesh.sock")
-}
-
-// ---------------------------------------------------------------------------------------
-// §5 *-local/1 JSON-RPC conventions
+// §4 *-local/1 JSON-RPC conventions
 // ---------------------------------------------------------------------------------------
 
 /// JSON-RPC error code: invalid params (also the shared "unknown method" code).
@@ -224,7 +211,7 @@ pub fn people_from_status(status: &Value) -> Vec<Value> {
 }
 
 // ---------------------------------------------------------------------------------------
-// §6 the *-local/1 Hello first frame
+// §5 the *-local/1 Hello first frame
 // ---------------------------------------------------------------------------------------
 
 /// Write the `*-local/N` Hello first frame (the shared handshake convention: every owner-face
@@ -282,14 +269,6 @@ mod tests {
             ]
         );
         assert!(people_from_status(&json!({})).is_empty());
-    }
-
-    #[test]
-    fn mcpmesh_control_socket_is_the_mcpmesh_sibling_dir() {
-        assert_eq!(
-            mcpmesh_control_socket_from(Path::new("/run/user/1000")),
-            Path::new("/run/user/1000/mcpmesh/mcpmesh.sock")
-        );
     }
 
     #[test]

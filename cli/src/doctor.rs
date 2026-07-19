@@ -362,7 +362,7 @@ struct DoctorInputs {
 /// Ping the local daemon over the control socket WITHOUT auto-starting it (read-only, local-only).
 /// Returns `(reachable, roster_state_word)`. A dead socket / any error → `(false, None)`.
 fn probe_daemon() -> (bool, Option<String>) {
-    let Ok(socket) = mcpmesh_trust::paths::default_socket_path() else {
+    let Ok(socket) = mcpmesh_trust::paths::default_endpoint() else {
         return (false, None);
     };
     let Ok(rt) = tokio::runtime::Builder::new_multi_thread()

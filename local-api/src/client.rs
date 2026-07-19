@@ -193,6 +193,14 @@ pub async fn connect_control(path: &Path) -> Result<ControlClient, ClientError> 
     })
 }
 
+/// [`connect_control`] at the platform default endpoint ([`crate::paths::default_endpoint`]):
+/// the quickstart front door — a consumer dials the running daemon without reimplementing
+/// the spec-§13 endpoint rule. Resolution failure surfaces as [`ClientError::Io`]
+/// (`NotFound`), same as a daemon that is not running.
+pub async fn connect_control_default() -> Result<ControlClient, ClientError> {
+    connect_control(&crate::paths::default_endpoint()?).await
+}
+
 // Seam-ported (Task 6): every stub daemon binds via the platform seam
 // (`transport::bind_local` + `LocalListener::accept`) rather than a raw `UnixListener`,
 // so these exercise the platform-identical `ControlClient` on BOTH unix (UDS) and windows

@@ -475,7 +475,7 @@ pub fn run() -> Result<()> {
             }
         }
     };
-    let socket = paths::default_socket_path()?;
+    let socket = paths::default_endpoint()?;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

@@ -63,7 +63,11 @@ On macOS/Linux the socket is `0600` inside a `0700` directory the daemon owns, a
 the **connecting process's uid matches its own** before serving. On Windows the pipe carries an
 **owner-only DACL** that grants access only to the current user's SID, so the kernel refuses a
 cross-user connect before the daemon ever sees it. Either way, only the same user can connect (see
-[Security model](#security-model)). Reference: [`trust/src/paths.rs`](../trust/src/paths.rs).
+[Security model](#security-model)). Reference: [`local-api/src/paths.rs`](../local-api/src/paths.rs).
+
+Rust consumers never need to reimplement this rule: `mcpmesh_local_api::paths::default_endpoint()`
+returns the resolved endpoint on either platform, and (behind the `client` feature)
+`connect_control_default()` dials it and completes the handshake in one call.
 
 If no daemon is running, the endpoint will not exist (no socket file on macOS/Linux; no bound pipe
 name on Windows). The CLI auto-starts one on demand; an embedding client either spawns `mcpmesh` (any
@@ -405,7 +409,7 @@ This document describes the surface; the code defines it.
 - Client (connect, handshake, request/response, session upgrade) —
   [`local-api/src/client.rs`](../local-api/src/client.rs)
 - Frame codec — [`codec/src/lib.rs`](../codec/src/lib.rs)
-- Socket path resolution — [`trust/src/paths.rs`](../trust/src/paths.rs)
+- Endpoint/path resolution — [`local-api/src/paths.rs`](../local-api/src/paths.rs)
 - Identity injection — [`cli/src/backends/`](../cli/src/backends/)
 - Live event-stream frames — [`cli/src/stream.rs`](../cli/src/stream.rs)
 
