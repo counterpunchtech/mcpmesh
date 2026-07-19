@@ -1,35 +1,36 @@
-//! M1 acceptance (spec §16): a full initialize + echo round-trip through the
+//! Session acceptance: a full initialize + echo round-trip through the
 //! framed session; -32054 for an unknown/unauthorized service; and a stranger
 //! refused by the gate before any MCP frame is exchanged.
 //!
 //! In-process, localhost only: `presets::Minimal` + `RelayMode::Disabled` (no
-//! external network, same as Task 6). The two-machines-on-different-NATs half of
-//! the AC is Task 13's `#[ignore]` runbook. Each test body runs under a 30s
-//! timeout so a composition hang fails cleanly instead of burning the CI budget.
+//! external network). The two-machines-on-different-NATs half is the `#[ignore]`d
+//! runbook at the bottom. Each test body runs under a 30s timeout so a
+//! composition hang fails cleanly instead of burning the CI budget.
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use mcpmesh_net::{
-    PeerIdentity, ServiceEntry, SessionBackend, SessionTransport, StaticGate, connect, serve,
+    ConnRegistry, EndpointId, PeerIdentity, ServiceEntry, SessionBackend, SessionTransport,
+    StaticGate, connect, serve,
 };
 use serde_json::json;
 
-/// M1 in-process backend: replies to `initialize`, then echoes `tools/call`.
+/// In-process backend: replies to `initialize`, then echoes `tools/call`.
 struct EchoBackend;
 
 #[async_trait::async_trait]
 impl SessionBackend for EchoBackend {
     async fn run(
         &self,
-        // M1 in-process backend ignores the injected identity (env/`_meta`
-        // injection is the M2 spawn/socket backends' concern); it is threaded
+        // The in-process backend ignores the injected identity (env/`_meta`
+        // injection is the spawn/socket backends' concern); it is threaded
         // through the trait so every backend gets the per-caller identity.
         _identity: Option<PeerIdentity>,
         initialize: serde_json::Value,
         mut transport: SessionTransport,
     ) -> anyhow::Result<()> {
-        // End-to-end proof of §6.3: the reserved key was stripped before the
+        // End-to-end proof: the reserved key was stripped before the
         // backend ever saw the frame.
         assert!(
             initialize
@@ -66,8 +67,8 @@ async fn test_endpoint() -> anyhow::Result<iroh::Endpoint> {
 }
 
 /// A one-service registry: `name`, an `EchoBackend`, and the `allow` list that
-/// admits callers to it. Used to build the M1 tests' `echo` service (allow=["bob"],
-/// matching the petname the gate resolves) and the new per-service-allow test.
+/// admits callers to it. Used to build the tests' `echo` service (allow=["bob"],
+/// matching the petname the gate resolves) and the per-service-allow test.
 fn service_with_allow(name: &str, allow: Vec<String>) -> mcpmesh_net::Services {
     let mut services = HashMap::new();
     services.insert(
@@ -80,7 +81,7 @@ fn service_with_allow(name: &str, allow: Vec<String>) -> mcpmesh_net::Services {
     mcpmesh_net::Services::new(services)
 }
 
-/// The M1 `echo` service, admitting the petname (`"bob"`) the tests' gate resolves.
+/// The `echo` service, admitting the petname (`"bob"`) the tests' gate resolves.
 fn echo_services() -> mcpmesh_net::Services {
     service_with_allow("echo", vec!["bob".into()])
 }
@@ -90,10 +91,10 @@ async fn known_peer_completes_initialize_and_echo() -> anyhow::Result<()> {
     tokio::time::timeout(Duration::from_secs(30), async {
         let server = test_endpoint().await?;
         let client = test_endpoint().await?;
-        let client_id = *client.id().as_bytes();
+        let client_id = EndpointId::from(client.id());
         let gate = Arc::new(StaticGate::new([(client_id, PeerIdentity::petname("bob"))]));
         let addr = server.addr();
-        let _handle = serve(server, gate, echo_services());
+        let _handle = serve(server, gate, echo_services(), Arc::new(ConnRegistry::new()));
 
         let mut transport = connect(&client, addr, "echo").await?;
         transport
@@ -123,10 +124,10 @@ async fn unknown_service_gets_32054_with_marker() -> anyhow::Result<()> {
     tokio::time::timeout(Duration::from_secs(30), async {
         let server = test_endpoint().await?;
         let client = test_endpoint().await?;
-        let client_id = *client.id().as_bytes();
+        let client_id = EndpointId::from(client.id());
         let gate = Arc::new(StaticGate::new([(client_id, PeerIdentity::petname("bob"))]));
         let addr = server.addr();
-        let _handle = serve(server, gate, echo_services());
+        let _handle = serve(server, gate, echo_services(), Arc::new(ConnRegistry::new()));
 
         let mut transport = connect(&client, addr, "nope").await?;
         transport
@@ -150,7 +151,12 @@ async fn unknown_endpoint_is_refused_before_mcp() -> anyhow::Result<()> {
         let stranger = test_endpoint().await?;
         let gate = Arc::new(StaticGate::new([])); // nobody is trusted
         let addr = server.addr();
-        let _handle = serve(server, gate, mcpmesh_net::Services::new(HashMap::new()));
+        let _handle = serve(
+            server,
+            gate,
+            mcpmesh_net::Services::new(HashMap::new()),
+            Arc::new(ConnRegistry::new()),
+        );
 
         // The gate must close the connection: either `connect` itself errors, or
         // the first read returns closed — but no MCP frame is ever exchanged.
@@ -173,14 +179,14 @@ async fn unknown_endpoint_is_refused_before_mcp() -> anyhow::Result<()> {
 /// only `"bob"`, but the connecting peer resolves (at the gate) to petname
 /// `"carol"` — trusted enough to pass the gate, yet not admitted by `notes`. She
 /// must get the same `-32054`/`data.source: "mcpmesh"` refusal an unknown service
-/// gets (§5 indistinguishability). Mirrors `known_peer_completes...`, changing only
+/// gets (the indistinguishability rule). Mirrors `known_peer_completes...`, changing only
 /// the gate identity (carol) and the service's `allow` (bob).
 #[tokio::test]
 async fn peer_not_in_service_allow_is_refused() -> anyhow::Result<()> {
     tokio::time::timeout(Duration::from_secs(30), async {
         let server = test_endpoint().await?;
         let client = test_endpoint().await?;
-        let client_id = *client.id().as_bytes();
+        let client_id = EndpointId::from(client.id());
         // Carol is trusted at the gate (resolves to a petname) but absent from
         // `notes`' allow — so `caller_allowed` for her is empty.
         let gate = Arc::new(StaticGate::new([(
@@ -192,6 +198,7 @@ async fn peer_not_in_service_allow_is_refused() -> anyhow::Result<()> {
             server,
             gate,
             service_with_allow("notes", vec!["bob".into()]),
+            Arc::new(ConnRegistry::new()),
         );
 
         let mut transport = connect(&client, addr, "notes").await?;
@@ -210,9 +217,9 @@ async fn peer_not_in_service_allow_is_refused() -> anyhow::Result<()> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Two-machine real-NAT smoke — the one M1 AC clause CI cannot exercise:
-// "two machines on different NATs complete an MCP session over mcpmesh/mcp/1"
-// (spec §16 AC; §10.2/§10.3). BOTH tests are `#[ignore]`d so CI never runs them
+// Two-machine real-NAT smoke — the one clause CI cannot exercise:
+// "two machines on different NATs complete an MCP session over mcpmesh/mcp/1".
+// BOTH tests are `#[ignore]`d so CI never runs them
 // (one hangs 10 min by design; both need two machines). Drive them by hand,
 // across two machines on different NATs (a maintainer release-validation step).
 //
@@ -231,7 +238,7 @@ async fn peer_not_in_service_allow_is_refused() -> anyhow::Result<()> {
 //     deserializes it from the MCPMESH_SMOKE_PEER env. No node-ticket type is
 //     needed — JSON round-trips cleanly.
 //   • Gate pinning: the server StaticGate resolves the CONNECTOR's EndpointId
-//     (D5/D8), so the connector binds a STABLE secret key (the fixed dev seed
+//     (default-deny), so the connector binds a STABLE secret key (the fixed dev seed
 //     below, overridable via MCPMESH_SMOKE_SECRET=<64 hex>) → its EndpointId is
 //     constant and pre-shareable. `two_machine_serve` allows
 //     MCPMESH_SMOKE_ALLOW=<EndpointId> if set, else the built-in connector identity
@@ -292,8 +299,8 @@ async fn two_machine_serve() -> anyhow::Result<()> {
     // Ephemeral server identity — it travels to the peer inside the printed addr.
     let server = smoke_endpoint(None).await?;
 
-    // The StaticGate must resolve the connector by its EndpointId (default-deny,
-    // D5/D8). Pin MCPMESH_SMOKE_ALLOW if set, else the built-in dev connector id.
+    // The StaticGate must resolve the connector by its EndpointId (default-deny).
+    // Pin MCPMESH_SMOKE_ALLOW if set, else the built-in dev connector id.
     let allow_id = match std::env::var("MCPMESH_SMOKE_ALLOW") {
         Ok(s) if !s.trim().is_empty() => s
             .trim()
@@ -308,7 +315,7 @@ async fn two_machine_serve() -> anyhow::Result<()> {
             default
         }
     };
-    let allow_bytes: mcpmesh_net::EndpointId = *allow_id.as_bytes();
+    let allow_bytes = EndpointId::from(allow_id);
     let gate = Arc::new(StaticGate::new([(
         allow_bytes,
         PeerIdentity::petname("smoke-peer"),
@@ -327,7 +334,7 @@ async fn two_machine_serve() -> anyhow::Result<()> {
         addr.id
     );
 
-    let _handle = serve(server, gate, echo_services());
+    let _handle = serve(server, gate, echo_services(), Arc::new(ConnRegistry::new()));
     tokio::time::sleep(Duration::from_secs(600)).await;
     Ok(())
 }
@@ -354,7 +361,7 @@ async fn two_machine_connect() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("MCPMESH_SMOKE_PEER is not a serialized EndpointAddr: {e}"))?;
 
     // Relay-forced variant: strip direct (Ip) addrs so the session establishes over
-    // the relay path (spec §10.3). iroh may still upgrade to direct via hole-punching.
+    // the relay path. iroh may still upgrade to direct via hole-punching.
     if std::env::var("MCPMESH_SMOKE_FORCE_RELAY").is_ok_and(|v| !v.trim().is_empty()) {
         peer.addrs.retain(|a| !a.is_ip());
         eprintln!("MCPMESH_SMOKE_FORCE_RELAY set — stripped direct addrs; dialing relay-only.");
@@ -373,7 +380,7 @@ async fn two_machine_connect() -> anyhow::Result<()> {
     let peer_id = peer.id;
 
     // A byte-faithful payload: unicode + escaped quote/newline/tab, proving the echo
-    // round-trips exactly (D1/§7.3), not just ASCII.
+    // round-trips exactly, not just ASCII.
     let payload = "over the real mesh — café 🌐\n\"quoted\"\ttab";
 
     // 60s timeout: a NAT/relay failure fails cleanly instead of hanging.
@@ -405,7 +412,7 @@ async fn two_machine_connect() -> anyhow::Result<()> {
     })
     .await??;
 
-    // Report the path actually used (direct hole-punched vs relayed) — spec §10.3.
+    // Report the path actually used (direct hole-punched vs relayed).
     let path = match client.remote_info(peer_id).await {
         Some(info) => {
             let active: Vec<String> = info

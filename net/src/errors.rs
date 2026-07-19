@@ -1,4 +1,4 @@
-//! Platform-reserved JSON-RPC codes -32050…-32069 + the data.source marker (spec §7.4).
+//! Platform-reserved JSON-RPC codes -32050…-32069 + the data.source marker.
 use serde_json::{Value, json};
 
 pub const ERR_FRAMING: i64 = -32051;
@@ -8,16 +8,17 @@ pub const ERR_SERVICE: i64 = -32054;
 pub const ERR_UNREACHABLE: i64 = -32055;
 pub const ERR_PARSE: i64 = -32700; // JSON-RPC standard parse error
 
-/// The refusal wording is identical for unknown and unauthorized (spec §5).
+/// The refusal wording is identical for unknown and unauthorized — deliberate:
+/// a caller must not be able to probe which services exist.
 pub const MSG_SERVICE: &str = "unknown or unauthorized service";
 
-/// Every synthesized error MUST carry data.source = "mcpmesh" (spec §7.4).
+/// Every synthesized error MUST carry data.source = "mcpmesh".
 pub fn synthesized(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": {
         "code": code, "message": message, "data": { "source": "mcpmesh" } } })
 }
 
-/// A rate-limit / concurrency-cap refusal (spec §7.3 / §7.4 `-32053`): carries `retry_after_ms` in
+/// A rate-limit / concurrency-cap refusal (`-32053`): carries `retry_after_ms` in
 /// `error.data` ALONGSIDE the mandatory `source` marker. Both the per-identity token bucket and the
 /// per-service concurrency cap synthesize this, so a throttled caller receives a well-formed,
 /// actionable answer rather than a hang. FAIL-SAFE: this is a DENY — the request is never served.

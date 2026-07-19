@@ -68,7 +68,12 @@ async fn daemon_serves_run_service_and_injects_caller_identity_over_the_mesh() {
         // serve.
         let server = local_endpoint().await;
         let addr = server.addr();
-        let _handle = serve(server, gate, build_services(&cfg));
+        let _handle = serve(
+            server,
+            gate,
+            build_services(&cfg),
+            Arc::new(mcpmesh_net::ConnRegistry::new()),
+        );
 
         // Connect as the trusted peer and complete initialize + tools/call.
         let mut transport = connect(&client, addr, "echo").await.unwrap();
@@ -166,6 +171,7 @@ async fn hot_reload_serves_a_newly_registered_service_over_the_mesh() {
             server.clone(),
             gate.clone(),
             build_services(&Config::from_toml_str("").unwrap()),
+            Arc::new(mcpmesh_net::ConnRegistry::new()),
         );
 
         // Pre-swap: `echo` is refused (unknown/unauthorized service, §5).
@@ -183,7 +189,12 @@ async fn hot_reload_serves_a_newly_registered_service_over_the_mesh() {
             "[services.echo]\nrun = ['{STUB}']\nallow = [\"tester\"]\n"
         ))
         .unwrap();
-        let _new_handle = serve(server.clone(), gate.clone(), build_services(&cfg));
+        let _new_handle = serve(
+            server.clone(),
+            gate.clone(),
+            build_services(&cfg),
+            Arc::new(mcpmesh_net::ConnRegistry::new()),
+        );
 
         // Post-swap: a real second endpoint completes initialize + tools/call against the
         // newly-served `echo`, identity injected.

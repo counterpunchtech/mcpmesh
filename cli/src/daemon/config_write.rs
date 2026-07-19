@@ -1,8 +1,9 @@
-//! The daemon's surgical `config.toml` read-modify-write writers (spec §12/§13). Every writer
-//! here follows one discipline: [`read_config_for_rmw`] → parse as a `toml::Table` → mutate only
-//! the touched keys → `to_string_pretty` → [`atomic_write`] (per-call-unique temp — no torn
-//! config). (DECLARED, for all of them: comments/formatting are not preserved — the
-//! machine-managed config surface; a `toml_edit` round-trip is a later refinement.)
+//! The daemon's surgical `config.toml` read-modify-write writers. Every writer here follows
+//! one discipline: [`read_config_for_rmw`] → parse as a `toml::Table` → mutate only the
+//! touched keys → [`write_config_doc`] (render + the reference-doc header + an atomic
+//! per-call-unique temp rename — no torn config). Comments/formatting are not preserved —
+//! this is the machine-managed config surface; a `toml_edit` round-trip is a possible later
+//! refinement.
 //!
 //! **Lock discipline (shared by every writer).** These are the LOCK-FREE halves of config
 //! mutations: each caller holds `mesh.reload_lock` around its WHOLE critical section (read →
@@ -37,6 +38,20 @@ pub(crate) fn read_config_for_rmw(path: &Path) -> Result<String> {
     }
 }
 
+/// The one-line comment header every managed write (re)adds to `config.toml`, pointing at the
+/// key reference (issue #12). The TOML round-trip above drops comments, so the header is
+/// prepended at write time by [`write_config_doc`] rather than stored — it therefore survives
+/// every rewrite and never duplicates (the parse strips it, the write re-adds it).
+const CONFIG_HEADER: &str = "# mcpmesh config — every table and key is documented in docs/config.md \
+     (https://github.com/counterpunchtech/mcpmesh/blob/main/docs/config.md)";
+
+/// Render a mutated config document and atomically replace the file, prepending
+/// [`CONFIG_HEADER`] — the single write seam every writer in this module funnels through.
+fn write_config_doc(path: &Path, doc: &toml::Table) -> Result<()> {
+    let rendered = toml::to_string_pretty(doc).context("serialize config.toml")?;
+    atomic_write(path, format!("{CONFIG_HEADER}\n{rendered}").as_bytes())
+}
+
 /// Surgically upsert string keys into ONE named top-level `[table]` of the config at `path`,
 /// preserving every other key, then atomically replace the file — the shared body of the four
 /// identity/roster pin writers below. Creates the table if absent; bails if the existing entry
@@ -54,8 +69,7 @@ fn upsert_config_strings(path: &Path, table: &str, pairs: &[(&str, &str)]) -> Re
     for (k, v) in pairs {
         entry.insert((*k).into(), toml::Value::String((*v).to_string()));
     }
-    let rendered = toml::to_string_pretty(&doc).context("serialize config.toml")?;
-    atomic_write(path, rendered.as_bytes())
+    write_config_doc(path, &doc)
 }
 
 /// Upsert `[identity].org_root_pk` + `[identity].org_id` — the pin write `install_roster` runs
@@ -68,13 +82,13 @@ pub(crate) fn write_identity_pin(path: &Path, org_root_pk: &str, org_id: &str) -
     )
 }
 
-/// Upsert `[identity].user_id` — the [RECONCILE-D] write `reconcile_user_id_from_roster` runs
-/// when the installed roster's authoritative value differs from config's proposal.
+/// Upsert `[identity].user_id` — the write `reconcile_user_id_from_roster` runs when the
+/// installed roster's authoritative value differs from config's proposal.
 pub(crate) fn write_identity_user_id(path: &Path, user_id: &str) -> Result<()> {
     upsert_config_strings(path, "identity", &[("user_id", user_id)])
 }
 
-/// Upsert the four `[identity]` join keys (spec §4.4 step 2, `org_join`). `user_key` is a LOCAL
+/// Upsert the four `[identity]` join keys (the `org_join` control arm). `user_key` is a LOCAL
 /// path string (the key file itself never crosses the API — only its path is recorded).
 pub(crate) fn write_join_pin(
     path: &Path,
@@ -95,8 +109,8 @@ pub(crate) fn write_join_pin(
     )
 }
 
-/// Upsert `[roster].url` (spec §4.3 M3c, `set_roster_url`). A pre-existing `grace_period` (or any
-/// other `[roster]` key) is preserved.
+/// Upsert `[roster].url` (the `set_roster_url` control arm). A pre-existing `grace_period` (or
+/// any other `[roster]` key) is preserved.
 pub(crate) fn write_roster_url(path: &Path, url: &str) -> Result<()> {
     upsert_config_strings(path, "roster", &[("url", url)])
 }
@@ -164,8 +178,7 @@ pub(crate) fn write_service_to_config(
     );
     services.insert(name.to_string(), toml::Value::Table(entry));
 
-    let rendered = toml::to_string_pretty(&doc).context("serialize config.toml")?;
-    atomic_write(path, rendered.as_bytes())
+    write_config_doc(path, &doc)
 }
 
 /// Append `petname` to each `[services.<svc>].allow` in the config at `path`, idempotently,
@@ -219,8 +232,7 @@ pub(crate) fn append_allow_to_config(
     }
 
     if changed {
-        let rendered = toml::to_string_pretty(&doc).context("serialize config.toml")?;
-        atomic_write(path, rendered.as_bytes())?;
+        write_config_doc(path, &doc)?;
     }
     Ok(changed)
 }
@@ -261,8 +273,7 @@ pub(crate) fn remove_allow_from_config(path: &Path, petname: &str) -> Result<boo
     }
 
     if changed {
-        let rendered = toml::to_string_pretty(&doc).context("serialize config.toml")?;
-        atomic_write(path, rendered.as_bytes())?;
+        write_config_doc(path, &doc)?;
     }
     Ok(changed)
 }
@@ -299,8 +310,7 @@ pub(crate) fn rename_allow_in_config(path: &Path, from: &str, to: &str) -> Resul
     }
 
     if changed {
-        let rendered = toml::to_string_pretty(&doc).context("serialize config.toml")?;
-        atomic_write(path, rendered.as_bytes())?;
+        write_config_doc(path, &doc)?;
     }
     Ok(changed)
 }
@@ -309,6 +319,38 @@ pub(crate) fn rename_allow_in_config(path: &Path, from: &str, to: &str) -> Resul
 mod tests {
     use super::*;
     use crate::config::Config;
+
+    /// Every managed write prepends the one-line reference header pointing at docs/config.md
+    /// (issue #12), a later rewrite does not duplicate it (the parse strips comments, the write
+    /// re-adds one), and the headered file still loads.
+    #[test]
+    fn managed_writes_carry_the_reference_header_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        write_service_to_config(
+            &path,
+            "kb",
+            &BackendSpec::Socket {
+                path: "/run/kb.sock".into(),
+            },
+            &[],
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.starts_with("# mcpmesh config") && text.contains("docs/config.md"),
+            "the generated config opens with the reference header: {text}"
+        );
+        // A second managed write re-adds the header exactly once, and the file still parses.
+        assert!(append_allow_to_config(&path, "bob", &["kb".to_string()]).unwrap());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            text.matches("# mcpmesh config").count(),
+            1,
+            "no duplicated header after a rewrite: {text}"
+        );
+        assert!(Config::load(&path).is_ok());
+    }
 
     /// `write_join_pin` upserts the FOUR `[identity]` keys while preserving every other config key
     /// (surgical RMW) and lands atomically. Sync (no endpoint) — isolates the write discipline.

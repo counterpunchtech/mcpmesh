@@ -1,30 +1,29 @@
 //! Framed local-endpoint transport for mcpmesh-local/1 (UDS on unix; owner-only named pipe
-//! on windows) (spec §6.1, §13). Reuses the family NDJSON codec (`mcpmesh_net::framing`) —
-//! "one codec everywhere". Same-uid clients are fully trusted (P12/P14); the peer gate bounds
+//! on windows). Reuses the family NDJSON codec (`mcpmesh_net::framing`) —
+//! "one codec everywhere". Same-uid clients are fully trusted; the peer gate bounds
 //! OTHER users only. These wrappers delegate to the platform seam
-//! ([`mcpmesh_local_api::transport`]); the peer-cred RECONCILE below is the UNIX arm of it.
+//! ([`mcpmesh_local_api::transport`]); the peer-uid check below is the UNIX arm of it.
 //!
-//! [RECONCILE settled — unix arm] Peer-uid API: `tokio::net::UnixStream::peer_cred()` supplies
+//! Peer-uid API: `tokio::net::UnixStream::peer_cred()` supplies
 //! the connecting process's uid cross-platform (Linux `SO_PEERCRED`, macOS `LOCAL_PEERCRED`
 //! / `getpeereid`) with tokio owning the platform `unsafe` internally — so our code needs
 //! neither the `nix` crate nor inline `unsafe`. Our own uid comes from
 //! `rustix::process::geteuid()` (a safe wrapper; rustix is already in the tree via iroh).
-//! Net delta from the plan: no `nix` dependency, no `deny.toml` change (rustix's licenses
-//! were already vetted for the iroh tree). The invariant is unchanged — refuse other users.
+//! The invariant: refuse other users.
 //! (On windows the seam's arm relies on the owner-only pipe DACL instead — see the seam.)
 use anyhow::{Context, Result};
 use mcpmesh_local_api::transport::{LocalListener, LocalStream};
 use std::path::Path;
 
-/// Per-connection frame cap for the control wire (spec §12 default, 16 MiB). Shared by the
+/// Per-connection frame cap for the control wire (16 MiB). Shared by the
 /// control server and client so both size the `FrameReader` identically.
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 /// Create + security-check the runtime dir: `create_dir_all`, refuse a symlink, chmod 0700,
-/// verify we own it (spec §13). Idempotent — safe to call from both the singleton-lock
+/// verify we own it. Idempotent — safe to call from both the singleton-lock
 /// acquisition (which must place a lock file here before the bind) and `bind_control_socket`.
 ///
-/// D3 parity: the implementation is the plugin seam's [`ensure_private_dir`] — ONE hardened
+/// The implementation is the plugin seam's [`ensure_private_dir`] — ONE hardened
 /// rule for every UDS face in the family (the daemon control socket AND every plugin
 /// daemon's socket), so the checks can never drift apart again.
 ///
@@ -42,8 +41,8 @@ pub fn ensure_runtime_dir(dir: &Path) -> Result<()> {
 ///
 /// The unix stale-socket unlink has NO liveness guard of its own — but `run`'s single-daemon
 /// flock runs BEFORE `serve_forever` reaches this bind, so no LIVE daemon can hold the socket
-/// when we arrive; the unlink can therefore only ever clear a dead daemon's leftover stub
-/// (spec §13). Windows needs no such argument: it has no flock and no unlink — the pipe bind
+/// when we arrive; the unlink can therefore only ever clear a dead daemon's leftover stub.
+/// Windows needs no such argument: it has no flock and no unlink — the pipe bind
 /// itself IS the singleton (AddrInUse when a peer daemon already owns the pipe).
 ///
 /// Kept `async` even though [`bind_local`] is synchronous: the smallest diff (the production
@@ -56,7 +55,7 @@ pub async fn bind_control_socket(path: &Path) -> Result<LocalListener> {
         .with_context(|| format!("bind control socket {}", path.display()))
 }
 
-/// Same-user gate on an accepted connection (spec §11.2 P12). Returns `Ok(())` iff the seam's
+/// Same-user gate on an accepted connection. Returns `Ok(())` iff the seam's
 /// platform gate authorizes the peer — the peer-euid check on unix (refuse a different uid or
 /// an unreadable credential), the owner-only pipe DACL on windows (the kernel already refused
 /// other users at connect). Delegates to the seam's [`authorize_local_peer`], which logs the
@@ -91,7 +90,7 @@ mod tests {
             let path = dir.path().join("mcpmesh").join("mcpmesh.sock");
             let mut listener = bind_control_socket(&path).await.unwrap();
 
-            // The security guarantees every client depends on (spec §13): the runtime
+            // The security guarantees every client depends on: the runtime
             // dir is 0700 and the control socket 0600 — no other user can traverse in or
             // connect.
             {

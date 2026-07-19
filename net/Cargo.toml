@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 description = "mcpmesh session transport: identity-scoped MCP services served and dialed over iroh/QUIC"
+readme = "README.md"
 
 [lints]
 workspace = true
@@ -14,13 +15,13 @@ workspace = true
 iroh.workspace = true
 rmcp.workspace = true
 tokio.workspace = true
-mcpmesh-codec.workspace = true  # the family codec — ONE implementation, both wire ends (§7.3)
-# DEFAULT-FEATURES ONLY (types-level: serde/serde_json, no tokio/rustix/iroh): the ONE §5
+mcpmesh-codec.workspace = true  # the family codec — ONE implementation, both wire ends
+# DEFAULT-FEATURES ONLY (types-level: serde/serde_json, no tokio/rustix/iroh): the ONE
 # principal-set expansion (`principal_set`) lives on local-api's dependency-free vocabulary
-# surface so the mesh allow check, the plugin seam, and the blob gate can never drift (D1).
+# surface so the mesh allow check, the plugin seam, and the blob gate can never drift.
 mcpmesh-local-api.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 async-trait.workspace = true
-anyhow.workspace = true  # SessionBackend::run + serve/connect return anyhow::Result (endpoint.rs)
+anyhow.workspace = true  # SessionBackend::run returns anyhow::Result (open-ended backend failures)

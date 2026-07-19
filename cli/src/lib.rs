@@ -34,6 +34,8 @@ pub mod pairing;
 #[doc(hidden)]
 pub mod proxy;
 #[doc(hidden)]
+pub mod render;
+#[doc(hidden)]
 pub mod roster;
 #[doc(hidden)]
 pub mod stream;

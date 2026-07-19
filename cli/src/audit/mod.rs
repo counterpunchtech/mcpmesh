@@ -1,4 +1,4 @@
-//! Local, append-only JSONL audit log (spec §11.3). One record per session open/close, per
+//! Local, append-only JSONL audit log. One record per session open/close, per
 //! proxied MCP request line (method + tool NAME + a blake3 hash of the arguments — NEVER the raw
 //! arguments), per blob fetch, and per trust event. Best-effort: an audit-write failure is a
 //! logged warning, never a blocked or failed session. Local-only: nothing here is ever transmitted;
@@ -7,7 +7,7 @@ pub mod log;
 pub mod record;
 
 // The writer types (`AuditLog`, `AuditSink`) plus the per-session proxied-line correlator
-// (`RequestAuditor`, Task 3/4) are re-exported from `log.rs`.
+// (`RequestAuditor`) are re-exported from `log.rs`.
 pub use log::{AuditLog, AuditSink, RequestAuditor};
 pub use record::{AuditKind, AuditRecord, args_hash, now_ts};
 
@@ -93,12 +93,12 @@ pub fn filter_records<'a>(
         .collect()
 }
 
-/// Aggregate audit records into per-peer / per-service SESSION counts (spec §11.3). A "session" is a
+/// Aggregate audit records into per-peer / per-service SESSION counts. A "session" is a
 /// `SessionOpen` record; every other kind (proxied requests, blob fetches, trust events) is ignored.
 /// Deterministic: `per_peer` / `per_service` are sorted ascending by name (BTreeMap iteration). PURE
-/// over an injected record slice — the §9 reconciliation gate asserts this equals a direct count over
-/// `read_all_records` (the same JSONL `internal audit` reads). LOCAL-only: the caller reads the
-/// daemon's own `default_audit_dir()`; this fn never touches the network. Surface-clean (§1.5): the
+/// over an injected record slice — the reconciliation test below asserts this equals a direct count
+/// over `read_all_records` (the same JSONL `internal audit` reads). LOCAL-only: the caller reads the
+/// daemon's own `default_audit_dir()`; this fn never touches the network. Surface-clean: the
 /// keys are the record's petnames / service names, never endpoints/transport vocabulary.
 pub fn summarize_sessions(records: &[AuditRecord]) -> AuditSummaryResult {
     use std::collections::BTreeMap;
@@ -308,7 +308,7 @@ mod tests {
         // total = 4 SessionOpen records (the proxied request + the trust event are excluded).
         assert_eq!(summary.total_sessions, 4);
 
-        // RECONCILIATION (§10 AC): each per-peer session count equals an INDEPENDENT direct count via
+        // RECONCILIATION: each per-peer session count equals an INDEPENDENT direct count via
         // filter_records — the SAME read path `internal audit --kind session_open --peer <p>` uses.
         for (peer, count) in &summary.per_peer {
             let direct =

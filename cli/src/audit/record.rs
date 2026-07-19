@@ -1,4 +1,4 @@
-//! The audit record's DAEMON side (spec §11.3). The record TYPE itself ([`AuditRecord`] /
+//! The audit record's DAEMON side. The record TYPE itself ([`AuditRecord`] /
 //! [`AuditKind`]) is published wire vocabulary — it rides the `subscribe` stream verbatim — so it
 //! lives in [`mcpmesh_local_api::protocol`] and is re-exported here; this module keeps the two
 //! pure PRODUCER helpers: the blake3 args hash (the PRIVACY core — arguments are hashed, never
@@ -8,7 +8,7 @@ use serde_json::Value;
 
 pub use mcpmesh_local_api::{AuditKind, AuditRecord};
 
-/// Hash a request's arguments to `"blake3:<hex>"` (spec §11.3). The raw argument bytes are NEVER
+/// Hash a request's arguments to `"blake3:<hex>"`. The raw argument bytes are NEVER
 /// stored — only this digest — because callers' inputs can be sensitive. Deterministic within a
 /// process for a given `params` value (serde_json serialization). `params` may be `Value::Null`
 /// (a parameterless method) — that hashes the four bytes `null`, a stable non-empty digest.
@@ -17,7 +17,7 @@ pub fn args_hash(params: &Value) -> String {
     format!("blake3:{}", blake3::hash(&bytes).to_hex())
 }
 
-/// The current wall-clock instant as an RFC3339 UTC millisecond string (spec §11.3 `ts`). Uses
+/// The current wall-clock instant as an RFC3339 UTC millisecond string (the record `ts`). Uses
 /// `SystemTime` + a hand-rolled civil-date conversion — NO date crate — matching the codebase's
 /// stated preference at `daemon::epoch_now` ("no date crate"). A pre-epoch clock (impossible on a
 /// sane host) collapses to the epoch rather than panicking.
@@ -89,7 +89,7 @@ mod tests {
         assert_eq!(h.len(), "blake3:".len() + 64);
     }
 
-    /// PRIVACY (spec §11.3): a proxied-request record NEVER carries the raw arguments — only their
+    /// PRIVACY: a proxied-request record NEVER carries the raw arguments — only their
     /// blake3 digest — and it carries the method + tool NAME. Serialize a record built from a
     /// sensitive argument and assert the raw secret is ABSENT from the JSON while the digest is
     /// present. This is the unit-level guard on the hard privacy invariant.

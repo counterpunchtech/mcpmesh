@@ -45,6 +45,28 @@ Both of you also see the same short code, like `tango-fig-cabbage`. 🗣️ Read
 **matching words mean the pairing is authentic.** Now your friend's AI can search your notes over an
 encrypted peer-to-peer link, and it works both ways whenever they want to share back.
 
+## 🧪 Try it alone
+
+Only one machine? Fake the friend. A daemon's whole world lives under `HOME` +
+`XDG_RUNTIME_DIR`, so a scratch `HOME` is a complete second identity — and the two pair on one
+machine exactly as two machines would (macOS/Linux):
+
+```sh
+FH=/tmp/mcpmesh-friend; mkdir -p $FH/notes $FH/run && echo hi > $FH/notes/hello.md
+
+# the "friend" serves a folder and mints a real invite under the scratch identity…
+HOME=$FH XDG_RUNTIME_DIR=$FH/run mcpmesh serve notes -- npx -y @modelcontextprotocol/server-filesystem $FH/notes
+HOME=$FH XDG_RUNTIME_DIR=$FH/run mcpmesh invite notes
+
+# …and YOUR identity redeems it, exactly as a real friend would:
+mcpmesh pair mcpmesh-invite:…
+```
+
+From `pair` onward you're in the two-machine flow — safety code, mount, connect. Nothing is
+mocked: real keys, a real one-time invite, a real encrypted session. The guided version with a
+live end-to-end proof and cleanup is [`docs/loopback.md`](docs/loopback.md), or just run
+[`docs/loopback.sh`](docs/loopback.sh).
+
 ## 🛡️ Why it's safe to try
 
 - **🔐 Default-deny.** Nothing is shared until *you* run `serve` + `invite`. Every grant names
@@ -62,7 +84,7 @@ both machines first — `cargo install mcpmesh`, or via Homebrew on macOS/Linux:
 
 ```sh
 brew tap counterpunchtech/mcpmesh https://github.com/counterpunchtech/mcpmesh
-brew install --HEAD counterpunchtech/mcpmesh/mcpmesh
+brew install counterpunchtech/mcpmesh/mcpmesh
 ```
 
 ### 1️⃣ Alice serves a server and invites Bob
@@ -87,9 +109,10 @@ match, out loud. Same words = the pairing is authentic.
 
 💡 Every command tells you what to do next, so you can follow the whole flow without the docs open.
 
-Alice sends that `mcpmesh-invite:…` line to Bob over **any** channel — chat, email, a sticky note.
-The channel doesn't need to be secure: tampering with the invite makes the next step's code
-mismatch, and the invite is one-time and expiring.
+Alice sends that `mcpmesh-invite:…` line to Bob over **any** channel he can paste from — chat,
+email, a shared doc. (It's a long line, a couple of KB of text — not one to copy by hand.) The
+channel doesn't need to be secure: tampering with the invite makes the next step's code mismatch,
+and the invite is one-time and expiring.
 
 ### 2️⃣ Bob redeems the invite
 
@@ -218,8 +241,8 @@ confirmations that make it safe) is in the 📘 [operator runbook](docs/operator
 🪪 **Identity is self-sovereign:** devices hold keys that never leave the machine, people are verified
 device→user bindings, and the names you see are petnames *you* chose. By default connections
 bootstrap via iroh's public relays; `relay_mode = "custom"` / `discovery_mode = "custom"` in the
-config let you self-host both, and `"disabled"` runs fully hermetic (LAN/localhost only). `mcpmesh
-doctor` validates whatever combination you configure.
+[config](docs/config.md) let you self-host both, and `"disabled"` runs fully hermetic
+(LAN/localhost only). `mcpmesh doctor` validates whatever combination you configure.
 
 > **⚖️ The trust boundary, in one line:** mcpmesh authenticates *who* you're talking to and encrypts
 > the pipe — it does **not** vet *what* a peer's MCP server says. Treat tool output from a peer like
@@ -238,7 +261,9 @@ To **drive the mesh** — a GUI, a launcher, a plugin daemon — talk to the per
 macOS/Linux, a named pipe on Windows), simple enough to implement in any language. The
 [**`mcpmesh-local/1` protocol spec**](docs/local-protocol.md) documents the
 framing, the handshake, every method, and the identity contract. Rust clients can depend on the
-[`mcpmesh-local-api`](https://crates.io/crates/mcpmesh-local-api) crate directly instead.
+[`mcpmesh-local-api`](https://crates.io/crates/mcpmesh-local-api) crate directly instead. Runnable
+samples of both — the typed Rust client and a dependency-free ~60-line Python client proving the
+any-language claim — live in [`local-api/examples/`](local-api/examples).
 
 📺 For a **live view of the mesh**, the daemon exposes an event stream (`subscribe`): an initial
 snapshot of active sessions and peer reachability, then per-event telemetry — sessions opening and

@@ -31,7 +31,7 @@ pub const REACH_TTL_SECS: i64 = 20;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Probe one peer over [`ALPN_PING`] and cache the result. Dials the peer BY ID (an id-only
-/// [`iroh::EndpointAddr`], exactly like `dial::dial_service`'s §10.2 fallback — discovery resolves
+/// [`iroh::EndpointAddr`], exactly like `dial::dial_service`'s single-petname fallback — discovery resolves
 /// the address from the id; hermetic localhost tests seed a `MemoryLookup`), sends one ping frame,
 /// reads the pong, and measures RTT (dial + round-trip). Writes the outcome into the in-memory
 /// `MeshState::reachability` cache and returns it. Reachable ⇔ a pong arrived within
@@ -82,7 +82,7 @@ async fn probe_once(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> Result<()> 
 /// refresh runs as its own spawned task (parallel probes, no join helper / new dependency needed —
 /// each `probe_peer` writes its own cache entry, read by the NEXT call).
 ///
-/// §1.5 surface discipline: the cache is keyed by endpoint-id INTERNALLY, but every returned
+/// Surface discipline: the cache is keyed by endpoint-id INTERNALLY, but every returned
 /// [`mcpmesh_local_api::PeerReachability`] carries only the peer's PETNAME — never the endpoint-id.
 pub fn reachability_of(mesh: &Arc<MeshState>) -> Vec<mcpmesh_local_api::PeerReachability> {
     let now = epoch_now_i64();

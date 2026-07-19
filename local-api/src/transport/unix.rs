@@ -28,7 +28,7 @@ mod server {
     // ── ensure_private_dir, bind_uds, check_peer_uid: moved VERBATIM from service.rs,
     //    visibility now `pub` (they are re-exported by service.rs for the plugin seam) ──
 
-    /// Create + security-check a private runtime dir (mcpmesh §13 — ONE hardened rule for every
+    /// Create + security-check a private runtime dir (ONE hardened rule for every
     /// UDS face in the family; the daemon control socket and the plugin seam both bind through
     /// it): `create_dir_all`, refuse a symlink, chmod 0700, verify we own it. Idempotent.
     ///
@@ -62,7 +62,7 @@ mod server {
     /// create, refuse-symlink, chmod 0700, verify ownership), remove any stale socket, bind,
     /// and chmod the socket 0600.
     ///
-    /// §hardening (loc-L6): the parent dir is forced private because the `XDG_RUNTIME_DIR`
+    /// The parent dir is forced private because the `XDG_RUNTIME_DIR`
     /// fallback is `std::env::temp_dir()`, whose subdirs are NOT otherwise guaranteed private.
     /// The 0700 dir + 0600 socket are defense in depth only — [`check_peer_uid`] remains the
     /// real gate on every accepted connection.
@@ -83,7 +83,7 @@ mod server {
 
     /// Is this connection's peer the same uid as us? `false` (refuse) on a different uid OR an
     /// unreadable peer credential — default-deny, defense in depth beyond the 0600 socket.
-    /// [RECONCILE-PEERUID]: `UnixStream::peer_cred()` -> `UCred::uid()`; `rustix::process::geteuid()`.
+    // Implementation: `UnixStream::peer_cred()` -> `UCred::uid()`; `rustix::process::geteuid()`.
     pub fn check_peer_uid(stream: &UnixStream) -> bool {
         let Ok(cred) = stream.peer_cred() else {
             tracing::warn!("peer_cred unreadable: refusing local connection");
@@ -116,8 +116,8 @@ mod server {
         check_peer_uid(stream)
     }
 
-    /// Bind the per-user local endpoint at `path`, fully hardened for the platform
-    /// (design §1): parent dir 0700 + symlink-refused + owned, stale socket removed,
+    /// Bind the per-user local endpoint at `path`, fully hardened for the platform:
+    /// parent dir 0700 + symlink-refused + owned, stale socket removed,
     /// socket 0600. (On Windows this is a first-instance owner-only-DACL pipe and a
     /// second daemon's bind fails AddrInUse — the Windows singleton.)
     pub fn bind_local(path: &Path) -> io::Result<LocalListener> {

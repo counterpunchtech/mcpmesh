@@ -1,6 +1,6 @@
 //! Adapts a framed byte stream (QUIC bi-stream, UDS, or in-memory pipe) to rmcp's
 //! [`Transport`](rmcp::transport::Transport) so both ends of a session speak MCP
-//! over our one codec (spec §3.1, D1).
+//! over our one codec.
 
 use std::sync::Arc;
 
@@ -51,10 +51,10 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NdjsonTransport<R, W> {
     /// Gracefully close the write half: shut the stream down so an iroh
     /// `SendStream` sends its FIN — flushing any buffered frame (e.g. a final
     /// refusal error) to the peer — instead of being dropped abruptly. For
-    /// iroh's `SendStream`, tokio's `AsyncWrite::poll_shutdown` calls `finish()`
-    /// (noq 1.0.0); for in-memory writers it is a graceful no-op. A no-op once
-    /// the transport is already closed. This is the orderly-teardown primitive
-    /// the session loop uses (Task 10 seam note: a bare drop abandons data).
+    /// iroh's `SendStream`, tokio's `AsyncWrite::poll_shutdown` calls `finish()`;
+    /// for in-memory writers it is a graceful no-op. A no-op once the transport
+    /// is already closed. This is the orderly-teardown primitive the session
+    /// loop uses (a bare drop abandons buffered data).
     pub async fn shutdown(&mut self) -> std::io::Result<()> {
         use tokio::io::AsyncWriteExt;
         if let Some(w) = self.writer.lock().await.as_mut() {
@@ -64,9 +64,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NdjsonTransport<R, W> {
     }
 
     /// Ok(None) = clean EOF. Violations surface as a TYPED error carrying the
-    /// [`Violation`] (Task 8 seam note (a) — supersedes the earlier io::Error
-    /// sketch): the session loop needs the discriminant to choose -32051 vs
-    /// -32700.
+    /// [`Violation`]: the session loop needs the discriminant to choose -32051
+    /// vs -32700.
     pub async fn recv_value(&mut self) -> Result<Option<Value>, RecvError> {
         match self.reader.next().await? {
             None => Ok(None),
@@ -96,7 +95,7 @@ impl<W: AsyncWrite + Unpin> TransportWriter<W> {
 
 /// The -32600 reply the rmcp `receive` path sends when a frame is valid JSON but
 /// not a JSON-RPC message for `Role`. This is platform-synthesized (the transport
-/// answers before any backend sees the frame), so §7.4 requires the
+/// answers before any backend sees the frame), so it MUST carry the
 /// `data.source: "mcpmesh"` marker — parity with [`crate::errors::synthesized`],
 /// the producer of the -32051/-32054/-32700 errors.
 fn invalid_request_reply<Role: ServiceRole>() -> TxJsonRpcMessage<Role> {
@@ -124,7 +123,11 @@ async fn send_locked<W: AsyncWrite + Unpin>(
     }
 }
 
+/// Why a [`NdjsonTransport::recv_value`] read failed: the underlying stream
+/// errored, or the peer sent a frame that violates the codec. `#[non_exhaustive]`
+/// so a future failure kind is not a breaking change — match with a wildcard arm.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum RecvError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
@@ -168,8 +171,8 @@ where
                 }
                 // Framing violations have no channel through rmcp's `receive`
                 // (it yields Option, not Result). Platform violation semantics
-                // (-32051/-32700 + strikes, spec §7.3) belong to the session
-                // loop, which drives `recv_value` directly; here we skip the
+                // (-32051/-32700 + strikes) belong to the session loop, which
+                // drives `recv_value` directly; here we skip the
                 // frame and keep reading, matching rmcp's own AsyncRwTransport
                 // treatment of unparsable input.
                 Err(RecvError::Violation(v)) => {
@@ -184,7 +187,7 @@ where
                 // reading. This reply is platform-synthesized (before any
                 // backend sees the frame), so it MUST carry the
                 // `data.source: "mcpmesh"` marker — parity with
-                // `errors::synthesized`, the other producer of §7.4 errors.
+                // `errors::synthesized`, the other producer of synthesized errors.
                 Err(e) => {
                     tracing::debug!("protocol-shape error on incoming message: {e}");
                     let Ok(frame) = serde_json::to_value(invalid_request_reply::<Role>()) else {
@@ -235,7 +238,7 @@ mod tests {
         t.close().await
     }
 
-    /// §7.4 MUST: EVERY platform-synthesized JSON-RPC error carries
+    /// Family MUST: EVERY platform-synthesized JSON-RPC error carries
     /// `data.source == "mcpmesh"`. There are two producers of such errors in the
     /// net crate — `errors::synthesized` (the -32051/-32054/-32700 codes) and
     /// the transport's -32600 wrong-shape reply (`invalid_request_reply`). This
@@ -255,7 +258,7 @@ mod tests {
         ] {
             assert_eq!(
                 e["error"]["data"]["source"], "mcpmesh",
-                "producer emitted a §7.4 error without the marker: {e}"
+                "producer emitted a synthesized error without the marker: {e}"
             );
         }
     }
@@ -317,8 +320,8 @@ mod tests {
         .expect("writer handle test timed out");
     }
 
-    /// Task 8 binding seam note: violations surface TYPED, carrying the
-    /// discriminant the session loop needs to choose -32051 vs -32700.
+    /// Violations surface TYPED, carrying the discriminant the session loop
+    /// needs to choose -32051 vs -32700.
     #[tokio::test]
     async fn recv_value_surfaces_typed_violations() {
         let mut t = NdjsonTransport::new(&b"not json\n"[..], Vec::new(), 64);
@@ -375,7 +378,7 @@ mod tests {
 
             let reply = probe.recv_value().await.unwrap().unwrap();
             assert_eq!(reply["error"]["code"], -32600);
-            // §7.4 MUST: this platform-synthesized error carries the marker,
+            // Family MUST: this platform-synthesized error carries the marker,
             // and it survives serialize -> wire -> parse (proves ErrorData.data
             // round-trips, not just that it was set).
             assert_eq!(reply["error"]["data"]["source"], "mcpmesh");

@@ -66,13 +66,13 @@ pub fn run() -> Result<()> {
 /// The async body: compose the mesh serve loop and the control server, then run until
 /// shutdown. Split out from [`run`] so the runtime setup stays synchronous.
 async fn serve_forever(socket: &Path) -> Result<()> {
-    // 0. [CRITICAL — M3c T7] Install a process-default rustls `CryptoProvider` (ring) BEFORE any
+    // 0. CRITICAL: install a process-default rustls `CryptoProvider` (ring) BEFORE any
     //    reqwest client is built. reqwest 0.13.4 (`rustls-no-provider`) resolves the provider via
     //    `CryptoProvider::get_default()` at CLIENT-BUILD time and PANICS ("No rustls crypto provider
     //    is configured") if none is installed. iroh 1.0.1 passes ring per-endpoint and installs NO
     //    process-default, so nothing else does this for us. Idempotent: `install_default` returns Err
     //    if a provider is already installed, which `let _ =` swallows (safe against a re-entry / a test
-    //    that also installed one). This MUST precede the URL poll loop spawned below (§4.3 HTTPS poll).
+    //    that also installed one). This MUST precede the URL poll loop spawned below.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     // 0a. Bind the control listener FIRST — before state.redb, the endpoint, or the audit log. On
@@ -94,7 +94,7 @@ async fn serve_forever(socket: &Path) -> Result<()> {
         Err(e) => return Err(e),
     };
 
-    // 0b. The audit log (spec §11.3): one bounded-channel writer over <state_dir>/audit. Best-effort
+    // 0b. The audit log: one bounded-channel writer over <state_dir>/audit. Best-effort
     //     — record() never blocks or fails a session. Threaded into the backends (build_services_
     //     audited) and stored on the mesh for the reload sites + trust-event hooks.
     let audit = AuditSink::new(AuditLog::spawn(paths::default_audit_dir()?));
@@ -110,16 +110,16 @@ async fn serve_forever(socket: &Path) -> Result<()> {
     let (key, _created) = DeviceKey::load_or_generate(&key_path)
         .map_err(|e| anyhow::anyhow!("device key error at {}: {e}", key_path.display()))?;
 
-    // 2. The single Iroh endpoint, seeded from the device key (spec §7.1). Roster mode (an org root
+    // 2. The single Iroh endpoint, seeded from the device key. Roster mode (an org root
     //    pinned in config) additionally advertises the gossip + blob ALPNs on this same endpoint;
-    //    a pure-pairing daemon advertises exactly mcp/1 + pair/1 (M2b parity, [Important] 1).
+    //    a pure-pairing daemon advertises exactly mcp/1 + pair/1 (no roster ALPNs to probe).
     let secret = iroh::SecretKey::from_bytes(&key.secret_bytes());
     let roster_mode = cfg.identity.org_root_pk.is_some();
     let endpoint = build_endpoint(secret, &cfg.network, roster_mode).await?;
     let our_id = endpoint.id();
 
     // 3. The peer allowlist store + gate. redb open + reads are blocking; open on a blocking
-    //    thread so a slow trust-file fsync never stalls a runtime worker (Task 4 seam note).
+    //    thread so a slow trust-file fsync never stalls a runtime worker.
     let db_path = paths::default_state_db_path()?;
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)
@@ -127,16 +127,16 @@ async fn serve_forever(socket: &Path) -> Result<()> {
     }
     let store = blocking("join peer-store open", move || PeerStore::open(&db_path)).await??;
     let store = Arc::new(store);
-    // The composed trust gate (spec §4.1): pairing ∪ roster with explicit precedence
-    // (revocation → roster → pairing). `pairs` is the M2b `AllowlistGate` over the redb peer
+    // The composed trust gate: pairing ∪ roster with explicit precedence
+    // (revocation → roster → pairing). `pairs` is the `AllowlistGate` over the redb peer
     // allowlist; `roster` is the hot-swappable roster gate, empty until a signed roster is
     // installed/loaded. With NO roster installed, `ComposedGate` falls through to `pairs` for
-    // everything — byte-identical to M2b (every pairing flow preserved).
+    // everything — every pairing flow preserved.
     let pairs = Arc::new(AllowlistGate::new(store.clone()));
-    // The degraded-expiry grace window (spec §4.3, default 72h; total parse — see
-    // `RosterCfg::grace_seconds`, which also carries the M3a/M3c degraded-split design note).
+    // The degraded-expiry grace window (default 72h; total parse — see
+    // `RosterCfg::grace_seconds`, which also carries the degraded-split design note).
     let grace = cfg.roster.grace_seconds();
-    // The roster-daemon gate: expiry grace AND the freshness bound (spec §4.3 P13). A stale roster
+    // The roster-daemon gate: expiry grace AND the freshness bound. A stale roster
     // (not re-confirmed within `max_staleness`) degrades on the SAME `RosterState` machine as expiry.
     let roster = Arc::new(RosterGate::with_freshness(
         grace,
@@ -155,7 +155,7 @@ async fn serve_forever(socket: &Path) -> Result<()> {
                         roster.install(view);
                         tracing::info!("installed roster loaded");
                         // If the loaded roster is already past expiry but within grace, warn on load
-                        // (spec §4.3) — an expired-but-valid installed roster loads into degraded mode.
+                        // — an expired-but-valid installed roster loads into degraded mode.
                         warn_if_degraded_grace(&roster);
                     }
                     Ok(Ok(None)) => {}
@@ -167,11 +167,12 @@ async fn serve_forever(socket: &Path) -> Result<()> {
             Err(e) => tracing::warn!(%e, "pinned org_root_pk is invalid; roster mode disabled"),
         }
     }
-    // Freshness bootstrap (M3c, spec §4.3 P13): arm the gate's `last_confirmed` from the sidecar.
+    // Freshness bootstrap: arm the gate's `last_confirmed` from the sidecar.
     //  - present sidecar  → restore the persisted confirmation instant.
-    //  - ABSENT sidecar + a roster IS installed → the ONE-TIME UPGRADE GRACE: an M3a/M3b node
-    //    upgrading to M3c has no sidecar yet; treat `now` as the confirmation instant and persist it,
-    //    so it does NOT instantly degrade to stale on first M3c boot (it re-confirms on its next poll).
+    //  - ABSENT sidecar + a roster IS installed → the ONE-TIME UPGRADE GRACE: a node upgrading
+    //    from a build without freshness tracking has no sidecar yet; treat `now` as the
+    //    confirmation instant and persist it, so it does NOT instantly degrade to stale on its
+    //    first boot with this build (it re-confirms on its next poll).
     //  - absent sidecar + NO roster → leave `None` (a fresh node arms freshness on its first confirm).
     // Best-effort persist: a write failure leaves the in-RAM arm intact.
     {
@@ -202,8 +203,8 @@ async fn serve_forever(socket: &Path) -> Result<()> {
     }
     let gate: Arc<dyn TrustGate> = Arc::new(ComposedGate::new(roster.clone(), pairs));
 
-    // 4. Rate/concurrency limiters (spec §11.2 P7), built once from config and shared across every
-    //    backend + (T9) the accept loop. Installed on the mesh AFTER it is built (below).
+    // 4. Rate/concurrency limiters, built once from config and shared across every
+    //    backend + the accept loop. Installed on the mesh AFTER it is built (below).
     let limiters = crate::limits::MeshLimiters::from_config(&cfg.limits);
     // 4b. Service registry from config. `run_mesh_connection` shares one registry across every
     //    connection, so wrap it once in `Arc` here. (The `status` service/peer lists are read
@@ -213,7 +214,7 @@ async fn serve_forever(socket: &Path) -> Result<()> {
     // 5. Assemble the mesh half, start the daemon's OWN ALPN-dispatch accept loop, and install
     //    its handle for hot-reload. Chicken-egg (the loop needs `mesh`, `mesh.accept_task` needs
     //    the loop's handle): build `mesh` with an empty accept_task, spawn the loop with
-    //    `mesh.clone()`, then set the handle. The invite registry starts empty (T5's `invite`
+    //    `mesh.clone()`, then set the handle. The invite registry starts empty (`invite`
     //    mints into it).
     let invites = Arc::new(LiveInvites::new());
     // The petname we suggest for ourselves in invites + advertise to peers: config override, else the
@@ -223,15 +224,15 @@ async fn serve_forever(socket: &Path) -> Result<()> {
         .petname
         .clone()
         .unwrap_or_else(|| default_self_petname(&our_id));
-    // The live-connection registry (M3a T8/T9): threaded into the accept loop's mesh handler
-    // (CHECK-register on accept) so a roster install can sever its live sessions (D8). `roster`
+    // The live-connection registry: threaded into the accept loop's mesh handler
+    // (CHECK-register on accept) so a roster install can sever its live sessions. `roster`
     // (the hot-swappable roster gate) + `gate` (the composed gate over it) were built above.
     let conn_registry = Arc::new(ConnRegistry::new());
-    // Roster-mode gossip/blob composition (spec §4.3/§10, [RECONCILE-COMPOSE]): spawn iroh-gossip +
+    // Roster-mode gossip/blob composition: spawn iroh-gossip +
     // the roster-blob transport on THIS SAME endpoint, and subscribe the roster topic bootstrapping
     // from the installed roster's device endpoints (the swarm forms as peers arrive — an empty
     // bootstrap is fine). The accept loop's gossip/blob arms dispatch to these handles. A pure-pairing
-    // daemon spawns NEITHER (`None`) — no gossip, byte-identical to M2b.
+    // daemon spawns NEITHER (`None`) — no gossip at all.
     let (gossip, blobs, roster_topic, presence_topic) =
         compose_roster_transport(&endpoint, &roster, &cfg, roster_mode, &our_id).await;
     let mesh = MeshState::new(
@@ -248,11 +249,11 @@ async fn serve_forever(socket: &Path) -> Result<()> {
         roster_topic,
         presence_topic,
     );
-    // Install the process audit sink on the mesh (spec §11.3) BEFORE serving, so the reload sites +
+    // Install the process audit sink on the mesh BEFORE serving, so the reload sites +
     // trust-event hooks can re-thread/read it.
     mesh.set_audit(audit.clone());
     mesh.set_limits(limiters.clone());
-    // Self-sovereign pairing identity (spec §4.2 identity — the adopted device->user binding): load
+    // Self-sovereign pairing identity: load
     // (or mint) this person's UserKey and precompute this daemon's binding over `our_id`, so the
     // pairing handlers PRESENT it and paired peers store a VERIFIED `user_id`. The key path mirrors
     // roster mode's (`[identity].user_key`, else the default), so a roster `join` and pairing share
@@ -277,7 +278,7 @@ async fn serve_forever(socket: &Path) -> Result<()> {
         }
     };
     mesh.set_self_binding(self_binding);
-    // M4a: build the gated per-scope app-blob provider (spec §9) in roster mode and install it on the
+    // Build the gated per-scope app-blob provider in roster mode and install it on the
     // mesh BEFORE the accept loop starts. Uses the SAME composed trust gate the mesh resolves inbound
     // MCP with, so the request-time scope check keys on the exact authenticated identity. A build
     // failure disables app blobs with a warning (pairing + mesh keep working); a pure-pairing daemon
@@ -311,7 +312,7 @@ async fn serve_forever(socket: &Path) -> Result<()> {
     let accept_task = spawn_accept_loop(mesh.clone(), services);
     mesh.set_accept_task(accept_task).await;
 
-    // 5b. Roster mode: spawn the distribution converge loop (spec §4.3) — it pulls `RosterAnnounce`s
+    // 5b. Roster mode: spawn the distribution converge loop — it pulls `RosterAnnounce`s
     //     off the roster topic and, on a higher serial, fetches + single-validates + installs the new
     //     roster, then re-seeds/re-announces (propagation is operator-offline-safe). Self-guards on a
     //     `None` receiver (pure-pairing daemon), so an unconditional call is a no-op there; the
@@ -325,18 +326,19 @@ async fn serve_forever(socket: &Path) -> Result<()> {
         let _converge = crate::roster::distribute::spawn_receive_loop(mesh.clone());
     }
 
-    // 5b'. Roster mode: spawn presence (spec §10.1). ADVISORY-ONLY — presence feeds `status` + (T11)
-    //      the person→device dial ORDERING; it NEVER touches a gate, an authz check, or a sever
-    //      decision (absence of a presence entry never blocks a dial). The TRACK loop records verified
-    //      heartbeats (each bound to the roster's authoritative user_id) into `mesh.presence_table`;
-    //      the PUBLISH loop beats this node's own device-key-signed heartbeat every ~60s. A pure-pairing
+    // 5b'. Roster mode: spawn presence. ADVISORY-ONLY — presence feeds `status` + the
+    //      person→device dial ORDERING; it NEVER touches a gate, an authz check, or a sever
+    //      decision (absence of a presence entry never blocks a dial). Both loops run against the
+    //      narrow presence context the mesh composes (table + topic + roster gate). The TRACK loop
+    //      records verified heartbeats (each bound to the roster's authoritative user_id); the
+    //      PUBLISH loop beats this node's own device-key-signed heartbeat every ~60s. A pure-pairing
     //      daemon (not roster mode) spawns NEITHER loop. The device SigningKey is the SAME ed25519 key
     //      the endpoint id derives from (`key.secret_bytes()`), so the beat's endpoint_id == our_id and
     //      peers resolve us in their roster. Publish only when this node's own user_id is known (config
     //      `[identity].user_id`, else its roster resolution) — a beat under an unknown user_id would be
     //      self-rejected by every peer's user_id binding, so it is skipped rather than sent as noise.
     if roster_mode {
-        let _track = crate::roster::presence::track_loop(mesh.clone());
+        let _track = crate::roster::presence::track_loop(mesh.presence_ctx());
         let self_user_id = cfg.identity.user_id.clone().or_else(|| {
             mesh.roster
                 .view()
@@ -346,7 +348,7 @@ async fn serve_forever(socket: &Path) -> Result<()> {
             Some(user_id) => {
                 let device_key = ed25519_dalek::SigningKey::from_bytes(&key.secret_bytes());
                 let _publish =
-                    crate::roster::presence::publish_loop(mesh.clone(), device_key, user_id);
+                    crate::roster::presence::publish_loop(mesh.presence_ctx(), device_key, user_id);
             }
             None => tracing::debug!(
                 "presence publish skipped: no user_id for this node (track loop still runs)"
@@ -354,18 +356,18 @@ async fn serve_forever(socket: &Path) -> Result<()> {
         }
     }
 
-    // M4c: periodic staleness sweep (spec §4.3 P13). The freshness bound denies NEW inbound at
+    // Periodic staleness sweep. The freshness bound denies NEW inbound at
     // `resolve`; this cuts EXISTING roster-authorized sessions once the node crosses
     // `last_confirmed + max_staleness + grace`. Roster mode only; never severs pairing-only sessions.
     if roster_mode {
         let _sweep = spawn_staleness_sweep(mesh.clone());
     }
 
-    // 5c. Roster mode with a pinned `[roster].url`: spawn the HTTPS fallback poll loop (spec §4.3).
+    // 5c. Roster mode with a pinned `[roster].url`: spawn the HTTPS fallback poll loop.
     //     It GETs the URL every `poll_interval` AND once at startup, so a joiner gets its FIRST roster
-    //     (D5 — a joiner cannot gossip before it holds a roster). A newer served roster converges
+    //     (a joiner cannot gossip before it holds a roster). A newer served roster converges
     //     through the SAME `install_from_file` path (no second validator); an equal serial CONFIRMS
-    //     currency (freshness, T9). Guarded on `roster_mode` (an org root pinned) — a stray url with no
+    //     currency (freshness). Guarded on `roster_mode` (an org root pinned) — a stray url with no
     //     anchor has nothing to converge to. The rustls provider is installed (step 0) before this runs.
     if roster_mode && let Some(url) = cfg.roster.url.clone() {
         // Route through the tracked helper (NOT a bare spawn) so the startup handle lands in
@@ -377,7 +379,7 @@ async fn serve_forever(socket: &Path) -> Result<()> {
     // 6. The control server on the local endpoint (bound in step 0a), running on the same runtime
     //    as the mesh serve loop.
     let state = Arc::new(DaemonState::with_mesh(STACK_VERSION, mesh));
-    // Our own endpoint id is operator-shareable (it is how a peer pairs us) — not a §1.5
+    // Our own endpoint id is operator-shareable (it is how a peer pairs us) — not a
     // surface leak (that discipline forbids leaking OTHER peers' ids/paths in porcelain).
     tracing::info!(
         endpoint_id = %our_id,
@@ -387,7 +389,7 @@ async fn serve_forever(socket: &Path) -> Result<()> {
     serve_control(listener, state).await
 }
 
-/// How this daemon's endpoint resolves peer addresses (spec §10.3): the n0 defaults
+/// How this daemon's endpoint resolves peer addresses: the n0 defaults
 /// (pkarr publish + DNS lookup against n0's servers — what `presets::N0` wires), or
 /// self-hosted pkarr relay URLs used for BOTH publish and resolve (`discovery_mode =
 /// "custom"` + `discovery_urls`).
@@ -397,9 +399,9 @@ pub(crate) enum DiscoveryPlan {
     Custom(Vec<url::Url>),
 }
 
-/// The validated `[network]` posture (spec §10.3/§12) — the SINGLE truth `build_endpoint`
+/// The validated `[network]` posture — the SINGLE truth `build_endpoint`
 /// binds and `doctor` reports on. `Hermetic` (`relay_mode = "disabled"`) is no relay AND no
-/// discovery — the localhost/tests mode, byte-identical to the pre-D2 behavior.
+/// discovery — the localhost/tests mode.
 #[derive(Debug)]
 pub(crate) enum NetPlan {
     Hermetic,
@@ -412,7 +414,7 @@ pub(crate) enum NetPlan {
 /// Validate `[network]` into a [`NetPlan`]. Pure (parses, never binds) so config tests and
 /// `doctor` share it. Unknown modes and a `"custom"` without URLs are ERRORS, never a silent
 /// fallback to public infrastructure — a metadata-privacy knob that quietly reverts to n0
-/// defaults would be worse than none (§10.3).
+/// defaults would be worse than none.
 pub(crate) fn net_plan(net: &crate::config::NetworkCfg) -> Result<NetPlan> {
     let relay = match net.relay_mode.as_str() {
         // Hermetic: no relay, no discovery (discovery_mode is ignored — doctor warns if set).
@@ -462,26 +464,25 @@ pub(crate) fn net_plan(net: &crate::config::NetworkCfg) -> Result<NetPlan> {
     Ok(NetPlan::Mesh { relay, discovery })
 }
 
-/// Build the Iroh endpoint advertising the mcpmesh/mcp/1 (mesh) + mcpmesh/pair/1 (pairing) ALPNs (spec
-/// §7.1) — the accept loop dispatches each inbound connection by whichever one negotiated. In ROSTER
-/// mode (`roster_mode == true`, an org root pinned) it ALSO advertises the gossip + blob ALPNs (spec
-/// §4.3/§10) so the roster/presence distribution + roster-blob transport share this ONE endpoint
-/// ([RECONCILE-COMPOSE]). A pure-pairing daemon (`roster_mode == false`) advertises EXACTLY mcp/1 +
-/// pair/1 — byte-identical to M2b ([Important] 1, the roster-None parity fix).
+/// Build the Iroh endpoint advertising the mcpmesh/mcp/1 (mesh) + mcpmesh/pair/1 (pairing)
+/// ALPNs — the accept loop dispatches each inbound connection by whichever one negotiated. In
+/// ROSTER mode (`roster_mode == true`, an org root pinned) it ALSO advertises the gossip + blob
+/// ALPNs so the roster/presence distribution + roster-blob transport share this ONE endpoint.
+/// A pure-pairing daemon (`roster_mode == false`) advertises EXACTLY mcp/1 + pair/1.
 ///
-/// The `[network]` posture comes from [`net_plan`] (spec §10.3):
+/// The `[network]` posture comes from [`net_plan`]:
 /// - Hermetic (`relay_mode = "disabled"`): `presets::Minimal` + `RelayMode::Disabled` — a
 ///   localhost-only endpoint, no relay, no discovery (hermetic tests).
 /// - n0-default discovery: `presets::N0` (pkarr publish + DNS lookup + n0 relays), with the
 ///   relay map overridden to the operator's `relay_urls` when `relay_mode = "custom"`.
 /// - Custom discovery (`discovery_urls`): `presets::Minimal` plus a `PkarrPublisher` AND a
 ///   `PkarrResolver` per URL — publish and resolve BOTH go to the self-hosted pkarr relay(s),
-///   never to n0 (a half-private discovery setup would defeat §10.3's point).
+///   never to n0 (a half-private discovery setup would defeat the metadata-privacy point).
 ///
-/// [RECONCILE — SETTLED against iroh 1.0.1: `Builder::alpns(Vec<Vec<u8>>)` advertises MULTIPLE
+/// Verified against iroh 1.0.1: `Builder::alpns(Vec<Vec<u8>>)` advertises MULTIPLE
 /// ALPNs on one endpoint; `Endpoint::builder(preset)`, `.secret_key()`, `.relay_mode()`,
 /// `.address_lookup()`, `.bind()` per the pinned crate; `RelayMode::custom(urls)` builds the
-/// custom `RelayMap`; all preset paths yield the same `Builder` type.]
+/// custom `RelayMap`; all preset paths yield the same `Builder` type.
 pub(crate) async fn build_endpoint(
     secret: iroh::SecretKey,
     net: &crate::config::NetworkCfg,
@@ -524,12 +525,12 @@ pub(crate) async fn build_endpoint(
         .context("bind iroh endpoint")
 }
 
-/// Compose the roster-mode gossip/blob transport on the daemon's ONE endpoint (spec §4.3/§10,
-/// [RECONCILE-COMPOSE]). In roster mode, spawns iroh-gossip + the roster-blob transport and
+/// Compose the roster-mode gossip/blob transport on the daemon's ONE endpoint.
+/// In roster mode, spawns iroh-gossip + the roster-blob transport and
 /// subscribes the roster topic (derived from the org_id — config's pinned value, else the loaded
 /// roster view's), bootstrapping from the installed roster's OTHER device endpoints (the swarm forms
 /// as peers arrive — an empty bootstrap is fine, [`subscribe`] does not block). Returns
-/// `(None, None, None)` for a pure-pairing daemon (no gossip spawned, byte-identical to M2b), or —
+/// `(None, None, None)` for a pure-pairing daemon (no gossip spawned), or —
 /// fail-safe — when no org_id is resolvable / the subscribe fails (pairing + mesh keep working;
 /// distribution is simply disabled with a warning).
 ///
@@ -563,7 +564,7 @@ async fn compose_roster_transport(
     let gossip = transport::spawn_gossip(endpoint);
     let blobs = transport::RosterBlobs::new(endpoint);
     // Bootstrap from the installed roster's device endpoints (excluding ourselves). BOTH the roster
-    // and presence topics bootstrap from the SAME peer set (§4.3/§10.1) — the swarm forms as peers
+    // and presence topics bootstrap from the SAME peer set — the swarm forms as peers
     // arrive, so an empty bootstrap is fine (subscribe does not block on a neighbor).
     let bootstrap: Vec<iroh::EndpointId> = roster
         .view()
@@ -587,7 +588,7 @@ async fn compose_roster_transport(
             None
         }
     };
-    // The presence topic (spec §10.1) — reuse `transport::presence_topic_bytes` (T1); same org_id +
+    // The presence topic — reuse `transport::presence_topic_bytes`; same org_id +
     // bootstrap. A subscribe failure disables presence ONLY (roster distribution is independent).
     let presence_topic =
         match transport::subscribe(&gossip, transport::presence_topic_bytes(&org_id), bootstrap)
@@ -602,7 +603,7 @@ async fn compose_roster_transport(
     (Some(gossip), Some(blobs), roster_topic, presence_topic)
 }
 
-/// Acquire the per-uid singleton lock (spec §13 single-daemon). Returns `Some(file)` when we
+/// Acquire the per-uid singleton lock. Returns `Some(file)` when we
 /// win the exclusive advisory lock (hold it for the process lifetime; dropping it releases
 /// the lock), or `None` when another daemon already holds it (`EWOULDBLOCK`). Unix-only: on
 /// Windows the control-pipe bind is the singleton (see `run`), so there is no flock path.
@@ -626,7 +627,7 @@ fn acquire_singleton_lock(lock_path: &Path) -> Result<Option<File>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    /// D2: `net_plan` implements EXACTLY the shipped `[network]` surface — the §10.3 knobs are
+    /// `net_plan` implements EXACTLY the shipped `[network]` surface — the privacy knobs are
     /// real, validated, and never silently fall back to public infrastructure.
     #[test]
     fn net_plan_validates_the_shipped_network_surface() {
@@ -701,7 +702,7 @@ mod tests {
         );
     }
 
-    /// D2: a custom-relay endpoint BINDS without any live relay (the RelayMap is config, not a
+    /// A custom-relay endpoint BINDS without any live relay (the RelayMap is config, not a
     /// connection) — proving the builder wiring end to end with no network dependency.
     #[tokio::test(flavor = "multi_thread")]
     async fn build_endpoint_binds_with_a_custom_relay_map() {

@@ -1,7 +1,7 @@
-//! A no-iroh mcpmesh-local/1 client (mcpmesh §6.1): connect the UDS, read the server's `Hello`
+//! A no-iroh mcpmesh-local/1 client: connect the UDS, read the server's `Hello`
 //! first frame, assert the api name, then issue typed request/response frames. Distinct
 //! from the CLI crate (`cli/`)'s ControlClient (which uses mcpmesh_net::framing) — this one links no
-//! iroh, so kb and the host shell can use it (host §7.1). kb calls this to self-register
+//! iroh, so kb and the host shell can use it. kb calls this to self-register
 //! its `[services.kb]` socket backend with the running mcpmesh daemon.
 use std::path::Path;
 
@@ -27,13 +27,12 @@ pub struct ControlClient {
     writer: LocalWriteHalf,
 }
 
-/// The error surface of the client — thin, so kb can `anyhow`-wrap it.
+/// The error surface of the client — thin, so callers can `anyhow`-wrap it.
 ///
-/// DEVIATION (declared): the plan derives `thiserror::Error`, but T2 Step 1's manifest adds
-/// no `thiserror` dep and the §7.1 invariant requires the `client` feature to pull ONLY
-/// tokio. The `Display`/`Error`/`From` impls below are hand-rolled to be behavior-identical
-/// (same messages, same `?`-conversion from `io::Error`) with zero extra dependencies.
-/// [source: plan T2 client.rs `ClientError` vs §7.1 "client adds ONLY tokio"]
+/// The `Display`/`Error`/`From` impls below are hand-rolled rather than derived: the
+/// `client` feature deliberately pulls ONLY tokio (no `thiserror`), and the hand-rolled
+/// impls are behavior-identical (same messages, same `?`-conversion from `io::Error`)
+/// with zero extra dependencies.
 #[derive(Debug)]
 pub enum ClientError {
     Io(std::io::Error),
@@ -308,11 +307,11 @@ impl ControlClient {
         .await
     }
 
-    /// Grant a scope to a principal — any §5 flat-namespace entry: a group name, a user_id,
-    /// or a petname (the shared `principal_set` expansion, D1).
-    /// [RECONCILE-BLOBGRANT]: the daemon acks; the ack body is discarded (a JSON-RPC error
-    /// surfaces as `ClientError::Api`). kb uses this to grant a per-mirror sync scope to the
-    /// owner's own user_id (all owner devices, incl. the mirror).
+    /// Grant a scope to a principal — any flat-namespace entry: a group name, a user_id,
+    /// or a petname (the shared `principal_set` expansion).
+    /// The daemon acks; the ack body is discarded (a JSON-RPC error surfaces as
+    /// `ClientError::Api`). Granting a scope to your own user_id reaches ALL of that
+    /// person's devices.
     pub async fn blob_grant(&mut self, scope: &str, principal: &str) -> Result<(), ClientError> {
         self.request_ack(Request::BlobGrant(BlobGrantParams {
             scope: scope.to_string(),
@@ -387,7 +386,7 @@ pub async fn connect_control(path: &Path) -> Result<ControlClient, ClientError> 
 
 /// [`connect_control`] at the platform default endpoint ([`crate::paths::default_endpoint`]):
 /// the quickstart front door — a consumer dials the running daemon without reimplementing
-/// the spec-§13 endpoint rule. Resolution failure surfaces as [`ClientError::Io`]
+/// the platform endpoint rule. Resolution failure surfaces as [`ClientError::Io`]
 /// (`NotFound`), same as a daemon that is not running.
 pub async fn connect_control_default() -> Result<ControlClient, ClientError> {
     connect_control(&crate::paths::default_endpoint()?).await
@@ -582,7 +581,7 @@ mod tests {
         server.await.unwrap();
     }
 
-    /// M2 regression (lossless rebox): a frame the server PIPELINES in the same write as
+    /// Regression (lossless rebox): a frame the server PIPELINES in the same write as
     /// the Hello must survive `open_session` + kb's production re-box shape
     /// (`FrameReader::new(Box::new(reader.into_inner()), …)`, bridge/session.rs). Against
     /// the old `into_inner -> R` — which unwrapped the internal `BufReader` and DROPPED

@@ -1,22 +1,22 @@
-//! The `run` backend (spec §6.2/§6.3): one child MCP server process per session.
+//! The `run` backend: one child MCP server process per session.
 //! Its stdio is pumped Value/semantic-faithfully to/from the QUIC-framed transport,
 //! the resolved caller identity is injected as environment variables, the child is
 //! killed when the session closes, and concurrent spawns are bounded per service.
 //!
-//! D6 — the platform PUMPS, it never INTERPRETS: frames move across as JSON `Value`s
+//! The platform PUMPS, it never INTERPRETS: frames move across as JSON `Value`s
 //! (one codec everywhere; the child's stdout MCP-stdio framing IS our wire framing —
 //! newline-delimited compact JSON), and nothing here inspects the child's MCP
 //! method/result semantics. Fidelity is Value/semantic, not byte-for-byte: each frame
 //! re-serializes through `serde_json::Value` (keys re-sorted, no arbitrary_precision),
-//! the shared property with the M1 mesh transport — see [`super`].
+//! the shared property with the mesh transport — see [`super`].
 //!
-//! Identity reaches a `run` child as ENV, not `_meta` (§6.3): `MCPMESH_PEER_NAME`
+//! Identity reaches a `run` child as ENV, not `_meta`: `MCPMESH_PEER_NAME`
 //! (always, when resolved), `MCPMESH_PEER_USER` (the self-sovereign user_id — set
 //! in roster mode, and in pairing mode once a device->user binding is verified),
 //! and `MCPMESH_PEER_GROUPS` (comma-joined). It arrives PER-CALLER through `run`
 //! (`Option<PeerIdentity>`), not as a construction field: `serve` builds each
 //! backend once per service and reuses it across all callers, so the injected
-//! identity cannot be baked in (Task 9). `select_service` already stripped the
+//! identity cannot be baked in. `select_service` already stripped the
 //! caller's reserved `mcpmesh/*` `_meta` keys upstream, so the forwarded
 //! `initialize` is clean before it reaches the child.
 use std::process::Stdio;
@@ -32,23 +32,23 @@ use tokio::sync::Semaphore;
 
 use crate::audit::RequestAuditor;
 
-/// The `retry_after_ms` hint on a concurrency-cap refusal (spec §7.4). Unlike a token bucket there is
+/// The `retry_after_ms` hint on a concurrency-cap refusal. Unlike a token bucket there is
 /// no exact refill instant — a held permit frees when a peer session ends — so a fixed ~1s nudge.
 const CONCURRENCY_RETRY_MS: u64 = 1000;
 
 /// The `run` backend for one registered service. `cmd` is an argv vector executed
-/// directly — NEVER through a shell (spec §5). `concurrency` is the per-service
-/// spawn cap (spec §6.2 default 4), shared across the sessions of one service. The
+/// directly — NEVER through a shell. `concurrency` is the per-service
+/// spawn cap (default 4), shared across the sessions of one service. The
 /// caller identity is NOT a field — it is threaded per-session through
-/// [`SessionBackend::run`] (this backend is shared across callers, Task 9).
+/// [`SessionBackend::run`] (this backend is shared across callers).
 pub struct SpawnBackend {
     pub cmd: Vec<String>,
     pub concurrency: std::sync::Arc<Semaphore>,
-    /// This service's name (the registry key) — recorded as `service` in audit records (spec §11.3).
+    /// This service's name (the registry key) — recorded as `service` in audit records.
     pub service: String,
-    /// The audit sink (spec §11.3). `AuditSink::disabled()` in tests / a non-audited build.
+    /// The audit sink. `AuditSink::disabled()` in tests / a non-audited build.
     pub audit: crate::audit::AuditSink,
-    /// The per-authenticated-endpoint request limiter (spec §11.2 P7), shared across all backends.
+    /// The per-authenticated-endpoint request limiter, shared across all backends.
     /// Consulted per proxied request line in `super::pump`. Keyed on `identity.endpoint`.
     pub limiter: std::sync::Arc<crate::limits::RateLimiter>,
 }
@@ -85,7 +85,7 @@ impl SpawnBackend {
     /// `ServiceDecision::Refuse` path, which also returns `Ok` so `serve`'s session
     /// task does not `warn!("session ended with error")` for a normal refusal). The
     /// caller sees a well-formed rate-limit answer, not a hang. `retry_after_ms` is
-    /// the M4 token-bucket feature, omitted here.
+    /// a token-bucket concept, omitted here.
     pub async fn run_over<R, W>(
         &self,
         identity: Option<PeerIdentity>,
@@ -133,7 +133,7 @@ impl SpawnBackend {
         let child_stdin = child.stdin.take().expect("stdin piped above");
         let child_stdout = child.stdout.take().expect("stdout piped above");
 
-        // Session lifecycle audit (spec §11.3): attribute to the gate-resolved identity (roster
+        // Session lifecycle audit: attribute to the gate-resolved identity (roster
         // user_id if present, else petname). The cap-refusal path above returns before this, so a
         // refused session is not recorded as opened.
         let peer = identity

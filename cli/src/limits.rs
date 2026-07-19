@@ -1,8 +1,8 @@
-//! Rate-limiting primitives (spec §7.3 / §11.2 P7): a monotonic token bucket + a bounded,
+//! Rate-limiting primitives: a monotonic token bucket + a bounded,
 //! idle-evicting per-endpoint bucket map. PURE and FAIL-SAFE by construction — an over-limit check
 //! DENIES (returns a retry hint), never serves-more; the bucket map self-prunes so a churn of distinct
-//! AUTHENTICATED endpoints cannot grow memory without bound (the AC's "no unbounded memory"). Keyed
-//! ONLY on the authenticated `EndpointId` (never a self-asserted name — SECURITY invariant 1).
+//! AUTHENTICATED endpoints cannot grow memory without bound. Keyed ONLY on the authenticated
+//! `EndpointId` (never a self-asserted name — the core attribution invariant).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -69,8 +69,8 @@ struct Tracked {
     last_seen: Instant,
 }
 
-/// A bounded, idle-evicting map of per-endpoint token buckets (spec §11.2 P7 "per-identity token
-/// buckets"; the AC's "no unbounded memory"). Keyed ONLY on the authenticated `EndpointId`.
+/// A bounded, idle-evicting map of per-identity token buckets (no unbounded memory).
+/// Keyed ONLY on the authenticated `EndpointId`.
 pub struct RateLimiter {
     capacity: f64,
     refill_per_sec: f64,
@@ -78,7 +78,7 @@ pub struct RateLimiter {
 }
 
 impl RateLimiter {
-    /// Build from a per-minute rate (spec §12 `[limits].rate_limit_per_min`). `burst` = bucket
+    /// Build from a per-minute rate (config `[limits].rate_limit_per_min`). `burst` = bucket
     /// capacity (the instantaneous allowance); sustained rate = `per_min / 60` tokens·s⁻¹.
     pub fn per_minute(per_min: u32, burst: u32) -> Self {
         Self {
@@ -159,19 +159,18 @@ impl RateGate {
     }
 }
 
-/// Global pair-ALPN accept rate (spec §7.1/§4.2, the M2b-deferred per-connection limit). The pair
-/// ALPN accepts strangers by design, who pick fresh ids — so a SINGLE global bucket bounds a
+/// Global pairing-accept rate. The pairing listener accepts strangers by design, who pick
+/// fresh ids — so a SINGLE global bucket bounds a
 /// distinct-id flood (a per-endpoint map would be defeated by fresh ids). NOT the removed per-invite
 /// attempt cap; the 32-byte secret is the security.
 const PAIR_ACCEPT_PER_MIN: u32 = 30;
-/// Per-authenticated-endpoint app-blob CONNECTION rate (spec §9, the M4a-deferred bound): a valid
+/// Per-authenticated-endpoint app-blob CONNECTION rate: a valid
 /// roster member with no scope grant can open blob connections whose GETs are denied — this bounds
 /// that churn per endpoint.
 const BLOB_CONN_PER_MIN: u32 = 60;
 
-/// The daemon's rate/concurrency limiter bundle (spec §11.2 P7), built ONCE from config and carried
-/// on `MeshState`. Bundled so `MeshState` gains ONE handle. Every map is bounded (T1). T9 extends
-/// this with the pair-accept + blob-connection limiters.
+/// The daemon's rate/concurrency limiter bundle, built ONCE from config and carried
+/// on `MeshState`. Bundled so `MeshState` gains ONE handle. Every map is bounded.
 pub struct MeshLimiters {
     /// Per-authenticated-endpoint proxied-request buckets (`[limits].rate_limit_per_min`).
     pub requests: Arc<RateLimiter>,
@@ -264,7 +263,7 @@ mod tests {
     fn buckets_are_per_endpoint() {
         let t0 = Instant::now();
         let rl = RateLimiter::per_minute(60, 2); // burst 2, 60/min
-        let (a, b) = ([1u8; 32], [2u8; 32]);
+        let (a, b) = (EndpointId::from([1u8; 32]), EndpointId::from([2u8; 32]));
         assert!(rl.check(&a, t0).is_ok());
         assert!(rl.check(&a, t0).is_ok());
         assert!(rl.check(&a, t0).is_err(), "a exhausted its own bucket");
@@ -275,12 +274,12 @@ mod tests {
     fn map_self_prunes_idle_buckets() {
         let t0 = Instant::now();
         let rl = RateLimiter::per_minute(60, 60);
-        assert!(rl.check(&[1u8; 32], t0).is_ok());
-        assert!(rl.check(&[2u8; 32], t0).is_ok());
+        assert!(rl.check(&[1u8; 32].into(), t0).is_ok());
+        assert!(rl.check(&[2u8; 32].into(), t0).is_ok());
         assert_eq!(rl.tracked(), 2);
         // A check far past IDLE_TTL prunes the two idle buckets before inserting the third.
         let later = t0 + IDLE_TTL + Duration::from_secs(1);
-        assert!(rl.check(&[3u8; 32], later).is_ok());
+        assert!(rl.check(&[3u8; 32].into(), later).is_ok());
         assert_eq!(
             rl.tracked(),
             1,
@@ -293,7 +292,7 @@ mod tests {
         let t0 = Instant::now();
         let rl = RateLimiter::unlimited_shared();
         for _ in 0..10_000 {
-            assert!(rl.check(&[9u8; 32], t0).is_ok());
+            assert!(rl.check(&[9u8; 32].into(), t0).is_ok());
         }
     }
 
@@ -301,7 +300,7 @@ mod tests {
     fn rate_gate_admits_then_throttles_and_none_endpoint_is_unlimited() {
         let t = Instant::now();
         let limiter = Arc::new(RateLimiter::per_minute(60, 2));
-        let gate = RateGate::new(limiter, Some([5u8; 32]));
+        let gate = RateGate::new(limiter, Some([5u8; 32].into()));
         assert!(gate.admit_at(t).is_ok());
         assert!(gate.admit_at(t).is_ok());
         assert!(
@@ -324,7 +323,7 @@ mod tests {
         };
         let ml = MeshLimiters::from_config(&cfg);
         let t = Instant::now();
-        let eid = [7u8; 32];
+        let eid = EndpointId::from([7u8; 32]);
         // burst == rate == 5 → five admits, then throttle.
         for _ in 0..5 {
             assert!(ml.requests.check(&eid, t).is_ok());
@@ -355,7 +354,7 @@ mod tests {
             "pair-accept limiter engages: admitted {admitted}"
         );
         // The per-endpoint blob-conn limiter engages per endpoint.
-        let eid = [4u8; 32];
+        let eid = EndpointId::from([4u8; 32]);
         let mut blob_ok = 0;
         for _ in 0..1000 {
             if ml.admit_blob_conn_at(&eid, t) {

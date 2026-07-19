@@ -1,4 +1,4 @@
-//! Shared paths rule (spec §13): resolved per-platform in ONE place (XDG on unix;
+//! Shared paths rule: resolved per-platform in ONE place (XDG on unix;
 //! APPDATA/LOCALAPPDATA + named-pipe names on windows). Featureless and std-only —
 //! it lives on the vocabulary crate precisely so EVERY consumer (the daemon, the CLI,
 //! and plugins, which are barred from `mcpmesh-trust`) resolves the same endpoint from
@@ -17,7 +17,7 @@ fn xdg_dir(var: &str, home_segments: &[&str]) -> std::io::Result<PathBuf> {
     xdg_dir_from(var, xdg.as_deref(), home.as_deref(), home_segments)
 }
 
-/// Pure core of the §13 rule (the same env-free split as [`runtime_dir_from`], so it is
+/// Pure core of the XDG rule (the same env-free split as [`runtime_dir_from`], so it is
 /// unit-testable without mutating process env). `xdg` is the raw `$<var>` value if set;
 /// `home` is the raw `$HOME` value if set. Deliberately un-cfg'd (like [`win_dir_from`]) so its
 /// unit tests run on every host; its only non-test caller is the `#[cfg(unix)]` [`xdg_dir`], so
@@ -122,7 +122,7 @@ fn sanitize_pipe_component(s: &str) -> String {
         .collect()
 }
 
-/// Windows local endpoint: a named pipe, not a filesystem socket (design §1).
+/// Windows local endpoint: a named pipe, not a filesystem socket.
 /// `\\.\pipe\mcpmesh-<domain>-<user>[-<fnv8(XDG_RUNTIME_DIR)>]`. The name is only a
 /// rendezvous label — same-user enforcement is the pipe's owner-only DACL
 /// (`mcpmesh-local-api`'s bind), never the name. USERDOMAIN disambiguates a local and
@@ -164,7 +164,7 @@ fn windows_pipe_name() -> std::io::Result<PathBuf> {
     windows_pipe_name_from(domain.as_deref(), user.as_deref(), xdg.as_deref())
 }
 
-/// Per-platform config dir (spec §13): `$XDG_CONFIG_HOME/mcpmesh` when that var is set,
+/// Per-platform config dir: `$XDG_CONFIG_HOME/mcpmesh` when that var is set,
 /// non-empty, and absolute; otherwise `$HOME/.config/mcpmesh` (unix). On Windows,
 /// `%APPDATA%\mcpmesh` (an absolute `XDG_CONFIG_HOME` override still wins, for test
 /// isolation).
@@ -183,7 +183,7 @@ pub fn default_config_path() -> std::io::Result<PathBuf> {
     Ok(config_dir()?.join("config.toml"))
 }
 
-/// Per-platform runtime dir for the control socket (spec §13): `$XDG_RUNTIME_DIR/mcpmesh`
+/// Per-platform runtime dir for the control socket: `$XDG_RUNTIME_DIR/mcpmesh`
 /// when that var is set, non-empty, and absolute (Linux); otherwise `$TMPDIR/mcpmesh`, or
 /// `std::env::temp_dir()/mcpmesh` when `TMPDIR` is unset (macOS — its per-user `$TMPDIR` is
 /// itself private). Returns the path only; the daemon creates it 0700 + verifies
@@ -198,15 +198,15 @@ pub fn runtime_dir() -> std::io::Result<PathBuf> {
     runtime_dir_from(xdg.as_deref(), tmp)
 }
 
-/// Pure core of the §13 rule, split out so the env logic is unit-testable without
+/// Pure core of the runtime-dir rule, split out so the env logic is unit-testable without
 /// mutating process env (no `temp_env` dev-dep). `xdg` is the raw `$XDG_RUNTIME_DIR`
 /// value if the var is set; `tmp` is the already-resolved fallback base. Prefers XDG
 /// iff it is non-empty and absolute; always returns the `mcpmesh` subdir.
 ///
 /// Guards absoluteness: a relative base (e.g. `TMPDIR=""` with no XDG, where
 /// `std::env::temp_dir()` also yields `""`) would place the control socket in the
-/// process CWD — a §13 violation and a double-daemon rendezvous hazard. Such a base is
-/// an error, not a silent relative path.
+/// process CWD — a per-user-endpoint violation and a double-daemon rendezvous hazard.
+/// Such a base is an error, not a silent relative path.
 fn runtime_dir_from(xdg: Option<&str>, tmp: PathBuf) -> std::io::Result<PathBuf> {
     if let Some(x) = xdg
         && !x.is_empty()
@@ -225,7 +225,7 @@ fn runtime_dir_from(xdg: Option<&str>, tmp: PathBuf) -> std::io::Result<PathBuf>
     Ok(dir)
 }
 
-/// The local control endpoint (spec §13), resolved for THIS platform: a Unix socket at
+/// The local control endpoint, resolved for THIS platform: a Unix socket at
 /// `<runtime_dir>/mcpmesh.sock` on unix. On Windows there is no per-user runtime dir with
 /// the right ACL semantics, so the control plane is a named pipe instead — see the private
 /// `windows_pipe_name` helper; the returned `PathBuf` is the pipe name (`\\.\pipe\…`), which is
@@ -239,7 +239,7 @@ pub fn default_endpoint() -> std::io::Result<PathBuf> {
     return windows_pipe_name();
 }
 
-/// Per-platform data dir for durable state (spec §13/§15): `$XDG_DATA_HOME/mcpmesh` when that
+/// Per-platform data dir for durable state: `$XDG_DATA_HOME/mcpmesh` when that
 /// var is set, non-empty, and absolute; otherwise `$HOME/.local/share/mcpmesh` (unix).
 /// `state.redb` (the peer allowlist) lives here. Unlike the runtime dir (ephemeral, per-boot),
 /// this is durable across reboots. On Windows, `%LOCALAPPDATA%\mcpmesh\data` (LOCALAPPDATA,
@@ -251,23 +251,23 @@ pub fn data_dir() -> std::io::Result<PathBuf> {
     return win_dir("XDG_DATA_HOME", "LOCALAPPDATA", &["data"]);
 }
 
-/// The peer allowlist store path (`<data_dir>/state.redb`, spec §4.2/§15).
+/// The peer allowlist store path (`<data_dir>/state.redb`).
 pub fn default_state_db_path() -> std::io::Result<PathBuf> {
     Ok(data_dir()?.join("state.redb"))
 }
 
-/// The gated app-blob store directory (`<data_dir>/blobs/`, spec §13 "gated iroh-blobs store").
+/// The gated app-blob store directory (`<data_dir>/blobs/` — the daemon's gated iroh-blobs store).
 pub fn default_blobs_dir() -> std::io::Result<PathBuf> {
     Ok(data_dir()?.join("blobs"))
 }
 
-/// The persisted blob-scope sidecar (`<data_dir>/blob-scopes.json`, spec §9). One JSON document:
+/// The persisted blob-scope sidecar (`<data_dir>/blob-scopes.json`). One JSON document:
 /// `scope_name -> { hashes, grants }`, atomic-write single-writer.
 pub fn default_blob_scopes_path() -> std::io::Result<PathBuf> {
     Ok(data_dir()?.join("blob-scopes.json"))
 }
 
-/// Per-platform STATE dir for durable, per-node runtime state (spec §13/§15): `$XDG_STATE_HOME/mcpmesh`
+/// Per-platform STATE dir for durable, per-node runtime state: `$XDG_STATE_HOME/mcpmesh`
 /// when that var is set, non-empty, and absolute; otherwise `$HOME/.local/state/mcpmesh`. Distinct
 /// from `data_dir()` (`~/.local/share`, XDG_DATA_HOME): the XDG basedir spec places *state* data
 /// (logs, history — the audit JSONL here) under `~/.local/state`, separate from portable app data.
@@ -280,34 +280,34 @@ pub fn state_dir() -> std::io::Result<PathBuf> {
     return win_dir("XDG_STATE_HOME", "LOCALAPPDATA", &["state"]);
 }
 
-/// The append-only audit-log directory (`<state_dir>/audit/`, spec §11.3/§13). One monthly JSONL
+/// The append-only audit-log directory (`<state_dir>/audit/`). One monthly JSONL
 /// file per calendar month (`YYYY-MM.jsonl`) lives here; the writer creates the directory lazily on
-/// first append. Local-only — nothing here is ever transmitted (§11.3).
+/// first append. Local-only — nothing here is ever transmitted.
 pub fn default_audit_dir() -> std::io::Result<PathBuf> {
     Ok(state_dir()?.join("audit"))
 }
 
-/// The installed roster document (`<config_dir>/roster.json`, spec §13/§4.3).
+/// The installed roster document (`<config_dir>/roster.json`).
 pub fn default_roster_path() -> std::io::Result<PathBuf> {
     Ok(config_dir()?.join("roster.json"))
 }
 
-/// The per-node freshness sidecar (`<config_dir>/roster.confirmed`, spec §4.3 P13). One epoch-seconds
+/// The per-node roster-freshness sidecar (`<config_dir>/roster.confirmed`). One epoch-seconds
 /// integer: the last instant this node validated the installed roster as current via an authenticated
 /// channel (a TLS URL poll ≥ installed, a gossip-delivered roster passing validation, or a manual
 /// install). Per-node LIVENESS state, NOT a roster-document field — keeps roster.json a pure
-/// re-serialization ([RECONCILE-C]).
+/// re-serialization.
 pub fn default_roster_confirmed_path() -> std::io::Result<PathBuf> {
     Ok(config_dir()?.join("roster.confirmed"))
 }
 
-/// The org-root key (`<config_dir>/org-root.key`, spec §4.3 "held by operator"). Present ONLY on
+/// The org-root key (`<config_dir>/org-root.key`) — held by the operator. Present ONLY on
 /// the operator's node (minted by `org create`); signs rosters.
 pub fn default_org_root_key_path() -> std::io::Result<PathBuf> {
     Ok(config_dir()?.join("org-root.key"))
 }
 
-/// This person's user key (`<config_dir>/user.key`, spec §12/§4.3). Minted by `join`; binds a
+/// This person's user key (`<config_dir>/user.key`). Minted by `join`; binds a
 /// person's devices. Present on every enrolled person's device (never moves between machines).
 pub fn default_user_key_path() -> std::io::Result<PathBuf> {
     Ok(config_dir()?.join("user.key"))

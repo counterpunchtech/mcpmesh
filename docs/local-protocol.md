@@ -4,7 +4,8 @@ This is the wire contract between the mcpmesh daemon and the programs on the **s
 drive it — the CLI, the desktop host, and plugin daemons like `kb` and `loc`. It is a small,
 line-delimited JSON protocol over a same-user local endpoint: a Unix domain socket on macOS/Linux, a
 named pipe on Windows. Anything that can open the endpoint and parse JSON can speak it, in any
-language.
+language — [`local-api/examples/status.py`](../local-api/examples/status.py) is a complete client
+in ~60 lines of dependency-free Python.
 
 > **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.0`) and evolves
 > **additively** (see [Versioning](#versioning)), but until a stable release this document — like the

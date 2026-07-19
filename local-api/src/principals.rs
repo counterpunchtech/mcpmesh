@@ -1,8 +1,8 @@
-//! THE principal-set expansion (mcpmesh §5): the ONE definition of a resolved caller's flat
+//! THE principal-set expansion: the ONE definition of a resolved caller's flat
 //! authorization identity — `groups ∪ {petname} ∪ {user_id}`, empty components skipped,
 //! default-deny (no identity ⇒ empty set ⇒ nothing matches).
 //!
-//! WHY THIS LIVES HERE (the D1 unification ruling): three enforcement sites consume this
+//! WHY THIS LIVES HERE: three enforcement sites consume this
 //! expansion — the mesh service allow check (`mcpmesh-net::endpoint::caller_admits`), the
 //! plugin-seam audience expansion (`service::peer_audiences`), and the blob-scope gate
 //! (`cli/src/blobs/provider.rs`). They live in crates with no other shared home:
@@ -14,11 +14,11 @@
 //! One implementation, drift impossible.
 use std::collections::BTreeSet;
 
-/// Expand a resolved peer identity into its flat principal set (mcpmesh §5):
+/// Expand a resolved peer identity into its flat principal set:
 /// `groups ∪ {name} ∪ {user_id}`. Borrowed — callers match `allow`/grant entries against it.
 ///
 /// - `name` is the device petname (pairing mode) or roster display handle — a legitimate
-///   grant target (spec §5: "petnames, user_ids, and group names — one flat namespace").
+///   grant target (petnames, user_ids, and group names share one flat namespace).
 /// - `user_id` is the person's verified id (roster, or a pairing device→user binding);
 ///   `None` for an unbound pairing peer.
 /// - Empty strings are never principals (an absent value must not become a matchable "").
@@ -64,7 +64,7 @@ mod tests {
     }
 
     /// A pairing-mode peer (petname only, no user binding) IS a principal by its petname —
-    /// the §5 flat namespace includes petnames (the D1 blob-scope ruling pins this).
+    /// the flat namespace deliberately includes petnames.
     #[test]
     fn pairing_mode_petname_is_a_principal() {
         let set = principal_set(Some("carol"), None, &[]);

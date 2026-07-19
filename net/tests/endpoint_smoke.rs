@@ -1,4 +1,4 @@
-//! Spike A: two in-process endpoints, dial by key, echo over one bi-stream.
+//! Endpoint smoke: two in-process endpoints, dial by key, echo over one bi-stream.
 //! Relay disabled; direct localhost addresses only — no external infra in CI.
 use anyhow::Result;
 use std::time::Duration;

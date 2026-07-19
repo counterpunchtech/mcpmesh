@@ -18,13 +18,13 @@ use crate::audit::{AuditRecord, AuditSink, now_ts};
 use crate::blobs::APP_BLOB_ALPN;
 use crate::blobs::scope::ScopeStore;
 
-/// The request-time scope-gate `EventMask` for the serving app-blob provider (spec §9).
+/// The request-time scope-gate `EventMask` for the serving app-blob provider.
 ///
 /// SECURITY — deny-by-default on every non-GET request type, made EXPLICIT (not left to a vestigial
 /// routing quirk). In the pinned iroh-blobs 0.103.0 the generic `EventSender::request()` reads ONLY
 /// `mask.get` for EVERY request type (get/get_many/push/observe), so `get: Intercept` currently
-/// routes all four to the drain loop, which denies the non-GET kinds explicitly
-/// ([RECONCILE-MASK-GET-ROUTES-ALL]). To keep the deny-by-default INDEPENDENT of that single-field
+/// routes all four to the drain loop, which denies the non-GET kinds explicitly.
+/// To keep the deny-by-default INDEPENDENT of that single-field
 /// routing, each non-GET request type is ALSO pinned to its most-refusing mask mode, so a FUTURE
 /// iroh-blobs that honors the per-type fields still refuses them WITHOUT serving bytes:
 ///  - `get_many` / `push` = `RequestMode::Disabled`: the crate refuses this request type at the
@@ -51,11 +51,11 @@ const APP_BLOB_EVENT_MASK: EventMask = EventMask {
     throttle: ThrottleMode::None,
 };
 
-/// The gated app-blob provider (spec §9). `events` is `Some` for a serving daemon (the request-time
+/// The gated app-blob provider. `events` is `Some` for a serving daemon (the request-time
 /// scope Intercept gate is armed) and `None` for a caller-only fetcher. `scopes` is the persisted
 /// scope table; a fetcher gets an empty one it never mutates.
 ///
-/// [RECONCILE-EVENTSENDER-LIFETIME] The drain loop's `Receiver<ProviderMessage>` is moved into a task
+/// The drain loop's `Receiver<ProviderMessage>` is moved into a task
 /// spawned once in `load`. The loop lives as long as ANY `EventSender` clone lives; `AppBlobs` holds
 /// one in `self.events` for the provider's lifetime (the daemon holds `AppBlobs` for its lifetime),
 /// and every `protocol()` clones another into the `BlobsProtocol`. So the gate loop runs until the
@@ -85,9 +85,9 @@ impl AppBlobs {
         }))
     }
 
-    /// The GATED provider (spec §9): an `FsStore` + the request-time scope Intercept `EventSender`.
+    /// The GATED provider: an `FsStore` + the request-time scope Intercept `EventSender`.
     /// Spawns the drain loop ONCE, wired to the trust `gate` (resolve endpoint → identity) and
-    /// `scopes` (the authz table). `[RECONCILE-FSSTORE-CTOR-ASYNC]` `FsStore::load` is async/fallible;
+    /// `scopes` (the authz table). `FsStore::load` is async/fallible;
     /// the dir is created first.
     pub async fn load(
         blobs_dir: PathBuf,
@@ -104,7 +104,7 @@ impl AppBlobs {
             .with_context(|| format!("load blob store {}", blobs_dir.display()))?;
         // The request-time scope gate: `APP_BLOB_EVENT_MASK` intercepts connect + single-blob GET,
         // and pins every non-GET request type to deny-by-default (Disabled/Intercept — see the
-        // const's SECURITY note). Per [RECONCILE-MASK-GET-ROUTES-ALL] `get: Intercept` also routes
+        // const's SECURITY note). Since `get: Intercept` also routes
         // get_many/observe/push to the drain loop today; the pinned fields keep them refused even if
         // a future iroh-blobs honors the per-type fields directly.
         let (events, rx) = EventSender::channel(64, APP_BLOB_EVENT_MASK);
@@ -127,7 +127,7 @@ impl AppBlobs {
     /// TEST-ONLY: register an app-blob ALPN accept handler directly on `endpoint`, BYPASSING the
     /// accept-time trust gate (the request-time scope gate still runs via `protocol()`'s events).
     /// Production accept ALWAYS goes through the gated daemon loop (`spawn_accept_loop`'s
-    /// `APP_BLOB_ALPN` arm: D8 resolve → 401 + rate-limit + check-register); this exists only so
+    /// `APP_BLOB_ALPN` arm: resolve → 401 + rate-limit + check-register); this exists only so
     /// same-file unit tests can serve blobs without assembling a daemon. `#[cfg(test)]` so it can
     /// never leak into a production accept path.
     #[cfg(test)]
@@ -158,7 +158,7 @@ impl AppBlobs {
         Ok((ticket.to_string(), tag.hash.to_hex().to_string()))
     }
 
-    /// Publish a LOCAL file INTO a scope (spec §9): add it to the store AND record its hash in the
+    /// Publish a LOCAL file INTO a scope: add it to the store AND record its hash in the
     /// named scope (single-writer via `ScopeStore`). Returns `(ticket_string, blake3_hex)`.
     pub async fn publish_scope(&self, scope: &str, path: &Path) -> Result<(String, String)> {
         let (ticket, hash_hex) = self.publish_path(path).await?;
@@ -166,8 +166,8 @@ impl AppBlobs {
         Ok((ticket, hash_hex))
     }
 
-    /// Grant a scope to a principal — any §5 flat-namespace entry: a group name, a user_id,
-    /// or a petname (D1 ruling) — persisted single-writer.
+    /// Grant a scope to a principal — any flat-namespace entry: a group name, a user_id,
+    /// or a petname — persisted single-writer.
     pub fn grant(&self, scope: &str, principal: &str) -> Result<()> {
         self.scopes.grant(scope, principal)
     }
@@ -178,7 +178,8 @@ impl AppBlobs {
     }
 
     /// Fetch a ticket THROUGH this endpoint over `APP_BLOB_ALPN`, streaming BLAKE3-verified bytes
-    /// into `self.store` ([RECONCILE-ALPN]). Returns the verified hash. A provider that refuses this
+    /// into `self.store` (the Downloader cannot dial a custom ALPN — see [`APP_BLOB_ALPN`]).
+    /// Returns the verified hash. A provider that refuses this
     /// caller (accept-time 401 or request-time Permission) surfaces here as an `Err`.
     pub async fn fetch(&self, ticket_str: &str) -> Result<Hash> {
         let ticket: BlobTicket = ticket_str.parse().context("parse blob ticket")?;
@@ -204,18 +205,18 @@ impl AppBlobs {
     }
 }
 
-/// The request-time scope Intercept drain loop (spec §9 — the security core). Single-consumer: this
+/// The request-time scope Intercept drain loop (the security core). Single-consumer: this
 /// task owns `rx`, so the `connection_id → endpoint_id` map is loop-local with NO lock
-/// ([RECONCILE-MAP-CONCURRENCY]) — FIFO delivery guarantees `ClientConnected(conn)` precedes any
+/// — FIFO delivery guarantees `ClientConnected(conn)` precedes any
 /// `GetRequestReceived(conn)` on that connection. SECURITY-CRITICAL:
 ///  - `ClientConnected`: record the AUTHENTICATED `endpoint_id` (QUIC/TLS) → reply `Ok(())` to admit
 ///    (the accept-time gate already vetted the endpoint; the GET hook is the per-hash boundary). A
 ///    missing endpoint id (never on an authenticated conn) is denied defensively.
 ///  - `GetRequestReceived`: resolve the endpoint via the trust gate to its identity and ALLOW iff a
-///    scope contains the hash AND grants one of the caller's §5 principals — `groups ∪ {petname} ∪
-///    {user_id}`, the shared `principal_set` (D1) — else `Permission`, BEFORE any bytes (the
+///    scope contains the hash AND grants one of the caller's principals — `groups ∪ {petname} ∪
+///    {user_id}`, the shared `principal_set` — else `Permission`, BEFORE any bytes (the
 ///    Intercept path blocks the transfer on the provider's `rx.await??`).
-///  - get_many/observe/push (all routed through `mask.get`, [RECONCILE-MASK-GET-ROUTES-ALL]): DENY
+///  - get_many/observe/push (all routed through `mask.get`): DENY
 ///    explicitly — deny-by-default, the store is not a general filesystem surface. Belt-and-suspenders
 ///    with `APP_BLOB_EVENT_MASK`, which ALSO pins these types (get_many/push = `Disabled`, observe =
 ///    `Intercept`): if a future iroh-blobs delivers them as events instead of refusing at the mask,
@@ -227,13 +228,13 @@ fn spawn_gate_loop(
     audit: AuditSink,
 ) {
     tokio::spawn(async move {
-        let mut conns: HashMap<u64, [u8; 32]> = HashMap::new();
+        let mut conns: HashMap<u64, mcpmesh_net::EndpointId> = HashMap::new();
         while let Some(msg) = rx.recv().await {
             match msg {
                 ProviderMessage::ClientConnected(msg) => {
                     let res = match msg.endpoint_id {
                         Some(eid) => {
-                            conns.insert(msg.connection_id, *eid.as_bytes());
+                            conns.insert(msg.connection_id, (*eid.as_bytes()).into());
                             Ok(())
                         }
                         None => Err(AbortReason::Permission),
@@ -242,23 +243,23 @@ fn spawn_gate_loop(
                 }
                 ProviderMessage::GetRequestReceived(msg) => {
                     // Resolve the authenticated caller for BOTH the authz decision and the audit
-                    // attribution (spec §11.3 — peer is the gate-resolved identity, not self-asserted).
+                    // attribution (peer is the gate-resolved identity, not self-asserted).
                     let identity = conns
                         .get(&msg.connection_id)
                         .and_then(|eid| gate.resolve(eid));
                     let hash_hex = msg.request.hash.to_hex().to_string();
                     let allow = msg.request.ranges.is_blob()
                         && identity.as_ref().is_some_and(|identity| {
-                            // D1 RULING: the grant namespace is THE §5 flat principal set —
+                            // The grant namespace is THE flat principal set —
                             // groups ∪ {petname} ∪ {user_id} — via the ONE shared
                             // `principal_set` (same expansion as the mesh allow check and
                             // the plugin seam). The petname is deliberately INCLUDED: a
                             // pairing-mode peer (no user binding) granted a scope by its
-                            // petname can fetch, matching service `allow` semantics; kb's
-                            // attachment scopes grant by kb audience strings, which include
-                            // petnames. Excluding it (the pre-D1 behavior) silently broke
-                            // petname-audience attachments. Default-deny is untouched: an
-                            // unlisted principal still gets `Permission` before any bytes.
+                            // petname can fetch, matching service `allow` semantics; a
+                            // plugin's attachment scopes may grant by audience strings,
+                            // which include petnames. Excluding it silently broke
+                            // petname-audience attachments once. Default-deny is untouched:
+                            // an unlisted principal still gets `Permission` before any bytes.
                             let principals: HashSet<&str> = mcpmesh_local_api::principal_set(
                                 Some(&identity.name),
                                 identity.user_id.as_deref(),
@@ -268,7 +269,7 @@ fn spawn_gate_loop(
                             .collect();
                             scopes.snapshot().allows(&hash_hex, &principals)
                         });
-                    // Audit the fetch (spec §11.3): peer + hash + status (ok/denied). A COUNT/ref only —
+                    // Audit the fetch: peer + hash + status (ok/denied). A COUNT/ref only —
                     // never blob content. Attributes to the resolved user_id/petname, or "unknown".
                     let peer = identity
                         .as_ref()
@@ -286,7 +287,7 @@ fn spawn_gate_loop(
                     };
                     msg.tx.send(res).await.ok();
                 }
-                // Deny-by-default for every non-GET request type ([RECONCILE-MASK-GET-ROUTES-ALL]).
+                // Deny-by-default for every non-GET request type.
                 ProviderMessage::GetManyRequestReceived(msg) => {
                     msg.tx.send(Err(AbortReason::Permission)).await.ok();
                 }
@@ -369,15 +370,15 @@ mod tests {
             // Two callers: alice (granted) and bob (rostered but ungranted for this scope).
             let alice_ep = ep().await;
             let bob_ep = ep().await;
-            let alice_id: EndpointId = *alice_ep.id().as_bytes();
-            let bob_id: EndpointId = *bob_ep.id().as_bytes();
+            let alice_id: EndpointId = alice_ep.id().into();
+            let bob_id: EndpointId = bob_ep.id().into();
 
             // Provider gate resolves BOTH (both pass the accept-time gate); scope grants only alice.
             let mut entries = std::collections::HashMap::new();
             entries.insert(
                 alice_id,
                 PeerIdentity {
-                    endpoint: [0u8; 32],
+                    endpoint: [0u8; 32].into(),
                     name: "alice".into(),
                     user_id: Some("alice".into()),
                     groups: vec!["team-eng".into()],
@@ -386,7 +387,7 @@ mod tests {
             entries.insert(
                 bob_id,
                 PeerIdentity {
-                    endpoint: [0u8; 32],
+                    endpoint: [0u8; 32].into(),
                     name: "bob".into(),
                     user_id: Some("bob".into()),
                     groups: vec!["team-eng".into()],
@@ -441,7 +442,7 @@ mod tests {
         .expect("timed out");
     }
 
-    /// D1 regression — the blob-scope grant namespace is the FULL §5 flat principal set,
+    /// Regression — the blob-scope grant namespace is the FULL flat principal set,
     /// petname included: a PAIRING-MODE peer (petname only, `user_id: None`, no groups)
     /// granted a scope by its petname CAN fetch; a resolved-but-unlisted peer is still
     /// denied (default-deny holds). Pins the ruling that aligned this gate with the mesh
@@ -451,14 +452,14 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
             let carol_ep = ep().await; // pairing-mode: petname only
             let mallory_ep = ep().await; // resolved by the gate, but granted nothing
-            let carol_id: EndpointId = *carol_ep.id().as_bytes();
-            let mallory_id: EndpointId = *mallory_ep.id().as_bytes();
+            let carol_id: EndpointId = carol_ep.id().into();
+            let mallory_id: EndpointId = mallory_ep.id().into();
 
             let mut entries = std::collections::HashMap::new();
             entries.insert(
                 carol_id,
                 PeerIdentity {
-                    endpoint: [0u8; 32],
+                    endpoint: [0u8; 32].into(),
                     name: "carol".into(),
                     user_id: None, // no device→user binding — petname is the ONLY principal
                     groups: vec![],
@@ -467,7 +468,7 @@ mod tests {
             entries.insert(
                 mallory_id,
                 PeerIdentity {
-                    endpoint: [0u8; 32],
+                    endpoint: [0u8; 32].into(),
                     name: "mallory".into(),
                     user_id: None,
                     groups: vec![],
@@ -528,18 +529,18 @@ mod tests {
     }
 
     /// A served GET records a `blob_fetch` audit line attributed to the authenticated peer, with the
-    /// hash and status=ok (spec §11.3 "each blob fetch — peer + hash + …"). Uses a real temp AuditLog.
+    /// hash and status=ok ("each blob fetch — peer + hash + …"). Uses a real temp AuditLog.
     #[tokio::test]
     async fn served_get_records_blob_fetch_audit() {
         use crate::audit::{AuditLog, AuditSink};
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
             let alice_ep = ep().await;
-            let alice_id: EndpointId = *alice_ep.id().as_bytes();
+            let alice_id: EndpointId = alice_ep.id().into();
             let mut entries = std::collections::HashMap::new();
             entries.insert(
                 alice_id,
                 PeerIdentity {
-                    endpoint: [0u8; 32],
+                    endpoint: [0u8; 32].into(),
                     name: "alice".into(),
                     user_id: Some("alice".into()),
                     groups: vec![],

@@ -153,6 +153,7 @@ async fn subscribe_pushes_snapshot_then_live_session_events() {
             server_ep.clone(),
             server_gate,
             build_services_audited(&server_cfg, &audit, &limiters),
+            Arc::new(ConnRegistry::new()),
         );
 
         let s_mesh = assemble_mesh(server_ep, server_store, config.clone());

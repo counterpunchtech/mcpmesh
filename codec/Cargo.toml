@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 description = "The mcpmesh family wire codec: newline-delimited compact JSON over async byte streams"
+readme = "README.md"
 
 [lints]
 workspace = true

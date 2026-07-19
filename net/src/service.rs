@@ -1,5 +1,5 @@
-//! Initialize-time service selection (spec §7.2 step 4) and the reserved-namespace
-//! rule (spec §6.3): caller-supplied `mcpmesh/*` _meta keys are deleted before anything
+//! Initialize-time service selection and the reserved-namespace rule:
+//! caller-supplied `mcpmesh/*` _meta keys are deleted before anything
 //! acts on the frame; refusal wording never distinguishes unknown from unauthorized.
 use serde_json::Value;
 
@@ -20,7 +20,7 @@ pub fn select_service(init: &mut Value, caller_allowed: &[String]) -> ServiceDec
     let malformed = entry.is_some_and(|v| !v.is_string());
     let requested: Option<String> = entry.and_then(Value::as_str).map(String::from);
 
-    // Strip ALL reserved keys, always — before any decision is acted on (spec §6.3).
+    // Strip ALL reserved keys, always — before any decision is acted on.
     // A non-object `_meta` (array/string) has no keys in the reserved namespace and
     // passes through untouched — deliberate asymmetry with the non-string-request
     // refusal above (D6: parse no further than the rule requires); the M2 peer

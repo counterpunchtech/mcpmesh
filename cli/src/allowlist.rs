@@ -1,18 +1,18 @@
-//! The pair allowlist (spec §4.2), persisted in state.redb. Populated in M2a via
-//! `mcpmesh internal peer add` / config import; in M2b via the pair rendezvous — the
-//! SAME store (architecture decision D-B). Entry: `{ endpoint_id, petname, services }`.
+//! The pair allowlist, persisted in state.redb. Populated by `mcpmesh internal peer add` /
+//! config import AND by the pair rendezvous — deliberately the SAME store, so a hand-added
+//! peer and a paired peer are indistinguishable to the gate. Entry:
+//! `{ endpoint_id, petname, services }`.
 //!
 //! redb 2.x shape (reconciled against docs.rs/redb 2.6.3): one table `peers` defined as
 //! `TableDefinition<&[u8], &[u8]>` — keyed by the 32-byte endpoint_id passed as a `&[u8]`
 //! slice, values are JSON-serialized [`PeerEntry`]. Every mutation is one
 //! `begin_write → open_table → insert/remove → commit` transaction, so the store is
-//! atomic per redb txn (spec §13 torn-state-never). The [`AllowlistGate`] over this store
-//! is Task 5.
+//! atomic per redb txn (a torn store is never observable).
 //!
 //! **Additive-only durable schema.** [`PeerEntry`] is durable on-disk JSON. New fields
-//! (`paired_at` in M2b, groups/user_id later) MUST land as `#[serde(default)]` so entries
+//! MUST land as `#[serde(default)]` so entries
 //! written by an older binary still deserialize (mirrors the mcpmesh-local-api additive-only
-//! convention, spec §6.1). A field added without `#[serde(default)]` would make every
+//! convention). A field added without `#[serde(default)]` would make every
 //! pre-existing row fail to deserialize; the corrupt-row handling below bounds the blast
 //! radius of such a mistake (or of on-disk corruption) per operation.
 use anyhow::{Context, Result};
@@ -26,8 +26,8 @@ use std::sync::Arc;
 /// pattern for a table definition.
 const PEERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("peers");
 
-/// One pair-allowlist entry (spec §4.2). `endpoint_id` is the routing key; `petname` is
-/// the local human name the gate resolves peers to (§1.5); `services` is the set the peer
+/// One pair-allowlist entry. `endpoint_id` is the routing key; `petname` is
+/// the local human name the gate resolves peers to; `services` is the set the peer
 /// was granted at pairing time. Durable on-disk JSON — see the module additive-only note.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PeerEntry {
@@ -35,8 +35,8 @@ pub struct PeerEntry {
     pub petname: String,
     pub services: Vec<String>,
     /// When this entry was written by the pair rendezvous, as epoch-seconds-as-`String`
-    /// (the daemon supplies it from `SystemTime` at the T5/T6 call site — no date crate).
-    /// `Option` + `#[serde(default)]` so pre-M2b rows and non-pairing writes
+    /// (the daemon supplies it from `SystemTime` — no date crate).
+    /// `Option` + `#[serde(default)]` so older rows and non-pairing writes
     /// (`internal peer add`) — which leave it unset — still deserialize (the module
     /// additive-only note). An audit stamp only; the gate never reads it.
     #[serde(default)]
@@ -52,7 +52,7 @@ pub struct PeerEntry {
 }
 
 /// The peer allowlist store over a redb database file (`state.redb`). Path-agnostic:
-/// [`open`](Self::open) takes the file path so the daemon (Task 9) decides where the data
+/// [`open`](Self::open) takes the file path so the daemon decides where the data
 /// dir lives.
 pub struct PeerStore {
     db: Database,
@@ -90,7 +90,7 @@ impl PeerStore {
     ///
     /// Fails CLOSED on a corrupt stored row: a row that will not deserialize (e.g. an
     /// entry written before a non-additive field change, or on-disk corruption) is treated
-    /// as unresolvable — `Ok(None)`, i.e. default-DENY (spec §13 D5) — never fail-open.
+    /// as unresolvable — `Ok(None)`, i.e. default-DENY — never fail-open.
     /// This is the deliberate opposite of [`list`](Self::list)/[`remove`](Self::remove),
     /// which fail OPEN on admin enumeration: authorization must never be granted off a
     /// row it could not read.
@@ -114,7 +114,7 @@ impl PeerStore {
     }
 
     /// Resolve a petname to its stored endpoint_id — the reverse of [`resolve`](Self::resolve)
-    /// (which is keyed BY id). The connect proxy's `open_session` dial (Task 10) turns the
+    /// (which is keyed BY id). The connect proxy's `open_session` dial turns the
     /// user-facing petname into the 32-byte routing key. Petnames are NOT unique (see
     /// [`remove`](Self::remove)); the FIRST match in key order wins. Fails OPEN on corrupt
     /// rows (it reuses [`list`](Self::list), which skips-and-logs them) — a poisoned row must
@@ -154,11 +154,11 @@ impl PeerStore {
         Ok(out)
     }
 
-    /// Remove every entry whose `petname` matches (for M2b `pair --remove`). The table is
+    /// Remove every entry whose `petname` matches (for `pair --remove`). The table is
     /// keyed by endpoint_id, so this scans within one write txn — find matching keys, then
     /// delete them — keeping the read+delete atomic. No-op if nothing matches.
     ///
-    /// M2a note: petnames are NOT unique (population is Task 9 `internal peer add` + M2b
+    /// NOTE: petnames are NOT unique (population is `internal peer add` +
     /// `pair`, neither of which enforces uniqueness), so this deletes ALL entries whose
     /// petname matches — a conscious decision, revisited if a uniqueness invariant lands.
     ///
@@ -167,7 +167,7 @@ impl PeerStore {
     /// other peers must still work.
     ///
     /// Returns whether ANY entry was actually deleted — `false` for an absent petname (a no-op) — so
-    /// callers can distinguish a real removal from a no-op (the `unpair` trust event, §11.3, fires
+    /// callers can distinguish a real removal from a no-op (the `unpair` audit event fires
     /// only on an actual tear-down).
     pub fn remove(&self, petname: &str) -> Result<bool> {
         let txn = self.db.begin_write()?;
@@ -202,10 +202,10 @@ impl PeerStore {
     }
 }
 
-/// The production trust gate (architecture decision D-B): a [`TrustGate`] over the
-/// [`PeerStore`]. The daemon (Task 9) builds `Arc<AllowlistGate>` and passes it to
-/// `mcpmesh_net::serve`; M2b's `pair` writes the SAME store this gate reads, so the gate is
-/// production-final in M2a — M2b only adds the population path.
+/// The production trust gate: a [`TrustGate`] over the
+/// [`PeerStore`]. The daemon builds `Arc<AllowlistGate>` and passes it to
+/// `mcpmesh_net::serve`; `pair` writes the SAME store this gate reads, so pairing and
+/// hand-population converge on one gate.
 pub struct AllowlistGate {
     store: Arc<PeerStore>,
 }
@@ -217,15 +217,14 @@ impl AllowlistGate {
 }
 
 impl TrustGate for AllowlistGate {
-    /// Resolve an inbound endpoint to a pairing-mode identity (petname only, no
-    /// `user_id`/`groups` — spec §4.2, D4; group matching is M3), or refuse.
+    /// Resolve an inbound endpoint to a pairing-mode identity (petname only; groups are a
+    /// roster-mode concept), or refuse.
     ///
-    /// `EndpointId` is `mcpmesh_net`'s `[u8; 32]` alias, so it passes straight to
-    /// [`PeerStore::resolve`]. A store read that errors collapses to `None` = default-deny
-    /// (D5), logged at `warn!`: a gate read failing is operationally notable but must NEVER
-    /// fail open.
+    /// The store is keyed by the raw 32 bytes of the `EndpointId`. A store read that errors
+    /// collapses to `None` = default-deny, logged at `warn!`: a gate read failing is
+    /// operationally notable but must NEVER fail open.
     fn resolve(&self, endpoint: &EndpointId) -> Option<PeerIdentity> {
-        match self.store.resolve(endpoint) {
+        match self.store.resolve(endpoint.as_bytes()) {
             Ok(Some(e)) => Some(PeerIdentity {
                 endpoint: *endpoint,
                 user_id: e.user_id, // self-sovereign user_id from a verified pairing binding (else None)
@@ -277,12 +276,12 @@ mod tests {
         store.add(entry(known_eid, "bob", &["notes"])).unwrap();
         let gate = AllowlistGate::new(Arc::new(store));
         // Known endpoint resolves to a pairing-mode identity (petname only).
-        let id = gate.resolve(&known_eid).unwrap();
+        let id = gate.resolve(&known_eid.into()).unwrap();
         assert_eq!(id.name, "bob");
         assert_eq!(id.user_id, None);
         assert!(id.groups.is_empty());
         // Unknown endpoint is refused (default-deny).
-        assert!(gate.resolve(&[9u8; 32]).is_none());
+        assert!(gate.resolve(&[9u8; 32].into()).is_none());
     }
 
     #[test]
@@ -298,7 +297,7 @@ mod tests {
 
     #[test]
     fn entry_persists_across_reopen() {
-        // The whole reason redb was chosen (§13 durability): an added entry survives the
+        // The whole reason redb was chosen (durability): an added entry survives the
         // store being dropped and reopened at the same path.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.redb");
@@ -382,7 +381,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = PeerStore::open(&dir.path().join("state.redb")).unwrap();
         let eid = [7u8; 32];
-        // Raw JSON in the exact pre-M2b shape (no `paired_at`), written straight to redb.
+        // Raw JSON in the exact legacy shape (no `paired_at`), written straight to redb.
         let old_shape = serde_json::json!({
             "endpoint_id": eid.to_vec(),
             "petname": "old",

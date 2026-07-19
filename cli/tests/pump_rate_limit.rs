@@ -56,7 +56,7 @@ async fn over_limit_request_is_throttled_dropped_and_the_session_survives() {
         // A resolved caller identity — the RateGate is keyed on `endpoint` (SECURITY invariant 1:
         // the authenticated id, never the self-asserted name).
         let identity = Some(PeerIdentity {
-            endpoint: [7u8; 32],
+            endpoint: [7u8; 32].into(),
             name: "bob".into(),
             user_id: None,
             groups: vec![],

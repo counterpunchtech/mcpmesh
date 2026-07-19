@@ -1,13 +1,12 @@
-//! Daemon-owned installed-roster PERSISTENCE ([RECONCILE-C], [RECONCILE-D]): read/parse/validate
-//! a roster file, atomically persist the accepted document (a field-set-preserving re-serialization
-//! of the parsed `Roster`; the sig re-verifies over the JCS canonical form, NOT the byte layout),
-//! load + re-verify at startup. The gate PLUMBING (RosterGate/ComposedGate) is `gate` (M3a T5/T6);
-//! the roster DOMAIN (schema, JCS, validation) is `mcpmesh_trust::roster`. `installed_serial` = the
-//! currently-persisted roster's serial (0 if none) — the rollback high-water mark ([RECONCILE-C]).
+//! Daemon-owned installed-roster PERSISTENCE: read/parse/validate a roster file, atomically
+//! persist the accepted document (a field-set-preserving re-serialization of the parsed
+//! `Roster`; the sig re-verifies over the JCS canonical form, NOT the byte layout), and
+//! load + re-verify at startup. The gate PLUMBING (RosterGate/ComposedGate) is `gate`;
+//! the roster DOMAIN (schema, JCS, validation) is `mcpmesh_trust::roster`. `installed_serial` =
+//! the currently-persisted roster's serial (0 if none) — the rollback high-water mark.
 //!
-//! Sync by design: the daemon (M3a T5+) drives these fs ops from `spawn_blocking` on a runtime
-//! worker (the house rule for every redb/fs op), so this module stays runtime-agnostic. The gate
-//! PLUMBING (`gate::RosterGate`/`ComposedGate`) is added in T5/T6 (`pub mod gate;` lands there).
+//! Sync by design: the daemon drives these fs ops from `spawn_blocking` on a runtime
+//! worker (the house rule for every redb/fs op), so this module stays runtime-agnostic.
 
 pub mod distribute;
 pub mod enroll;
@@ -35,7 +34,7 @@ impl RosterStore {
     }
 
     /// Load + re-verify the installed roster, or `None` when none is installed. Startup path
-    /// ([RECONCILE-C] load): verifies the signature (rule 1) but not expiry/serial (degraded mode
+    /// (load): verifies the signature (rule 1) but not expiry/serial (degraded mode
     /// is computed later at resolve-time).
     pub fn load(&self, root_pk: &VerifyingKey) -> Result<Option<RosterView>> {
         let bytes = match std::fs::read(&self.path) {

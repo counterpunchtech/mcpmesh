@@ -1,4 +1,5 @@
-//! Config per spec §12 — only the M0/M1 subset; grows with the milestones.
+//! The `config.toml` model. Every table and key here is real, implemented surface —
+//! docs/config.md is the operator-facing reference for all of it.
 use figment::{
     Figment,
     providers::{Format, Toml},
@@ -12,12 +13,12 @@ pub struct Config {
     pub identity: IdentityCfg,
     pub network: NetworkCfg,
     pub limits: LimitsCfg,
-    /// Roster-mode tunables (spec §4.3 `[roster]`). Currently just the degraded-expiry grace
-    /// window; M3c grows it with freshness (`max_staleness`) tunables on the SAME state machine.
+    /// Roster-mode `[roster]` tunables: the degraded-expiry grace window, the roster URL +
+    /// poll interval, and the freshness bound — one `RosterState` machine consumes them all.
     pub roster: RosterCfg,
     /// `[services.<name>]` registry — each entry is a served MCP server plus its allow
-    /// list (spec §12/§6.2). Peers do NOT live in config; they live in state.redb
-    /// (§4.2/§13), so there is no `[peers]` table here.
+    /// list. Peers do NOT live in config; they live in the daemon's state store, so
+    /// there is no `[peers]` table here.
     pub services: std::collections::BTreeMap<String, ServiceCfg>,
 }
 
@@ -32,13 +33,13 @@ pub struct ServiceCfg {
     pub run: Option<Vec<String>>,
     /// `socket`: dial this local UDS (an already-running MCP server).
     pub socket: Option<String>,
-    /// Petnames/groups admitted to this service (flat namespace, §5).
+    /// Petnames/groups admitted to this service (one flat namespace).
     pub allow: Vec<String>,
 }
 
 /// The resolved backend kind of a [`ServiceCfg`], borrowing the config as slices (no
-/// clone). `&[String]`/`&str` rather than `&Vec`/`&String` — idiomatic and gives Task 9's
-/// backend builders the most flexible borrow.
+/// clone). `&[String]`/`&str` rather than `&Vec`/`&String` — idiomatic and gives the
+/// daemon's backend builders the most flexible borrow.
 #[derive(Debug)]
 pub enum Backend<'a> {
     Run(&'a [String]),
@@ -48,7 +49,7 @@ pub enum Backend<'a> {
 impl ServiceCfg {
     /// Resolve the backend, enforcing exactly-one-of `run`/`socket`. Both or neither is an
     /// error — surfaced to the operator, never a silent default.
-    #[allow(dead_code)] // consumed by the daemon service wiring (Task 9)
+    #[allow(dead_code)] // consumed by the daemon service wiring
     pub fn backend_result(&self) -> Result<Backend<'_>, String> {
         match (&self.run, &self.socket) {
             (Some(cmd), None) => Ok(Backend::Run(cmd.as_slice())),
@@ -63,24 +64,24 @@ impl ServiceCfg {
 #[serde(default)]
 pub struct IdentityCfg {
     pub device_key: Option<PathBuf>, // None → paths::default_device_key_path()
-    /// This device's suggested name for itself, carried in a minted pairing invite
-    /// (spec §4.2). `None` → the daemon defaults to a short base32 fingerprint of the
-    /// endpoint id (M2b Task 5). Additive (`#[serde(default)]` at the struct level).
+    /// This device's suggested name for itself, carried in a minted pairing invite.
+    /// `None` → the daemon defaults to a short fingerprint of the endpoint id.
+    /// Additive (`#[serde(default)]` at the struct level).
     pub petname: Option<String>,
-    /// Roster mode: the org id this node joined (spec §12; pinned at install/join).
+    /// Roster mode: the org id this node joined (pinned at install/join).
     pub org_id: Option<String>,
-    /// Roster mode: the pinned org-root public key, `b64u:` (spec §12/§4.3). The single trust
-    /// anchor roster signatures verify against. Pinned on first install (M3a) / `join` (M3b).
+    /// Roster mode: the pinned org-root public key, `b64u:`. The single trust anchor
+    /// roster signatures verify against. Pinned on first roster install / `join`.
     pub org_root_pk: Option<String>,
-    /// Roster mode: this node's stable user_id in the org (spec §12/§4.6). Pinned at `join`
-    /// (proposed) and reconciled to the roster's authoritative value once installed (M3c).
+    /// Roster mode: this node's stable user_id in the org. Pinned at `join` (proposed)
+    /// and reconciled to the roster's authoritative value once installed.
     pub user_id: Option<String>,
-    /// Roster mode: path to this person's user key (spec §12/§4.3). Minted by `join`; binds this
+    /// Roster mode: path to this person's user key. Minted by `join`; binds this
     /// person's devices. `None` → paths::default_user_key_path() when needed.
     pub user_key: Option<PathBuf>,
 }
 
-/// `[network]` (spec §12/§10.3). The knobs are exactly what `daemon::net_plan` implements —
+/// `[network]`. The knobs are exactly what `daemon::net_plan` implements —
 /// no aspirational surface:
 /// - `relay_mode = "default" | "custom" | "disabled"`. `"custom"` requires `relay_urls`
 ///   (self-hosted iroh relays); `"disabled"` is the HERMETIC mode — no relay AND no
@@ -113,10 +114,10 @@ impl Default for NetworkCfg {
     }
 }
 
-/// `[limits]` (spec §12). NOTE — the frame cap is deliberately NOT here: the spec-default
-/// 16 MiB `max_frame` is a fixed CONSTANT at each wire (`mcpmesh_net::endpoint` for the mesh,
+/// `[limits]`. NOTE — the frame cap is deliberately NOT here: the 16 MiB `max_frame`
+/// default is a fixed CONSTANT at each wire (`mcpmesh_net::endpoint` for the mesh,
 /// `ipc::MAX_FRAME_BYTES` for the control socket, `backends::MAX_FRAME_BYTES` for local MCP
-/// servers), not a config tunable. A `max_frame` config field existed through M4 but was never
+/// servers), not a config tunable. A `max_frame` config field existed historically but was never
 /// threaded into any `FrameReader` (dead surface); threading it into the mesh path would widen
 /// `mcpmesh-net`'s public API for no demonstrated need, so the field was removed instead (serde
 /// ignores an unknown `max_frame` key in existing configs).
@@ -137,38 +138,37 @@ impl Default for LimitsCfg {
     }
 }
 
-/// The default degraded-expiry grace window (spec §4.3 `[roster].grace_period` default "72h").
+/// The default degraded-expiry grace window (`[roster].grace_period` default "72h").
 /// A stale roster keeps serving for this window past `expires_at` (with a warning) before it
 /// stops granting roster identity. Kept here so [`RosterCfg::default`] and the parse fallback
 /// share one source; the gate mirrors it as `roster::gate::DEFAULT_GRACE_SECS`.
 const DEFAULT_GRACE_SECS: i64 = 72 * 3600;
 
-/// The default freshness bound (spec §4.3 P13 `[roster].max_staleness`, default "24h" = 86400s). A
-/// roster this node has not re-confirmed current within this window degrades on the SAME `RosterState`
+/// The default freshness bound (`[roster].max_staleness`, default "24h" = 86400s). A roster
+/// this node has not re-confirmed current within this window degrades on the SAME `RosterState`
 /// machine as expiry (warnings within `grace`, then serving stops) — bounding adversarial staleness at
 /// `max_staleness + grace` independent of `expires_at`. Shared by [`RosterCfg::default`] + the parse
 /// fallback.
 const DEFAULT_MAX_STALENESS_SECS: i64 = 24 * 3600;
 
-/// `[roster]` config table (spec §4.3). `grace_period` is the degraded-expiry grace window — how
+/// The `[roster]` config table. `grace_period` is the degraded-expiry grace window — how
 /// long a roster past `expires_at` keeps serving (degraded, warning) before it stops. Additive
-/// (`#[serde(default)]`): a config with no `[roster]` table gets the 72h default. M3c adds the
-/// freshness (`max_staleness`) tunables here on the SAME `RosterState` machine.
+/// (`#[serde(default)]`): a config with no `[roster]` table gets the 72h default.
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct RosterCfg {
-    /// Degraded-expiry grace window: `"72h"` / `"24h"` / plain seconds (spec §4.3, default "72h").
+    /// Degraded-expiry grace window: `"72h"` / `"24h"` / plain seconds (default "72h").
     pub grace_period: String,
-    /// The pinned roster URL for the HTTPS poll (spec §4.3). Operator-managed static hosting; the
-    /// joiner's FIRST roster bootstrap (D5). `None` → no URL poll (gossip/manual only). Additive
-    /// (`#[serde(default)]`): a config with no `url` key gets `None`, byte-identical to M3b.
+    /// The pinned roster URL for the HTTPS poll. Operator-managed static hosting; also how a
+    /// joiner bootstraps its FIRST roster. `None` → no URL poll (manual installs only).
+    /// Additive (`#[serde(default)]`): a config with no `url` key gets `None`.
     pub url: Option<String>,
-    /// How often to poll `url` (spec §4.3 default "1h"). Total-parse like `grace_period` — an
+    /// How often to poll `url` (default "1h"). Total-parse like `grace_period` — an
     /// unparseable value falls back to the hourly default rather than disabling the poll.
     pub poll_interval: String,
-    /// The freshness bound (spec §4.3 P13, default "24h"): how long this node may go without
-    /// re-confirming the installed roster current (via a TLS URL poll ≥ installed, a gossip install,
-    /// or a manual install) before it degrades on the SAME `RosterState` machine as expiry. Total-parse
+    /// The freshness bound (default "24h"): how long this node may go without re-confirming
+    /// the installed roster current (via a TLS URL poll ≥ installed, a gossip install, or a
+    /// manual install) before it degrades on the SAME `RosterState` machine as expiry. Total-parse
     /// like `grace_period` (an unparseable value falls back to the 24h default — a typo never disables
     /// the bound). Additive (`#[serde(default)]`): a config with no `max_staleness` key gets 24h.
     pub max_staleness: String,
@@ -187,16 +187,14 @@ impl Default for RosterCfg {
 impl RosterCfg {
     /// The grace window in SECONDS. An absent or unparseable `grace_period` falls back to the 72h
     /// default rather than erroring — an operator typo must never disable degraded serving, and a
-    /// grace window is advisory (spec §4.3), not a security bound (revocation is enforced regardless
-    /// of degraded state).
+    /// grace window is advisory, not a security bound (revocation is enforced regardless of
+    /// degraded state).
     ///
-    /// **M3a/M3c degraded split (DECLARED).** M3a implements the EXPIRY-driven degraded core: the
-    /// `RosterState` machine (`RosterView::state`) computed from `expires_at` + THIS grace window
-    /// (Approved → DegradedGrace → DegradedStopped), the gate that stops granting roster identity once
-    /// DegradedStopped (fail-closed — revocation is still enforced), and the degraded-grace serving
-    /// warning (`daemon::warn_if_degraded_grace`). M3c layers the `last_confirmed`/`max_staleness`
-    /// FRESHNESS path (§4.3 P13) onto the SAME `RosterState` (a stale-but-unexpired roster degrades
-    /// identically).
+    /// Two paths degrade on the ONE `RosterState` machine (`RosterView::state`, Approved →
+    /// DegradedGrace → DegradedStopped): expiry (`expires_at` + THIS grace window) and freshness
+    /// (`last_confirmed` + `max_staleness`). Once DegradedStopped, the gate stops granting roster
+    /// identity (fail-closed — revocation is still enforced); within grace, serving continues
+    /// with a warning (`daemon::warn_if_degraded_grace`).
     pub fn grace_seconds(&self) -> i64 {
         parse_duration(&self.grace_period).unwrap_or(DEFAULT_GRACE_SECS)
     }
@@ -210,7 +208,7 @@ impl RosterCfg {
 
     /// The freshness bound in SECONDS (default 86400 = 24h). Like [`grace_seconds`](Self::grace_seconds)
     /// it is TOTAL — an absent/unparseable value falls back to the 24h default rather than erroring, so
-    /// an operator typo tightens/loosens to 24h instead of disabling the freshness bound (spec §4.3 P13).
+    /// an operator typo tightens/loosens to 24h instead of disabling the freshness bound.
     pub fn max_staleness_seconds(&self) -> i64 {
         parse_duration(&self.max_staleness).unwrap_or(DEFAULT_MAX_STALENESS_SECS)
     }
@@ -222,7 +220,7 @@ impl RosterCfg {
 /// default). `u64` parse then a checked `i64` conversion: a negative grace is meaningless, so `-1`
 /// fails the `u64` parse and falls back to the default rather than becoming a negative window.
 // `pub(crate)`: reached only by the accessors above and the `org create --expires` porcelain
-// (`enrollcmd`, spec §4.3 operator-managed validity window) — nothing outside the lib needs it.
+// (`enrollcmd`, the operator-managed validity window) — nothing outside the lib needs it.
 // Pure parser — no state.
 pub(crate) fn parse_duration(s: &str) -> Result<i64, String> {
     let s = s.trim();
@@ -294,7 +292,7 @@ mod tests {
         assert_eq!(c.limits.max_sessions, 2);
     }
 
-    /// §10.3 self-hosting knobs parse: `custom` modes with their URL lists. (Validation —
+    /// The self-hosting knobs parse: `custom` modes with their URL lists. (Validation —
     /// custom-without-urls, unknown modes — lives in `daemon::net_plan`, tested there.)
     #[test]
     fn network_relay_and_discovery_urls_parse() {
@@ -352,7 +350,7 @@ mod tests {
 
     #[test]
     fn roster_max_staleness_defaults_to_24h_and_parses() {
-        // No [roster] table → the 24h freshness bound (spec §4.3 P13 default).
+        // No [roster] table → the 24h freshness bound (the default).
         let c = Config::from_toml_str("").unwrap();
         assert_eq!(c.roster.max_staleness_seconds(), 24 * 3600);
         // A configured value parses (units, like grace_period).

@@ -7,7 +7,7 @@
 //! echoing `params.arguments.text` AND the injected identity env — `MCPMESH_PEER_NAME`
 //! (`peer_name`), `MCPMESH_PEER_USER` (`peer_user`, roster mode only) and
 //! `MCPMESH_PEER_GROUPS` (`peer_groups`, comma-joined) — so the tests prove the full
-//! §6.3 env injection (roster user_id + groups, not just the petname). It loops until
+//! identity env injection (roster user_id + groups, not just the petname). It loops until
 //! stdin EOF.
 //!
 //! Crude string extraction is deliberate: the test controls the exact wire shape,
@@ -56,7 +56,7 @@ fn main() {
             )
         } else if line.contains("\"method\":\"tools/call\"") {
             let text = extract_text(&line);
-            // The injected §6.3 identity env — `peer_user`/`peer_groups` are empty in pairing mode
+            // The injected identity env — `peer_user`/`peer_groups` are empty in pairing mode
             // (no user_id, no groups) and populated in roster mode, proving the superset injection.
             let peer = std::env::var("MCPMESH_PEER_NAME").unwrap_or_default();
             let user = std::env::var("MCPMESH_PEER_USER").unwrap_or_default();

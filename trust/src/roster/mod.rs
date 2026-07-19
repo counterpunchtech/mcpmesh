@@ -1,8 +1,8 @@
-//! The `mcpmesh-roster/1` document (spec §4.3): pure schema types + the `b64u:` codec + the
+//! The `mcpmesh-roster/1` document: pure schema types + the `b64u:` codec + the
 //! typed [`RosterError`]. Crypto (JCS + Ed25519) and validation + the resolvable `RosterView`
-//! land in sibling `sign`/`validate` modules (M3a T2/T3). Net-free and redb-free by design —
-//! this is the trust DOMAIN; the daemon PLUMBING (gates, persistence, hot-swap) lives in the cli
-//! crate ([RECONCILE-D]).
+//! live in the sibling `sign`/`validate` modules. Net-free and redb-free by design —
+//! this is the trust DOMAIN; the daemon PLUMBING (gates, persistence, hot-swap) lives with the
+//! daemon.
 
 use serde::{Deserialize, Serialize};
 
@@ -10,20 +10,21 @@ pub mod mutate;
 pub mod sign;
 pub mod validate;
 
-/// The only `format` value this version accepts (spec §4.3).
+/// The only `format` value this version accepts.
 pub const ROSTER_FORMAT: &str = "mcpmesh-roster/1";
-/// The scheme prefix on every key/id/signature string in the schema (spec §4.3 `"b64u:…"`).
+/// The scheme prefix on every key/id/signature string in the schema (`"b64u:…"`).
 pub const B64U_PREFIX: &str = "b64u:";
-/// Clock-skew tolerance for the validity window (spec §4.3 rule 3, "±10 min").
+/// Clock-skew tolerance for the validity window (rule 3, ±10 min).
 pub const SKEW_SECS: i64 = 10 * 60;
 
-/// A signed org roster (spec §4.3). Field order + names are the wire contract — do NOT rename;
+/// A signed org roster. Field order + names are the wire contract — do NOT rename;
 /// additive fields are a format bump (`mcpmesh-roster/2`, a distinct `format` value + a distinct
-/// parse — T3 validates the value), never a silent `#[serde(default)]` on THIS security document
-/// (unlike the local-api additive convention). `#[serde(deny_unknown_fields)]` makes the parse
-/// strict: `mcpmesh-roster/1` is a CLOSED schema, so an unknown field is REJECTED at deserialize
-/// rather than silently dropped — the verified canonical form (T2 canonicalizes the re-serialized
-/// struct) is therefore exactly this closed field set, with no ambiguity about dropped input.
+/// parse — validation checks the value), never a silent `#[serde(default)]` on THIS security
+/// document (unlike the local-api additive convention). `#[serde(deny_unknown_fields)]` makes the
+/// parse strict: `mcpmesh-roster/1` is a CLOSED schema, so an unknown field is REJECTED at
+/// deserialize rather than silently dropped — the verified canonical form (signing canonicalizes
+/// the re-serialized struct) is therefore exactly this closed field set, with no ambiguity about
+/// dropped input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Roster {
@@ -53,7 +54,7 @@ pub struct RosterUser {
 pub struct RosterDevice {
     pub endpoint_id: String, // `b64u:<endpoint_id>`
     pub label: String,
-    /// Advisory dial-ordering hint (`primary`|`mirror`), NEVER a security property (§4.3).
+    /// Advisory dial-ordering hint (`primary`|`mirror`), NEVER a security property.
     #[serde(default = "default_role")]
     pub role: String,
 }
@@ -63,7 +64,10 @@ fn default_role() -> String {
 }
 
 /// Typed roster failure — callers (and tests) match on the specific rule violated.
+/// `#[non_exhaustive]` so a future rule is not a breaking change — match with a
+/// wildcard arm.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum RosterError {
     #[error("roster json: {0}")]
     Json(#[from] serde_json::Error),
@@ -87,7 +91,7 @@ pub enum RosterError {
     /// Rule 4a: an endpoint appears under more than one user.
     #[error("endpoint appears more than once across users")]
     DuplicateEndpoint,
-    /// Defensive completeness (beyond §4.3 rules 1–6, parallel to rule 4's endpoint uniqueness): a
+    /// Defensive completeness (beyond rules 1–6, parallel to rule 4's endpoint uniqueness): a
     /// `user_id` appears on more than one user entry, which would make `allow = ["<user_id>"]`
     /// ambiguous. The roster is org-root-signed, so this is an integrity footgun, not an attack.
     #[error("user_id {0:?} appears on more than one user entry")]
@@ -132,7 +136,7 @@ mod tests {
 
     #[test]
     fn schema_json_round_trips_the_spec_example() {
-        // The §4.3 example, verbatim shape. Deserialize → serialize → the field set survives.
+        // A representative roster, verbatim shape. Deserialize → serialize → the field set survives.
         let src = serde_json::json!({
             "format": "mcpmesh-roster/1", "org_id": "acme", "serial": 42,
             "issued_at": "2026-07-03T12:00:00Z", "expires_at": "2026-10-01T00:00:00Z",
@@ -177,7 +181,7 @@ mod tests {
             "endpoint_id": "b64u:AAAA", "label": "laptop"
         }))
         .unwrap();
-        assert_eq!(d.role, "primary"); // #[serde(default = ...)] advisory dial-hint (§4.3)
+        assert_eq!(d.role, "primary"); // #[serde(default = ...)] advisory dial-hint
     }
 
     #[test]

@@ -32,18 +32,18 @@ use super::config_write::{
 use super::status::service_infos;
 use super::{MeshState, build_services_audited, dial_service, pipe_session};
 
-/// A minted pairing invite lives at most 24h (spec §4.2 "expiry ≤ 24h").
+/// A minted pairing invite lives at most 24h.
 const INVITE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Cap on how long `mint_invite` waits for the endpoint to come "online" (a home-relay
 /// handshake) before minting, so the invite's address carries the relay URL the redeemer
-/// bootstraps from across NAT (spec §4.2; bolo runs relay.runbolo.com). It is a CAP, not a
+/// bootstraps from across NAT. It is a CAP, not a
 /// fixed wait: production returns the instant the relay handshake completes (~1s). On the
 /// relay-disabled localhost preset `online()` never completes, so this fires and we mint
 /// with the direct-address-only addr (dialable on localhost/LAN — sufficient for tests).
 const RELAY_READY_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Handle a `blob_publish` control request (spec §9, M4a): add a LOCAL file into a scope on the gated
+/// Handle a `blob_publish` control request: add a LOCAL file into a scope on the gated
 /// app-blob store, returning the ticket + hash. Requires roster mode (the provider is built only
 /// there); a pure-pairing daemon answers a clean error.
 pub(crate) async fn blob_publish(
@@ -63,7 +63,7 @@ pub(crate) async fn blob_publish(
     Ok(BlobPublishResult { ticket, hash })
 }
 
-/// Handle a `blob_grant` control request (spec §9): grant a scope to a principal (single-writer).
+/// Handle a `blob_grant` control request: grant a scope to a principal (single-writer).
 pub(crate) async fn blob_grant(
     state: &DaemonState,
     scope: String,
@@ -77,7 +77,7 @@ pub(crate) async fn blob_grant(
     provider.grant(&scope, &principal)
 }
 
-/// Handle a `blob_list` control request (spec §9): the daemon's scopes (name → hashes + grants).
+/// Handle a `blob_list` control request: the daemon's scopes (name → hashes + grants).
 pub(crate) async fn blob_list(state: &DaemonState) -> Result<BlobScopeList> {
     let mesh = state.mesh_required()?;
     let scopes = match mesh.app_blobs().await {
@@ -95,9 +95,9 @@ pub(crate) async fn blob_list(state: &DaemonState) -> Result<BlobScopeList> {
     Ok(BlobScopeList { scopes })
 }
 
-/// Handle a `blob_fetch` control request (spec §9): fetch a `mcpmesh/blob/1` ticket THROUGH the daemon
+/// Handle a `blob_fetch` control request: fetch a `mcpmesh/blob/1` ticket THROUGH the daemon
 /// (BLAKE3-verified streaming into the gated store) and export the verified blob to `dest_path` (a
-/// local file the same-uid daemon writes, P12/P14). Returns the verified hash + byte length.
+/// local file the same-uid daemon writes — within the trust boundary). Returns the verified hash + byte length.
 pub(crate) async fn blob_fetch(
     state: &DaemonState,
     ticket: String,
@@ -143,7 +143,7 @@ async fn reload_services_from_disk(mesh: &Arc<MeshState>, why: &str) -> Result<(
 
 /// Handle a `register_service` control request: write/update the `[services.*]` config entry
 /// (atomic), reload the registry, and hot-reload the mesh serve loop. Config writes block, so
-/// they run on `spawn_blocking` (Task 4 seam note).
+/// they run on `spawn_blocking` (the fs house rule).
 pub(crate) async fn register_service(
     state: &DaemonState,
     params: RegisterServiceParams,
@@ -170,7 +170,7 @@ pub(crate) async fn register_service(
 
     // 2/3. Reload config, rebuild the registry from the persisted truth, and hot-reload: abort the
     //      old accept loop, spawn a fresh one on the same endpoint carrying the rebuilt registry
-    //      (a brief serving blip is acceptable, spec §6.1). Shared with the pairing grant / revoke /
+    //      (a brief serving blip is acceptable). Shared with the pairing grant / revoke /
     //      rename via [`reload_services_from_disk`] (DRY). `status` reads the config live, so the
     //      new service is visible on the very next call.
     reload_services_from_disk(mesh, "register").await?;
@@ -179,7 +179,7 @@ pub(crate) async fn register_service(
     Ok(())
 }
 
-/// Handle a `peer_add` control request (the M2a trust-population stand-in for pairing): write
+/// Handle a `peer_add` control request: write
 /// a [`PeerEntry`] to the daemon's OPEN store (redb is single-process, so this must route
 /// through the daemon). The live [`AllowlistGate`](crate::allowlist::AllowlistGate) reads the
 /// same database, so the new peer is resolvable on the very next accept — no gate rebuild
@@ -200,13 +200,13 @@ pub(crate) async fn add_peer(state: &DaemonState, params: PeerAddParams) -> Resu
         endpoint_id: *endpoint_id.as_bytes(),
         petname: petname.clone(),
         services: allow,
-        // `internal peer add` is not a pairing write — leave the audit stamp unset (M2b:
-        // only the pair rendezvous records `paired_at`, T5/T6).
+        // `internal peer add` is not a pairing write — leave the audit stamp unset
+        // (only the pair rendezvous records `paired_at`).
         paired_at: None,
         user_id: None,
     };
 
-    // redb writes block + fsync — run on a blocking thread (Task 4 BINDING seam note).
+    // redb writes block + fsync — run on a blocking thread (the fs house rule).
     let store = mesh.store.clone();
     blocking("join peer add", move || store.add(entry)).await??;
 
@@ -214,7 +214,7 @@ pub(crate) async fn add_peer(state: &DaemonState, params: PeerAddParams) -> Resu
     Ok(())
 }
 
-/// Handle a `peer_remove` control request (spec §4.2, `mcpmesh pair --remove`): drop a paired
+/// Handle a `peer_remove` control request: drop a paired
 /// peer's authorization AND identity — the strict INVERSE of the pairing grant.
 ///
 /// **Fail-safe teardown order (DECLARED).** The pairing grant writes, in order, (1) the
@@ -239,8 +239,9 @@ pub(crate) async fn add_peer(state: &DaemonState, params: PeerAddParams) -> Resu
 /// as a completed cut-off. Each half stays individually idempotent, so retrying a
 /// partially-failed removal (allow stripped, identity row still present) still finishes clean.
 ///
-/// **Live sessions (M3/D8).** This severs only the ability to establish NEW authorized sessions;
-/// an in-flight mesh session runs to completion (session severing is deferred to M3).
+/// **Live sessions.** This severs only the ability to establish NEW authorized sessions;
+/// an in-flight mesh session runs to completion (an unpair does not cut live sessions —
+/// roster revocation is the surface that does).
 ///
 /// **Status snapshot.** Not refreshed here — and it no longer needs to be: `status` reads the
 /// config + store LIVE (control.rs `status_result`), so a revoke is reflected immediately even
@@ -256,7 +257,7 @@ pub async fn remove_peer(state: &DaemonState, params: PeerRemoveParams) -> Resul
     let revoked = revoke_service_access(mesh, &petname).await?;
 
     // (1)⁻¹ IDENTITY: drop the PeerEntry (removes ALL entries sharing this petname — petnames are
-    // not unique). redb writes block + fsync — run on a blocking thread (M2a seam note). Capture
+    // not unique). redb writes block + fsync — run on a blocking thread. Capture
     // whether a PeerEntry was actually deleted — the other half of the actual-removal signal.
     let store = mesh.store.clone();
     let petname_w = petname.clone();
@@ -272,9 +273,9 @@ pub async fn remove_peer(state: &DaemonState, params: PeerRemoveParams) -> Resul
     }
 
     tracing::info!(peer = %petname, "unpaired peer");
-    // Trust event (spec §11.3): an unpair — reached only when something was ACTUALLY torn down (a
+    // Trust event: an unpair — reached only when something was ACTUALLY torn down (a
     // stripped allow OR a deleted PeerEntry; the all-no-op case errored above), so a refused
-    // remove of a never-paired petname writes NO phantom `unpair` record. Petname only (§1.5).
+    // remove of a never-paired petname writes NO phantom `unpair` record. Petname only.
     mesh.audit().record(AuditRecord::trust(
         now_ts(),
         "unpair".into(),
@@ -343,7 +344,7 @@ fn rename_plan(
     }))
 }
 
-/// Handle a `peer_rename` control request (Contacts rename, spec §mcpmesh). Renames a contact's
+/// Handle a `peer_rename` control request (the Contacts rename). Renames a contact's
 /// nickname (petname) authoritatively — all the person's `PeerEntry`s to `to`, and rewrites the old
 /// petname → `to` in every `[services.*].allow` so grants follow — then reloads so the new name
 /// admits. Guarded against renaming onto another identity's name/grant. Held entirely under
@@ -437,18 +438,18 @@ fn unregistered_service_error(requested: &[String], served: &[String]) -> Option
     })
 }
 
-/// Mint a one-time pairing invite granting `services` (spec §4.2, control method `"invite"`).
+/// Mint a one-time pairing invite granting `services`.
 ///
 /// Builds an [`Invite`] { 32 CSPRNG-byte secret, our endpoint id + dialable address, our
 /// suggested petname, the granted services, a `≤ now + 24h` expiry }, registers it in the
 /// live registry so the accept loop's `mcpmesh/pair/1` branch will redeem it, and returns the
-/// copyable `mcpmesh-invite:` line. Logs a trust event (§11.3) carrying NO secret and NO peer
-/// id — an invite has no peer yet; the redeemer is only known once it dials (T5 rendezvous).
+/// copyable `mcpmesh-invite:` line. Logs a trust event carrying NO secret and NO peer
+/// id — an invite has no peer yet; the redeemer is only known once it dials the rendezvous.
 ///
-/// The secret uses the OS CSPRNG via `rand::rngs::OsRng` — the SAME source M0's device-key
+/// The secret uses the OS CSPRNG via `rand::rngs::OsRng` — the SAME source the device-key
 /// mint uses (mcpmesh-trust), no new crate. The address comes from `endpoint.addr()`; we first
 /// wait (bounded by [`RELAY_READY_TIMEOUT`]) for the endpoint to come online so the addr
-/// carries the home-relay URL the redeemer bootstraps from across NAT (§4.2).
+/// carries the home-relay URL the redeemer bootstraps from across NAT.
 ///
 /// **Registration check (DECLARED).** Every requested name must have a well-formed
 /// `[services.<name>]` entry, or the mint is REFUSED: an invite for an unregistered name would
@@ -468,7 +469,7 @@ pub(crate) async fn mint_invite(services: Vec<String>, mesh: &MeshState) -> Resu
         anyhow::bail!(msg);
     }
 
-    // 32 CSPRNG bytes — the single-use bearer credential (spec §4.2).
+    // 32 CSPRNG bytes — the single-use bearer credential.
     let mut secret = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut secret);
 
@@ -494,11 +495,11 @@ pub(crate) async fn mint_invite(services: Vec<String>, mesh: &MeshState) -> Resu
     let invite_line = invite.encode();
     // Reap expired invites before minting so a long-lived daemon's registry can't grow
     // unboundedly with never-redeemed invites (bounds map growth; the invite lifetime cap,
-    // spec §4.2). Cheap: one lock + retain over a small map.
+    // the invite-lifetime cap). Cheap: one lock + retain over a small map.
     mesh.invites.remove_expired(now);
     mesh.invites.mint(invite);
 
-    // Trust event (§11.3): record the mint. NO secret, NO peer id (there is no peer yet).
+    // Trust event: record the mint. NO secret, NO peer id (there is no peer yet).
     tracing::info!(?services, "invite minted");
     Ok(InviteResult {
         invite_line,
@@ -506,9 +507,9 @@ pub(crate) async fn mint_invite(services: Vec<String>, mesh: &MeshState) -> Resu
     })
 }
 
-/// Handle a `pair` control request (spec §4.2, the REDEEMER side): dial the inviter named by
+/// Handle a `pair` control request: dial the inviter named by
 /// `invite_line` on `mcpmesh/pair/1`, verify its TLS identity binds the invite's `inviter_id`
-/// (P3 address-swap defense), prove the secret, write OUR dial-back [`PeerEntry`], and return
+/// (the address-swap defense), prove the secret, write OUR dial-back [`PeerEntry`], and return
 /// the inviter's petname + the display-only SAS. Delegates to
 /// [`crate::pairing::rendezvous::redeem_invite`], threading our own endpoint + self-petname +
 /// store. The inviter-side authorization (adding US to its service `allow`) happens on ITS
@@ -531,7 +532,7 @@ pub(crate) async fn redeem(state: &DaemonState, invite_line: String) -> Result<P
 ///
 /// Why it is separate from (and necessary alongside) the [`PeerEntry`] the rendezvous writes:
 /// the [`AllowlistGate`](crate::allowlist::AllowlistGate) only RESOLVES an inbound endpoint to
-/// a petname (identity); `select_service` (spec §5) then ADMITS that petname only if the
+/// a petname (identity); `select_service` then ADMITS that petname only if the
 /// service's config `allow` names it — and that allow is baked into the [`Services`](mcpmesh_net::Services) snapshot
 /// at [`build_services`](crate::daemon::build_services) time. So a PeerEntry makes the peer KNOWN; only appending to `allow`
 /// + reloading makes it AUTHORIZED. Without this the peer is known-but-forbidden.
@@ -554,7 +555,7 @@ pub async fn grant_service_access(
     // SAME serialization as register_service: hold the whole append→reload→swap section.
     let _reload = mesh.reload_lock.lock().await;
 
-    // 1. Idempotent allow-append on a blocking thread (config IO blocks, Task 4 seam note).
+    // 1. Idempotent allow-append on a blocking thread (config IO blocks).
     let config_path = mesh.config_path.clone();
     let petname = redeemer_petname.to_string();
     let services_w = services.to_vec();
@@ -570,9 +571,9 @@ pub async fn grant_service_access(
         reload_services_from_disk(mesh, "grant").await?;
     }
 
-    // Trust event (§11.3): NO secret, NO endpoint id (petname only, §1.5).
+    // Trust event: NO secret, NO endpoint id (petname only).
     tracing::info!(peer = %redeemer_petname, ?services, changed, "granted service access");
-    // Trust event (spec §11.3): a pairing grant. Petname only — NO secret, NO endpoint id (§1.5).
+    // Trust event: a pairing grant. Petname only — NO secret, NO endpoint id.
     mesh.audit().record(AuditRecord::trust(
         now_ts(),
         "pair".into(),
@@ -600,7 +601,7 @@ pub(crate) async fn revoke_service_access(mesh: &Arc<MeshState>, petname: &str) 
     // SAME serialization as register_service / grant: hold the whole remove→reload→swap section.
     let _reload = mesh.reload_lock.lock().await;
 
-    // 1. Idempotent allow-removal on a blocking thread (config IO blocks, M2a seam note).
+    // 1. Idempotent allow-removal on a blocking thread (config IO blocks).
     let config_path = mesh.config_path.clone();
     let petname_w = petname.to_string();
     let changed = blocking("join revoke config write", move || {
@@ -615,19 +616,19 @@ pub(crate) async fn revoke_service_access(mesh: &Arc<MeshState>, petname: &str) 
         reload_services_from_disk(mesh, "revoke").await?;
     }
 
-    // Return whether an allow was actually stripped so `remove_peer` audits an `unpair` (§11.3) only
-    // on a real tear-down (petname only — NO secret, NO endpoint id, §1.5).
+    // Return whether an allow was actually stripped so `remove_peer` audits an `unpair` only
+    // on a real tear-down (petname only — NO secret, NO endpoint id).
     tracing::info!(peer = %petname, changed, "revoked service access");
     Ok(changed)
 }
 
-/// Handle an `open_session` control request (spec §8): resolve the petname, dial the named
+/// Handle an `open_session` control request: resolve the petname, dial the named
 /// service over the mesh, and pipe that session to/from the control connection — which, after
 /// this request, STOPS being JSON-RPC and becomes a raw MCP byte pipe (protocol.rs
 /// `OpenSession`). On any dial-ESTABLISHMENT failure (peer not allowlisted, malformed stored
 /// id, unreachable) the caller is handed a synthesized `-32055` (ERR_UNREACHABLE) frame, so
 /// the AI client gets a well-formed answer instead of a hang; the remote's own `-32054`
-/// refusal, and every session frame, flow back verbatim through the pipe (§8). There is no
+/// refusal, and every session frame, flow back verbatim through the pipe. There is no
 /// mid-session re-dial — the remote session state died with the session, so a severed session
 /// simply ends the pipe (the AI client re-invokes if it wants a fresh one).
 pub(crate) async fn open_session<CR, CW>(
@@ -657,13 +658,13 @@ where
             // it (no session_open/close). Emit an error record HERE — exactly once, ONLY on
             // this failure branch (the Ok arm pipes the session instead) — so the telemetry
             // stream shows the attempted-and-failed reach. `peer` is the caller's
-            // petname/user_id (§1.5), never an endpoint-id.
+            // petname/user_id, never an endpoint-id.
             mesh.audit().record(
                 AuditRecord::session_open(now_ts(), Some(peer.to_string()), service.to_string())
                     .with_status("error"),
             );
             // Dial establishment failed: hand the proxy a well-formed -32055 (not a hang),
-            // which it relays to the AI client (spec §8). The error id is null — the AI
+            // which it relays to the AI client. The error id is null — the AI
             // client's request id is not known daemon-side (the dial precedes the client's
             // first frame); this matches the null-id synthesis discipline in net::endpoint.
             tracing::warn!(peer, service, %e, "open_session dial failed; answering -32055");

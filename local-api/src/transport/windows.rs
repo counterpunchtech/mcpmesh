@@ -1,8 +1,8 @@
-//! Windows impl of the transport seam: a per-user named pipe with an OWNER-ONLY DACL
-//! (design §1). The DACL is the platform equivalent of the whole unix rule (0700 dir,
+//! Windows impl of the transport seam: a per-user named pipe with an OWNER-ONLY DACL.
+//! The DACL is the platform equivalent of the whole unix rule (0700 dir,
 //! 0600 socket, peer-euid gate): the kernel refuses a cross-user connect outright,
 //! so [`authorize_local_peer`] is trivially true post-accept. `first_pipe_instance`
-//! doubles as the per-user single-daemon lock (design §3): a second bind fails and is
+//! doubles as the per-user single-daemon lock: a second bind fails and is
 //! mapped to [`io::ErrorKind::AddrInUse`].
 //!
 //! Layout mirrors `unix.rs`: the client surface (stream type, halves, `split_local`,
@@ -83,8 +83,8 @@ pub fn split_local(stream: LocalStream) -> (LocalReadHalf, LocalWriteHalf) {
     tokio::io::split(stream)
 }
 
-/// Connect the per-user local endpoint with a bounded ERROR_PIPE_BUSY retry (design
-/// §5): the server pre-creates the next instance right after each accept, so "busy"
+/// Connect the per-user local endpoint with a bounded ERROR_PIPE_BUSY retry:
+/// the server pre-creates the next instance right after each accept, so "busy"
 /// is a sub-millisecond window; 50×20ms is a generous bound. A missing pipe surfaces
 /// as `NotFound` — the autostart trigger, exactly as a dead unix socket does.
 pub async fn connect_local(path: &Path) -> io::Result<LocalStream> {
@@ -101,10 +101,10 @@ pub async fn connect_local(path: &Path) -> io::Result<LocalStream> {
     }
 }
 
-// ── service half: listener + bind + the owner-only-DACL FFI (design §1/§4) ──────────
+// ── service half: listener + bind + the owner-only-DACL FFI ─────────────────────────
 
 /// Post-accept same-user gate. Trivially true here: the owner-only DACL already made
-/// the kernel refuse any cross-user connect (design §1), so there is no peer
+/// the kernel refuse any cross-user connect, so there is no peer
 /// credential left to check — the DACL *is* the gate, applied before accept.
 #[cfg(feature = "service")]
 pub fn authorize_local_peer(_stream: &LocalStream) -> bool {
@@ -177,7 +177,7 @@ fn create_instance(path: &Path, first: bool) -> io::Result<NamedPipeServer> {
     sd.create(&mut opts, path)
 }
 
-/// The one unsafe leaf (design §4): build a `SECURITY_ATTRIBUTES` whose DACL grants
+/// The one unsafe leaf: build a `SECURITY_ATTRIBUTES` whose DACL grants
 /// GENERIC_ALL to the CURRENT USER'S SID and to no one else — the peer-credential
 /// equivalent. SDDL keeps it auditable: `D:P(A;;GA;;;<sid>)` = protected DACL (no
 /// inherited ACEs), exactly one allow-ACE, no inheritance out. `sddl_for_current_user`
@@ -343,7 +343,7 @@ mod winsec {
 mod tests {
     use super::*;
 
-    /// The descriptor is exactly one protected allow-ACE for OUR sid (design §6).
+    /// The descriptor is exactly one protected allow-ACE for OUR sid.
     #[test]
     fn sddl_is_owner_only() {
         let sddl = winsec::sddl_for_current_user().unwrap();

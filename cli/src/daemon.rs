@@ -1,21 +1,21 @@
-//! The long-lived mcpmesh daemon. It owns the single Iroh endpoint (seeded from the M0 device
-//! key) and runs two UDS-facing roles simultaneously on one tokio runtime: (1) it runs its
+//! The long-lived mcpmesh daemon. It owns the single Iroh endpoint (seeded from the device
+//! key) and runs two roles simultaneously on one tokio runtime: (1) it runs its
 //! OWN accept loop ([`spawn_accept_loop`]) that dispatches each inbound connection by its
-//! negotiated ALPN (spec §7.1) — `mcpmesh/mcp/1` flows through M1's gated per-connection handler
+//! negotiated ALPN — `mcpmesh/mcp/1` flows through net's gated per-connection handler
 //! [`mcpmesh_net::run_mesh_connection`], where `gate` is an
 //! [`AllowlistGate`] over the `state.redb` peer allowlist and
 //! `services` are backends built from config, while `mcpmesh/pair/1` flows to the pairing
-//! rendezvous, GATE-EXEMPT (D8 exception) and authenticated by the invite secret rather than
+//! rendezvous, GATE-EXEMPT by design and authenticated by the invite secret rather than
 //! the trust gate; and (2) it serves the `mcpmesh-local/1` control API on
 //! `<runtime_dir>/mcpmesh.sock` (hello + status + service registration + peer add), consumed by
 //! the porcelain.
 //!
-//! The daemon deliberately no longer calls `mcpmesh_net::serve`: routing by ALPN is the whole
-//! point (D8's gate exemption only applies to the pair ALPN), which the mesh-only `serve`
+//! The daemon deliberately does not call `mcpmesh_net::serve`: routing by ALPN is the whole
+//! point (the gate exemption only applies to the pair ALPN), which the mesh-only `serve`
 //! cannot do. `serve`/`ServeHandle` REMAIN in net for its own tests + standalone use; the
 //! daemon just composes the same [`mcpmesh_net::run_mesh_connection`] under its own loop.
 //!
-//! Single-daemon-per-uid (Task 2 BINDING hand-off): an exclusive non-blocking `flock` on
+//! Single-daemon-per-uid: an exclusive non-blocking `flock` on
 //! `<runtime_dir>/mcpmesh.lock` is acquired BEFORE any endpoint/store/socket work and held for
 //! the process lifetime. This makes `ipc::bind_control_socket`'s stale-socket unlink safe —
 //! no LIVE daemon can exist while we hold the lock — and (critically for redb, which takes
@@ -67,23 +67,20 @@ pub(crate) use handlers::{
     add_peer, blob_fetch, blob_grant, blob_list, blob_publish, mint_invite, open_session, redeem,
     register_service,
 };
-pub(crate) use roster_install::{
-    install_roster, installed_roster_path, mesh_config_org_root_pk, org_join,
-    reconcile_user_id_from_roster, set_roster_url, write_temp_roster,
-};
+pub(crate) use roster_install::{install_roster, org_join, set_roster_url};
 pub(crate) use status::{peer_infos, presence_peers, roster_status, service_infos};
 
 /// The lockstep stack version (workspace version) reported in `Hello`/`status`.
 pub const STACK_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Default per-service spawn concurrency cap (spec §6.2). Each `run` service gets its own
-/// semaphore of this size; a socket service has no per-session cap (T8 decision). The runtime cap is
+/// Default per-service spawn concurrency cap. Each `run` service gets its own
+/// semaphore of this size; a socket service has no per-session cap (deliberate). The runtime cap is
 /// now config-driven via [`spawn_concurrency`] (`[limits].max_sessions`); this const remains the
 /// DOCUMENTED default, pinned to the config default by `spawn_concurrency_reads_max_sessions_*`.
 #[allow(dead_code)] // documented default; asserted (test-only) to equal LimitsCfg::default().max_sessions
 const SPAWN_CONCURRENCY: usize = 4;
 
-/// The per-service spawn concurrency (spec §6.2 / §12 `[limits].max_sessions`, default 4). Floors to
+/// The per-service spawn concurrency. Floors to
 /// 1 so a `max_sessions = 0` misconfig bounds to one session rather than refusing every session.
 pub(crate) fn spawn_concurrency(cfg: &Config) -> usize {
     (cfg.limits.max_sessions.max(1)) as usize
@@ -95,38 +92,41 @@ pub(crate) fn spawn_concurrency(cfg: &Config) -> usize {
 /// hot-reload the registry and populate the store on the SAME open database the gate reads
 /// (redb is single-process; routing writes through the daemon is the only correct design).
 ///
-/// It is `Arc<MeshState>` (not owned) because the accept loop's `mcpmesh/pair/1` branch hands
-/// the WHOLE mesh to [`pairing::rendezvous::handle_inviter_side`], which on a successful pair
-/// calls [`grant_service_access`] — the config-append + reload machinery that also lives on
-/// this struct (M2b T6). Threading `Arc<MeshState>` through [`spawn_accept_loop`] lets the
-/// pair grant reload the very loop that spawned it (the handler is a detached child task, so
-/// the reload's abort does not touch it — see [`handle_inviter_side`] for that reasoning).
+/// It is `Arc<MeshState>` (not owned) because the accept loop and every long-lived roster loop
+/// share it. The subsystem modules deliberately never see this struct: the pair rendezvous runs
+/// against the narrow [`InviterCtx`] (`inviter_ctx`), the presence loops
+/// against [`PresenceCtx`] (`presence_ctx`), and the roster distribution
+/// channels against the [`DistributionHost`] seam this struct implements — `MeshState` is the
+/// COMPOSER that hands out those contexts, not a parameter the modules take.
 ///
 /// `pub` (fields `pub(crate)`) only so integration tests can assemble one via [`MeshState::new`]
 /// + [`MeshState::set_accept_task`] and drive the SAME accept loop the daemon runs.
 ///
-/// [`handle_inviter_side`]: crate::pairing::rendezvous::handle_inviter_side
-/// [`pairing::rendezvous::handle_inviter_side`]: crate::pairing::rendezvous::handle_inviter_side
+/// [`InviterCtx`]: crate::pairing::rendezvous::InviterCtx
+/// [`PresenceCtx`]: crate::roster::presence::PresenceCtx
+/// [`DistributionHost`]: crate::roster::distribute::DistributionHost
 pub struct MeshState {
     pub(crate) endpoint: iroh::Endpoint,
     pub(crate) gate: Arc<dyn TrustGate>,
     pub(crate) store: Arc<PeerStore>,
-    /// The in-RAM registry of outstanding pairing invites (spec §4.2). The accept loop's
-    /// `mcpmesh/pair/1` branch redeems against it (T5); shared with every spawned pair handler.
+    /// The in-RAM registry of outstanding pairing invites. The accept loop's
+    /// `mcpmesh/pair/1` branch redeems against it; shared with every spawned pair handler.
     pub(crate) invites: Arc<LiveInvites>,
-    /// This device's suggested name for itself, carried in a minted invite (spec §4.2).
+    /// This device's suggested name for itself, carried in a minted invite.
     /// Resolved once at startup: config `identity.petname`, else a short base32 fingerprint
-    /// of the endpoint id (T5). The redeemer stores it as its local name for us.
+    /// of the endpoint id. The redeemer stores it as its local name for us.
     pub(crate) self_petname: String,
     /// The daemon's own ALPN-dispatch accept loop (see [`spawn_accept_loop`]). Hot-reload
     /// takes it, `.abort()`s it, and installs a fresh loop with the rebuilt registry — a brief
-    /// serving blip is acceptable (spec §6.1 "hot-reloads").
+    /// serving blip is acceptable.
     pub(crate) accept_task: tokio::sync::Mutex<Option<JoinHandle<()>>>,
-    /// The running HTTPS roster-poll loop (spec §4.3 M3c), if `[roster].url` is set. `None` until a
-    /// URL is pinned. Held so [`respawn_poll_loop`] can ABORT+REPLACE it — a runtime `set_roster_url`
-    /// (a joiner's D5 first-roster bootstrap, or a URL change) (re)starts polling WITHOUT a daemon
+    /// The running HTTPS roster-poll loop, if `[roster].url` is set. `None` until a URL is
+    /// pinned. Held so [`respawn_poll_loop`] can ABORT+REPLACE it — a runtime `set_roster_url`
+    /// (a joiner's first-roster bootstrap, or a URL change) (re)starts polling WITHOUT a daemon
     /// restart, and repeated calls never STACK duplicate loops (the idempotency guard). Initialized
     /// `None` inside [`new`](Self::new) (like `accept_task`), so no call site changes.
+    ///
+    /// [`respawn_poll_loop`]: roster_install::respawn_poll_loop
     pub(crate) poll_loop: tokio::sync::Mutex<Option<JoinHandle<()>>>,
     /// Serializes the WHOLE config-mutating critical section — `register_service` (config read →
     /// upsert → atomic write → reload → rebuild → accept-loop swap → status refresh) AND the
@@ -136,66 +136,69 @@ pub struct MeshState {
     /// by redb's write lock; this gives the config path an equivalent.
     pub(crate) reload_lock: tokio::sync::Mutex<()>,
     pub(crate) config_path: PathBuf,
-    /// The roster-mode gate handle (hot-swapped on install; consulted for the D8 sever set + status).
+    /// The roster-mode gate handle (hot-swapped on install; consulted for the sever set + status).
     /// `RosterGate::empty()` in a pure-pairing daemon — where [`ComposedGate`] then falls through to
-    /// pairing for everything, byte-identical to M2b. In a roster daemon this is the SAME
+    /// pairing for everything, exactly as a pairing-only build behaved. In a roster daemon this is the SAME
     /// `Arc<RosterGate>` [`ComposedGate`] holds, so [`install_roster_view_and_sever`] hot-swaps the
     /// live gate's view with a single `install` (no gate rebuild).
     ///
     /// [`ComposedGate`]: crate::roster::gate::ComposedGate
     pub(crate) roster: Arc<RosterGate>,
-    /// Live mesh connections, for D8 revocation-severing on roster install (spec §4.3 rule 6, §4.5).
+    /// Live mesh connections, for revocation-severing on roster install.
     /// [`spawn_accept_loop`] threads it into [`run_mesh_connection`] (CHECK-register on accept); the
-    /// T9 install path calls [`ConnRegistry::sever_matching`] against it.
+    /// install path calls [`ConnRegistry::sever_matching`] against it.
     pub(crate) conn_registry: Arc<ConnRegistry>,
-    /// The roster/presence gossip handle + roster-blob transport (spec §4.3/§10.1), spawned on the
-    /// daemon's ONE endpoint ([RECONCILE-COMPOSE]). `None` in a pure-pairing daemon (no org root
-    /// pinned) — no gossip is spawned, byte-identical to M2b. [`spawn_accept_loop`]'s new gossip/blob
+    /// The roster/presence gossip handle + roster-blob transport, spawned on the
+    /// daemon's ONE endpoint (). `None` in a pure-pairing daemon (no org root
+    /// pinned) — no gossip is spawned, exactly the pairing-only behavior. [`spawn_accept_loop`]'s gossip/blob
     /// arms dispatch inbound connections to these; a `None` arm closes the connection cleanly.
     pub(crate) gossip: Option<iroh_gossip::net::Gossip>,
     pub(crate) blobs: Option<crate::roster::transport::RosterBlobs>,
-    /// The roster-topic subscription (spec §4.3): the sender announces (T6, cloned per call), the
-    /// receiver is moved out ONCE by the converge loop (T6). `None`/empty in a pure-pairing daemon.
+    /// The roster-topic subscription: the sender announces (cloned per call), the receiver is
+    /// moved out ONCE by the converge loop. `None`/empty in a pure-pairing daemon.
     pub(crate) roster_topic: tokio::sync::Mutex<Option<crate::roster::transport::RosterGossip>>,
-    /// The presence-topic subscription (spec §10.1): the publish loop clones the sender to broadcast
-    /// heartbeats; the track loop moves the receiver out ONCE. `None`/empty in a pure-pairing daemon.
-    pub(crate) presence_topic: tokio::sync::Mutex<Option<crate::roster::transport::RosterGossip>>,
-    /// The advisory presence table (spec §10.1): the track loop records verified heartbeats here;
-    /// `status` + (T11) the person→device dial read it for recency ORDERING. ADVISORY-ONLY — no gate,
+    /// The presence-topic subscription: the publish loop clones the sender to broadcast
+    /// heartbeats; the track loop moves the receiver out ONCE. `None`/empty in a pure-pairing
+    /// daemon. Behind an `Arc` because `presence_ctx` shares the SAME
+    /// handle with the presence loops (which own the sender/receiver access).
+    pub(crate) presence_topic:
+        Arc<tokio::sync::Mutex<Option<crate::roster::transport::RosterGossip>>>,
+    /// The advisory presence table: the track loop records verified heartbeats here;
+    /// `status` + the person→device dial read it for recency ORDERING. ADVISORY-ONLY — no gate,
     /// authz check, or sever decision ever consults it (absence never blocks a dial). Always present
     /// (constructed in [`new`](Self::new)); a pure-pairing daemon simply never records into it.
     pub(crate) presence_table: Arc<crate::roster::presence::PresenceTable>,
-    /// The gated per-scope app-blob provider (spec §9, M4a). `None` in a pure-pairing daemon and
+    /// The gated per-scope app-blob provider. `None` in a pure-pairing daemon and
     /// until [`set_app_blobs`](Self::set_app_blobs) installs it (roster mode only — grants use roster
     /// vocabulary). Behind a `tokio::sync::Mutex<Option<..>>` set post-construction (like
     /// `accept_task`/`poll_loop`), so `MeshState::new`'s signature is unchanged and no existing caller
     /// breaks. The accept loop's `APP_BLOB_ALPN` arm reads it per-connection.
     pub(crate) app_blobs: tokio::sync::Mutex<Option<Arc<crate::blobs::provider::AppBlobs>>>,
-    /// The process-wide audit sink (spec §11.3). Set ONCE by [`serve_forever`] before serving via
+    /// The process-wide audit sink. Set ONCE by [`serve_forever`] before serving via
     /// [`set_audit`](Self::set_audit); read by the reload sites (to re-thread it into rebuilt
     /// backends) and the trust-event hooks. `OnceLock` — set-once, lock-free reads, no async.
     /// Empty (→ `AuditSink::disabled()`) in a control-only test daemon.
     pub(crate) audit: std::sync::OnceLock<AuditSink>,
-    /// The process rate/concurrency limiters (spec §11.2 P7). Set ONCE by `serve_forever` before
+    /// The process rate/concurrency limiters. Set ONCE by `serve_forever` before
     /// serving (like `audit`); read by the reload sites (rebuilt backends re-thread it) and the
-    /// accept loop (T9). Empty (→ an unlimited default) in a control-only test daemon.
+    /// accept loop. Empty (→ an unlimited default) in a control-only test daemon.
     pub(crate) limits: std::sync::OnceLock<Arc<crate::limits::MeshLimiters>>,
-    /// The bounded provider address book for roster-blob fetches (spec §11.2 P7). Registered once in
+    /// The bounded provider address book for roster-blob fetches. Registered once in
     /// roster mode; a per-announce address add goes through it (bounded). `None` (unset) → tests use
     /// the per-fetch fallback. Kept in a OnceLock (like `audit`/`limits`) so `MeshState::new` is
     /// unchanged.
     pub(crate) roster_addr_book:
         std::sync::OnceLock<std::sync::Arc<crate::roster::transport::RosterAddrBook>>,
     /// This daemon's precomputed self-sovereign identity presentation for pairing (the device->user
-    /// binding, spec §4.2 identity). Loaded ONCE by [`serve_forever`] from the config
+    /// binding, identity). Loaded ONCE by [`serve_forever`] from the config
     /// `[identity].user_key` (auto-generated if absent) and signed over THIS endpoint via
     /// [`set_self_binding`](Self::set_self_binding) — same set-once discipline as `audit`/`limits`.
     /// `None` (unset) in a control-only/test daemon or when no user key exists → the pairing handlers
-    /// present nothing and paired peers store `user_id: None` (M2b parity).
+    /// present nothing and paired peers store `user_id: None` (the pre-identity behavior).
     pub(crate) self_binding: std::sync::OnceLock<Option<crate::pairing::rendezvous::SelfBinding>>,
     /// Recent INVITER-side pairing completions — a tiny in-memory ring (cap
     /// [`RECENT_PAIRINGS_CAP`]) `status` surfaces so the inviter's HUMAN can read the SAS and
-    /// compare it with the redeemer's out-of-band (spec §4.2 "both humans compare the code"; the
+    /// compare it with the redeemer's out-of-band ("both humans compare the code"; the
     /// redeemer gets the code in its `PairResult`, this is the inviter's porcelain path to the
     /// same words). DISPLAY-ONLY ceremony state, NOT trust data: never persisted, lost on daemon
     /// restart (acceptable — the ceremony happens right after the pair), never an authorization
@@ -203,7 +206,7 @@ pub struct MeshState {
     pub(crate) recent_pairings:
         std::sync::Mutex<std::collections::VecDeque<mcpmesh_local_api::RecentPairing>>,
     /// On-demand reachability probe cache (pairing-mode liveness). Keyed by endpoint-id INTERNALLY;
-    /// [`probe_peer`] writes it and [`reachability_of`] reads it (projecting to the §1.5 PETNAME —
+    /// [`probe_peer`] writes it and [`reachability_of`] reads it (projecting to the PETNAME —
     /// never the id). In-memory + ephemeral: never persisted, lost on restart, never an
     /// authorization input (advisory presence only). std `Mutex` — held only for the tiny
     /// insert/clone, never across an await.
@@ -223,9 +226,10 @@ impl MeshState {
     ///
     /// `pub` so integration tests can build one; the fields stay `pub(crate)`.
     // The mesh half genuinely has 12 collaborators to assemble (endpoint, gate, store, invites,
-    // petname, config, roster, registry — plus M3c's gossip/blobs handles + the roster/presence
-    // topic subscriptions); a params-struct would only rename the same fields. The M3c bump (8 → 12)
-    // extends the deliberate T8 allow; the four new params are `None`/empty in a pure-pairing daemon.
+    // petname, config, roster, registry — plus roster mode's gossip/blobs handles + the two topic
+    // subscriptions); a params-struct would only rename the same fields, and this signature is
+    // pinned by the integration tests that assemble hermetic meshes. The four roster-transport
+    // params are `None`/empty in a pure-pairing daemon.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         endpoint: iroh::Endpoint,
@@ -256,7 +260,7 @@ impl MeshState {
             gossip,
             blobs,
             roster_topic: tokio::sync::Mutex::new(roster_topic),
-            presence_topic: tokio::sync::Mutex::new(presence_topic),
+            presence_topic: Arc::new(tokio::sync::Mutex::new(presence_topic)),
             presence_table: Arc::new(crate::roster::presence::PresenceTable::new()),
             app_blobs: tokio::sync::Mutex::new(None),
             audit: std::sync::OnceLock::new(),
@@ -303,7 +307,7 @@ impl MeshState {
             .collect()
     }
 
-    /// Install the gated app-blob provider (spec §9, M4a) post-construction (roster mode only).
+    /// Install the gated app-blob provider post-construction (roster mode only).
     /// Called by `serve_forever` BEFORE `spawn_accept_loop`, so the `APP_BLOB_ALPN` arm always sees
     /// it once serving begins.
     pub async fn set_app_blobs(&self, provider: Arc<crate::blobs::provider::AppBlobs>) {
@@ -315,7 +319,7 @@ impl MeshState {
         self.app_blobs.lock().await.clone()
     }
 
-    /// Install the process audit sink (spec §11.3), once, before serving. A second call is ignored
+    /// Install the process audit sink, once, before serving. A second call is ignored
     /// (`OnceLock::set` returns `Err`), keeping the invariant self-healing.
     pub fn set_audit(&self, sink: AuditSink) {
         let _ = self.audit.set(sink);
@@ -355,9 +359,9 @@ impl MeshState {
         self.roster_addr_book.get().cloned()
     }
 
-    /// A clone of the roster-topic gossip SENDER (spec §4.3 announce), or `None` in a pure-pairing
-    /// daemon. Cloned under the mutex so `announce_roster` (T6) can broadcast from any site while the
-    /// receiver has been moved out by the converge loop — the sender stays live in `roster_topic`.
+    /// A clone of the roster-topic gossip SENDER, or `None` in a pure-pairing daemon. Cloned
+    /// under the mutex so `announce_roster` can broadcast from any site while the receiver has
+    /// been moved out by the converge loop — the sender stays live in `roster_topic`.
     pub async fn roster_topic_sender(&self) -> Option<iroh_gossip::api::GossipSender> {
         self.roster_topic
             .lock()
@@ -366,8 +370,8 @@ impl MeshState {
             .map(|g| g.sender.clone())
     }
 
-    /// Move the roster-topic gossip RECEIVER out (spec §4.3 converge) — EXACTLY ONCE, for the T6
-    /// receive loop (a `GossipReceiver` is a single-consumer stream). Leaves the sender in place so
+    /// Move the roster-topic gossip RECEIVER out — EXACTLY ONCE, for the distribution receive
+    /// loop (a `GossipReceiver` is a single-consumer stream). Leaves the sender in place so
     /// `roster_topic_sender` still announces. `None` if pure-pairing or already taken.
     pub async fn take_roster_topic_receiver(&self) -> Option<iroh_gossip::api::GossipReceiver> {
         self.roster_topic
@@ -377,32 +381,46 @@ impl MeshState {
             .and_then(|g| g.receiver.take())
     }
 
-    /// A clone of the presence-topic gossip SENDER (spec §10.1 heartbeat), or `None` in a pure-pairing
-    /// daemon / when the subscribe failed. The publish loop clones it once and broadcasts every beat;
-    /// the sender stays live in `presence_topic` after the track loop takes the receiver.
-    pub async fn presence_topic_sender(&self) -> Option<iroh_gossip::api::GossipSender> {
-        self.presence_topic
-            .lock()
-            .await
-            .as_ref()
-            .map(|g| g.sender.clone())
+    /// The narrow context the presence loops run against (`roster::presence::publish_loop` /
+    /// `track_loop`): the presence table, the presence-topic handle, and the roster gate — the
+    /// SAME `Arc`s this struct holds, so the loops observe live roster hot-swaps without ever
+    /// seeing the rest of the daemon.
+    pub(crate) fn presence_ctx(&self) -> crate::roster::presence::PresenceCtx {
+        crate::roster::presence::PresenceCtx {
+            roster: self.roster.clone(),
+            table: self.presence_table.clone(),
+            topic: self.presence_topic.clone(),
+        }
     }
 
-    /// Move the presence-topic gossip RECEIVER out (spec §10.1 track) — EXACTLY ONCE, for the track
-    /// loop (a `GossipReceiver` is a single-consumer stream). Leaves the sender in place so
-    /// `presence_topic_sender` still publishes. `None` if pure-pairing / already taken.
-    pub async fn take_presence_topic_receiver(&self) -> Option<iroh_gossip::api::GossipReceiver> {
-        self.presence_topic
-            .lock()
-            .await
-            .as_mut()
-            .and_then(|g| g.receiver.take())
+    /// The narrow context the inviter-side pair rendezvous runs against: the peer store + invite
+    /// ring + this daemon's identity presentation, plus two hooks that reach back into the mesh —
+    /// `grant` (the config-append + reload machinery behind [`grant_service_access`], which may
+    /// abort/respawn the very accept loop that spawned the handler; safe because the handler is a
+    /// detached child task — see the `InviterCtx` doc) and `record_pairing` (the `status`
+    /// ceremony ring). Assembled per accepted pair connection by the accept loop.
+    pub(crate) fn inviter_ctx(self: &Arc<Self>) -> crate::pairing::rendezvous::InviterCtx {
+        let grant_mesh = self.clone();
+        let record_mesh = self.clone();
+        crate::pairing::rendezvous::InviterCtx {
+            store: self.store.clone(),
+            invites: self.invites.clone(),
+            config_path: self.config_path.clone(),
+            self_binding: self.self_binding(),
+            grant: Box::new(move |petname, services| {
+                let mesh = grant_mesh.clone();
+                Box::pin(async move { grant_service_access(&mesh, &petname, &services).await })
+            }),
+            record_pairing: Box::new(move |petname, sas, paired_at| {
+                record_mesh.record_pairing(petname, sas, paired_at);
+            }),
+        }
     }
 
     /// Record that the installed roster was CONFIRMED current at `now` — the freshness `last_confirmed`
-    /// bump (spec §4.3 P13). Bumps the LIVE gate (the resolve/sever paths see it on the very next call)
+    /// bump. Bumps the LIVE gate (the resolve/sever paths see it on the very next call)
     /// AND persists the instant to the per-node sidecar (`<config_dir>/roster.confirmed`) so a restart
-    /// re-arms freshness at the confirmed time rather than instantly degrading. Called from ALL FOUR
+    /// re-arms freshness at the confirmed time rather than instantly degrading. Called from ALL the
     /// confirmation events: a URL poll whose served serial is `>= installed` (even EQUAL — proof of
     /// currency without a serial bump, the only channel that gives it), a gossip-delivered roster
     /// passing validation, and a manual install. The persist is best-effort — a write failure leaves
@@ -439,13 +457,73 @@ impl MeshState {
     }
 }
 
-/// Build the M1 `Services` registry from config `[services.*]`: a `run` service becomes a
+/// The mesh state IS the roster-distribution channels' host: the narrow seam
+/// `roster::distribute` runs against (endpoint + roster gate + blob transport + topic handles +
+/// the install pipeline), implemented here so that module never sees this struct. The install
+/// pipeline itself lives in [`roster_install`] (`converge_roster_bytes` — the single-writer
+/// converge shared with the manual install).
+impl crate::roster::distribute::DistributionHost for MeshState {
+    fn endpoint(&self) -> &iroh::Endpoint {
+        &self.endpoint
+    }
+
+    fn roster(&self) -> &RosterGate {
+        &self.roster
+    }
+
+    fn blobs(&self) -> Option<&crate::roster::transport::RosterBlobs> {
+        self.blobs.as_ref()
+    }
+
+    fn gossip_active(&self) -> bool {
+        self.gossip.is_some()
+    }
+
+    fn installed_roster_path(&self) -> PathBuf {
+        roster_install::installed_roster_path(self)
+    }
+
+    fn pinned_org_root_pk(&self) -> anyhow::Result<Option<String>> {
+        roster_install::mesh_config_org_root_pk(self)
+    }
+
+    fn addr_book(&self) -> Option<Arc<crate::roster::transport::RosterAddrBook>> {
+        self.roster_addr_book()
+    }
+
+    fn roster_topic_sender(
+        &self,
+    ) -> impl std::future::Future<Output = Option<iroh_gossip::api::GossipSender>> + Send {
+        MeshState::roster_topic_sender(self)
+    }
+
+    fn take_roster_topic_receiver(
+        &self,
+    ) -> impl std::future::Future<Output = Option<iroh_gossip::api::GossipReceiver>> + Send {
+        MeshState::take_roster_topic_receiver(self)
+    }
+
+    fn confirm_roster_current(&self, now: i64) -> impl std::future::Future<Output = ()> + Send {
+        MeshState::confirm_roster_current(self, now)
+    }
+
+    fn install_roster_bytes(
+        &self,
+        bytes: &[u8],
+        serial: u64,
+        channel: &'static str,
+    ) -> impl std::future::Future<Output = anyhow::Result<bool>> + Send {
+        roster_install::converge_roster_bytes(self, bytes, serial, channel)
+    }
+}
+
+/// Build the `Services` registry from config `[services.*]`: a `run` service becomes a
 /// [`SpawnBackend`] (its own concurrency semaphore), a `socket` service a [`SocketBackend`].
 /// Backends carry NO identity — that is threaded per-caller through `SessionBackend::run`
 /// (the injected identity is per-session, the backend is shared). A malformed service (both
 /// or neither backend kind) is logged and skipped rather than failing the whole daemon.
 ///
-/// `pub` so the Task 9 integration test can compose the SAME registry wiring the daemon uses
+/// `pub` so the integration tests can compose the SAME registry wiring the daemon uses
 /// against an in-process endpoint (the daemon's own `run()` is a subprocess; the test drives
 /// the composition directly to prove config → services → gate → backend → env injection).
 pub fn build_services(cfg: &Config) -> Services {
@@ -456,8 +534,8 @@ pub fn build_services(cfg: &Config) -> Services {
     )
 }
 
-/// Build the service registry, giving every backend its service NAME, the audit sink (spec §11.3),
-/// and the shared per-identity request limiter (spec §11.2 P7). The limiter is ONE `Arc` shared
+/// Build the service registry, giving every backend its service NAME, the audit sink,
+/// and the shared per-identity request limiter. The limiter is ONE `Arc` shared
 /// across ALL backends so a peer's rate spans every mount (SECURITY invariant 1, keyed on endpoint).
 pub fn build_services_audited(
     cfg: &Config,
@@ -497,7 +575,7 @@ pub fn build_services_audited(
 }
 
 /// A short, human-glanceable fingerprint of an endpoint id: the first 8 chars of its base32
-/// (`EndpointId`'s `Display`) form. The default self-petname when config sets none (spec §4.2
+/// (`EndpointId`'s `Display`) form. The default self-petname when config sets none (
 /// "suggested petname"). Not security-bearing — the id itself is the routing key.
 fn short_fingerprint(id: &iroh::EndpointId) -> String {
     id.to_string().chars().take(8).collect()
@@ -535,7 +613,7 @@ fn sanitize_hostname(raw: &str) -> Option<String> {
 
 /// Assemble a serving [`DaemonState`] around an already-bound endpoint and peer store, for
 /// in-process integration tests that must drive the REAL control server (`serve_control`) —
-/// the Task 10 proxy round-trip binds a control socket over this and runs `mcpmesh connect` as
+/// the proxy round-trip test binds a control socket over this and runs `mcpmesh connect` as
 /// a subprocess against it, so the actual `open_session` dial-by-id + pipe are exercised. The
 /// mesh's serve loop is inert here (`open_session` reads only the endpoint + store to DIAL
 /// outbound); production assembles its own `MeshState` inline in `serve_forever`.

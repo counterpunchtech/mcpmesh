@@ -1,4 +1,4 @@
-//! Session backends (spec §6.2): the two ways the daemon answers a selected
+//! Session backends: the two ways the daemon answers a selected
 //! service. Each implements `mcpmesh_net::SessionBackend`, so `mcpmesh_net::serve`
 //! hands it the stripped `initialize` frame and the by-value transport, and the
 //! backend owns the session's teardown.
@@ -7,7 +7,7 @@
 //!   its stdio to/from the transport, inject the resolved identity as env vars.
 //! * [`socket`] — the `socket` backend: dial a long-running local MCP server per
 //!   session and inject the resolved identity into the forwarded `initialize`
-//!   `_meta["mcpmesh/peer"]` (authoritative — overwrites, never merges — §6.3).
+//!   `_meta["mcpmesh/peer"]` (authoritative — overwrites, never merges).
 //!
 //! Both backends drive the same session shape once their local MCP server's byte
 //! stream exists: forward the `initialize`, then pump frames both directions over
@@ -15,9 +15,9 @@
 //! thing that differs is HOW the server stream is obtained (fork+stdio vs. dial+UDS)
 //! and HOW identity is injected (env vars vs. `_meta`).
 //!
-//! Fidelity is Value/semantic, not byte-for-byte (D6, the shared property): every
+//! Fidelity is Value/semantic, not byte-for-byte: every
 //! frame round-trips through `serde_json::Value` (object keys re-sorted, no
-//! `arbitrary_precision`) — the same caveat as the M1 mesh transport. The platform
+//! `arbitrary_precision`) — the same caveat as the mesh transport. The platform
 //! pumps and never INTERPRETS the MCP method/result semantics; it does re-serialize
 //! the JSON.
 use anyhow::{Context, Result};
@@ -30,11 +30,11 @@ use tokio::io::{AsyncRead, AsyncWrite, BufReader};
 pub mod socket;
 pub mod spawn;
 
-/// Per-session frame cap for the local MCP server's output (spec §12 default,
-/// 16 MiB) — the same bound `mcpmesh_net::serve` applies to the mesh transport.
+/// Per-session frame cap for the local MCP server's output (16 MiB) — the same
+/// bound `mcpmesh_net::serve` applies to the mesh transport.
 pub(crate) const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
-// NOTE (Task 9 review): the per-service spawn cap (spec §6.2) is fully HANDLED inside
+// NOTE: the per-service spawn cap is fully HANDLED inside
 // `SpawnBackend::run_over` — on cap it synthesizes `-32053` on the transport and returns
 // `Ok(())` (a clean refusal, not a session error). There is deliberately no returned error
 // type: `run_session` lives in `mcpmesh-net`, which cannot depend on a cli error type (a real
@@ -55,7 +55,7 @@ pub(crate) const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 /// just throughput: with a single loop, awaiting a blocked write in one direction
 /// (e.g. the server's input pipe is full because the peer is not draining the
 /// server's output) would prevent reading the other direction — a classic full-duplex
-/// pipe deadlock, reachable under §7.3's 16 MiB frames. Running the directions
+/// pipe deadlock, reachable under 16 MiB frames. Running the directions
 /// concurrently means direction B keeps draining the server's output (unblocking a
 /// full pipe) while direction A is blocked writing, so neither side can wedge. A
 /// wedge would be doubly bad: `run_over` would never return, so the spawn backend's
@@ -69,7 +69,7 @@ pub(crate) const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 /// fine — the session is closing).
 ///
 /// A trusted local server that emits a malformed line is a bug, not an attack: the
-/// session ends rather than interpreting it (D6).
+/// session ends rather than interpreting it (the platform pumps, never interprets).
 pub(crate) async fn pump<TR, TW, SR, SW>(
     initialize: Value,
     transport: &mut NdjsonTransport<TR, TW>,
@@ -104,7 +104,7 @@ where
         loop {
             match transport.recv_value().await {
                 Ok(Some(frame)) => {
-                    // Per-identity rate limit (spec §7.3 / §11.2 P7): consult BEFORE forwarding a
+                    // Per-identity rate limit: consult BEFORE forwarding a
                     // proxied REQUEST/notification (a method-bearing frame). FAIL-SAFE over-limit —
                     // DROP the request (never forward, never queue), reply -32053{retry_after_ms}
                     // for a request id (silent-drop a notification), and CONTINUE the session
@@ -119,7 +119,7 @@ where
                         }
                         continue;
                     }
-                    // Proxied-request-line hook (spec §11.3): hash args + record method/tool BEFORE
+                    // Proxied-request-line audit hook: hash args + record method/tool BEFORE
                     // forwarding. PRIVACY — sees raw args (the server needs them); stores only blake3.
                     auditor.on_request(&frame);
                     if write_frame(&mut server_write, &frame).await.is_err() {
@@ -138,7 +138,7 @@ where
         loop {
             match server_out.next().await {
                 Ok(Some(Inbound::Frame(frame))) => {
-                    // Response correlation (spec §11.3): count the bytes going OUT to the peer (a
+                    // Response correlation: count the bytes going OUT to the peer (a
                     // COUNT, never the content) and let the auditor emit the completed request record.
                     let bytes_out = serde_json::to_vec(&frame)
                         .map(|v| v.len() as u64)
