@@ -2255,6 +2255,12 @@ pub(crate) async fn add_peer(state: &DaemonState, params: PeerAddParams) -> Resu
 /// allow name that also trips the pairing collision guard on a later re-pair; revoke-first avoids
 /// that.)
 ///
+/// **Unknown petname is an error (DECLARED).** When NEITHER half tears anything down (no allow
+/// stripped, no PeerEntry deleted) the petname matches no paired peer, and the removal FAILS with
+/// a pointer at `mcpmesh status` — false success on a revocation surface would make a typo read
+/// as a completed cut-off. Each half stays individually idempotent, so retrying a
+/// partially-failed removal (allow stripped, identity row still present) still finishes clean.
+///
 /// **Live sessions (M3/D8).** This severs only the ability to establish NEW authorized sessions;
 /// an in-flight mesh session runs to completion (session severing is deferred to M3).
 ///
@@ -2282,17 +2288,24 @@ pub async fn remove_peer(state: &DaemonState, params: PeerRemoveParams) -> Resul
         .await
         .context("join peer remove")??;
 
-    tracing::info!(peer = %petname, "unpaired peer");
-    // Trust event (spec §11.3): an unpair — recorded ONLY when something was ACTUALLY torn down (a
-    // stripped allow OR a deleted PeerEntry). `pair --remove <never-paired>` is an idempotent no-op on
-    // both halves, so it writes NO phantom `unpair` record. Petname only (§1.5).
-    if revoked || removed {
-        mesh.audit().record(AuditRecord::trust(
-            now_ts(),
-            "unpair".into(),
-            Some(petname.clone()),
-        ));
+    // Actual-removal signal: neither an allow stripped NOR a PeerEntry deleted means the petname
+    // matches no paired peer. `pair --remove` is a REVOCATION surface — reporting success here
+    // would let a typo ("alice" vs "Alice") read as a completed cut-off — so an all-no-op removal
+    // is an ERROR, not a silent success. Retry-after-partial-failure still completes: with the
+    // allow already stripped but the identity row still present, `removed` comes back true.
+    if !revoked && !removed {
+        anyhow::bail!("no paired peer named '{petname}' — 'mcpmesh status' lists your peers");
     }
+
+    tracing::info!(peer = %petname, "unpaired peer");
+    // Trust event (spec §11.3): an unpair — reached only when something was ACTUALLY torn down (a
+    // stripped allow OR a deleted PeerEntry; the all-no-op case errored above), so a refused
+    // remove of a never-paired petname writes NO phantom `unpair` record. Petname only (§1.5).
+    mesh.audit().record(AuditRecord::trust(
+        now_ts(),
+        "unpair".into(),
+        Some(petname.clone()),
+    ));
     Ok(())
 }
 
@@ -2466,6 +2479,31 @@ fn sanitize_hostname(raw: &str) -> Option<String> {
     (!cleaned.is_empty()).then_some(cleaned)
 }
 
+/// The invite-time registration check: the refusal message when any requested service name has
+/// no well-formed `[services.<name>]` entry, or `None` when every name is registered. Pure over
+/// (requested, served) so the message shapes are unit-testable. The message states what IS
+/// served (or that nothing is yet) and names the exact next command — never wire vocabulary.
+fn unregistered_service_error(requested: &[String], served: &[String]) -> Option<String> {
+    let unknown: Vec<&String> = requested.iter().filter(|r| !served.contains(r)).collect();
+    let quoted: Vec<String> = unknown.iter().map(|n| format!("'{n}'")).collect();
+    let named = match quoted.as_slice() {
+        [] => return None,
+        [one] => format!("no service named {one}"),
+        many => format!("no services named {}", many.join(", ")),
+    };
+    Some(if served.is_empty() {
+        format!(
+            "{named} — nothing is served yet; register one with \
+             'mcpmesh serve <name> -- <command>'"
+        )
+    } else {
+        format!(
+            "{named} — you serve: {} (see 'mcpmesh status')",
+            served.join(", ")
+        )
+    })
+}
+
 /// Mint a one-time pairing invite granting `services` (spec §4.2, control method `"invite"`).
 ///
 /// Builds an [`Invite`] { 32 CSPRNG-byte secret, our endpoint id + dialable address, our
@@ -2478,8 +2516,24 @@ fn sanitize_hostname(raw: &str) -> Option<String> {
 /// mint uses (mcpmesh-trust), no new crate. The address comes from `endpoint.addr()`; we first
 /// wait (bounded by [`RELAY_READY_TIMEOUT`]) for the endpoint to come online so the addr
 /// carries the home-relay URL the redeemer bootstraps from across NAT (§4.2).
+///
+/// **Registration check (DECLARED).** Every requested name must have a well-formed
+/// `[services.<name>]` entry, or the mint is REFUSED: an invite for an unregistered name would
+/// redeem fine, pass the safety-code ceremony, and only fail at connect time on the REDEEMER's
+/// machine — the worst place to discover the inviter's typo. Validated against the SAME view
+/// `status` renders ([`service_infos`], read live from disk like `status_result`), so the
+/// refusal's "you serve:" list always matches what `mcpmesh status` shows.
 pub(crate) async fn mint_invite(services: Vec<String>, mesh: &MeshState) -> Result<InviteResult> {
     use rand::RngCore;
+
+    // Registration check FIRST — before the CSPRNG mint and the online()-wait, so a typo'd
+    // name fails fast and never touches the invite registry.
+    let cfg = Config::load(&mesh.config_path)
+        .map_err(|e| anyhow::anyhow!("config error in {}: {e}", mesh.config_path.display()))?;
+    let served: Vec<String> = service_infos(&cfg).into_iter().map(|s| s.name).collect();
+    if let Some(msg) = unregistered_service_error(&services, &served) {
+        anyhow::bail!(msg);
+    }
 
     // 32 CSPRNG bytes — the single-use bearer credential (spec §4.2).
     let mut secret = [0u8; 32];
@@ -2772,6 +2826,36 @@ mod tests {
         assert_eq!(sanitize_hostname("   ").as_deref(), None);
         assert_eq!(sanitize_hostname("").as_deref(), None);
         assert_eq!(sanitize_hostname(".local").as_deref(), None);
+    }
+
+    /// The invite registration-check message shapes: silent on all-registered, names the missing
+    /// service(s), lists what IS served (matching `status`) or says nothing is served yet, and
+    /// always states the exact next command — never wire vocabulary.
+    #[test]
+    fn unregistered_service_error_message_shapes() {
+        let s = |names: &[&str]| -> Vec<String> { names.iter().map(|n| n.to_string()).collect() };
+
+        // Every requested name registered → no error.
+        assert_eq!(
+            unregistered_service_error(&s(&["notes"]), &s(&["notes", "kb"])),
+            None
+        );
+        // One unknown name, with a served list → name it, list what IS served, point at status.
+        assert_eq!(
+            unregistered_service_error(&s(&["nosuchsvc"]), &s(&["notes", "code"])).unwrap(),
+            "no service named 'nosuchsvc' — you serve: notes, code (see 'mcpmesh status')"
+        );
+        // Several unknown names → all of them named (the mixed known name is not).
+        assert_eq!(
+            unregistered_service_error(&s(&["a", "notes", "b"]), &s(&["notes"])).unwrap(),
+            "no services named 'a', 'b' — you serve: notes (see 'mcpmesh status')"
+        );
+        // Nothing served at all → say so, and name the serve command as the next step.
+        assert_eq!(
+            unregistered_service_error(&s(&["nosuchsvc"]), &[]).unwrap(),
+            "no service named 'nosuchsvc' — nothing is served yet; register one with \
+             'mcpmesh serve <name> -- <command>'"
+        );
     }
 
     /// The blob control operations fail gracefully (Err, never a panic) in control-only mode — the

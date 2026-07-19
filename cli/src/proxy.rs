@@ -18,7 +18,9 @@
 //! shapes and locations are the AI clients' to change, a half-working writer that silently targets
 //! the wrong file is worse than no writer, and a human who pastes the line knows what they mounted.
 use anyhow::{Context, Result};
+use mcpmesh_net::errors::{ERR_SERVICE, ERR_UNREACHABLE};
 use mcpmesh_net::framing::{FrameReader, Inbound, write_frame};
+use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 use crate::client::ensure_daemon;
@@ -119,16 +121,49 @@ pub fn client_instruction_lines(peer: &str, services: &[String]) -> Vec<String> 
 /// Run the proxy: connect the daemon, open the session (the shared client's `open_session`
 /// sends the frame and hands back the raw framed halves — the socket stops being JSON-RPC),
 /// then pump stdio <-> control verbatim.
+///
+/// One human-facing exception to full transparency (issue #10): when stdout is a TERMINAL —
+/// so a person, not an MCP client, ran `connect` — and the session ended on a
+/// mesh-synthesized refusal frame, one plain hint line goes to STDERR. The stdout protocol,
+/// the relayed frame, and the exit-0 semantics the real consumer depends on are untouched.
 pub async fn run(peer: String, service: String) -> Result<()> {
     let client = ensure_daemon().await?;
-    let (control_reader, control_writer) = client.open_session(peer, service).await?;
-    pump_stdio(
+    let (control_reader, control_writer) = client.open_session(peer.clone(), service).await?;
+    let ended_on_mesh_error = pump_stdio(
         tokio::io::stdin(),
         tokio::io::stdout(),
         control_reader,
         control_writer,
     )
-    .await
+    .await?;
+    if ended_on_mesh_error.is_some() && std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        eprintln!("{}", unreachable_hint_line(&peer));
+    }
+    Ok(())
+}
+
+/// The one stderr line a human at a terminal gets when their `connect` session ended on a
+/// mesh-synthesized refusal (issue #10). Pure so it is unit-testable. Surface-clean (§1.5):
+/// the peer petname + porcelain commands only.
+fn unreachable_hint_line(peer: &str) -> String {
+    format!(
+        "peer unreachable — is {peer} online? ('mcpmesh status' shows reachability). \
+         This command is normally run by your MCP client."
+    )
+}
+
+/// `Some(code)` when `frame` is a mesh-SYNTHESIZED pre-response refusal — the `-32055`
+/// unreachable / `-32054` service-refusal pair carrying the mandatory `data.source ==
+/// "mcpmesh"` marker (spec §7.4). A backend's own JSON-RPC errors (no marker) and the other
+/// platform codes (e.g. a mid-session rate limit) return `None`: only the two
+/// session-refusing shapes warrant the human hint.
+fn mesh_error_code(frame: &Value) -> Option<i64> {
+    let error = frame.get("error")?;
+    if error.get("data")?.get("source")?.as_str()? != "mcpmesh" {
+        return None;
+    }
+    let code = error.get("code")?.as_i64()?;
+    (code == ERR_UNREACHABLE || code == ERR_SERVICE).then_some(code)
 }
 
 /// Bidirectionally pump MCP frames between the AI client's stdio and the control connection
@@ -139,12 +174,16 @@ pub async fn run(peer: String, service: String) -> Result<()> {
 /// half-closes toward the daemon and then drains, because a synthesized -32055 can already be
 /// buffered on the control socket when the stdin->control write hits the dead pipe — the AI
 /// client must still be handed that well-formed answer, not a bare EOF (§8).
+///
+/// Returns the [`mesh_error_code`] of the LAST frame relayed to stdout when the session ended
+/// on a mesh-synthesized refusal, else `None` — the caller's seam for the human TTY hint
+/// (issue #10). Purely observational: every frame still flows verbatim.
 pub(crate) async fn pump_stdio<SI, SO, CR, CW>(
     stdin: SI,
     mut stdout: SO,
     mut control_reader: FrameReader<CR>,
     mut control_writer: CW,
-) -> Result<()>
+) -> Result<Option<i64>>
 where
     SI: AsyncRead + Unpin + Send,
     SO: AsyncWrite + Unpin + Send,
@@ -173,11 +212,14 @@ where
         std::future::pending::<()>().await
     };
     // control (the daemon's session pipe) -> stdout (AI client). Relays session responses AND
-    // a synthesized -32055/-32054 error frame verbatim (spec §8).
+    // a synthesized -32055/-32054 error frame verbatim (spec §8), remembering whether the
+    // LAST relayed frame was such a refusal (reset by any later ordinary frame).
     let to_stdout = async {
+        let mut ended_on: Option<i64> = None;
         loop {
             match control_reader.next().await {
                 Ok(Some(Inbound::Frame(frame))) => {
+                    ended_on = mesh_error_code(&frame);
                     if write_frame(&mut stdout, &frame).await.is_err() {
                         break; // stdout closed
                     }
@@ -186,13 +228,14 @@ where
                 Ok(None) | Err(_) => break, // remote closed / IO error → clean EOF (§8)
             }
         }
+        ended_on
     };
-    tokio::select! {
-        () = to_control => {}
-        () = to_stdout => {}
-    }
+    let ended_on = tokio::select! {
+        () = to_control => None, // unreachable: to_control parks forever after its half-close
+        ended = to_stdout => ended,
+    };
     let _ = stdout.shutdown().await;
-    Ok(())
+    Ok(ended_on)
 }
 
 #[cfg(test)]
@@ -346,10 +389,11 @@ mod tests {
                 daemon_reader.next().await.unwrap().is_none(),
                 "stdin close must propagate to the daemon as a half-close"
             );
-            // …and the daemon closing in turn ends the pump (clean EOF, §8).
+            // …and the daemon closing in turn ends the pump (clean EOF, §8). The last frame
+            // relayed was the synthesized -32055, so the pump reports it (the TTY-hint seam).
             drop(daemon_reader);
             drop(dc_w);
-            pump.await.unwrap().unwrap();
+            assert_eq!(pump.await.unwrap().unwrap(), Some(-32055));
         })
         .await
         .expect("pump test timed out");
@@ -397,10 +441,84 @@ mod tests {
                     other => panic!("the -32055 must reach stdout, got {other:?}"),
                 }
                 drop(a_in);
-                pump.await.unwrap().unwrap();
+                assert_eq!(pump.await.unwrap().unwrap(), Some(-32055));
             }
         })
         .await
         .expect("drain test timed out");
+    }
+
+    /// A session that ends on an ORDINARY frame (a real MCP response, then clean close)
+    /// reports no mesh error — the human hint must never fire on a successful session.
+    #[tokio::test]
+    async fn clean_session_end_reports_no_mesh_error() {
+        timeout(Duration::from_secs(10), async {
+            let (a_in, b_in) = duplex(64 * 1024);
+            let (a_out, b_out) = duplex(64 * 1024);
+            let (pc, dc) = duplex(64 * 1024);
+            let (pc_r, pc_w) = split(pc);
+            let (dc_r, mut dc_w) = split(dc);
+
+            let resp = json!({"jsonrpc":"2.0","id":1,"result":{"ok":true}});
+            write_frame(&mut dc_w, &resp).await.unwrap();
+            drop(dc_w);
+            drop(dc_r);
+
+            let pump = tokio::spawn(pump_stdio(
+                b_in,
+                b_out,
+                FrameReader::new(pc_r, MAX_FRAME_BYTES),
+                pc_w,
+            ));
+            let mut a_out_reader = FrameReader::new(a_out, MAX_FRAME_BYTES);
+            match a_out_reader.next().await.unwrap().unwrap() {
+                Inbound::Frame(f) => assert_eq!(f, resp),
+                other => panic!("expected the response frame, got {other:?}"),
+            }
+            drop(a_in);
+            assert_eq!(pump.await.unwrap().unwrap(), None);
+        })
+        .await
+        .expect("clean-end test timed out");
+    }
+
+    #[test]
+    fn mesh_error_code_matches_only_the_synthesized_refusal_pair() {
+        // The two session-refusing shapes, WITH the §7.4 marker → Some.
+        let unreachable = json!({"jsonrpc":"2.0","id":null,"error":{"code":-32055,
+            "message":"peer unreachable","data":{"source":"mcpmesh"}}});
+        assert_eq!(mesh_error_code(&unreachable), Some(-32055));
+        let refused = json!({"jsonrpc":"2.0","id":null,"error":{"code":-32054,
+            "message":"unknown or unauthorized service","data":{"source":"mcpmesh"}}});
+        assert_eq!(mesh_error_code(&refused), Some(-32054));
+        // A backend's OWN JSON-RPC error (no source marker) is the service's business.
+        let backend = json!({"jsonrpc":"2.0","id":1,"error":{"code":-32055,"message":"x"}});
+        assert_eq!(mesh_error_code(&backend), None);
+        // Another platform code (a mid-session rate limit) does not end a session.
+        let limited = json!({"jsonrpc":"2.0","id":1,"error":{"code":-32053,
+            "message":"rate limited","data":{"source":"mcpmesh"}}});
+        assert_eq!(mesh_error_code(&limited), None);
+        // An ordinary response is no error at all.
+        assert_eq!(
+            mesh_error_code(&json!({"jsonrpc":"2.0","id":1,"result":{}})),
+            None
+        );
+    }
+
+    #[test]
+    fn unreachable_hint_line_names_the_peer_and_the_status_command_only() {
+        let line = unreachable_hint_line("alice");
+        assert!(
+            line.contains("is alice online?") && line.contains("'mcpmesh status'"),
+            "the hint names the peer and the exact next command: {line}"
+        );
+        assert!(
+            line.contains("normally run by your MCP client"),
+            "the hint explains who normally runs connect: {line}"
+        );
+        // §1.5/§17: no transport vocabulary in a human-facing line.
+        for term in ["ALPN", "endpoint", "iroh", "dial", "-32055"] {
+            assert!(!line.contains(term), "hint leaked '{term}': {line}");
+        }
     }
 }

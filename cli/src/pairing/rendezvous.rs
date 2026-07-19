@@ -423,7 +423,7 @@ pub async fn redeem_invite(
     let conn = endpoint
         .connect(addr, mcpmesh_net::ALPN_PAIR)
         .await
-        .context("dial the inviter on the pairing ALPN")?;
+        .context("could not dial the inviter's machine")?;
 
     // P3 address-swap defense: the TLS-authenticated peer id is AUTHORITATIVE. If it is not the
     // id the invite names, we reached a substituted/MITM endpoint — refuse BEFORE revealing the

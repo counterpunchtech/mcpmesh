@@ -293,10 +293,12 @@ async fn org_create_cleans_up_the_staged_temp_when_the_install_is_rejected() {
         );
         // The failure is the daemon's install REJECTION (a staged temp was written + handed to the
         // daemon, which rejected the serial-1 rollback) — not some earlier bail, so the cleanup path
-        // is genuinely exercised. The daemon collapses validation failures to "roster_install failed".
+        // is genuinely exercised. "roster failed validation" is the install-rejection sentence
+        // (install_from_file); the wire's "roster_install failed:" framing is stripped by the
+        // porcelain error renderer (issue #10), so it must NOT be asserted here.
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
-            stderr.contains("roster_install failed"),
+            stderr.contains("roster failed validation"),
             "expected a daemon install rejection, got: {stderr}"
         );
 
