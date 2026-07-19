@@ -1,7 +1,7 @@
-//! Porcelain-side client of mcpmesh-local/1 (spec §6.1). The WIRE client — connect the UDS,
+//! Porcelain-side client of mcpmesh-local/1. The WIRE client — connect the UDS,
 //! read the server's `Hello` first frame, issue request/response frames, `open_session`'s
 //! raw-pipe transition — is THE shared no-iroh implementation in
-//! [`mcpmesh_local_api::client`] (D5: one mcpmesh-local/1 client, re-exported here); this module
+//! [`mcpmesh_local_api::client`] (one mcpmesh-local/1 client, re-exported here); this module
 //! layers on top of it only what the PORCELAIN adds: `ensure_daemon` auto-starts a detached
 //! daemon when the socket is dead and converges on the single flock winner.
 use std::ffi::OsString;
@@ -35,8 +35,8 @@ impl DaemonLaunch {
     }
 }
 
-/// Return a connected client to the running daemon, auto-starting it if the socket is dead
-/// (spec §6.1). Idempotent: a second caller connects to the already-running daemon; racing
+/// Return a connected client to the running daemon, auto-starting it if the socket is dead.
+/// Idempotent: a second caller connects to the already-running daemon; racing
 /// callers converge on the single flock winner.
 pub async fn ensure_daemon() -> Result<ControlClient> {
     ensure_daemon_with(&DaemonLaunch::ambient()?).await

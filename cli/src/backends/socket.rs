@@ -1,18 +1,18 @@
-//! The `socket` backend (spec §6.2/§6.3): the daemon dials a long-running local
+//! The `socket` backend: the daemon dials a long-running local
 //! MCP server on its local endpoint (a UDS path on unix; a `\\.\pipe\…` name on
 //! windows) per session and injects the resolved caller identity into the forwarded
 //! `initialize` as `_meta["mcpmesh/peer"]`.
 //!
-//! The injection is AUTHORITATIVE — it REPLACES, never merges (§6.3). The value the
+//! The injection is AUTHORITATIVE — it REPLACES, never merges. The value the
 //! backend writes is the daemon-authored one; a caller-forged `_meta["mcpmesh/peer"]`
 //! must never survive. In the real flow `select_service` has already STRIPPED every
 //! caller `mcpmesh/*` key upstream, so the forged key is already gone — this REPLACE is
 //! both defense-in-depth AND the single authoritative source of the value the warm
 //! server trusts.
 //!
-//! Unlike the `run` backend, the server is a warm, shared process (e.g. the kb
-//! daemon in M2+), so identity cannot travel as per-process env vars; it rides in
-//! the MCP `initialize` `_meta` instead (§6.3). Once the socket is dialed and the
+//! Unlike the `run` backend, the server is a warm, shared process (e.g. a
+//! plugin daemon), so identity cannot travel as per-process env vars; it rides in
+//! the MCP `initialize` `_meta` instead. Once the socket is dialed and the
 //! augmented `initialize` sent, the session is the SAME bidirectional frame pump the
 //! spawn backend uses (`super::pump`, one codec).
 use anyhow::{Context, Result};
@@ -27,22 +27,22 @@ use crate::audit::{AuditSink, RequestAuditor};
 /// local MCP server's endpoint (a UDS path on unix; a `\\.\pipe\…` name on windows),
 /// dialed fresh per session. The caller
 /// identity is NOT a field — it is threaded per-session through
-/// [`SessionBackend::run`] (`Some` iff the peer resolved through the trust gate,
-/// spec §6.3), because `serve` shares this backend across all callers (Task 9).
+/// [`SessionBackend::run`] (`Some` iff the peer resolved through the trust gate),
+/// because `serve` shares this backend across all callers.
 ///
-/// No per-session concurrency cap (conscious decision, spec §6.2): the cap scopes to
+/// No per-session concurrency cap (conscious decision): the cap scopes to
 /// `run` (spawn) backends — one child per session, so unbounded sessions mean
 /// unbounded processes. A `socket` backend dials ONE long-running server that
 /// multiplexes its own sessions, so the daemon adds no per-session limit here; the
-/// general per-identity defense against abuse is the M4 token bucket (§5). Hence no
+/// general per-identity defense against abuse is the request token bucket. Hence no
 /// `concurrency` field, unlike [`super::spawn::SpawnBackend`].
 pub struct SocketBackend {
     pub path: String,
-    /// This service's name (the registry key) — recorded as `service` in audit records (spec §11.3).
+    /// This service's name (the registry key) — recorded as `service` in audit records.
     pub service: String,
-    /// The audit sink (spec §11.3). `AuditSink::disabled()` in tests / a non-audited build.
+    /// The audit sink. `AuditSink::disabled()` in tests / a non-audited build.
     pub audit: AuditSink,
-    /// The per-authenticated-endpoint request limiter (spec §11.2 P7), shared across all backends.
+    /// The per-authenticated-endpoint request limiter, shared across all backends.
     /// Consulted per proxied request line in `super::pump`. Keyed on `identity.endpoint`.
     pub limiter: std::sync::Arc<crate::limits::RateLimiter>,
 }
@@ -85,11 +85,11 @@ impl SocketBackend {
             .with_context(|| format!("dial socket backend at {}", self.path))?;
 
         if let Some(id) = &identity {
-            // REPLACE-not-merge (§6.3 + the Task 9 seam note): a caller-forged
+            // REPLACE-not-merge: a caller-forged
             // `mcpmesh/peer` must never survive. Guard non-object shapes before indexing
             // — `Value`'s IndexMut PANICS on a non-object base — building each level:
             //   * root: a bare array/string/number/bool first frame would panic on the
-            //     `initialize["params"]` write below (reachable once T9 wires this:
+            //     `initialize["params"]` write below (reachable:
             //     select_service's key-absent default forwards even a non-object frame).
             //     A fresh object discards it; a null root is coerced by IndexMut anyway.
             //   * params / _meta: absent or non-object → build an empty object.
@@ -102,8 +102,8 @@ impl SocketBackend {
             if !initialize["params"]["_meta"].is_object() {
                 initialize["params"]["_meta"] = serde_json::json!({});
             }
-            // Whole-value overwrite: forged `groups`/`user_id` (authorization-relevant,
-            // §6.3) are dropped along with a forged `name`, not merged over.
+            // Whole-value overwrite: forged `groups`/`user_id` (authorization-relevant)
+            // are dropped along with a forged `name`, not merged over.
             initialize["params"]["_meta"]["mcpmesh/peer"] = serde_json::json!({
                 "name": id.name,
                 // The peer's self-sovereign user_id: the org roster value in roster mode, else the
@@ -116,7 +116,7 @@ impl SocketBackend {
             });
         }
 
-        // Session lifecycle audit (spec §11.3): attribute to the gate-resolved identity — the roster
+        // Session lifecycle audit: attribute to the gate-resolved identity — the roster
         // user_id when present, else the petname (endpoint_id-keyed authenticated name, never a
         // self-asserted one). `None` only on a hypothetical no-identity path.
         let peer = identity
@@ -128,7 +128,7 @@ impl SocketBackend {
         let _session = self
             .audit
             .session(peer.clone().unwrap_or_default(), self.service.clone());
-        // The per-request-line auditor (Task 4): hashes each caller request's args and correlates
+        // The per-request-line auditor: hashes each caller request's args and correlates
         // the response. Threaded into the shared pump.
         let auditor = RequestAuditor::new(self.audit.clone(), peer.clone(), self.service.clone());
 
@@ -326,7 +326,7 @@ mod tests {
     }
 
     /// `params` absent entirely: the backend builds `params` then `_meta` and injects
-    /// cleanly (the Task 9 seam note — params may be non-object, guard it).
+    /// cleanly (params may be non-object, guard it).
     #[tokio::test]
     async fn socket_backend_builds_params_when_absent() {
         timeout(Duration::from_secs(30), async {
@@ -678,7 +678,7 @@ mod tests {
     }
 
     /// A driven session emits exactly one `session_open` and one `session_close` record for the
-    /// resolved peer + service (spec §11.3 session lifecycle). Uses a real temp-dir AuditLog.
+    /// resolved peer + service (the session-lifecycle audit contract). Uses a real temp-dir AuditLog.
     #[tokio::test]
     async fn socket_backend_records_session_open_and_close() {
         use crate::audit::{AuditLog, AuditSink};

@@ -1,8 +1,8 @@
-//! Rate-limiting primitives (spec §7.3 / §11.2 P7): a monotonic token bucket + a bounded,
+//! Rate-limiting primitives: a monotonic token bucket + a bounded,
 //! idle-evicting per-endpoint bucket map. PURE and FAIL-SAFE by construction — an over-limit check
 //! DENIES (returns a retry hint), never serves-more; the bucket map self-prunes so a churn of distinct
-//! AUTHENTICATED endpoints cannot grow memory without bound (the AC's "no unbounded memory"). Keyed
-//! ONLY on the authenticated `EndpointId` (never a self-asserted name — SECURITY invariant 1).
+//! AUTHENTICATED endpoints cannot grow memory without bound. Keyed ONLY on the authenticated
+//! `EndpointId` (never a self-asserted name — the core attribution invariant).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -69,8 +69,8 @@ struct Tracked {
     last_seen: Instant,
 }
 
-/// A bounded, idle-evicting map of per-endpoint token buckets (spec §11.2 P7 "per-identity token
-/// buckets"; the AC's "no unbounded memory"). Keyed ONLY on the authenticated `EndpointId`.
+/// A bounded, idle-evicting map of per-identity token buckets (no unbounded memory).
+/// Keyed ONLY on the authenticated `EndpointId`.
 pub struct RateLimiter {
     capacity: f64,
     refill_per_sec: f64,
@@ -78,7 +78,7 @@ pub struct RateLimiter {
 }
 
 impl RateLimiter {
-    /// Build from a per-minute rate (spec §12 `[limits].rate_limit_per_min`). `burst` = bucket
+    /// Build from a per-minute rate (config `[limits].rate_limit_per_min`). `burst` = bucket
     /// capacity (the instantaneous allowance); sustained rate = `per_min / 60` tokens·s⁻¹.
     pub fn per_minute(per_min: u32, burst: u32) -> Self {
         Self {
@@ -159,19 +159,18 @@ impl RateGate {
     }
 }
 
-/// Global pair-ALPN accept rate (spec §7.1/§4.2, the M2b-deferred per-connection limit). The pair
-/// ALPN accepts strangers by design, who pick fresh ids — so a SINGLE global bucket bounds a
+/// Global pairing-accept rate. The pairing listener accepts strangers by design, who pick
+/// fresh ids — so a SINGLE global bucket bounds a
 /// distinct-id flood (a per-endpoint map would be defeated by fresh ids). NOT the removed per-invite
 /// attempt cap; the 32-byte secret is the security.
 const PAIR_ACCEPT_PER_MIN: u32 = 30;
-/// Per-authenticated-endpoint app-blob CONNECTION rate (spec §9, the M4a-deferred bound): a valid
+/// Per-authenticated-endpoint app-blob CONNECTION rate: a valid
 /// roster member with no scope grant can open blob connections whose GETs are denied — this bounds
 /// that churn per endpoint.
 const BLOB_CONN_PER_MIN: u32 = 60;
 
-/// The daemon's rate/concurrency limiter bundle (spec §11.2 P7), built ONCE from config and carried
-/// on `MeshState`. Bundled so `MeshState` gains ONE handle. Every map is bounded (T1). T9 extends
-/// this with the pair-accept + blob-connection limiters.
+/// The daemon's rate/concurrency limiter bundle, built ONCE from config and carried
+/// on `MeshState`. Bundled so `MeshState` gains ONE handle. Every map is bounded.
 pub struct MeshLimiters {
     /// Per-authenticated-endpoint proxied-request buckets (`[limits].rate_limit_per_min`).
     pub requests: Arc<RateLimiter>,

@@ -1,15 +1,16 @@
-//! `mcpmesh doctor` (spec §1.6/§13): a local-only, read-only health diagnostic. It inspects the on-disk
+//! `mcpmesh doctor`: a local-only, read-only health diagnostic. It inspects the on-disk
 //! config/keys/runtime dir and OPTIONALLY pings the local daemon, then reports actionable WARN/ERROR
 //! findings. It NEVER mutates trust/config, NEVER mints a key (it STATS key files, never
 //! `load_or_generate`), NEVER auto-starts the daemon (`connect_control`, not `ensure_daemon`), and
 //! NEVER touches the network — a diagnostic, not an actuator.
 //!
-//! Surface-clean (§1.5): findings carry flat vocabulary, file PATHS (§13 sanctions doctor printing the
-//! resolved paths), plain state words, and octal mode strings ONLY — never an EndpointId / pubkey /
-//! ALPN / blob hash / raw key bytes. The raw-id surface stays at `mcpmesh internal id`.
+//! Surface-clean: findings carry flat vocabulary, file PATHS (doctor is the one surface allowed
+//! to print the resolved paths), plain state words, and octal mode strings ONLY — never an
+//! endpoint id / pubkey / ALPN / blob hash / raw key bytes. The raw-id surface stays at
+//! `mcpmesh internal id`.
 //!
 //! Every verdict is produced by a PURE `check_*` fn (unit-tested with literal inputs, no daemon); the
-//! only impure code is `gather`/`probe_daemon`/`run_doctor` (T4).
+//! only impure code is `gather`/`probe_daemon`/`run_doctor`.
 
 /// The severity of one check. `Info` is below `Ok` for exit purposes (purely advisory, never
 /// warns): it carries a platform note such as the Windows "permission lints don't apply here"
@@ -56,7 +57,7 @@ impl Verdict {
     }
 }
 
-/// §10.3: the `[network]` posture, checked against what ACTUALLY ships. Validation is the
+/// The `[network]` posture, checked against what ACTUALLY ships. Validation is the
 /// daemon's own `net_plan` (one validator — doctor can never bless a config the daemon
 /// refuses): an unknown mode or a `custom` without URLs is an ERROR. On a valid config:
 /// hermetic (`relay_mode = "disabled"`) is OK — no relay AND no discovery — with a WARN when
@@ -100,9 +101,9 @@ pub fn check_network(net: &crate::config::NetworkCfg) -> Verdict {
     }
 }
 
-/// §16 M4 candidate / \[Minor\] 7: WARN when the node is roster-mode (`org_root_pinned`) but has no
-/// `[roster].url` — it degrades to stale after `max_staleness` with no authenticated channel to
-/// re-confirm currency (§4.3/P13). The full-diagnostic version of the one-liner `status` already
+/// WARN when the node is roster-mode (`org_root_pinned`) but has no `[roster].url` — it
+/// degrades to stale after `max_staleness` with no authenticated channel to re-confirm
+/// currency. The full-diagnostic version of the hint the one-liner `status` already
 /// surfaces. Pairing mode (no org root) → OK; roster mode with a URL → OK.
 pub fn check_roster_url(org_root_pinned: bool, roster_url: Option<&str>) -> Verdict {
     match (org_root_pinned, roster_url) {
@@ -115,10 +116,10 @@ pub fn check_roster_url(org_root_pinned: bool, roster_url: Option<&str>) -> Verd
     }
 }
 
-/// P2/§12: a private ed25519 key file's permission verdict. `present` = the file exists;
+/// A private ed25519 key file's permission verdict. `present` = the file exists;
 /// `mode` = its `st_mode & 0o777`. A key must be 0600. Group/world-WRITABLE (`mode & 0o022`) → ERROR
 /// (an attacker could replace the key → identity takeover, catastrophic for org-root/user keys).
-/// Group/world-READABLE but not writable (`mode & 0o044`) → WARN (exfiltration risk, §12). Absent →
+/// Group/world-READABLE but not writable (`mode & 0o044`) → WARN (exfiltration risk). Absent →
 /// OK (a key not yet minted is not a finding). Doctor NEVER chmods — it only reports.
 pub fn check_key_perms(present: bool, mode: u32) -> Verdict {
     if !present {
@@ -137,12 +138,12 @@ pub fn check_key_perms(present: bool, mode: u32) -> Verdict {
     Verdict::ok(format!("0600 (mode {mode:04o})"))
 }
 
-/// P12/§13: the daemon's runtime dir must be mode 0700 and owned by us (it houses the 0600 control
+/// The daemon's runtime dir must be mode 0700 and owned by us (it houses the 0600 control
 /// socket). `present` = the dir exists; `mode` = its `st_mode & 0o777`; `uid` = its owner; `our_uid` =
 /// this process's euid. Absent → OK (the daemon has not started). Foreign owner → ERROR (the daemon
 /// refuses to bind under `ipc::ensure_runtime_dir`). Any group/world bit (`mode & 0o077`) → ERROR
-/// (P12 wants 0700). Doctor only STATS — it never chmods/chowns. (Re-derives the `ipc.rs` expectation;
-/// see [RECONCILE R2].)
+/// (0700 is the contract). Doctor only STATS — it never chmods/chowns. (Deliberately re-derives
+/// the `ipc.rs` expectation so a drift there becomes a failing doctor test.)
 pub fn check_runtime_dir(present: bool, mode: u32, uid: u32, our_uid: u32) -> Verdict {
     if !present {
         return Verdict::ok("not present (daemon not started)");
@@ -175,7 +176,7 @@ fn friendly_age(secs: i64) -> String {
     }
 }
 
-/// P13/§4.3: surface the roster's effective state + freshness. `roster_mode` = an org root is
+/// Surface the roster's effective state + freshness. `roster_mode` = an org root is
 /// pinned; `daemon_state` = the live state word from the daemon (`"approved"|"degraded"|"stopped"|
 /// "pending"`), or `None` when the daemon is unreachable; `staleness_secs` = age since `last_confirmed`
 /// (from the local sidecar, `None` when unknown); `max_staleness_secs` = the configured bound. The
@@ -268,7 +269,7 @@ pub fn worst_level(findings: &[(&str, Verdict)]) -> Level {
 }
 
 /// Render the report. Pure → unit-testable. One `[OK  |WARN|ERR ] <label>: <message>` line per
-/// finding, then a blank line + a summary. Surface-clean (§1.5): it adds NO vocabulary of its own —
+/// finding, then a blank line + a summary. Surface-clean: it adds NO vocabulary of its own —
 /// every message the checks pass is already flat/path/fingerprint-only.
 pub fn render_report(findings: &[(&str, Verdict)]) -> Vec<String> {
     let mut lines: Vec<String> = findings
@@ -590,7 +591,7 @@ mod tests {
             check_network(&net("custom", RELAY, "custom", DISC)).level,
             Level::Ok
         );
-        // Exactly one self-hosted → WARN (both directions, §10.3).
+        // Exactly one self-hosted → WARN (both directions).
         let relay_only = check_network(&net("custom", RELAY, "default", &[]));
         assert_eq!(relay_only.level, Level::Warn);
         assert!(relay_only.message.contains("relay") && relay_only.message.contains("discovery"));
@@ -649,7 +650,7 @@ mod tests {
         assert_eq!(check_key_perms(false, 0).level, Level::Ok);
         // 0600 → OK.
         assert_eq!(check_key_perms(true, 0o600).level, Level::Ok);
-        // Group-readable (0640), not writable → WARN (exfiltration risk, §12).
+        // Group-readable (0640), not writable → WARN (exfiltration risk).
         let r = check_key_perms(true, 0o640);
         assert_eq!(r.level, Level::Warn);
         assert!(r.message.contains("readable") && r.message.contains("0640"));
@@ -683,11 +684,7 @@ mod tests {
     fn friendly_age_compacts_seconds_to_the_largest_unit() {
         // Monotonic thresholds (>=86400→d, >=3600→h, >=60→m, else s): the shipping `friendly_age`
         // and the `check_roster_freshness` test (which needs friendly_age(3600)=="1h") are consistent
-        // with THIS bucketing. [DEVIATION, DECLARED] the plan's original literals here ("90m" for
-        // 90*60=5400s, "36h" for 36*3600=129600s) contradicted both the plan's own `friendly_age`
-        // impl AND its roster-freshness test — no monotonic bucketing can render 3600s as "1h" yet
-        // 5400s as "90m". Impl kept verbatim (roster message contract depends on "1h"); the two wrong
-        // expected literals corrected to the impl's actual output, minutes-branch coverage retained.
+        // with THIS bucketing — no monotonic bucketing can render 3600s as "1h" yet 5400s as "90m".
         assert_eq!(friendly_age(45), "45s");
         assert_eq!(friendly_age(30 * 60), "30m");
         assert_eq!(friendly_age(90 * 60), "1h");
@@ -800,7 +797,7 @@ mod tests {
 
     #[test]
     fn report_leaks_no_transport_vocabulary() {
-        // A real base32 EndpointId — doctor must NEVER render one (surface-clean, §1.5).
+        // A real base32 EndpointId — doctor must NEVER render one (surface-clean).
         let sample_id = iroh::SecretKey::from_bytes(&[9u8; 32]).public().to_string();
         // Build the full finding set the way `findings()` does, with adversarial inputs that exercise
         // every branch (warns + an error), then assert the rendered report is clean.

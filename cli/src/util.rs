@@ -26,8 +26,8 @@ where
 /// The name is pid + a process-global counter, so two writers (even concurrent ones within ONE
 /// daemon process) can NEVER collide on the same temp file. A pid-only name would let two
 /// in-process writers interleave `create(O_TRUNC)` + `write_all` on the same temp → byte-mixed
-/// content → a torn file published by whichever rename runs last. This mirrors the M0 device-key
-/// mint fix (spec §13 "no fixed temp name").
+/// content → a torn file published by whichever rename runs last. This mirrors the device-key
+/// mint path ("no fixed temp name").
 pub(crate) fn unique_temp_path(dir: &Path, prefix: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -73,7 +73,7 @@ pub fn epoch_now_i64() -> i64 {
 }
 
 /// Atomically replace `path`: write a same-dir temp file, fsync, rename over the target
-/// (spec §13 torn-state-never). The rename is atomic on the same filesystem.
+/// (a torn file is never published). The rename is atomic on the same filesystem.
 ///
 /// The temp name comes from [`unique_temp_path`] (pid + a process-global counter), whose doc
 /// carries the two-in-process-writers collision argument; [`TempPathGuard`] cleans up on any

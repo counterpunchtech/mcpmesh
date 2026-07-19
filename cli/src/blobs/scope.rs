@@ -1,6 +1,6 @@
-//! The persisted scope model (spec §9): a named set of blob hashes + a set of granted principals.
+//! The persisted scope model: a named set of blob hashes + a set of granted principals.
 //! An app publishes blobs INTO a scope and grants the scope to principals (a roster group name or a
-//! user_id — one flat namespace, §4.3 rule 5). The request-time gate (Task 3) ALLOWS a GET iff some
+//! user_id — one flat namespace). The request-time gate ALLOWS a GET iff some
 //! scope contains the hash AND grants one of the caller's `{user_id} ∪ groups`.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -19,7 +19,7 @@ pub struct Scope {
     pub grants: BTreeSet<String>,
 }
 
-/// The full scope table (spec §9): `scope_name -> Scope`. `Default` is the empty table.
+/// The full scope table: `scope_name -> Scope`. `Default` is the empty table.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobScopes {
     #[serde(default)]
@@ -75,11 +75,11 @@ impl BlobScopes {
     }
 }
 
-/// The single-writer scope store (spec §9 persistence). An in-RAM `RwLock<BlobScopes>` serves the hot
+/// The single-writer scope store. An in-RAM `RwLock<BlobScopes>` serves the hot
 /// authz read (`snapshot`, a cheap clone taken per GET — no lock held across the async reply); every
 /// mutation (`publish_hash`/`grant`) takes the write lock, mutates, and atomically persists the JSON
-/// sidecar (`crate::roster::atomic_write_str` = write-new + rename, §13). All mutations flow through
-/// the daemon control path, so there is exactly one writer ([RECONCILE-SCOPE-PERSIST-SINGLE-WRITER]).
+/// sidecar (`crate::roster::atomic_write_str` = write-new + rename). All mutations flow through
+/// the daemon control path, so there is exactly one writer.
 pub struct ScopeStore {
     path: PathBuf,
     inner: RwLock<BlobScopes>,
@@ -113,7 +113,7 @@ impl ScopeStore {
         })
     }
 
-    /// A cheap clone of the current scope table for the hot authz read (Task 3) + `list` rendering.
+    /// A cheap clone of the current scope table for the hot authz read + `list` rendering.
     /// The read lock is released as the clone returns — NEVER held across an await.
     pub fn snapshot(&self) -> BlobScopes {
         self.inner.read().expect("scope lock not poisoned").clone()

@@ -1,17 +1,18 @@
-//! The `connect` stdio proxy (spec §8) — the ONLY thing an AI client ever runs:
+//! The `connect` stdio proxy — the ONLY thing an AI client ever runs:
 //! `mcpmesh connect <peer>/<service>`. It is a thin, transparent pipe: `ensure_daemon()`, send
 //! one `OpenSession`, then pump the MCP session verbatim between this process's stdin/stdout
 //! and the daemon's control socket (which the daemon has turned into a raw session pipe). The
-//! daemon owns dialing, the session, and pooling; the proxy interprets nothing (D6). When a
+//! daemon owns dialing, the session, and pooling; the proxy interprets nothing (it pumps,
+//! never inspects). When a
 //! session is unreachable or refused pre-response, the daemon relays a `-32055`/`-32054`
 //! frame that flows straight to stdout, so the AI client gets a well-formed answer rather
 //! than a hang; a session severed mid-stream instead surfaces as a clean EOF (the pipe ends,
-//! stdout closes). No mid-session re-dial (§8) — the AI client re-invokes if it wants a fresh
+//! stdout closes). No mid-session re-dial — the AI client re-invokes if it wants a fresh
 //! session.
 //!
 //! The config-entry authority lives here too: `mcp_servers_entry` mints the one `mcpServers`
 //! entry shape a client config needs, [`client_instruction_lines`] renders the plain-language
-//! "here is exactly what to do next" block (spec §11.1 — including the trust-boundary line) that
+//! "here is exactly what to do next" block (including the trust-boundary line) that
 //! `pair` and `use` print, and [`split_target`] parses the shared `<peer>/<service>` argument.
 //!
 //! We PRINT those instructions rather than writing a third-party app's config file: the config
@@ -40,7 +41,7 @@ pub fn split_target(target: &str) -> Result<(String, String)> {
     Ok((peer.to_string(), service.to_string()))
 }
 
-/// One `mcpServers` entry that mounts `<peer>/<service>` through the proxy (spec §8), rendered as
+/// One `mcpServers` entry that mounts `<peer>/<service>` through the proxy, rendered as
 /// the text a human pastes into a client config:
 /// `"<peer>-<service>": {"command": "mcpmesh", "args": ["connect", "<peer>/<service>"]}`.
 ///
@@ -78,9 +79,9 @@ fn claude_desktop_config_path() -> String {
 ///
 /// Every line is either a sentence or a command to copy: the Claude Code invocation, the Claude
 /// Desktop config path + entry + restart step, and the generic stdio command any other MCP client
-/// takes. It opens with the §11.1 trust boundary — this is the mount-time moment that line exists
-/// for. Surface-clean (§1.5): petnames, service names, and the `mcpmesh connect` command only —
-/// never an EndpointId.
+/// takes. It opens with the trust boundary ("runs on their machine") — this is the mount-time
+/// moment that line exists for. Surface-clean (no transport vocabulary): petnames, service
+/// names, and the `mcpmesh connect` command only — never an endpoint id.
 ///
 /// Empty `services` renders NOTHING (no dangling "add this to your config" with no entry under it).
 pub fn client_instruction_lines(peer: &str, services: &[String]) -> Vec<String> {
@@ -143,7 +144,7 @@ pub async fn run(peer: String, service: String) -> Result<()> {
 }
 
 /// The one stderr line a human at a terminal gets when their `connect` session ended on a
-/// mesh-synthesized refusal (issue #10). Pure so it is unit-testable. Surface-clean (§1.5):
+/// mesh-synthesized refusal (issue #10). Pure so it is unit-testable. Surface-clean:
 /// the peer petname + porcelain commands only.
 fn unreachable_hint_line(peer: &str) -> String {
     format!(
@@ -154,7 +155,8 @@ fn unreachable_hint_line(peer: &str) -> String {
 
 /// `Some(code)` when `frame` is a mesh-SYNTHESIZED pre-response refusal — the `-32055`
 /// unreachable / `-32054` service-refusal pair carrying the mandatory `data.source ==
-/// "mcpmesh"` marker (spec §7.4). A backend's own JSON-RPC errors (no marker) and the other
+/// "mcpmesh"` marker (the platform's synthesized-error signature). A backend's own JSON-RPC
+/// errors (no marker) and the other
 /// platform codes (e.g. a mid-session rate limit) return `None`: only the two
 /// session-refusing shapes warrant the human hint.
 fn mesh_error_code(frame: &Value) -> Option<i64> {
@@ -167,13 +169,13 @@ fn mesh_error_code(frame: &Value) -> Option<i64> {
 }
 
 /// Bidirectionally pump MCP frames between the AI client's stdio and the control connection
-/// (one codec everywhere, D6). Generic over the four byte substrates so an in-memory variant
+/// (one codec everywhere). Generic over the four byte substrates so an in-memory variant
 /// is testable without a subprocess. The two directions run as independent concurrent loops —
 /// the same anti-deadlock discipline as the backends' pump. Teardown is driven by the CONTROL
-/// side closing (clean EOF on remote close, spec §8); the stdin direction ending only
+/// side closing (clean EOF on remote close); the stdin direction ending only
 /// half-closes toward the daemon and then drains, because a synthesized -32055 can already be
 /// buffered on the control socket when the stdin->control write hits the dead pipe — the AI
-/// client must still be handed that well-formed answer, not a bare EOF (§8).
+/// client must still be handed that well-formed answer, not a bare EOF.
 ///
 /// Returns the [`mesh_error_code`] of the LAST frame relayed to stdout when the session ended
 /// on a mesh-synthesized refusal, else `None` — the caller's seam for the human TTY hint
@@ -212,7 +214,7 @@ where
         std::future::pending::<()>().await
     };
     // control (the daemon's session pipe) -> stdout (AI client). Relays session responses AND
-    // a synthesized -32055/-32054 error frame verbatim (spec §8), remembering whether the
+    // a synthesized -32055/-32054 error frame verbatim, remembering whether the
     // LAST relayed frame was such a refusal (reset by any later ordinary frame).
     let to_stdout = async {
         let mut ended_on: Option<i64> = None;
@@ -225,7 +227,7 @@ where
                     }
                 }
                 Ok(Some(Inbound::Violation(_))) => break,
-                Ok(None) | Err(_) => break, // remote closed / IO error → clean EOF (§8)
+                Ok(None) | Err(_) => break, // remote closed / IO error → clean EOF
             }
         }
         ended_on
@@ -250,7 +252,7 @@ mod tests {
 
     #[test]
     fn mcp_servers_entry_parses_back_to_the_exact_wire_shape() {
-        // The rendered entry is real JSON with the §8 shape: wrap it in the braces it is pasted
+        // The rendered entry is real JSON with the documented wire shape: wrap it in the braces it is pasted
         // between and parse it back (proving both validity and shape, whatever the formatting).
         let doc: Value =
             serde_json::from_str(&format!("{{{}}}", mcp_servers_entry("alice", "notes"))).unwrap();
@@ -295,7 +297,7 @@ mod tests {
             rendered.contains("mcpServers") && rendered.to_lowercase().contains("restart"),
             "the Desktop instructions must say where it goes and to restart:\n{rendered}"
         );
-        // §11.1: the trust boundary is stated plainly at mount time.
+        // The trust boundary is stated plainly at mount time.
         assert!(
             rendered.contains("run on alice's machine"),
             "the trust-boundary line must survive:\n{rendered}"
@@ -339,9 +341,9 @@ mod tests {
         assert!(split_target("/notes").is_err());
     }
 
-    /// The proxy pump is transparent both ways (D6): a frame written to "stdin" reaches the
+    /// The proxy pump is transparent both ways: a frame written to "stdin" reaches the
     /// control connection unmodified, and a frame the control side sends reaches "stdout"
-    /// unmodified — here a synthesized -32055 error frame (the unreachable/severed path, §8),
+    /// unmodified — here a synthesized -32055 error frame (the unreachable/severed path),
     /// proving the AI client is handed a well-formed answer rather than a hang. Closing
     /// "stdin" then tears the pump down cleanly.
     #[tokio::test]
@@ -389,7 +391,7 @@ mod tests {
                 daemon_reader.next().await.unwrap().is_none(),
                 "stdin close must propagate to the daemon as a half-close"
             );
-            // …and the daemon closing in turn ends the pump (clean EOF, §8). The last frame
+            // …and the daemon closing in turn ends the pump (clean EOF). The last frame
             // relayed was the synthesized -32055, so the pump reports it (the TTY-hint seam).
             drop(daemon_reader);
             drop(dc_w);
@@ -399,7 +401,7 @@ mod tests {
         .expect("pump test timed out");
     }
 
-    /// The unreachable race (spec §8): the daemon can synthesize a -32055 and close the
+    /// The unreachable race: the daemon can synthesize a -32055 and close the
     /// control connection BEFORE the pump is first polled, while the AI client's initialize
     /// is already sitting in stdin. The stdin->control direction then breaks on a dead pipe —
     /// and the pump must still drain the buffered error frame to stdout rather than tear the
@@ -484,7 +486,7 @@ mod tests {
 
     #[test]
     fn mesh_error_code_matches_only_the_synthesized_refusal_pair() {
-        // The two session-refusing shapes, WITH the §7.4 marker → Some.
+        // The two session-refusing shapes, WITH the synthesized-error marker → Some.
         let unreachable = json!({"jsonrpc":"2.0","id":null,"error":{"code":-32055,
             "message":"peer unreachable","data":{"source":"mcpmesh"}}});
         assert_eq!(mesh_error_code(&unreachable), Some(-32055));
@@ -516,7 +518,7 @@ mod tests {
             line.contains("normally run by your MCP client"),
             "the hint explains who normally runs connect: {line}"
         );
-        // §1.5/§17: no transport vocabulary in a human-facing line.
+        // No transport vocabulary in a human-facing line.
         for term in ["ALPN", "endpoint", "iroh", "dial", "-32055"] {
             assert!(!line.contains(term), "hint leaked '{term}': {line}");
         }

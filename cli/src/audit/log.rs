@@ -1,7 +1,7 @@
-//! The append-only JSONL writer (spec §11.3): a bounded-channel single-writer task whose `record()`
+//! The append-only JSONL writer: a bounded-channel single-writer task whose `record()`
 //! never blocks the caller, plus the sync append core. Best-effort by construction — an audit-write
-//! failure is a logged warning, never a blocked or failed session (spec §11.3 "must not block or
-//! fail the hot path"). Local-only: nothing here is transmitted; the file is written and read only
+//! failure is a logged warning, never a blocked or failed session (audit must not block or
+//! fail the hot path). Local-only: nothing here is transmitted; the file is written and read only
 //! on this machine.
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -12,8 +12,8 @@ use tokio::sync::{broadcast, mpsc};
 use crate::audit::record::AuditRecord;
 
 /// Bounded queue depth between the hot path and the single writer task. Deep enough that a bursty
-/// session never drops under normal load; bounded so a stuck disk cannot grow memory without limit
-/// (spec §11.3 robustness). On overflow, `record()` DROPS the record with a warning rather than
+/// session never drops under normal load; bounded so a stuck disk cannot grow memory without limit.
+/// On overflow, `record()` DROPS the record with a warning rather than
 /// awaiting — the hot path never blocks on the audit channel.
 const AUDIT_CHANNEL_DEPTH: usize = 1024;
 
@@ -94,13 +94,13 @@ impl AuditLog {
         })
     }
 
-    /// Record one event — NON-BLOCKING and infallible from the caller's view (spec §11.3). Uses
+    /// Record one event — NON-BLOCKING and infallible from the caller's view. Uses
     /// `try_send`: a full channel (writer wedged on a slow disk) or a closed channel (writer gone)
     /// DROPS the record with a debug log and returns immediately. The hot path NEVER awaits the disk
     /// and an audit failure NEVER propagates into a session.
     pub fn record(&self, rec: AuditRecord) {
         // Live fan-out FIRST (a cheap clone): an `Err` means zero subscribers — fine, ignore it.
-        // This never blocks and never affects the file path below (spec §11.3 preserved).
+        // This never blocks and never affects the file path below.
         let _ = self.bcast.send(rec.clone());
         if let Err(e) = self.tx.try_send(rec) {
             tracing::debug!(%e, "audit channel full or closed; dropping record (best-effort)");
@@ -176,7 +176,7 @@ impl AuditSink {
     pub fn disabled() -> Self {
         Self(None)
     }
-    /// Record an event if enabled; a no-op otherwise. Never blocks, never errors (spec §11.3).
+    /// Record an event if enabled; a no-op otherwise. Never blocks, never errors.
     pub fn record(&self, rec: AuditRecord) {
         if let Some(log) = &self.0 {
             log.record(rec);
@@ -243,7 +243,7 @@ struct Pending {
     started: Instant,
 }
 
-/// Per-session correlation for the proxied-request-line hook (spec §11.3). The pump drives it from
+/// Per-session correlation for the proxied-request-line hook. The pump drives it from
 /// its two directions: `on_request` (caller → server) hashes the args and remembers the request by
 /// id; `on_response` (server → caller) matches the id, computes latency + status, and emits ONE
 /// completed record with the response's `bytes_out` COUNT. A NOTIFICATION (no id) is recorded at
@@ -285,7 +285,7 @@ impl RequestAuditor {
         let Some(method) = frame.get("method").and_then(Value::as_str) else {
             return; // not a request/notification line (e.g. a client-side response); nothing to log
         };
-        // Tool NAME only for tools/call (spec §11.3) — never the tool arguments or output.
+        // Tool NAME only for tools/call — never the tool arguments or output.
         let tool = if method == "tools/call" {
             frame
                 .pointer("/params/name")
