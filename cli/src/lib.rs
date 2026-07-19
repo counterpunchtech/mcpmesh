@@ -12,6 +12,7 @@ pub mod config;
 pub mod control;
 pub mod daemon;
 pub mod doctor;
+pub mod enrollcmd;
 pub mod ipc;
 pub mod limits;
 pub mod pairing;
