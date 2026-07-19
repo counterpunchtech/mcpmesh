@@ -326,9 +326,10 @@ resume in sync.
 ```
 
 Typed Rust bindings for these frames (`StreamFrame`, `ActiveSession`, and the audit record) ship in
-[`mcpmesh-local-api`](../local-api/src/protocol.rs), so a Rust consumer deserializes the stream
-instead of hand-parsing it. `mcpmesh internal watch` is a thin reference consumer of this stream.
-Reference: [`cli/src/stream.rs`](../cli/src/stream.rs).
+[`mcpmesh-local-api`](../local-api/src/protocol.rs), and `ControlClient::subscribe` yields them
+directly, so a Rust consumer deserializes the stream instead of hand-parsing it. `mcpmesh internal
+watch` is a thin reference consumer of this stream.
+Reference: [`local-api/src/client.rs`](../local-api/src/client.rs).
 
 ## The identity contract
 

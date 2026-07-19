@@ -375,10 +375,9 @@ fn probe_daemon() -> (bool, Option<String>) {
         match crate::client::connect_control(&socket).await {
             Ok(mut client) => {
                 let state = client
-                    .request(mcpmesh_local_api::Request::Status)
+                    .status()
                     .await
                     .ok()
-                    .and_then(|v| serde_json::from_value::<mcpmesh_local_api::StatusResult>(v).ok())
                     .and_then(|s| s.roster.map(|r| r.state));
                 (true, state)
             }

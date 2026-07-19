@@ -385,6 +385,207 @@ pub struct PairResult {
     pub services: Vec<String>,
 }
 
+/// The event class of an [`AuditRecord`] (spec §11.3's four classes). An additive discriminant on
+/// top of the §11.3 example schema: it removes no spec field and makes the JSONL self-describing so
+/// a consumer can filter by class without guessing from which optional fields are present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditKind {
+    /// A mesh session opened (a backend was selected for an authenticated peer).
+    /// (A `session_open` with `status:"error"` is a synthesized FAILED-dial marker — no backend
+    /// was reached; it records an attempted-and-failed reach for the telemetry stream.)
+    SessionOpen,
+    /// A mesh session closed (the backend returned / the session tore down).
+    SessionClose,
+    /// One proxied MCP request line (method + tool NAME + args_hash). NEVER carries raw arguments.
+    Request,
+    /// A peer fetched a blob from this node's gated provider (peer + hash + allow/deny).
+    BlobFetch,
+    /// A trust mutation (pair, unpair, roster install/swap, revoke).
+    Trust,
+}
+
+/// One audit record — the union of the §11.3 event classes, and the `record` payload of a
+/// [`StreamFrame::Event`]. ONE schema for the on-disk JSONL log and the live stream. Every field
+/// beyond `ts`/`kind` is optional and elided when absent (`skip_serializing_if`), so each class
+/// serializes to just its relevant keys (a session record has no `method`; a trust record has no
+/// `bytes_out`).
+///
+/// PRIVACY (spec §11.3): the proxied-request record carries `method` + `tool` (NAME only) +
+/// `args_hash` (`"blake3:<hex>"`), and NEVER the raw arguments, the request/response content, or
+/// any tool-output bytes — only a `bytes_out` COUNT and a `status`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuditRecord {
+    /// RFC3339 UTC with millisecond precision, e.g. `"2026-07-03T14:02:11.480Z"`. The `YYYY-MM`
+    /// prefix also selects the monthly file (the rotation boundary), so it is always present.
+    pub ts: String,
+    pub kind: AuditKind,
+    /// The gate-resolved authenticated peer (spec §11.3 attribution; endpoint_id-keyed). Absent on
+    /// local-only events with no remote peer (a manual roster install).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    /// The tool NAME only (never its arguments or output) — e.g. `"read_file"` for a `tools/call`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// `"blake3:<hex>"` of the request arguments. The raw arguments are NEVER stored (spec §11.3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub args_hash: Option<String>,
+    /// Byte COUNT of the response sent back to the peer — a count, never the content.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_out: Option<u64>,
+    /// `"ok"` / `"error"` (proxied request) or `"ok"` / `"denied"` (blob fetch).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
+    /// Trust-event verb: `"pair"` / `"unpair"` / `"roster_install"` / `"revoke"` (kind == Trust).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event: Option<String>,
+    /// A reference, NEVER content: a blob hash (`BlobFetch`) or a trust-event target such as a
+    /// petname or `org/serial` (`Trust`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+}
+
+impl AuditRecord {
+    fn base(ts: String, kind: AuditKind) -> Self {
+        Self {
+            ts,
+            kind,
+            peer: None,
+            service: None,
+            method: None,
+            tool: None,
+            args_hash: None,
+            bytes_out: None,
+            status: None,
+            latency_ms: None,
+            event: None,
+            target: None,
+        }
+    }
+
+    pub fn session_open(ts: String, peer: Option<String>, service: String) -> Self {
+        let mut r = Self::base(ts, AuditKind::SessionOpen);
+        r.peer = peer;
+        r.service = Some(service);
+        r
+    }
+
+    /// Set the record's `status` (`"ok"`/`"error"`/`"denied"`), returning `self` for chaining.
+    /// Marks a synthesized failure record — e.g. the `session_open` for a FAILED dial, which
+    /// reaches no backend and so is never audited by the far side's session guard — without a
+    /// dedicated constructor. DRY: reuses the existing optional `status` field.
+    pub fn with_status(mut self, status: &str) -> Self {
+        self.status = Some(status.into());
+        self
+    }
+
+    pub fn session_close(ts: String, peer: Option<String>, service: String) -> Self {
+        let mut r = Self::base(ts, AuditKind::SessionClose);
+        r.peer = peer;
+        r.service = Some(service);
+        r
+    }
+
+    /// A completed (request→response correlated) proxied line: method + tool NAME + args_hash, plus
+    /// the response's `bytes_out` COUNT, `status`, and `latency_ms`. PRIVACY: `args_hash` is a digest;
+    /// no raw arguments, request/response content, or tool-output bytes are ever passed in.
+    #[allow(clippy::too_many_arguments)]
+    pub fn proxied_request(
+        ts: String,
+        peer: Option<String>,
+        service: String,
+        method: String,
+        tool: Option<String>,
+        args_hash: String,
+        bytes_out: u64,
+        status: String,
+        latency_ms: u64,
+    ) -> Self {
+        let mut r = Self::base(ts, AuditKind::Request);
+        r.peer = peer;
+        r.service = Some(service);
+        r.method = Some(method);
+        r.tool = tool;
+        r.args_hash = Some(args_hash);
+        r.bytes_out = Some(bytes_out);
+        r.status = Some(status);
+        r.latency_ms = Some(latency_ms);
+        r
+    }
+
+    /// A proxied NOTIFICATION line (no `id`, so no response correlates): method + tool + args_hash,
+    /// no `bytes_out`/`status`/`latency_ms`. Still records the line per spec §11.3.
+    pub fn proxied_notification(
+        ts: String,
+        peer: Option<String>,
+        service: String,
+        method: String,
+        tool: Option<String>,
+        args_hash: String,
+    ) -> Self {
+        let mut r = Self::base(ts, AuditKind::Request);
+        r.peer = peer;
+        r.service = Some(service);
+        r.method = Some(method);
+        r.tool = tool;
+        r.args_hash = Some(args_hash);
+        r
+    }
+
+    pub fn blob_fetch(ts: String, peer: Option<String>, hash: String, status: String) -> Self {
+        let mut r = Self::base(ts, AuditKind::BlobFetch);
+        r.peer = peer;
+        r.target = Some(hash);
+        r.status = Some(status);
+        r
+    }
+
+    pub fn trust(ts: String, event: String, target: Option<String>) -> Self {
+        let mut r = Self::base(ts, AuditKind::Trust);
+        r.event = Some(event);
+        r.target = target;
+        r
+    }
+}
+
+/// One live mesh session, in a [`StreamFrame::Snapshot`]. Surface-clean: `peer` is the
+/// user_id-or-petname the audit records carry, never an endpoint-id. `opened_at` is epoch seconds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveSession {
+    pub peer: String,
+    pub service: String,
+    pub opened_at: i64,
+}
+
+/// One frame of the [`Request::Subscribe`] stream (pairing liveness & health telemetry). Tagged on
+/// `type` (snake_case), so a frame is `{"type":"snapshot",...}` / `{"type":"event",...}` /
+/// `{"type":"lagged",...}`. `Event.record` is the [`AuditRecord`] verbatim, so the stream and the
+/// on-disk log carry ONE schema. The daemon serializes these; an embedding consumer deserializes
+/// them (see `docs/local-protocol.md` "Live event stream").
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum StreamFrame {
+    /// The FIRST frame: a point-in-time picture of the mesh (open sessions + paired-peer
+    /// reachability) so a fresh subscriber renders immediately without replaying history.
+    Snapshot {
+        active_sessions: Vec<ActiveSession>,
+        reachability: Vec<PeerReachability>,
+    },
+    /// A live audit event (session open/close, request, blob fetch, trust) — the tap on the hub.
+    /// Boxed so this (much larger) variant does not bloat every frame; serde delegates through the
+    /// `Box`, so the wire shape is the record's fields verbatim.
+    Event { record: Box<AuditRecord> },
+    /// The subscriber fell `dropped` records behind the broadcast ring; the stream continues (a
+    /// fresh reconnect would re-`Snapshot`). Never drops the subscriber (spec: backpressure).
+    Lagged { dropped: u64 },
+}
+
 /// Extract the `method` tag from a raw request value without deserializing the whole
 /// message. Task 3's dispatcher uses this: match on the method string, then deserialize
 /// `params` per-method — which tolerates omitted / null / `{}` params for parameterless
@@ -955,6 +1156,62 @@ mod tests {
         let v = serde_json::to_value(&res).unwrap();
         assert_eq!(v["bytes_len"], 4194304u64);
         assert_eq!(serde_json::from_value::<BlobFetchResult>(v).unwrap(), res);
+    }
+
+    /// The three `subscribe` frame shapes round-trip with the documented `type`-tagged wire form
+    /// (docs/local-protocol.md "Live event stream"): `snapshot` carries the flat session/reachability
+    /// lists, `event` delegates through the `Box` so the record's fields sit VERBATIM under
+    /// `record` (one schema with the JSONL log), and `lagged` carries the dropped count.
+    #[test]
+    fn stream_frames_roundtrip_with_the_documented_tags() {
+        let snap = StreamFrame::Snapshot {
+            active_sessions: vec![ActiveSession {
+                peer: "bob".into(),
+                service: "notes".into(),
+                opened_at: 1_751_760_000,
+            }],
+            reachability: vec![PeerReachability {
+                name: "bob".into(),
+                reachable: true,
+                rtt_ms: Some(42),
+                age_secs: Some(3),
+            }],
+        };
+        let v = serde_json::to_value(&snap).unwrap();
+        assert_eq!(v["type"], "snapshot");
+        assert_eq!(v["active_sessions"][0]["peer"], "bob");
+        assert_eq!(v["active_sessions"][0]["opened_at"], 1_751_760_000i64);
+        assert_eq!(v["reachability"][0]["name"], "bob");
+        assert_eq!(serde_json::from_value::<StreamFrame>(v).unwrap(), snap);
+
+        let event = StreamFrame::Event {
+            record: Box::new(AuditRecord::session_open(
+                "2026-07-03T14:02:11.480Z".into(),
+                Some("bob".into()),
+                "notes".into(),
+            )),
+        };
+        let v = serde_json::to_value(&event).unwrap();
+        assert_eq!(v["type"], "event");
+        // The record's fields ride verbatim under `record` — no Box indirection on the wire.
+        assert_eq!(v["record"]["kind"], "session_open");
+        assert_eq!(v["record"]["peer"], "bob");
+        assert_eq!(v["record"]["service"], "notes");
+        assert_eq!(serde_json::from_value::<StreamFrame>(v).unwrap(), event);
+
+        let lagged = StreamFrame::Lagged { dropped: 12 };
+        let v = serde_json::to_value(&lagged).unwrap();
+        assert_eq!(v, serde_json::json!({ "type": "lagged", "dropped": 12 }));
+        assert_eq!(serde_json::from_value::<StreamFrame>(v).unwrap(), lagged);
+    }
+
+    /// A frame minted by a NEWER daemon (an unknown `type`) fails to deserialize rather than
+    /// mis-parsing — the typed stream surface is closed; a forward-compatible consumer reads the
+    /// raw `Value` stream instead (`ControlClient::open_stream`).
+    #[test]
+    fn unknown_stream_frame_type_is_rejected() {
+        let future = serde_json::json!({ "type": "future_kind", "x": 1 });
+        assert!(serde_json::from_value::<StreamFrame>(future).is_err());
     }
 
     #[test]

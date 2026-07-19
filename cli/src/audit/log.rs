@@ -44,14 +44,9 @@ pub(crate) fn append_record(dir: &Path, rec: &AuditRecord) -> std::io::Result<()
     f.write_all(&line)
 }
 
-/// One live mesh session, for the telemetry snapshot. Surface-clean: `peer` is the
-/// user_id-or-petname the audit records carry, never an endpoint-id. `opened_at` is epoch seconds.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ActiveSession {
-    pub peer: String,
-    pub service: String,
-    pub opened_at: i64,
-}
+/// One live mesh session, for the telemetry snapshot — published wire vocabulary
+/// ([`mcpmesh_local_api::protocol`]), re-exported where the live table that mints it lives.
+pub use mcpmesh_local_api::ActiveSession;
 
 /// A running audit log: a handle over the sender half of the writer channel. Cheap to clone (an
 /// `Arc` over the sender). The writer task drains the channel and appends each record on the

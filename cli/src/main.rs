@@ -4,9 +4,8 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use mcpmesh::{client, config, daemon, doctor, pairing, proxy, roster, util};
 use mcpmesh_local_api::{
-    BackendKind, BackendSpec, BlobFetchResult, BlobPublishResult, BlobScopeList, Hello,
-    InviteResult, PairResult, PresencePeer, RecentPairing, Request, RosterInstallResult,
-    RosterStatus, StatusResult,
+    AuditKind, BackendKind, BackendSpec, Hello, InviteResult, PairResult, PresencePeer,
+    RecentPairing, RosterInstallResult, RosterStatus, StatusResult, StreamFrame,
 };
 use mcpmesh_trust::{DeviceKey, paths};
 use serde_json::json;
@@ -412,11 +411,7 @@ fn run_serve(name: String, allow: Option<String>, cmd: Vec<String>) -> anyhow::R
     let allow = split_csv(allow);
     with_daemon(async move |mut client| {
         client
-            .request(Request::RegisterService {
-                name: name.clone(),
-                backend: BackendSpec::Run { cmd },
-                allow,
-            })
+            .register_service(&name, BackendSpec::Run { cmd }, allow)
             .await?;
         println!("serving '{name}'");
         // The next exact instruction. Nothing is shared until someone is granted access, so the
@@ -452,12 +447,7 @@ fn run_invite(services: Vec<String>) -> anyhow::Result<()> {
         anyhow::bail!("specify at least one service to grant (e.g. `mcpmesh invite notes`)");
     }
     with_daemon(async move |mut client| {
-        let result = client
-            .request(Request::Invite {
-                services: services.clone(),
-            })
-            .await?;
-        let invite: InviteResult = serde_json::from_value(result).context("parse invite result")?;
+        let invite = client.invite(services.clone()).await?;
         for line in invite_lines(&invite, &services, util::epoch_now_u64()) {
             println!("{line}");
         }
@@ -481,19 +471,14 @@ fn run_pair(invite: Option<String>, remove: Option<String>) -> anyhow::Result<()
             anyhow::bail!("provide an invite to redeem, or --remove <petname> to unpair")
         }
         (Some(invite_line), None) => with_daemon(async move |mut client| {
-            let result = client.request(Request::Pair { invite_line }).await?;
-            let paired: PairResult = serde_json::from_value(result).context("parse pair result")?;
+            let paired = client.pair(&invite_line).await?;
             for line in pair_lines(&paired) {
                 println!("{line}");
             }
             Ok(())
         }),
         (None, Some(petname)) => with_daemon(async move |mut client| {
-            client
-                .request(Request::PeerRemove {
-                    petname: petname.clone(),
-                })
-                .await?;
+            client.peer_remove(&petname).await?;
             // Live in-flight sessions are NOT severed (M3/D8) — only new authorized sessions
             // are blocked from here on. The petname just stops resolving + being admitted.
             println!("Unpaired {petname}.");
@@ -614,11 +599,7 @@ fn run_peer_add(petname: String, endpoint_id: String, allow: Option<String>) -> 
 fn run_roster_install(file: PathBuf, org_root_pk: Option<String>) -> anyhow::Result<()> {
     let path = file.to_string_lossy().into_owned();
     with_daemon(async move |mut client| {
-        let result = client
-            .request(Request::RosterInstall { path, org_root_pk })
-            .await?;
-        let installed: RosterInstallResult =
-            serde_json::from_value(result).context("parse roster install result")?;
+        let installed = client.roster_install(&path, org_root_pk).await?;
         println!("{}", roster_install_line(&installed));
         Ok(())
     })
@@ -632,25 +613,16 @@ fn run_internal_blob(command: BlobCmd) -> anyhow::Result<()> {
         match command {
             BlobCmd::Publish { scope, file } => {
                 let path = file.to_string_lossy().into_owned();
-                let result = client.request(Request::BlobPublish { scope, path }).await?;
-                let r: BlobPublishResult =
-                    serde_json::from_value(result).context("parse blob publish result")?;
+                let r = client.blob_publish(&scope, &path).await?;
                 println!("Published (hash {}).", r.hash);
                 println!("{}", r.ticket);
             }
             BlobCmd::Grant { scope, principal } => {
-                client
-                    .request(Request::BlobGrant {
-                        scope: scope.clone(),
-                        principal: principal.clone(),
-                    })
-                    .await?;
+                client.blob_grant(&scope, &principal).await?;
                 println!("Granted scope '{scope}' to '{principal}'.");
             }
             BlobCmd::List => {
-                let result = client.request(Request::BlobList).await?;
-                let r: BlobScopeList =
-                    serde_json::from_value(result).context("parse blob list result")?;
+                let r = client.blob_list().await?;
                 for s in r.scopes {
                     println!(
                         "{}: {} blob(s), granted to [{}]",
@@ -662,11 +634,7 @@ fn run_internal_blob(command: BlobCmd) -> anyhow::Result<()> {
             }
             BlobCmd::Fetch { ticket, dest } => {
                 let dest_path = dest.to_string_lossy().into_owned();
-                let result = client
-                    .request(Request::BlobFetch { ticket, dest_path })
-                    .await?;
-                let r: BlobFetchResult =
-                    serde_json::from_value(result).context("parse blob fetch result")?;
+                let r = client.blob_fetch(&ticket, &dest_path).await?;
                 println!(
                     "Fetched {} bytes (hash {}) → {}",
                     r.bytes_len,
@@ -808,20 +776,18 @@ fn run_join(
     // Pin the org root (+ user id/key path) through the daemon (single-writer; no roster yet, D5).
     with_daemon(async |mut client| {
         client
-            .request(Request::OrgJoin {
-                org_id: invite.org_id.clone(),
-                org_root_pk: invite.org_root_pk.clone(),
-                user_id: requested_user_id.clone(),
-                user_key: user_key_path.to_string_lossy().into_owned(),
-            })
+            .org_join(
+                &invite.org_id,
+                &invite.org_root_pk,
+                &requested_user_id,
+                &user_key_path.to_string_lossy(),
+            )
             .await?;
         // If the invite carried a roster URL, pin it to config `[roster].url` so the joiner's poll
         // loop fetches its FIRST roster on the next daemon start (D5 — the joiner can't gossip before
         // it holds a roster). Same daemon connection, immediately after the org-root pin.
         if let Some(url) = &invite.roster_url {
-            client
-                .request(Request::SetRosterUrl { url: url.clone() })
-                .await?;
+            client.set_roster_url(url).await?;
         }
         Ok(())
     })?;
@@ -879,9 +845,7 @@ fn run_org_create(
     // so the daemon's poll loop keeps the hosted document current on the next start (spec §4.3).
     if let Some(url) = &roster_url {
         with_daemon(async |mut client| {
-            client
-                .request(Request::SetRosterUrl { url: url.clone() })
-                .await?;
+            client.set_roster_url(url).await?;
             Ok(())
         })?;
     }
@@ -1145,12 +1109,7 @@ fn install_signed_roster(
     std::fs::write(&temp, serde_json::to_vec(roster)?)
         .with_context(|| format!("write staged roster {}", temp.display()))?;
     let path = temp.to_string_lossy().into_owned();
-    with_daemon(async move |mut client| {
-        let value = client
-            .request(Request::RosterInstall { path, org_root_pk })
-            .await?;
-        serde_json::from_value::<RosterInstallResult>(value).context("parse roster install result")
-    })
+    with_daemon(async move |mut client| Ok(client.roster_install(&path, org_root_pk).await?))
 }
 
 /// Split a comma-separated `--allow` flag into trimmed, non-empty entries.
@@ -1186,8 +1145,7 @@ fn run_status() -> anyhow::Result<()> {
         .unwrap_or(false);
     with_daemon(async move |mut client| {
         let hello = client.hello().clone();
-        let result = client.request(Request::Status).await?;
-        let status: StatusResult = serde_json::from_value(result).context("parse status result")?;
+        let status = client.status().await?;
         render_status(&fingerprint, &hello, &status, has_roster_url);
         Ok(())
     })
@@ -1450,73 +1408,81 @@ fn backend_kind_label(kind: BackendKind) -> &'static str {
 }
 
 /// `mcpmesh internal watch`: subscribe to the daemon's live event stream and pretty-print it
-/// (pairing liveness & health telemetry). A thin reference consumer of the `subscribe` surface —
-/// the UAT/dogfood window on the mesh. Auto-starts the daemon, opens the stream (the same
-/// connection-upgrade as `open_session`, one-way after the request), and loops printing frames
-/// until the stream ends or the process is interrupted. Surface-clean (§1.5): the output carries
-/// only the petnames/user_ids/service names/numbers the frames themselves carry — never a raw
-/// endpoint-id (the frames don't carry one).
+/// (pairing liveness & health telemetry). A thin reference consumer of the TYPED `subscribe`
+/// surface ([`client::ControlClient::subscribe`] → [`StreamFrame`]) — the UAT/dogfood window on
+/// the mesh. Auto-starts the daemon, opens the stream (the same connection-upgrade as
+/// `open_session`, one-way after the request), and loops printing frames until the stream ends or
+/// the process is interrupted. Surface-clean (§1.5): the output carries only the
+/// petnames/user_ids/service names/numbers the frames themselves carry — never a raw endpoint-id
+/// (the frames don't carry one).
 fn run_watch() -> anyhow::Result<()> {
     with_daemon(async move |client| {
-        // Hold the write half for the connection's lifetime: `watch` only READS, but dropping the
-        // writer would half-close the socket.
-        let (mut reader, _writer) = client.open_stream("subscribe").await?;
+        let mut stream = client.subscribe().await?;
         println!("watching the mesh — Ctrl-C to stop");
-        while let Some(inbound) = reader.next().await? {
-            if let mcpmesh_net::framing::Inbound::Frame(v) = inbound
-                && let Some(line) = render_frame(&v)
-            {
-                println!("{line}");
-            }
+        while let Some(frame) = stream.next().await? {
+            println!("{}", render_frame(&frame));
         }
         Ok(())
     })
 }
 
-/// Render one untyped `subscribe` stream frame to a display line, or `None` for a frame with no
-/// known type (forward-compat: an unrecognized frame is skipped, never a crash). Pure so the
-/// rendering is unit-testable without a live daemon. The frames are read as `serde_json::Value`
-/// (the typed `StreamFrame` lives daemon-side) and every field is read defensively — a missing
-/// `peer`/`service`/`ts` degrades to an empty piece, never an `unwrap` panic. Surface-clean
-/// (§1.5): only petnames/service names/user_ids/numbers appear — the stream carries no endpoint-id.
-fn render_frame(v: &serde_json::Value) -> Option<String> {
-    match v["type"].as_str()? {
-        "snapshot" => Some(format!(
+/// The snake_case wire word for an [`AuditKind`] — how a record's class reads on a `watch` line
+/// (the same word the JSONL log carries, so the live view and `internal audit` agree).
+fn kind_label(kind: AuditKind) -> &'static str {
+    match kind {
+        AuditKind::SessionOpen => "session_open",
+        AuditKind::SessionClose => "session_close",
+        AuditKind::Request => "request",
+        AuditKind::BlobFetch => "blob_fetch",
+        AuditKind::Trust => "trust",
+    }
+}
+
+/// Render one typed `subscribe` stream frame to a display line. Pure so the rendering is
+/// unit-testable without a live daemon. Optional record fields degrade to an empty piece (a bare
+/// trust event has no peer/service — never a dangling separator). Surface-clean (§1.5): only
+/// petnames/service names/user_ids/numbers appear — the stream carries no endpoint-id.
+fn render_frame(frame: &StreamFrame) -> String {
+    match frame {
+        StreamFrame::Snapshot {
+            active_sessions,
+            reachability,
+        } => format!(
             "snapshot: {} active session(s), {} peer(s) known",
-            v["active_sessions"].as_array().map_or(0, |a| a.len()),
-            v["reachability"].as_array().map_or(0, |a| a.len()),
-        )),
-        "event" => {
-            let r = &v["record"];
-            let peer = r["peer"]
-                .as_str()
+            active_sessions.len(),
+            reachability.len(),
+        ),
+        StreamFrame::Event { record } => {
+            let peer = record
+                .peer
+                .as_deref()
                 .map(|p| format!("{p} "))
                 .unwrap_or_default();
-            let service = r["service"]
-                .as_str()
+            let service = record
+                .service
+                .as_deref()
                 .map(|s| format!("→ {s}"))
                 .unwrap_or_default();
             // `status` is absent on a normal open/close but present ("error"/"ok"/"denied") on
             // records like a failed dial (a `session_open` with `status:"error"`) — surface it so
             // a failed reach doesn't render identically to a real session open.
-            let status = r["status"]
-                .as_str()
+            let status = record
+                .status
+                .as_deref()
                 .map(|s| format!(" ({s})"))
                 .unwrap_or_default();
             let line = format!(
                 "[{}] {} {peer}{service}",
-                r["ts"].as_str().unwrap_or(""),
-                r["kind"].as_str().unwrap_or("?"),
+                record.ts,
+                kind_label(record.kind)
             );
             // A bare event (no peer/service) must not dangle a trailing separator/space; the
             // status suffix (when present) follows the trimmed line.
-            Some(format!("{}{status}", line.trim_end()))
+            format!("{}{status}", line.trim_end())
         }
-        "lagged" => Some(format!(
-            "(lagged {} events — reconnect for a fresh snapshot)",
-            v["dropped"].as_u64().unwrap_or(0)
-        )),
-        _ => None,
+        StreamFrame::Lagged { dropped } => {
+            format!("(lagged {dropped} events — reconnect for a fresh snapshot)")
+        }
     }
 }
 
@@ -2094,38 +2060,45 @@ mod tests {
         assert_eq!(friendly_expiry(100, 1_000), "soon");
     }
 
+    /// Parse a wire-shaped frame into the published [`StreamFrame`] type — the same path
+    /// `run_watch`'s typed subscription takes, so these tests pin BOTH that the documented wire
+    /// JSON deserializes and how it renders.
+    fn frame(v: serde_json::Value) -> StreamFrame {
+        serde_json::from_value(v).expect("wire frame deserializes into StreamFrame")
+    }
+
     #[test]
     fn render_frame_summarizes_a_snapshot() {
-        let v = json!({
+        let v = frame(json!({
             "type": "snapshot",
             "active_sessions": [
                 {"peer": "bob", "service": "notes", "opened_at": 1},
                 {"peer": "carol", "service": "kb", "opened_at": 2},
             ],
             "reachability": [{"name": "bob", "reachable": true}],
-        });
+        }));
         assert_eq!(
-            render_frame(&v).as_deref(),
-            Some("snapshot: 2 active session(s), 1 peer(s) known")
+            render_frame(&v),
+            "snapshot: 2 active session(s), 1 peer(s) known"
         );
         // A daemon with nothing live still summarizes cleanly (no panic on empty arrays).
-        let empty = json!({ "type": "snapshot", "active_sessions": [], "reachability": [] });
+        let empty = frame(json!({ "type": "snapshot", "active_sessions": [], "reachability": [] }));
         assert_eq!(
-            render_frame(&empty).as_deref(),
-            Some("snapshot: 0 active session(s), 0 peer(s) known")
+            render_frame(&empty),
+            "snapshot: 0 active session(s), 0 peer(s) known"
         );
     }
 
     #[test]
     fn render_frame_renders_an_event_line() {
-        let v = json!({
+        let v = frame(json!({
             "type": "event",
             "record": { "ts": "2026-07-17T14:02:11.480Z", "kind": "session_open",
                         "peer": "bob", "service": "notes" },
-        });
+        }));
         assert_eq!(
-            render_frame(&v).as_deref(),
-            Some("[2026-07-17T14:02:11.480Z] session_open bob → notes")
+            render_frame(&v),
+            "[2026-07-17T14:02:11.480Z] session_open bob → notes"
         );
     }
 
@@ -2133,74 +2106,64 @@ mod tests {
     fn render_frame_marks_a_failed_dial_with_its_status() {
         // A failed dial arrives as a `session_open` carrying `status:"error"` — the line must
         // append the status so it doesn't render identically to a real (statusless) open.
-        let failed = json!({
+        let failed = frame(json!({
             "type": "event",
             "record": { "ts": "2026-07-17T14:02:11.480Z", "kind": "session_open",
                         "peer": "bob", "service": "notes", "status": "error" },
-        });
+        }));
         assert_eq!(
-            render_frame(&failed).as_deref(),
-            Some("[2026-07-17T14:02:11.480Z] session_open bob → notes (error)")
+            render_frame(&failed),
+            "[2026-07-17T14:02:11.480Z] session_open bob → notes (error)"
         );
         // A normal open has no `status` field, so no suffix is appended.
-        let normal = json!({
+        let normal = frame(json!({
             "type": "event",
             "record": { "ts": "2026-07-17T14:02:11.480Z", "kind": "session_open",
                         "peer": "bob", "service": "notes" },
-        });
-        assert!(!render_frame(&normal).unwrap().contains('('));
+        }));
+        assert!(!render_frame(&normal).contains('('));
     }
 
     #[test]
     fn render_frame_tolerates_a_bare_event_record() {
-        // A trust/roster event may carry no peer/service — read the untyped JSON defensively
-        // (no unwrap on absent fields), and don't dangle a trailing separator.
-        let v = json!({
+        // A trust/roster event may carry no peer/service — the optional fields degrade to an
+        // empty piece, and the line doesn't dangle a trailing separator.
+        let v = frame(json!({
             "type": "event",
             "record": { "ts": "2026-07-17T14:02:11.480Z", "kind": "trust", "event": "unpair" },
-        });
-        assert_eq!(
-            render_frame(&v).as_deref(),
-            Some("[2026-07-17T14:02:11.480Z] trust")
-        );
+        }));
+        assert_eq!(render_frame(&v), "[2026-07-17T14:02:11.480Z] trust");
     }
 
     #[test]
     fn render_frame_tolerates_asymmetric_event_records() {
         // peer present, service absent (a real shape — `blob_fetch` records carry a peer, no
         // service): the peer renders with no dangling "→ " and no trailing space.
-        let peer_only = json!({
+        let peer_only = frame(json!({
             "type": "event",
             "record": { "ts": "2026-07-17T14:02:11.480Z", "kind": "blob_fetch", "peer": "bob" },
-        });
+        }));
         assert_eq!(
-            render_frame(&peer_only).as_deref(),
-            Some("[2026-07-17T14:02:11.480Z] blob_fetch bob")
+            render_frame(&peer_only),
+            "[2026-07-17T14:02:11.480Z] blob_fetch bob"
         );
         // service present, peer absent: the arrow renders with no phantom peer, no leading space.
-        let service_only = json!({
+        let service_only = frame(json!({
             "type": "event",
             "record": { "ts": "2026-07-17T14:02:11.480Z", "kind": "session_open", "service": "notes" },
-        });
+        }));
         assert_eq!(
-            render_frame(&service_only).as_deref(),
-            Some("[2026-07-17T14:02:11.480Z] session_open → notes")
+            render_frame(&service_only),
+            "[2026-07-17T14:02:11.480Z] session_open → notes"
         );
     }
 
     #[test]
     fn render_frame_renders_a_lagged_notice() {
-        let v = json!({ "type": "lagged", "dropped": 7 });
+        let v = frame(json!({ "type": "lagged", "dropped": 7 }));
         assert_eq!(
-            render_frame(&v).as_deref(),
-            Some("(lagged 7 events — reconnect for a fresh snapshot)")
+            render_frame(&v),
+            "(lagged 7 events — reconnect for a fresh snapshot)"
         );
-    }
-
-    #[test]
-    fn render_frame_skips_an_unknown_frame() {
-        // Robustness (§forward-compat): an unrecognized frame type is skipped, never a crash.
-        assert_eq!(render_frame(&json!({ "type": "future_kind" })), None);
-        assert_eq!(render_frame(&json!({ "not_a_frame": true })), None);
     }
 }
