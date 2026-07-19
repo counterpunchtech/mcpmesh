@@ -354,11 +354,15 @@ fn error_lines(err: &anyhow::Error) -> Vec<String> {
 /// the known daemon failure shapes to user language (issue #10). The daemon's failed-dial
 /// pair message carries transport vocabulary ("dial the inviter on the pairing ALPN") that
 /// SECURITY.md bars from user-facing surfaces — this porcelain seam owns the translation.
+/// The wire's `"{method} failed: "` framing (the shape every control arm answers with) is
+/// stripped first: `peer_remove` is a method name, not a command the user typed — the
+/// remainder is the daemon's own user-facing sentence.
 fn control_error_lines(error: &serde_json::Value) -> Vec<String> {
     let message = error
         .get("message")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
+    let message = strip_wire_framing(message);
     if message.contains("dial the inviter") {
         return vec![
             "Error: could not reach the inviter's machine — are they online?".to_string(),
@@ -375,6 +379,23 @@ fn control_error_lines(error: &serde_json::Value) -> Vec<String> {
         ];
     }
     vec![format!("Error: {message}")]
+}
+
+/// Strip the control wire's `"{method} failed: "` framing from an error message. The prefix
+/// is recognized only when the token before the FIRST `" failed: "` is a bare method name
+/// (lowercase + underscores, the `respond` shape in control.rs) — anything else passes
+/// through untouched, so a daemon sentence that merely contains the words keeps them.
+fn strip_wire_framing(message: &str) -> &str {
+    match message.split_once(" failed: ") {
+        Some((method, rest))
+            if !method.is_empty()
+                && !rest.is_empty()
+                && method.bytes().all(|b| b == b'_' || b.is_ascii_lowercase()) =>
+        {
+            rest
+        }
+        _ => message,
+    }
 }
 
 /// Dispatch the parsed command — split from [`main`] so every verb's failure flows through
@@ -2252,6 +2273,37 @@ mod tests {
         assert!(
             !rendered.contains('{') && !rendered.contains("-32000"),
             "no JSON-RPC object/code may leak: {rendered}"
+        );
+    }
+
+    #[test]
+    fn wire_method_framing_is_stripped_from_control_errors() {
+        // The wire answers `"{method} failed: {reason}"` (respond() in control.rs); the method
+        // token is not user language — the daemon's own sentence is what a human gets. These
+        // are the end-to-end shapes for issues #8 and #9.
+        let err = api_error(json!({"code": -32000, "message":
+            "peer_remove failed: no paired peer named 'nobody' — 'mcpmesh status' lists your peers"}));
+        assert_eq!(
+            error_lines(&err),
+            vec![
+                "Error: no paired peer named 'nobody' — 'mcpmesh status' lists your peers"
+                    .to_string()
+            ]
+        );
+        let err = api_error(json!({"code": -32000, "message":
+            "invite failed: no service named 'nosuchsvc' — you serve: notes (see 'mcpmesh status')"}));
+        assert_eq!(
+            error_lines(&err),
+            vec![
+                "Error: no service named 'nosuchsvc' — you serve: notes (see 'mcpmesh status')"
+                    .to_string()
+            ]
+        );
+        // No framing → untouched; a non-method token before " failed: " → untouched.
+        assert_eq!(strip_wire_framing("invite expired"), "invite expired");
+        assert_eq!(
+            strip_wire_framing("the Frobnicator failed: twice"),
+            "the Frobnicator failed: twice"
         );
     }
 
