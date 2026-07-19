@@ -317,7 +317,7 @@ async fn pair_remove_drops_the_peer_and_revokes_every_service_allow() {
             None,
             None,
         );
-        let state = DaemonState::with_mesh(STACK_VERSION, mesh, Vec::new(), Vec::new());
+        let state = DaemonState::with_mesh(STACK_VERSION, mesh);
 
         // ── Unpair bob ──
         daemon::remove_peer(&state, unpair("bob"))
@@ -418,7 +418,7 @@ async fn pair_remove_drops_a_peer_with_no_service_allow() {
             None,
             None,
         );
-        let state = DaemonState::with_mesh(STACK_VERSION, mesh, Vec::new(), Vec::new());
+        let state = DaemonState::with_mesh(STACK_VERSION, mesh);
 
         daemon::remove_peer(&state, unpair("dave"))
             .await
@@ -479,7 +479,7 @@ async fn pair_remove_audits_a_real_unpair_but_not_a_no_op() {
         );
         let audit_dir = dir.path().join("audit");
         mesh.set_audit(AuditSink::new(AuditLog::spawn(audit_dir.clone())));
-        let state = DaemonState::with_mesh(STACK_VERSION, mesh, Vec::new(), Vec::new());
+        let state = DaemonState::with_mesh(STACK_VERSION, mesh);
 
         let month = &now_ts()[..7];
         let file = audit_dir.join(format!("{month}.jsonl"));

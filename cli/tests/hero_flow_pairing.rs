@@ -144,12 +144,7 @@ async fn four_command_hero_flow() {
         // Alice's control socket (driven only in-process, so any path works).
         let alice_socket = alice_dir.path().join("control.sock");
         let alice_listener = mcpmesh::ipc::bind_control_socket(&alice_socket).await.unwrap();
-        let alice_state = Arc::new(DaemonState::with_mesh(
-            daemon::STACK_VERSION,
-            alice_mesh,
-            Vec::new(),
-            Vec::new(),
-        ));
+        let alice_state = Arc::new(DaemonState::with_mesh(daemon::STACK_VERSION, alice_mesh));
         let alice_control = tokio::spawn(serve_control(alice_listener, alice_state));
 
         // ── BOB: a REAL daemon (control API) that DIALS. No accept loop — Bob only redeems and
@@ -184,12 +179,7 @@ async fn four_command_hero_flow() {
         );
         let bob_socket = bob_dir.path().join("mcpmesh").join("mcpmesh.sock");
         let bob_listener = mcpmesh::ipc::bind_control_socket(&bob_socket).await.unwrap();
-        let bob_state = Arc::new(DaemonState::with_mesh(
-            daemon::STACK_VERSION,
-            bob_mesh,
-            Vec::new(),
-            Vec::new(),
-        ));
+        let bob_state = Arc::new(DaemonState::with_mesh(daemon::STACK_VERSION, bob_mesh));
         let bob_control = tokio::spawn(serve_control(bob_listener, bob_state));
 
         // ══════════════════════════════════════════════════════════════════════════════════

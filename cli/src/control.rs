@@ -14,15 +14,15 @@
 //! `open_session` (Task 10) is special: after that request the connection stops being
 //! JSON-RPC and becomes a raw MCP byte pipe the daemon dials + pumps (spec §8).
 use std::future::Future;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use mcpmesh_local_api::transport::{LocalListener, LocalStream};
 use mcpmesh_local_api::{
     API_NAME, API_VERSION, BlobFetchParams, BlobGrantParams, BlobPublishParams, Hello,
-    InviteParams, OpenSessionParams, OrgJoinParams, PairParams, PeerInfo, RosterInstallParams,
-    ServiceInfo, SetRosterUrlParams, StatusResult, method_of,
+    InviteParams, OpenSessionParams, OrgJoinParams, PairParams, RosterInstallParams,
+    SetRosterUrlParams, StatusResult, method_of,
 };
 use mcpmesh_net::framing::{FrameReader, Inbound, write_frame};
 use serde_json::{Value, json};
@@ -31,15 +31,14 @@ use tokio::sync::Notify;
 use crate::daemon::MeshState;
 use crate::ipc::{self, MAX_FRAME_BYTES};
 
-/// Live daemon state behind the control API. `services`/`peers` are the `status` snapshots,
-/// refreshed by `register_service`/`peer_add`. `mesh` is the endpoint + gate + serve handle
+/// Live daemon state behind the control API. `mesh` is the endpoint + gate + serve handle
 /// the real daemon owns (Task 9); it is `None` in control-only construction (unit tests),
-/// in which case `register_service`/`peer_add` fail gracefully. `shutdown` is the internal
-/// signal a `shutdown` request raises so the accept loop can stop cleanly.
+/// in which case `register_service`/`peer_add` fail gracefully. The `status` service/peer
+/// lists are read LIVE from the mesh's config + store on each call — there is no cached
+/// snapshot here. `shutdown` is the internal signal a `shutdown` request raises so the
+/// accept loop can stop cleanly.
 pub struct DaemonState {
     pub stack_version: String,
-    pub services: RwLock<Vec<ServiceInfo>>,
-    pub peers: RwLock<Vec<PeerInfo>>,
     pub(crate) mesh: Option<Arc<MeshState>>,
     shutdown: Notify,
 }
@@ -50,29 +49,20 @@ impl DaemonState {
     pub fn new(stack_version: impl Into<String>) -> Self {
         Self {
             stack_version: stack_version.into(),
-            services: RwLock::new(Vec::new()),
-            peers: RwLock::new(Vec::new()),
             mesh: None,
             shutdown: Notify::new(),
         }
     }
 
-    /// The full daemon state: control snapshots + the mesh half (Task 9).
+    /// The full daemon state: the control server over the mesh half (Task 9).
     ///
     /// `pub` (like [`MeshState::new`](crate::daemon::MeshState::new)) so integration tests can
     /// assemble a serving `DaemonState` around a HERMETIC `MeshState` (temp config + store +
     /// endpoint) and drive the real control handlers — e.g. the M2b `pair --remove` test calls
     /// `daemon::remove_peer` over a state built this way, asserting on the store + config truth.
-    pub fn with_mesh(
-        stack_version: impl Into<String>,
-        mesh: Arc<MeshState>,
-        services: Vec<ServiceInfo>,
-        peers: Vec<PeerInfo>,
-    ) -> Self {
+    pub fn with_mesh(stack_version: impl Into<String>, mesh: Arc<MeshState>) -> Self {
         Self {
             stack_version: stack_version.into(),
-            services: RwLock::new(services),
-            peers: RwLock::new(peers),
             mesh: Some(mesh),
             shutdown: Notify::new(),
         }
@@ -83,6 +73,13 @@ impl DaemonState {
     /// grant, `register_service`) can cheaply clone the shared handle.
     pub(crate) fn mesh(&self) -> Option<&Arc<MeshState>> {
         self.mesh.as_ref()
+    }
+
+    /// The mesh half, or the one control-only-mode refusal every mesh-requiring control verb
+    /// answers — the single home of the "daemon has no mesh (control-only mode)" guard.
+    pub(crate) fn mesh_required(&self) -> Result<&Arc<MeshState>> {
+        self.mesh()
+            .context("daemon has no mesh (control-only mode)")
     }
 }
 
@@ -304,8 +301,9 @@ async fn handle_request(req: &Value, state: &DaemonState) -> Value {
         Some("invite") => {
             // Mint a pairing invite (spec §4.2) granting a service list ([`InviteParams`]
             // tolerates an absent list).
-            let Some(mesh) = state.mesh() else {
-                return error(id, -32000, "daemon has no mesh (control-only mode)");
+            let mesh = match state.mesh_required() {
+                Ok(mesh) => mesh,
+                Err(e) => return error(id, -32000, e.to_string()),
             };
             respond(
                 id,
@@ -440,58 +438,41 @@ fn unit((): ()) -> Value {
 fn dispatch(req: &Value, state: &DaemonState) -> Value {
     let id = req.get("id").cloned().unwrap_or(Value::Null);
     match method_of(req) {
-        Some("status") => {
-            let result =
-                serde_json::to_value(status_result(state)).expect("StatusResult serializes");
-            ok(id, result)
-        }
+        Some("status") => respond(id, "status", status_result(state)),
         Some("shutdown") => ok(id, json!({})),
         Some(other) => error(id, -32601, format!("unknown method: {other}")),
         None => error(id, -32600, "request is missing a `method`"),
     }
 }
 
-pub(crate) fn status_result(state: &DaemonState) -> StatusResult {
+pub(crate) fn status_result(state: &DaemonState) -> Result<StatusResult> {
     // Services + peers are read LIVE from the mesh's config + store (like `roster`/`presence`
-    // below), NOT from the cached snapshot: the pairing grant (grant_service_access) and the
-    // rendezvous PeerEntry write are durable but do NOT refresh the snapshot, so a cached read
-    // showed a just-paired peer as absent / its grant as `no one yet` until the next
-    // register/restart. A live read is always-current and cheap (status is a human-invoked
-    // command). The cached snapshot remains the fallback for a rare config-read error and for a
-    // control-only daemon (no mesh → no config/store to read). std RwLock guards are cloned out
-    // and dropped inside this sync fn — no lock is ever held across an await.
+    // below) — there is no cached snapshot: the pairing grant (grant_service_access) and the
+    // rendezvous PeerEntry write land durably without touching `DaemonState`, so only a live
+    // read shows a just-paired peer / its grant immediately. A live read is always-current and
+    // cheap (status is a human-invoked command). An unreadable config is an explicit ERROR —
+    // never silently-stale data. A control-only daemon (no mesh → no config/store to read)
+    // answers empty lists.
     // The config is loaded ONCE per status call and shared by the live service list AND
     // `roster_status` (which reads only the pinned org anchor from it) — the host polls status,
-    // so the previous load-twice was a real per-poll cost.
+    // so a load-twice would be a real per-poll cost.
     let (services, peers, roster) = match state.mesh() {
         Some(mesh) => {
-            let cfg = crate::config::Config::load(&mesh.config_path).ok();
-            let services = cfg
-                .as_ref()
-                .map(crate::daemon::service_infos)
-                .unwrap_or_else(|| {
-                    state
-                        .services
-                        .read()
-                        .expect("services lock not poisoned")
-                        .clone()
-                });
+            let cfg = crate::config::Config::load(&mesh.config_path).map_err(|e| {
+                anyhow::anyhow!("config unreadable at {}: {e}", mesh.config_path.display())
+            })?;
             // Roster status is computed LIVE from `mesh.roster.view()` (never a cached snapshot —
             // the gate view is already hot-swapped on install; a live read is cheap + always-
             // current). A pure-pairing daemon (no mesh, or an empty roster gate) yields None → no
             // roster block.
-            let roster = crate::daemon::roster_status(mesh, cfg.as_ref());
-            (services, crate::daemon::peer_infos(&mesh.store), roster)
+            let roster = crate::daemon::roster_status(mesh, Some(&cfg));
+            (
+                crate::daemon::service_infos(&cfg),
+                crate::daemon::peer_infos(&mesh.store),
+                roster,
+            )
         }
-        None => (
-            state
-                .services
-                .read()
-                .expect("services lock not poisoned")
-                .clone(),
-            state.peers.read().expect("peers lock not poisoned").clone(),
-            None,
-        ),
+        None => (Vec::new(), Vec::new(), None),
     };
     // Advisory presence read (spec §10.1): the installed roster's devices joined with the live
     // presence table (online = a non-expired heartbeat). ADVISORY — a display convenience; a device
@@ -523,7 +504,7 @@ pub(crate) fn status_result(state: &DaemonState) -> StatusResult {
         .mesh()
         .map(crate::daemon::reachability_of)
         .unwrap_or_default();
-    StatusResult {
+    Ok(StatusResult {
         stack_version: state.stack_version.clone(),
         services,
         peers,
@@ -532,7 +513,7 @@ pub(crate) fn status_result(state: &DaemonState) -> StatusResult {
         self_user_id,
         recent_pairings,
         reachability,
-    }
+    })
 }
 
 /// Deserialize a request's `params` into a method's typed param struct — the local-api wire
@@ -578,10 +559,10 @@ mod tests {
         json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params })
     }
 
-    /// `status` on a control-only daemon answers from the (empty) snapshot: version + empty peers,
-    /// no roster/presence block. Exercises `status_result`'s no-mesh fallback branch.
+    /// `status` on a control-only daemon answers version + empty service/peer lists and no
+    /// roster/presence block. Exercises `status_result`'s no-mesh branch.
     #[test]
-    fn dispatch_status_answers_from_the_snapshot() {
+    fn dispatch_status_answers_empty_lists_without_a_mesh() {
         let st = control_only();
         let r = dispatch(&req("status", json!({})), &st);
         assert_eq!(r["result"]["stack_version"], "0.1.0-test");
