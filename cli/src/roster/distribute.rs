@@ -57,9 +57,8 @@ pub async fn announce_roster(mesh: &Arc<MeshState>) -> Result<()> {
     };
     let serial = view.serial();
     let path = installed_roster_path(mesh);
-    let bytes = tokio::task::spawn_blocking(move || std::fs::read(path))
-        .await
-        .context("join roster read")?
+    let bytes = crate::util::blocking("join roster read", move || std::fs::read(path))
+        .await?
         .context("read installed roster for announce")?;
     let (ticket, roster_hash) = blobs.publish(&bytes, &mesh.endpoint).await?;
     let announce = RosterAnnounce {
@@ -158,13 +157,12 @@ async fn converge_roster_bytes(
     let tmp = write_temp_roster(bytes)?;
     let rstore = RosterStore::new(installed_roster_path(mesh));
     let now = crate::util::epoch_now_i64();
-    let view = tokio::task::spawn_blocking(move || {
-        let v = rstore.install_from_file(&tmp, &pk, now);
-        let _ = std::fs::remove_file(&tmp);
-        v
+    // `tmp` moves into the closure: its guard removes the temp file when the install returns
+    // (success and failure alike).
+    let view = crate::util::blocking("join roster install", move || {
+        rstore.install_from_file(tmp.path(), &pk, now)
     })
-    .await
-    .context("join roster install")??;
+    .await??;
     mesh.confirm_roster_current(now).await;
     let severed = install_roster_view_and_sever(mesh, view);
     reconcile_user_id_from_roster(mesh).await;

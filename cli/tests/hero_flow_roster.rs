@@ -464,12 +464,7 @@ async fn status_reports_the_installed_roster_over_the_control_api() {
         // Bind a control socket + serve the real control API over the roster-installed mesh.
         let socket = dir.path().join("control.sock");
         let listener = mcpmesh::ipc::bind_control_socket(&socket).await.unwrap();
-        let state = Arc::new(DaemonState::with_mesh(
-            daemon::STACK_VERSION,
-            mesh,
-            Vec::new(),
-            Vec::new(),
-        ));
+        let state = Arc::new(DaemonState::with_mesh(daemon::STACK_VERSION, mesh));
         let control = tokio::spawn(serve_control(listener, state));
 
         // A raw (non-porcelain) client reads status.roster over mcpmesh-local/1.

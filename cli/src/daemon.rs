@@ -57,7 +57,7 @@ use self::config_write::{
     append_allow_to_config, remove_allow_from_config, rename_allow_in_config, write_identity_pin,
     write_identity_user_id, write_join_pin, write_roster_url, write_service_to_config,
 };
-use crate::util::{epoch_now_i64, epoch_now_u64};
+use crate::util::{TempPathGuard, blocking, epoch_now_i64, epoch_now_u64, unique_temp_path};
 
 use crate::allowlist::{AllowlistGate, PeerEntry, PeerStore};
 use crate::audit::{AuditLog, AuditRecord, AuditSink, now_ts};
@@ -423,12 +423,11 @@ impl MeshState {
         // Then persist (best-effort). Derived per-node from `config_path` so two daemons in one process
         // (the multi-node integration tests) keep separate sidecars — mirrors `installed_roster_path`.
         let store = FreshnessStore::new(roster_confirmed_path(&self.config_path));
-        match tokio::task::spawn_blocking(move || store.store(now)).await {
+        match blocking("join roster freshness persist", move || store.store(now)).await {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => {
+            Ok(Err(e)) | Err(e) => {
                 tracing::warn!(%e, "persist roster freshness (in-memory freshness still applied)")
             }
-            Err(e) => tracing::warn!(%e, "join roster freshness persist"),
         }
     }
 
@@ -545,9 +544,7 @@ async fn serve_forever(socket: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create data dir {}", parent.display()))?;
     }
-    let store = tokio::task::spawn_blocking(move || PeerStore::open(&db_path))
-        .await
-        .context("join peer-store open")??;
+    let store = blocking("join peer-store open", move || PeerStore::open(&db_path)).await??;
     let store = Arc::new(store);
     // The composed trust gate (spec §4.1): pairing ∪ roster with explicit precedence
     // (revocation → roster → pairing). `pairs` is the M2b `AllowlistGate` over the redb peer
@@ -572,7 +569,7 @@ async fn serve_forever(socket: &Path) -> Result<()> {
         match crate::roster::parse_org_root_pk(&pk_str) {
             Ok(pk) => {
                 let rstore = RosterStore::new(paths::default_roster_path()?);
-                match tokio::task::spawn_blocking(move || rstore.load(&pk)).await {
+                match blocking("join roster load", move || rstore.load(&pk)).await {
                     Ok(Ok(Some(view))) => {
                         roster.install(view);
                         tracing::info!("installed roster loaded");
@@ -581,10 +578,9 @@ async fn serve_forever(socket: &Path) -> Result<()> {
                         warn_if_degraded_grace(&roster);
                     }
                     Ok(Ok(None)) => {}
-                    Ok(Err(e)) => {
+                    Ok(Err(e)) | Err(e) => {
                         tracing::warn!(%e, "installed roster failed to load; refusing roster peers")
                     }
-                    Err(e) => tracing::warn!(%e, "join roster load"),
                 }
             }
             Err(e) => tracing::warn!(%e, "pinned org_root_pk is invalid; roster mode disabled"),
@@ -600,23 +596,27 @@ async fn serve_forever(socket: &Path) -> Result<()> {
     {
         let fpath = roster_confirmed_path(&config_path);
         let fstore = FreshnessStore::new(fpath.clone());
-        match tokio::task::spawn_blocking(move || fstore.load()).await {
+        match blocking("join roster freshness load", move || fstore.load()).await {
             Ok(Ok(Some(lc))) => roster.set_last_confirmed(lc),
             Ok(Ok(None)) if roster.view().is_some() => {
                 let now = epoch_now_i64();
                 roster.set_last_confirmed(now);
                 let fstore = FreshnessStore::new(fpath);
-                match tokio::task::spawn_blocking(move || fstore.store(now)).await {
+                match blocking("join roster freshness upgrade-grace persist", move || {
+                    fstore.store(now)
+                })
+                .await
+                {
                     Ok(Ok(())) => tracing::info!("roster freshness upgrade grace applied"),
-                    Ok(Err(e)) => tracing::warn!(%e, "persist roster freshness upgrade grace"),
-                    Err(e) => tracing::warn!(%e, "join roster freshness upgrade-grace persist"),
+                    Ok(Err(e)) | Err(e) => {
+                        tracing::warn!(%e, "persist roster freshness upgrade grace")
+                    }
                 }
             }
             Ok(Ok(None)) => {}
-            Ok(Err(e)) => {
+            Ok(Err(e)) | Err(e) => {
                 tracing::warn!(%e, "read roster freshness sidecar; treating as unconfirmed")
             }
-            Err(e) => tracing::warn!(%e, "join roster freshness load"),
         }
     }
     let gate: Arc<dyn TrustGate> = Arc::new(ComposedGate::new(roster.clone(), pairs));
@@ -624,14 +624,10 @@ async fn serve_forever(socket: &Path) -> Result<()> {
     // 4. Rate/concurrency limiters (spec §11.2 P7), built once from config and shared across every
     //    backend + (T9) the accept loop. Installed on the mesh AFTER it is built (below).
     let limiters = crate::limits::MeshLimiters::from_config(&cfg.limits);
-    // 4b. Service registry + status snapshots from config/store. `run_mesh_connection` shares
-    //    one registry across every connection, so wrap it once in `Arc` here.
+    // 4b. Service registry from config. `run_mesh_connection` shares one registry across every
+    //    connection, so wrap it once in `Arc` here. (The `status` service/peer lists are read
+    //    LIVE from config + store per call — nothing to snapshot here.)
     let services = Arc::new(build_services_audited(&cfg, &audit, &limiters));
-    let service_list = service_infos(&cfg);
-    let store_for_list = store.clone();
-    let peer_list = tokio::task::spawn_blocking(move || peer_infos(&store_for_list))
-        .await
-        .context("join peer list")?;
 
     // 5. Assemble the mesh half, start the daemon's OWN ALPN-dispatch accept loop, and install
     //    its handle for hot-reload. Chicken-egg (the loop needs `mesh`, `mesh.accept_task` needs
@@ -707,7 +703,7 @@ async fn serve_forever(socket: &Path) -> Result<()> {
     // never builds it.
     if roster_mode {
         let scopes_path = paths::default_blob_scopes_path()?;
-        match tokio::task::spawn_blocking(move || {
+        match blocking("join app-blob scopes load", move || {
             crate::blobs::scope::ScopeStore::load(scopes_path)
         })
         .await
@@ -726,8 +722,9 @@ async fn serve_forever(socket: &Path) -> Result<()> {
                     Err(e) => tracing::warn!(%e, "app-blob provider disabled (build failed)"),
                 }
             }
-            Ok(Err(e)) => tracing::warn!(%e, "app-blob scopes failed to load; provider disabled"),
-            Err(e) => tracing::warn!(%e, "join app-blob scopes load"),
+            Ok(Err(e)) | Err(e) => {
+                tracing::warn!(%e, "app-blob scopes failed to load; provider disabled")
+            }
         }
     }
     let accept_task = spawn_accept_loop(mesh.clone(), services);
@@ -798,12 +795,7 @@ async fn serve_forever(socket: &Path) -> Result<()> {
 
     // 6. The control server on the local endpoint (bound in step 0a), running on the same runtime
     //    as the mesh serve loop.
-    let state = Arc::new(DaemonState::with_mesh(
-        STACK_VERSION,
-        mesh,
-        service_list,
-        peer_list,
-    ));
+    let state = Arc::new(DaemonState::with_mesh(STACK_VERSION, mesh));
     // Our own endpoint id is operator-shareable (it is how a peer pairs us) — not a §1.5
     // surface leak (that discipline forbids leaking OTHER peers' ids/paths in porcelain).
     tracing::info!(
@@ -1070,9 +1062,7 @@ pub(crate) async fn install_roster(
     path: String,
     org_root_pk: Option<String>,
 ) -> Result<RosterInstallResult> {
-    let mesh = state
-        .mesh()
-        .context("daemon has no mesh (control-only mode)")?;
+    let mesh = state.mesh_required()?;
     // Serialize the ENTIRE install critical section — installed-serial read → validate → persist →
     // pin → gate hot-swap → sever — under the SAME `reload_lock` that register_service /
     // grant_service_access / revoke_service_access hold around their whole read→write→swap sections
@@ -1101,9 +1091,10 @@ pub(crate) async fn install_roster(
     let file = PathBuf::from(path);
     // Read + validate + persist on a blocking thread (fs + verify); returns the resolvable view.
     // A FAILED validation returns Err BEFORE the write, so the on-disk roster is left untouched.
-    let view = tokio::task::spawn_blocking(move || rstore.install_from_file(&file, &pk, now))
-        .await
-        .context("join roster install")??;
+    let view = blocking("join roster install", move || {
+        rstore.install_from_file(&file, &pk, now)
+    })
+    .await??;
     let (org_id, serial) = (view.org_id().to_string(), view.serial());
     // Pin the trust anchor + org_id to config now that the roster validated — only when an explicit
     // pk was provided (a first install or an operator re-pin). Call the lock-free `write_identity_pin`
@@ -1113,9 +1104,10 @@ pub(crate) async fn install_roster(
     if org_root_pk.is_some() {
         let config_path = mesh.config_path.clone();
         let (pk_w, oid_w) = (pk_str.clone(), org_id.clone());
-        tokio::task::spawn_blocking(move || write_identity_pin(&config_path, &pk_w, &oid_w))
-            .await
-            .context("join org-root pin config write")??;
+        blocking("join org-root pin config write", move || {
+            write_identity_pin(&config_path, &pk_w, &oid_w)
+        })
+        .await??;
         tracing::info!(org_id = %org_id, "pinned org root");
     }
     // Freshness (T9): a manual install is proof of currency — CONFIRM so the live gate's future
@@ -1155,9 +1147,7 @@ pub(crate) async fn blob_publish(
     scope: String,
     path: String,
 ) -> Result<BlobPublishResult> {
-    let mesh = state
-        .mesh()
-        .context("daemon has no mesh (control-only mode)")?;
+    let mesh = state.mesh_required()?;
     let provider = mesh
         .app_blobs()
         .await
@@ -1175,9 +1165,7 @@ pub(crate) async fn blob_grant(
     scope: String,
     principal: String,
 ) -> Result<()> {
-    let mesh = state
-        .mesh()
-        .context("daemon has no mesh (control-only mode)")?;
+    let mesh = state.mesh_required()?;
     let provider = mesh
         .app_blobs()
         .await
@@ -1187,9 +1175,7 @@ pub(crate) async fn blob_grant(
 
 /// Handle a `blob_list` control request (spec §9): the daemon's scopes (name → hashes + grants).
 pub(crate) async fn blob_list(state: &DaemonState) -> Result<BlobScopeList> {
-    let mesh = state
-        .mesh()
-        .context("daemon has no mesh (control-only mode)")?;
+    let mesh = state.mesh_required()?;
     let scopes = match mesh.app_blobs().await {
         Some(provider) => provider
             .list()
@@ -1213,9 +1199,7 @@ pub(crate) async fn blob_fetch(
     ticket: String,
     dest_path: String,
 ) -> Result<BlobFetchResult> {
-    let mesh = state
-        .mesh()
-        .context("daemon has no mesh (control-only mode)")?;
+    let mesh = state.mesh_required()?;
     let provider = mesh
         .app_blobs()
         .await
@@ -1321,34 +1305,31 @@ pub(crate) async fn reconcile_user_id_from_roster(mesh: &Arc<MeshState>) {
     // Rewrite config to the ROSTER's authoritative value. LOCK-FREE writer under the caller's HELD
     // `reload_lock` (see the doc note — a nested lock would deadlock); on a blocking worker.
     let uid = roster_user_id.clone();
-    match tokio::task::spawn_blocking(move || write_identity_user_id(&config_path, &uid)).await {
+    match blocking("join reconcile config user_id write", move || {
+        write_identity_user_id(&config_path, &uid)
+    })
+    .await
+    {
         Ok(Ok(())) => {
             tracing::info!(user_id = %roster_user_id, "reconciled config user_id from the authoritative roster")
         }
-        Ok(Err(e)) => tracing::warn!(%e, "reconcile config user_id write failed"),
-        Err(e) => tracing::warn!(%e, "join reconcile config user_id write"),
+        Ok(Err(e)) | Err(e) => tracing::warn!(%e, "reconcile config user_id write failed"),
     }
 }
 
 /// Write roster BYTES to a unique temp file so [`RosterStore::install_from_file`] — the SINGLE
 /// convergence path (validate rules 1–6 → persist) — can judge them. The gossip/URL channels fetch
 /// bytes, but the install path takes a PATH (P12/P14: the same-uid daemon reads its own local file);
-/// this bridges the two. The caller removes the temp file after the install. A per-call-unique name
-/// (pid + seq — §13 "no fixed temp name"); the file is only ever READ by `install_from_file`.
-pub(crate) fn write_temp_roster(bytes: &[u8]) -> Result<PathBuf> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!(
-        "mcpmesh-roster-in.{}.{}.json",
-        std::process::id(),
-        seq
-    ));
-    let mut f =
-        File::create(&path).with_context(|| format!("create temp roster {}", path.display()))?;
+/// this bridges the two. The returned [`TempPathGuard`] removes the temp file on drop — the caller
+/// holds it across the install. A per-call-unique name ([`unique_temp_path`]: pid + seq — §13 "no
+/// fixed temp name"); the file is only ever READ by `install_from_file`.
+pub(crate) fn write_temp_roster(bytes: &[u8]) -> Result<TempPathGuard> {
+    let tmp = TempPathGuard::new(unique_temp_path(&std::env::temp_dir(), "mcpmesh-roster-in"));
+    let mut f = File::create(tmp.path())
+        .with_context(|| format!("create temp roster {}", tmp.path().display()))?;
     f.write_all(bytes).context("write temp roster")?;
     f.sync_all().context("sync temp roster")?;
-    Ok(path)
+    Ok(tmp)
 }
 
 /// Handle an `org_join` control request (spec §4.4 step 2): pin the org root + user key in config so
@@ -1367,15 +1348,14 @@ pub(crate) async fn org_join(
 ) -> Result<OrgJoinResult> {
     // Validate the pinned pk parses BEFORE writing (a garbage anchor must not land in config).
     crate::roster::parse_org_root_pk(&org_root_pk)?;
-    let mesh = state
-        .mesh()
-        .context("daemon has no mesh (control-only mode)")?;
+    let mesh = state.mesh_required()?;
     let _reload = mesh.reload_lock.lock().await;
     let config_path = mesh.config_path.clone();
     let (oid, pk, uid, uk) = (org_id.clone(), org_root_pk, user_id, user_key);
-    tokio::task::spawn_blocking(move || write_join_pin(&config_path, &oid, &pk, &uid, &uk))
-        .await
-        .context("join org-root pin config write")??;
+    blocking("join org-root pin config write", move || {
+        write_join_pin(&config_path, &oid, &pk, &uid, &uk)
+    })
+    .await??;
     tracing::info!(org_id = %org_id, "pinned org root (join)");
     Ok(OrgJoinResult { org_id })
 }
@@ -1399,15 +1379,14 @@ pub(crate) async fn org_join(
 /// `org_join` / `install_roster` / `register_service`); the respawn runs AFTER the write is durable and
 /// takes only the short-lived `poll_loop` lock. The URL value is NOT logged (out of the trace surface).
 pub(crate) async fn set_roster_url(state: &DaemonState, url: String) -> Result<()> {
-    let mesh = state
-        .mesh()
-        .context("daemon has no mesh (control-only mode)")?;
+    let mesh = state.mesh_required()?;
     let _reload = mesh.reload_lock.lock().await;
     let config_path = mesh.config_path.clone();
     let url_w = url.clone();
-    tokio::task::spawn_blocking(move || write_roster_url(&config_path, &url_w))
-        .await
-        .context("roster-url config write")??;
+    blocking("roster-url config write", move || {
+        write_roster_url(&config_path, &url_w)
+    })
+    .await??;
     tracing::info!("pinned roster url");
     // Roster mode (an org root is pinned in the LIVE config — the `OrgJoin` before this write set it
     // on a joiner, or `org create` on an operator): (re)start the poll loop NOW so a runtime join
@@ -2017,9 +1996,8 @@ pub fn reachability_of(mesh: &Arc<MeshState>) -> Vec<mcpmesh_local_api::PeerReac
 /// [`rename_peer`], [`grant_service_access`], [`revoke_service_access`]). `why` names the mutation
 /// for the reload error (`"reload config after {why}: …"`). The CALLER holds `mesh.reload_lock`
 /// around its whole critical section; this helper takes no lock beyond [`reload_accept_loop`]'s
-/// short-lived `accept_task` swap. Returns the reloaded `Config` so a caller that also refreshes
-/// its status snapshot ([`register_service`]) does not read the file twice.
-async fn reload_services_from_disk(mesh: &Arc<MeshState>, why: &str) -> Result<Config> {
+/// short-lived `accept_task` swap.
+async fn reload_services_from_disk(mesh: &Arc<MeshState>, why: &str) -> Result<()> {
     let cfg = Config::load(&mesh.config_path)
         .map_err(|e| anyhow::anyhow!("reload config after {why}: {e}"))?;
     reload_accept_loop(
@@ -2027,7 +2005,7 @@ async fn reload_services_from_disk(mesh: &Arc<MeshState>, why: &str) -> Result<C
         build_services_audited(&cfg, &mesh.audit(), &mesh.limits()),
     )
     .await;
-    Ok(cfg)
+    Ok(())
 }
 
 /// (Re)start the HTTPS roster-poll loop (spec §4.3 M3c), ABORTING any prior one first so repeated
@@ -2156,9 +2134,7 @@ pub(crate) async fn register_service(
     state: &DaemonState,
     params: RegisterServiceParams,
 ) -> Result<()> {
-    let mesh = state
-        .mesh()
-        .context("daemon has no mesh (control-only mode)")?;
+    let mesh = state.mesh_required()?;
 
     // Serialize the ENTIRE critical section (read → upsert → write → reload → rebuild → serve
     // swap → status). Two concurrent registrations must not read the same base config and
@@ -2173,33 +2149,29 @@ pub(crate) async fn register_service(
         allow,
     } = params;
     let (name_w, backend_w, allow_w) = (name.clone(), backend.clone(), allow.clone());
-    tokio::task::spawn_blocking(move || {
+    blocking("join config write", move || {
         write_service_to_config(&config_path, &name_w, &backend_w, &allow_w)
     })
-    .await
-    .context("join config write")??;
+    .await??;
 
     // 2/3. Reload config, rebuild the registry from the persisted truth, and hot-reload: abort the
     //      old accept loop, spawn a fresh one on the same endpoint carrying the rebuilt registry
     //      (a brief serving blip is acceptable, spec §6.1). Shared with the pairing grant / revoke /
-    //      rename via [`reload_services_from_disk`] (DRY).
-    let cfg = reload_services_from_disk(mesh, "register").await?;
+    //      rename via [`reload_services_from_disk`] (DRY). `status` reads the config live, so the
+    //      new service is visible on the very next call.
+    reload_services_from_disk(mesh, "register").await?;
 
-    // 4. Refresh the status snapshot.
-    *state.services.write().expect("services lock not poisoned") = service_infos(&cfg);
     tracing::info!(service = %name, "registered/updated service");
     Ok(())
 }
 
 /// Handle a `peer_add` control request (the M2a trust-population stand-in for pairing): write
 /// a [`PeerEntry`] to the daemon's OPEN store (redb is single-process, so this must route
-/// through the daemon), then refresh the `status` peer snapshot. The live
-/// [`AllowlistGate`](crate::allowlist::AllowlistGate) reads the same database, so the new
-/// peer is resolvable on the very next accept — no gate rebuild needed.
+/// through the daemon). The live [`AllowlistGate`](crate::allowlist::AllowlistGate) reads the
+/// same database, so the new peer is resolvable on the very next accept — no gate rebuild
+/// needed — and `status` reads the store live, so it shows the peer immediately.
 pub(crate) async fn add_peer(state: &DaemonState, params: PeerAddParams) -> Result<()> {
-    let mesh = state
-        .mesh()
-        .context("daemon has no mesh (control-only mode)")?;
+    let mesh = state.mesh_required()?;
     let PeerAddParams {
         petname,
         endpoint_id,
@@ -2222,16 +2194,8 @@ pub(crate) async fn add_peer(state: &DaemonState, params: PeerAddParams) -> Resu
 
     // redb writes block + fsync — run on a blocking thread (Task 4 BINDING seam note).
     let store = mesh.store.clone();
-    tokio::task::spawn_blocking(move || store.add(entry))
-        .await
-        .context("join peer add")??;
+    blocking("join peer add", move || store.add(entry)).await??;
 
-    // Refresh the status peer snapshot from the store.
-    let store = mesh.store.clone();
-    let peers = tokio::task::spawn_blocking(move || peer_infos(&store))
-        .await
-        .context("join peer list")?;
-    *state.peers.write().expect("peers lock not poisoned") = peers;
     tracing::info!(peer = %petname, "added peer to allowlist");
     Ok(())
 }
@@ -2269,9 +2233,7 @@ pub(crate) async fn add_peer(state: &DaemonState, params: PeerAddParams) -> Resu
 /// though this detached handler holds no `DaemonState`. The functional truth is the store +
 /// config (which the `pair --remove` tests assert on), and `status` now reads exactly that.
 pub async fn remove_peer(state: &DaemonState, params: PeerRemoveParams) -> Result<()> {
-    let mesh = state
-        .mesh()
-        .context("daemon has no mesh (control-only mode)")?;
+    let mesh = state.mesh_required()?;
     let petname = params.petname;
 
     // (2)⁻¹ AUTHORIZATION: revoke first (the security-relevant half). Propagate its error so a
@@ -2284,9 +2246,7 @@ pub async fn remove_peer(state: &DaemonState, params: PeerRemoveParams) -> Resul
     // whether a PeerEntry was actually deleted — the other half of the actual-removal signal.
     let store = mesh.store.clone();
     let petname_w = petname.clone();
-    let removed = tokio::task::spawn_blocking(move || store.remove(&petname_w))
-        .await
-        .context("join peer remove")??;
+    let removed = blocking("join peer remove", move || store.remove(&petname_w)).await??;
 
     // Actual-removal signal: neither an allow stripped NOR a PeerEntry deleted means the petname
     // matches no paired peer. `pair --remove` is a REVOCATION surface — reporting success here
@@ -2375,9 +2335,7 @@ fn rename_plan(
 /// admits. Guarded against renaming onto another identity's name/grant. Held entirely under
 /// `reload_lock` (like grant/revoke/register) so guard→mutate→reload is one atomic critical section.
 pub async fn rename_peer(state: &DaemonState, params: PeerRenameParams) -> Result<()> {
-    let mesh = state
-        .mesh()
-        .context("daemon has no mesh (control-only mode)")?;
+    let mesh = state.mesh_required()?;
     let to = params.to.trim().to_string();
     if to.is_empty() {
         anyhow::bail!("peer_rename: the new nickname is empty");
@@ -2396,7 +2354,7 @@ pub async fn rename_peer(state: &DaemonState, params: PeerRenameParams) -> Resul
     let store = mesh.store.clone();
     let config_path = mesh.config_path.clone();
     let (uid_c, pn_c, to_c) = (user_id.clone(), petname.clone(), to.clone());
-    let plan = tokio::task::spawn_blocking(move || {
+    let plan = blocking("join rename plan", move || {
         rename_plan(
             &store,
             &config_path,
@@ -2405,8 +2363,7 @@ pub async fn rename_peer(state: &DaemonState, params: PeerRenameParams) -> Resul
             &to_c,
         )
     })
-    .await
-    .context("join rename plan")??;
+    .await??;
     let RenamePlan {
         targets,
         old_petnames,
@@ -2420,7 +2377,7 @@ pub async fn rename_peer(state: &DaemonState, params: PeerRenameParams) -> Resul
     let store = mesh.store.clone();
     let config_path = mesh.config_path.clone();
     let to_c = to.clone();
-    tokio::task::spawn_blocking(move || {
+    blocking("join rename mutate", move || {
         for old in &old_petnames {
             if old != &to_c {
                 rename_allow_in_config(&config_path, old, &to_c)?;
@@ -2432,8 +2389,7 @@ pub async fn rename_peer(state: &DaemonState, params: PeerRenameParams) -> Resul
         }
         anyhow::Ok(())
     })
-    .await
-    .context("join rename mutate")??;
+    .await??;
 
     // Reload so the rebuilt `Services` admit under the new petname (select_service reads the allow
     // baked in at build time).
@@ -2581,9 +2537,7 @@ pub(crate) async fn mint_invite(services: Vec<String>, mesh: &MeshState) -> Resu
 /// store. The inviter-side authorization (adding US to its service `allow`) happens on ITS
 /// daemon inside its rendezvous handler — see [`grant_service_access`].
 pub(crate) async fn redeem(state: &DaemonState, invite_line: String) -> Result<PairResult> {
-    let mesh = state
-        .mesh()
-        .context("daemon has no mesh (control-only mode)")?;
+    let mesh = state.mesh_required()?;
     crate::pairing::rendezvous::redeem_invite(
         mesh.endpoint.clone(),
         mesh.self_petname.clone(),
@@ -2627,11 +2581,10 @@ pub async fn grant_service_access(
     let config_path = mesh.config_path.clone();
     let petname = redeemer_petname.to_string();
     let services_w = services.to_vec();
-    let changed = tokio::task::spawn_blocking(move || {
+    let changed = blocking("join grant config write", move || {
         append_allow_to_config(&config_path, &petname, &services_w)
     })
-    .await
-    .context("join grant config write")??;
+    .await??;
 
     // 2/3. Reload + hot-swap ONLY when the allow actually changed (else the running registry
     //      already admits the peer). The reload MUST happen for a real append to take effect,
@@ -2673,10 +2626,10 @@ pub(crate) async fn revoke_service_access(mesh: &Arc<MeshState>, petname: &str) 
     // 1. Idempotent allow-removal on a blocking thread (config IO blocks, M2a seam note).
     let config_path = mesh.config_path.clone();
     let petname_w = petname.to_string();
-    let changed =
-        tokio::task::spawn_blocking(move || remove_allow_from_config(&config_path, &petname_w))
-            .await
-            .context("join revoke config write")??;
+    let changed = blocking("join revoke config write", move || {
+        remove_allow_from_config(&config_path, &petname_w)
+    })
+    .await??;
 
     // 2/3. Reload + hot-swap ONLY when the allow actually changed (else the running registry
     //      already excludes the peer). A real removal MUST reload for `select_service` — which
@@ -2775,12 +2728,7 @@ pub fn serving_state(endpoint: iroh::Endpoint, store: Arc<PeerStore>) -> Arc<Dae
         None,
         None,
     );
-    Arc::new(DaemonState::with_mesh(
-        STACK_VERSION,
-        mesh,
-        Vec::new(),
-        Vec::new(),
-    ))
+    Arc::new(DaemonState::with_mesh(STACK_VERSION, mesh))
 }
 
 /// Acquire the per-uid singleton lock (spec §13 single-daemon). Returns `Some(file)` when we
@@ -2877,14 +2825,14 @@ mod tests {
         );
     }
 
-    /// `status` reflects the LIVE config + store, not a stale cached snapshot. A pairing grant
-    /// (grant_service_access → allow-append) and a rendezvous PeerEntry write are durable but do
-    /// NOT refresh the snapshot; `status` must still show the just-granted allow + the just-paired
-    /// peer (the Jetson-proof "status says `allowed: no one yet` right after pairing" confusion).
-    /// Models the bug faithfully by mutating the config + store directly (exactly what grant +
-    /// rendezvous do to the durable state) behind the seeded snapshot's back.
+    /// `status` reflects the LIVE config + store on every call. A pairing grant
+    /// (grant_service_access → allow-append) and a rendezvous PeerEntry write land durably
+    /// WITHOUT touching `DaemonState`; `status` must still show the just-granted allow + the
+    /// just-paired peer (the Jetson-proof "status says `allowed: no one yet` right after
+    /// pairing" confusion). Models the flows faithfully by mutating the config + store directly
+    /// (exactly what grant + rendezvous do to the durable state).
     #[tokio::test(flavor = "multi_thread")]
-    async fn status_reads_live_config_and_store_not_the_stale_snapshot() {
+    async fn status_reads_the_live_config_and_store() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
         std::fs::write(
@@ -2893,18 +2841,10 @@ mod tests {
         )
         .unwrap();
         let mesh = hermetic_mesh(config_path.clone()).await;
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
 
-        // Seed the status snapshot with the PRE-grant truth (what startup/register would cache).
-        let cfg0 = Config::load(&config_path).unwrap();
-        let state = crate::control::DaemonState::with_mesh(
-            "test",
-            mesh.clone(),
-            service_infos(&cfg0),
-            peer_infos(&mesh.store),
-        );
-
-        // Durable mutations that BYPASS the snapshot (as grant + rendezvous do): append the grant
-        // to the config, and write the peer's PeerEntry straight to the store.
+        // Durable mutations exactly as grant + rendezvous perform them: append the grant to the
+        // config, and write the peer's PeerEntry straight to the store.
         append_allow_to_config(&config_path, "alice", &["kb".to_string()]).unwrap();
         mesh.store
             .add(PeerEntry {
@@ -2916,8 +2856,8 @@ mod tests {
             })
             .unwrap();
 
-        // Status must reflect the LIVE truth, not the stale (empty) snapshot.
-        let status = crate::control::status_result(&state);
+        // Status must reflect the LIVE truth.
+        let status = crate::control::status_result(&state).unwrap();
         let kb = status
             .services
             .iter()
@@ -2972,14 +2912,8 @@ mod tests {
             })
             .unwrap();
 
-        let cfg0 = Config::load(&config_path).unwrap();
-        let state = crate::control::DaemonState::with_mesh(
-            "test",
-            mesh.clone(),
-            service_infos(&cfg0),
-            peer_infos(&mesh.store),
-        );
-        let status = crate::control::status_result(&state);
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+        let status = crate::control::status_result(&state).unwrap();
 
         assert_eq!(
             status.self_user_id.as_deref(),
@@ -3027,8 +2961,8 @@ mod tests {
             "the two oldest were dropped"
         );
 
-        let state = crate::control::DaemonState::with_mesh("test", mesh, Vec::new(), Vec::new());
-        let status = crate::control::status_result(&state);
+        let state = crate::control::DaemonState::with_mesh("test", mesh);
+        let status = crate::control::status_result(&state).unwrap();
         assert_eq!(status.recent_pairings.len(), 8);
         assert_eq!(status.recent_pairings[0].sas_code, "code-9");
         assert_eq!(status.recent_pairings[0].paired_at_epoch, 9);
@@ -3063,8 +2997,7 @@ mod tests {
         mesh.store
             .add(rename_entry(2, "alice-old", Some("b64u:ALICE")))
             .unwrap();
-        let state =
-            crate::control::DaemonState::with_mesh("test", mesh.clone(), Vec::new(), Vec::new());
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
 
         rename_peer(&state, rename_params(Some("b64u:ALICE"), "Alice"))
             .await
@@ -3109,8 +3042,7 @@ mod tests {
         mesh.store
             .add(rename_entry(2, "bob", Some("b64u:BOB")))
             .unwrap();
-        let state =
-            crate::control::DaemonState::with_mesh("test", mesh.clone(), Vec::new(), Vec::new());
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
 
         // Empty `to` (whitespace trims to empty).
         assert!(
@@ -3343,7 +3275,7 @@ mod tests {
         )
         .unwrap();
         let mesh = hermetic_mesh(config_path.clone()).await;
-        let state = DaemonState::with_mesh("0.0.0", mesh.clone(), vec![], vec![]);
+        let state = DaemonState::with_mesh("0.0.0", mesh.clone());
         // `roster_status` takes the caller's already-loaded config (L6: status loads it once);
         // the test mirrors control.rs `status_result` by loading fresh at each check.
         let live_status =
@@ -3526,7 +3458,7 @@ mod tests {
             mesh.roster.view().is_none(),
             "pending joiner: no roster installed yet (D5)"
         );
-        let state = DaemonState::with_mesh("0.0.0", mesh.clone(), vec![], vec![]);
+        let state = DaemonState::with_mesh("0.0.0", mesh.clone());
 
         // A valid signed serial-1 roster hosted over HTTP (what the operator publishes to the URL).
         let now = epoch_now_i64();
@@ -3543,8 +3475,11 @@ mod tests {
             .expect("set_roster_url pins the URL and (re)starts polling");
 
         // Poll-assert the first roster installs autonomously (timeout + interval, never a fixed sleep).
-        // Deadline widened for full-workspace parallelism: convergence is fast in isolation but CPU starvation under many concurrent test binaries can slow the real HTTP/mesh path; a wider bound tolerates that without masking a real hang (a genuine failure still hits the bound).
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        // Deadline widened for full-workspace parallelism AND cold CI runners: convergence is fast in
+        // isolation, but CPU starvation — many concurrent test binaries, or a cold windows runner still
+        // warming up — can slow the real HTTP/mesh path well past a tight bound. The wide bound
+        // tolerates that starvation without masking a real hang: a genuine hang still fails at the bound.
+        let deadline = std::time::Instant::now() + Duration::from_secs(180);
         loop {
             if mesh.roster.view().map(|v| v.serial()).unwrap_or(0) >= 1 {
                 break;

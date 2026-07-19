@@ -228,12 +228,7 @@ async fn status_includes_reachability() {
         // Serve B's control API and drive the REAL `status` request over mcpmesh-local/1.
         let socket = dir.path().join("control.sock");
         let listener = mcpmesh::ipc::bind_control_socket(&socket).await.unwrap();
-        let state = Arc::new(DaemonState::with_mesh(
-            STACK_VERSION,
-            b_mesh.clone(),
-            Vec::new(),
-            Vec::new(),
-        ));
+        let state = Arc::new(DaemonState::with_mesh(STACK_VERSION, b_mesh.clone()));
         let control = tokio::spawn(serve_control(listener, state));
 
         let mut client = connect_control(&socket)

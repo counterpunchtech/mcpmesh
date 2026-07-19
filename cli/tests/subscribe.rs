@@ -159,12 +159,7 @@ async fn subscribe_pushes_snapshot_then_live_session_events() {
         s_mesh.set_audit(audit.clone());
         let s_socket = dir.path().join("s.sock");
         let s_listener = mcpmesh::ipc::bind_control_socket(&s_socket).await.unwrap();
-        let s_state = Arc::new(DaemonState::with_mesh(
-            STACK_VERSION,
-            s_mesh,
-            Vec::new(),
-            Vec::new(),
-        ));
+        let s_state = Arc::new(DaemonState::with_mesh(STACK_VERSION, s_mesh));
         let s_control = tokio::spawn(serve_control(s_listener, s_state));
 
         // --- Dialing node D: resolves `tester` -> S's endpoint and dials over the mesh. ---
@@ -277,12 +272,7 @@ async fn dial_failure_emits_error_event() {
         mesh.set_audit(audit.clone());
         let socket = dir.path().join("node.sock");
         let listener = mcpmesh::ipc::bind_control_socket(&socket).await.unwrap();
-        let state = Arc::new(DaemonState::with_mesh(
-            STACK_VERSION,
-            mesh,
-            Vec::new(),
-            Vec::new(),
-        ));
+        let state = Arc::new(DaemonState::with_mesh(STACK_VERSION, mesh));
         let control = tokio::spawn(serve_control(listener, state));
 
         // Subscribe; consume the snapshot (this also registers the broadcast receiver, so the
