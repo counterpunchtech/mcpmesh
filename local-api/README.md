@@ -41,6 +41,11 @@ This expects a running daemon — any porcelain verb (e.g. `mcpmesh status`) sta
 control method has a typed helper on `ControlClient` (`invite`, `pair`, `register_service`, …);
 `request()` remains as a raw-`serde_json::Value` escape hatch.
 
+Runnable versions live in [`examples/`](examples): `status` (the picture above, rendered) and
+`watch` (the typed live event stream) — run them from the repo with
+`cargo run -p mcpmesh-local-api --features client --example status` — plus `status.py`, the same
+`status` call in dependency-free Python, because the wire protocol needs no SDK.
+
 ## Features
 
 | Feature | Adds |

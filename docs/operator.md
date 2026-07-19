@@ -24,8 +24,11 @@ cargo install mcpmesh
 
 ```
 brew tap counterpunchtech/mcpmesh https://github.com/counterpunchtech/mcpmesh
-brew install --HEAD counterpunchtech/mcpmesh/mcpmesh
+brew install counterpunchtech/mcpmesh/mcpmesh
 ```
+
+This builds the pinned release the formula carries; add `--HEAD` only if you deliberately want the
+current `main` instead.
 
 **Debian/Ubuntu (.deb):**
 
@@ -252,6 +255,9 @@ silently falling back to public infrastructure.
 WARNs on that combination (and ERRs on a `[network]` the daemon would refuse). Bolo operates
 `relay.runbolo.com` if you want a relay without running your own. Restart the daemon after editing
 (`mcpmesh status` auto-starts it).
+
+`[network]` is one of five config tables; every table, key, and default is tabulated in the
+[configuration reference](config.md).
 
 ---
 
