@@ -1,5 +1,5 @@
-//! The family's one codec (compact JSON, UTF-8, newline-terminated, spec §7.3) plus the
-//! §7.3 strike policy.
+//! The family's one codec (compact JSON, UTF-8, newline-terminated) plus the
+//! session strike policy.
 //!
 //! The CODEC itself ([`FrameReader`], [`Inbound`], [`Violation`], [`write_frame`],
 //! [`MAX_FRAME_BYTES`]) lives in `mcpmesh-codec` — ONE implementation provably shared by

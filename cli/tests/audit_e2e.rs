@@ -71,6 +71,7 @@ async fn real_session_audits_with_hashed_args_and_all_event_classes() {
             server_ep,
             gate,
             build_services_audited(&cfg, &sink, &mcpmesh::limits::MeshLimiters::unlimited()),
+            Arc::new(mcpmesh_net::ConnRegistry::new()),
         );
 
         // Drive one MCP session over the mesh from the caller endpoint: connect (dialing the FULL

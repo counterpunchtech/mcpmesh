@@ -1,4 +1,4 @@
-//! The six validation rules (spec §4.3, all MUST) + the resolvable [`RosterView`] a gate reads +
+//! The six validation rules (all MUST) + the resolvable [`RosterView`] a gate reads +
 //! [`RosterState`] (degraded-mode computation). Rule 1 (signature) lives in
 //! [`sign::verify`](crate::roster::sign::verify); this module runs it plus rules 2–6. Pure:
 //! `now` and `installed_serial` are PARAMETERS (no clock, no I/O) so every rule is unit-testable.
@@ -23,26 +23,26 @@ pub struct RosterView {
     revoked: HashSet<[u8; 32]>,
 }
 
-/// A rostered device's resolved identity (the roster-mode half of a `PeerIdentity`, spec §6.3).
+/// A rostered device's resolved identity (the roster-mode half of a `PeerIdentity`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedDevice {
     pub user_id: String,
     pub groups: Vec<String>,
     /// The device's role in its user's device set (`"primary"` | `"mirror"`; free-form otherwise).
-    /// Feeds the T11 person→device dial candidate ORDER (`devices_for_user`) — primary before mirror
+    /// Feeds the person→device dial candidate ORDER (`devices_for_user`) — primary before mirror
     /// — never an authorization decision.
     pub role: String,
-    /// The device's human label (spec §4.3 `RosterDevice.label`). Display-only — the T11 advisory
+    /// The device's human label (`RosterDevice.label`). Display-only — the advisory
     /// presence read (`status`) renders it; never an authorization input.
     pub label: String,
 }
 
-/// Roster liveness (spec §4.3 degraded mode). Computed from `expires_at` + a grace window.
+/// Roster liveness (degraded mode). Computed from `expires_at` + a grace window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RosterState {
     /// now ≤ expires_at: full authority.
     Approved,
-    /// expires_at < now ≤ expires_at + grace: keep serving, warn (spec: "continues … with warnings").
+    /// expires_at < now ≤ expires_at + grace: keep serving, warn.
     DegradedGrace,
     /// now > expires_at + grace: inbound serving stops (roster authorizes nothing).
     DegradedStopped,
@@ -70,13 +70,13 @@ impl RosterView {
         self.revoked.contains(endpoint)
     }
 
-    /// All active device endpoints (the D8 sever rule's "still in the new roster" set).
+    /// All active device endpoints (the sever rule's "still in the new roster" set).
     pub fn device_endpoints(&self) -> impl Iterator<Item = &[u8; 32]> {
         self.devices.keys()
     }
 
-    /// Every active (non-revoked) device with its resolved identity + display fields — the T11
-    /// advisory presence read (`status`, spec §10.1) enumerates these and marks each `online` from
+    /// Every active (non-revoked) device with its resolved identity + display fields — the
+    /// advisory presence read (`status`) enumerates these and marks each `online` from
     /// the presence table. Revoked endpoints are absent (excluded at `build_view`). Iteration order
     /// is the underlying map's (unordered) — the caller sorts for a stable display.
     pub fn devices(&self) -> impl Iterator<Item = (&[u8; 32], &ResolvedDevice)> {
@@ -88,7 +88,7 @@ impl RosterView {
     /// tiebreak (the `devices` map is unordered, so a total order is needed for a reproducible result).
     /// Empty for an unknown user.
     ///
-    /// This is the T11 person→device dial's CANDIDATE ORDER (spec §10.1). Two invariants the dial
+    /// This is the person→device dial's CANDIDATE ORDER. Two invariants the dial
     /// leans on: (1) a REVOKED endpoint is NEVER returned — `build_view` already excludes revoked
     /// endpoints from `devices`, so a revoked device can never be a dial candidate; (2) EVERY active
     /// device of the user is returned regardless of presence — the dial then re-orders WITHIN a role
@@ -109,15 +109,15 @@ impl RosterView {
         out
     }
 
-    /// Every revoked endpoint (the D8 sever rule's revoked set).
+    /// Every revoked endpoint (the sever rule's revoked set).
     pub fn revoked_endpoints(&self) -> impl Iterator<Item = &[u8; 32]> {
         self.revoked.iter()
     }
 
-    /// Degraded-mode state machine (spec §4.3). M3a implements the EXPIRY-driven core here;
-    /// M3c layers the `last_confirmed`/`max_staleness` staleness poll onto the SAME `RosterState`
-    /// (a stale-but-unexpired roster degrades identically). Grace is a config window (T5), NOT the
-    /// install-time ±skew — freshness vs. liveness are separate concerns ([RECONCILE-C]).
+    /// The EXPIRY-driven degraded-mode state machine. [`effective_state`](Self::effective_state)
+    /// layers the `last_confirmed`/`max_staleness` staleness poll onto the SAME `RosterState`
+    /// (a stale-but-unexpired roster degrades identically). Grace is a config window, NOT the
+    /// install-time ±skew — freshness vs. liveness are separate concerns.
     pub fn state(&self, now_epoch: i64, grace_secs: i64) -> RosterState {
         if now_epoch <= self.expires_at_epoch {
             RosterState::Approved
@@ -141,13 +141,13 @@ impl RosterState {
 }
 
 impl RosterView {
-    /// The EFFECTIVE degraded state (spec §4.3): the MORE-degraded of the expiry state
+    /// The EFFECTIVE degraded state: the MORE-degraded of the expiry state
     /// ([`state`](Self::state)) and the freshness/staleness state. Freshness: `last_confirmed` is the
     /// last instant this node validated the roster as current via an authenticated channel (a TLS URL
     /// poll ≥ installed, a gossip-delivered roster passing validation, or manual install). If
     /// `now - last_confirmed > max_staleness` the node degrades exactly like expiry — warnings within
     /// `grace`, then serving stops — bounding adversarial staleness at `max_staleness + grace`
-    /// independent of `expires_at` (P13). `last_confirmed = None` imposes NO freshness constraint
+    /// independent of `expires_at`. `last_confirmed = None` imposes NO freshness constraint
     /// (a node with no freshness tracking configured is expiry-governed only — back-compat).
     pub fn effective_state(
         &self,
@@ -187,7 +187,7 @@ fn parse_rfc3339(s: &str) -> Result<i64, RosterError> {
         .map_err(|e| RosterError::BadTimestamp(format!("{s:?}: {e}")))
 }
 
-/// Full validation for INSTALLING a new roster (spec §4.3 rules 1–6, all MUST). On success
+/// Full validation for INSTALLING a new roster (rules 1–6, all MUST). On success
 /// returns the resolvable [`RosterView`]. `installed_serial` is the current installed serial (0
 /// if none); `now_epoch` is wall-clock seconds (a parameter — the caller supplies `epoch_now`).
 pub fn validate_for_install(
@@ -221,7 +221,7 @@ pub fn validate_for_install(
 
 /// Re-verify + rebuild the view for LOADING an already-installed roster at startup. Verifies the
 /// signature (rule 1) and structural rules (4, 5), but NOT expiry/serial — a legitimately-expired
-/// installed roster loads into degraded mode ([RECONCILE-C] install-vs-load).
+/// installed roster loads into degraded mode (the install-vs-load distinction).
 pub fn load_installed(roster: &Roster, root_pk: &VerifyingKey) -> Result<RosterView, RosterError> {
     if roster.format != ROSTER_FORMAT {
         return Err(RosterError::BadFormat(roster.format.clone()));
@@ -231,7 +231,7 @@ pub fn load_installed(roster: &Roster, root_pk: &VerifyingKey) -> Result<RosterV
     build_view(roster, expires)
 }
 
-/// Dial-candidate ordering rank for a device role (spec §10.1): `"primary"` first, then `"mirror"`,
+/// Dial-candidate ordering rank for a device role: `"primary"` first, then `"mirror"`,
 /// then any other role. Pure — an unrecognized role sorts last rather than erroring (the roster is
 /// org-root-signed; an unknown role is a forward-compat value, not an attack).
 fn role_rank(role: &str) -> u8 {

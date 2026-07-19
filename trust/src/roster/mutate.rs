@@ -1,5 +1,5 @@
 //! Pure roster TRANSFORMS (net-free, redb-free) — the operator-side mutations `org create`/`approve`/
-//! `revoke` apply BEFORE signing (spec §4.4/§4.5/§4.6). Each maintains the §4.3 schema invariants
+//! `revoke` apply BEFORE signing. Each maintains the schema invariants
 //! (flat namespace disjointness, declared groups) so the subsequent [`validate_for_install`] accepts,
 //! and CLEARS `sig` (the caller re-signs via [`sign`]). Serial bumping + signing + install are the
 //! cli/daemon plumbing; this module is the roster-mutation domain.
@@ -13,7 +13,10 @@ use super::{ROSTER_FORMAT, Roster, RosterDevice, RosterUser};
 /// lookups. Parallel to the crate's [`RosterError`](super::RosterError) (validation) but a
 /// separate enum: these are OPERATOR-INPUT rejections, not document-validation failures.
 /// `Display` wording is the porcelain contract — the cli prints these verbatim.
+/// `#[non_exhaustive]` so a future guard is not a breaking change — match with a
+/// wildcard arm.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum MutateError {
     /// Rule 5a pre-image: the user_id equals an existing (or newly requested) group name.
     #[error("user_id {0:?} collides with a group name (flat namespace must be disjoint)")]
@@ -37,7 +40,7 @@ pub enum MutateError {
     },
 }
 
-/// A fresh EMPTY roster for `org create` (spec §4.4 step 1): `serial`, no users/groups/revocations,
+/// A fresh EMPTY roster for `org create`: `serial`, no users/groups/revocations,
 /// timestamps formatted from the supplied epochs. `sig` empty (the caller signs with the org root).
 pub fn empty_roster(org_id: &str, serial: u64, issued_epoch: i64, expires_epoch: i64) -> Roster {
     Roster {
@@ -61,13 +64,13 @@ fn rfc3339(epoch: i64) -> String {
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
-/// Upsert a member + device (spec §4.4 `org approve` / `devices add`; §4.6 rotation), keyed by
+/// Upsert a member + device (`org approve` / `devices add`; also user-key rotation), keyed by
 /// `user_id`:
 ///  - NEW user_id → add the user with `[device]`.
 ///  - EXISTING user_id, SAME `user_pk` → APPEND `device` (dedup by endpoint), UNION the groups (a
 ///    `devices add` for an already-enrolled person).
 ///  - EXISTING user_id, DIFFERENT `user_pk` → REPLACE the user (fresh key + `[device]` + `groups`) —
-///    the §4.6 user-key rotation re-enrollment (same STABLE user_id, new key).
+///    the user-key rotation re-enrollment (same STABLE user_id, new key).
 ///
 /// A COMPLETE pre-image of `validate_for_install` (rules 4a + 5a) AND its INTENDED semantic
 /// (installable AND functional): rejects — BEFORE any mutation, with a clear typed
@@ -75,7 +78,7 @@ fn rfc3339(epoch: i64) -> String {
 /// that is a group name, a requested group that is an existing user_id, a device endpoint already
 /// under another user, AND a device endpoint that is currently REVOKED (re-adding it would produce a
 /// roster `validate_for_install` ACCEPTS — rule 4b, revocation-wins — but where the device resolves to
-/// nothing: a silently DEAD device; there is no un-revoke path in M3b, so the device must re-join with
+/// nothing: a silently DEAD device; there is no un-revoke path by design, so the device must re-join with
 /// a FRESH device key). So a roster the operator SIGNS can never be rejected by — or silently defeated
 /// under — their own `RosterInstall`. DECLARES any new group at the top level (rule 5b). Clears `sig`.
 /// `user_pk` / `device_endpoint_id` are the `b64u:` strings straight from the join code.
@@ -188,8 +191,8 @@ pub fn upsert_member(
     Ok(())
 }
 
-/// Revoke ONE device (spec §4.5 `org revoke alice/laptop`): remove the endpoint from its user's
-/// device list AND add it to `revoked_endpoints` (revocation wins across all ALPNs — D8 severs even a
+/// Revoke ONE device (`org revoke alice/laptop`): remove the endpoint from its user's
+/// device list AND add it to `revoked_endpoints` (revocation wins across all ALPNs — severing cuts even a
 /// stale pair entry). The user entry (and their other devices) survive. Err on an unknown person/device.
 pub fn revoke_device(
     roster: &mut Roster,
@@ -221,12 +224,12 @@ pub fn revoke_device(
     Ok(())
 }
 
-/// Remove a PERSON entirely (spec §4.5 person-departing / §4.6 user-key rotation): drop the user
+/// Remove a PERSON entirely (a departure, or a user-key rotation): drop the user
 /// entry. `revoke_endpoints` = true (departing — hard cut) also pushes every device endpoint to
 /// `revoked_endpoints`; false (rotation, `--user-key`) leaves them un-revoked so the SAME device can
 /// re-enroll with a fresh user key (revoking them would trip validation rule 4b at re-approval). In
 /// BOTH cases live sessions are severed on install (the removed endpoints are absent from the new
-/// active-device set — M3a's roster-resolved-but-absent sever arm). Err on an unknown person.
+/// active-device set — the roster-resolved-but-absent sever arm). Err on an unknown person.
 pub fn remove_user(
     roster: &mut Roster,
     user_id: &str,

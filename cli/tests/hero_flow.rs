@@ -100,7 +100,7 @@ async fn hero_flow_minus_pairing() {
             })
             .unwrap();
         let alice_gate: Arc<dyn TrustGate> = Arc::new(AllowlistGate::new(Arc::new(alice_store)));
-        let _alice_handle = serve(alice_ep, alice_gate, build_services(&alice_cfg));
+        let _alice_handle = serve(alice_ep, alice_gate, build_services(&alice_cfg), Arc::new(mcpmesh_net::ConnRegistry::new()));
 
         // ── BOB (consuming side): an in-process daemon with the REAL control server. ──
         // Bob's store resolves petname `alice` → Alice's endpoint id (the M2a trust stand-in),

@@ -1,4 +1,4 @@
-//! mcpmesh-codec: the family's ONE wire codec (mcpmesh spec §7.3) — compact JSON, UTF-8,
+//! mcpmesh-codec: the family's ONE wire codec — compact JSON, UTF-8,
 //! one frame per `\n`, 16 MiB cap.
 //!
 //! Both ends of every wire share THIS implementation: the daemon side re-exports it as
@@ -10,18 +10,24 @@
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
-/// 16 MiB — the family frame cap (mcpmesh §7.3, spec §12 default). App payloads are
-/// ≤1 MiB by policy.
+/// 16 MiB — the family frame cap. App payloads are ≤1 MiB by policy.
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 /// One inbound frame, or a framing violation (kept distinct so callers can log/strike).
+///
+/// Deliberately EXHAUSTIVE (no `#[non_exhaustive]`): a reader yields exactly these
+/// two outcomes, and every caller must decide both — a silently-ignorable third
+/// outcome would be a codec bug, not an extension point.
 #[derive(Debug)]
 pub enum Inbound {
     Frame(Value),
     Violation(Violation),
 }
 
+/// How an inbound frame violated the codec. `#[non_exhaustive]` so a future
+/// violation kind is not a breaking change — match with a wildcard arm.
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Violation {
     TooLarge,
     InvalidJson,
@@ -83,7 +89,7 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
                     return Ok(Some(Inbound::Violation(Violation::TooLarge)));
                 }
                 // Re-grows from zero each frame by design: no 16MiB pinned per idle
-                // session; do not "optimize" into buffer retention (M4 note).
+                // session; do not "optimize" into buffer retention.
                 let line = std::mem::take(&mut self.buf);
                 // An empty line is InvalidJson (-32700) and strikes: recorded decision.
                 return Ok(Some(match serde_json::from_slice::<Value>(&line) {

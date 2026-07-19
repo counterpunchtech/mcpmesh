@@ -87,7 +87,8 @@ pub(crate) async fn connect_with_timeout(
     timeout: Duration,
 ) -> Result<SessionTransport> {
     match tokio::time::timeout(timeout, connect(endpoint, addr, service)).await {
-        Ok(r) => r,
+        // A typed ConnectError (dial vs open-stream) converts into the anyhow chain.
+        Ok(r) => r.map_err(Into::into),
         Err(_) => anyhow::bail!("dial timed out after {timeout:?}"),
     }
 }

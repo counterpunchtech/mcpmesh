@@ -130,10 +130,10 @@ impl TrustGate for RosterGate {
             return None;
         }
         // Revocation wins over any active listing (also enforced in build_view, belt-and-suspenders).
-        if view.is_revoked(endpoint) {
+        if view.is_revoked(endpoint.as_bytes()) {
             return None;
         }
-        let d = view.resolve(endpoint)?;
+        let d = view.resolve(endpoint.as_bytes())?;
         Some(PeerIdentity {
             endpoint: *endpoint,
             name: d.user_id.clone(), // name == user_id (§6.3 / the select_service arm)
@@ -146,7 +146,9 @@ impl TrustGate for RosterGate {
     /// (fail-closed) — even a degraded-STOPPED roster still enforces its last-known revocations.
     /// The composed gate consults this FIRST (spec §4.1 precedence 1); an empty gate → `false`.
     fn is_revoked(&self, endpoint: &EndpointId) -> bool {
-        self.view().map(|v| v.is_revoked(endpoint)).unwrap_or(false)
+        self.view()
+            .map(|v| v.is_revoked(endpoint.as_bytes()))
+            .unwrap_or(false)
     }
 
     /// The roster-resolved user_id for the D8 sever discriminator: `Some` IFF this endpoint would
@@ -237,7 +239,7 @@ impl TrustGate for ComposedGate {
                 && self
                     .roster
                     .view()
-                    .is_some_and(|v| v.resolve(endpoint).is_none()))
+                    .is_some_and(|v| v.resolve(endpoint.as_bytes()).is_none()))
     }
 }
 
@@ -295,27 +297,29 @@ mod tests {
     fn resolves_rostered_device_to_user_identity() {
         let gate = RosterGate::empty();
         gate.install(view(5, "2999-01-01T00:00:00Z", false));
-        let id = gate.resolve(&[2u8; 32]).expect("alice's laptop resolves");
+        let id = gate
+            .resolve(&[2u8; 32].into())
+            .expect("alice's laptop resolves");
         assert_eq!(id.name, "alice"); // name == user_id (§6.3)
         assert_eq!(id.user_id.as_deref(), Some("alice"));
         assert_eq!(id.groups, vec!["team-eng".to_string(), "all".to_string()]);
         // An unknown endpoint is refused.
-        assert!(gate.resolve(&[42u8; 32]).is_none());
+        assert!(gate.resolve(&[42u8; 32].into()).is_none());
     }
 
     #[test]
     fn empty_gate_resolves_nothing_and_is_never_revoked() {
         let gate = RosterGate::empty(); // pure-pairing daemon (no roster installed)
-        assert!(gate.resolve(&[2u8; 32]).is_none());
-        assert!(!gate.is_revoked(&[2u8; 32]));
+        assert!(gate.resolve(&[2u8; 32].into()).is_none());
+        assert!(!gate.is_revoked(&[2u8; 32].into()));
     }
 
     #[test]
     fn revoked_endpoint_does_not_resolve_and_is_flagged() {
         let gate = RosterGate::empty();
         gate.install(view(5, "2999-01-01T00:00:00Z", true)); // laptop revoked
-        assert!(gate.resolve(&[2u8; 32]).is_none()); // revocation wins → no identity
-        assert!(gate.is_revoked(&[2u8; 32])); // consulted first by the composed gate
+        assert!(gate.resolve(&[2u8; 32].into()).is_none()); // revocation wins → no identity
+        assert!(gate.is_revoked(&[2u8; 32].into())); // consulted first by the composed gate
     }
 
     #[test]
@@ -327,8 +331,8 @@ mod tests {
         let gate = RosterGate::empty();
         gate.install(view(5, "2999-01-01T00:00:00Z", true)); // laptop revoked
         let g: &dyn TrustGate = &gate; // the PRODUCTION path (ComposedGate holds Arc<dyn>)
-        assert!(g.is_revoked(&[2u8; 32])); // FAILS if is_revoked ever regresses to inherent
-        assert!(g.resolve(&[2u8; 32]).is_none()); // revocation wins via dyn too
+        assert!(g.is_revoked(&[2u8; 32].into())); // FAILS if is_revoked ever regresses to inherent
+        assert!(g.resolve(&[2u8; 32].into()).is_none()); // revocation wins via dyn too
     }
 
     #[test]
@@ -337,9 +341,9 @@ mod tests {
         let gate = RosterGate::empty();
         gate.install(view(5, "2001-01-01T00:00:00Z", true));
         // now is 2026 ≫ expires+grace → stopped: no roster identity is granted.
-        assert!(gate.resolve(&[2u8; 32]).is_none());
+        assert!(gate.resolve(&[2u8; 32].into()).is_none());
         // But revocation is still enforced (fail-closed) even when stopped.
-        assert!(gate.is_revoked(&[2u8; 32]));
+        assert!(gate.is_revoked(&[2u8; 32].into()));
     }
 
     #[test]
@@ -348,15 +352,15 @@ mod tests {
         gate.install(view(5, "2999-01-01T00:00:00Z", false)); // never expiry-degraded
         gate.set_last_confirmed(now_epoch() - 24 * 3600 - 72 * 3600 - 10); // past max_staleness+grace
         assert!(
-            gate.resolve(&[2u8; 32]).is_none(),
+            gate.resolve(&[2u8; 32].into()).is_none(),
             "a stale roster stops granting identity"
         );
         gate.set_last_confirmed(now_epoch()); // fresh confirmation restores it
         assert!(
-            gate.resolve(&[2u8; 32]).is_some(),
+            gate.resolve(&[2u8; 32].into()).is_some(),
             "a freshly-confirmed roster resolves again"
         );
-        assert!(!gate.is_revoked(&[2u8; 32])); // revocation honored regardless of freshness
+        assert!(!gate.is_revoked(&[2u8; 32].into())); // revocation honored regardless of freshness
     }
 
     #[test]
@@ -386,22 +390,22 @@ mod tests {
         let composed = ComposedGate::new(roster, pairs);
 
         // (a) rostered + paired → the ROSTER identity (masks the pair petname).
-        let id = composed.resolve(&[2u8; 32]).expect("resolves");
+        let id = composed.resolve(&[2u8; 32].into()).expect("resolves");
         assert_eq!(id.user_id.as_deref(), Some("alice"));
         assert_eq!(id.name, "alice"); // NOT "p-2"
 
         // (b) revoked + paired → REFUSED (revocation wins over the pair entry, spec §4.1(1)).
-        assert!(composed.resolve(&[3u8; 32]).is_none());
+        assert!(composed.resolve(&[3u8; 32].into()).is_none());
 
         // (c) paired only (not in roster) → the PAIR identity.
-        let id = composed.resolve(&[4u8; 32]).expect("resolves");
+        let id = composed.resolve(&[4u8; 32].into()).expect("resolves");
         assert_eq!(id.user_id, None);
         assert_eq!(id.name, "p-4");
 
         // (d) neither (unknown, no pair, no roster) → REFUSED.
-        assert!(composed.resolve(&[9u8; 32]).is_none());
+        assert!(composed.resolve(&[9u8; 32].into()).is_none());
         // (e) paired-only [5;32] still resolves (control: roster did not disturb it).
-        assert_eq!(composed.resolve(&[5u8; 32]).unwrap().name, "p-5");
+        assert_eq!(composed.resolve(&[5u8; 32].into()).unwrap().name, "p-5");
     }
 
     #[test]
@@ -430,25 +434,33 @@ mod tests {
         let composed = ComposedGate::new(roster, pairs);
 
         // The paired peer resolves WITH its binding user_id (needed for authz/audiences)…
-        let id = composed.resolve(&[7u8; 32]).expect("paired peer resolves");
+        let id = composed
+            .resolve(&[7u8; 32].into())
+            .expect("paired peer resolves");
         assert_eq!(id.user_id.as_deref(), Some("b64u:BOB"));
         // …but it is NOT roster-resolved, so the D8 sever discriminator is None.
         assert_eq!(
-            composed.roster_user(&[7u8; 32]),
+            composed.roster_user(&[7u8; 32].into()),
             None,
             "a pairing-only peer must not be treated as roster-resolved"
         );
         // Therefore the register-time recheck must NOT sever it (the regression: keyed on the
         // binding user_id it WAS severed — asserted on the last line to pin the contrast).
         assert!(
-            !composed.should_sever_now(&[7u8; 32], composed.roster_user(&[7u8; 32]).as_deref()),
+            !composed.should_sever_now(
+                &[7u8; 32].into(),
+                composed.roster_user(&[7u8; 32].into()).as_deref()
+            ),
             "a legitimately-paired peer must survive in roster mode"
         );
         // A genuinely roster-resolved peer still carries the discriminator (alice, in the roster).
-        assert_eq!(composed.roster_user(&[2u8; 32]).as_deref(), Some("alice"));
+        assert_eq!(
+            composed.roster_user(&[2u8; 32].into()).as_deref(),
+            Some("alice")
+        );
         // Contrast — the OLD (buggy) discriminator (`identity.user_id`) DID sever the paired peer:
         assert!(
-            composed.should_sever_now(&[7u8; 32], Some("b64u:BOB")),
+            composed.should_sever_now(&[7u8; 32].into(), Some("b64u:BOB")),
             "regression witness: keying the sever on identity.user_id severs a paired peer"
         );
     }
@@ -484,7 +496,7 @@ mod tests {
         // through to its PAIR petname "p-2" (not refused). Revocation still wins over this (step 1,
         // is_revoked is honored even when stopped) — a revoked-and-paired peer is still refused.
         let id = composed
-            .resolve(&[2u8; 32])
+            .resolve(&[2u8; 32].into())
             .expect("falls through to pairing");
         assert_eq!(id.name, "p-2");
         assert_eq!(id.user_id, None);
@@ -517,8 +529,8 @@ mod tests {
         let composed = ComposedGate::new(roster, pairs);
 
         let g: &dyn TrustGate = &composed; // the PRODUCTION path (daemon holds Arc<dyn TrustGate>)
-        assert!(g.is_revoked(&[3u8; 32])); // FAILS if ComposedGate::is_revoked regresses to inherent
-        assert!(g.resolve(&[3u8; 32]).is_none()); // revocation wins via dyn too
+        assert!(g.is_revoked(&[3u8; 32].into())); // FAILS if ComposedGate::is_revoked regresses to inherent
+        assert!(g.resolve(&[3u8; 32].into()).is_none()); // revocation wins via dyn too
     }
 
     #[test]
@@ -537,15 +549,15 @@ mod tests {
         let g: &dyn TrustGate = &composed; // PRODUCTION path (daemon holds Arc<dyn TrustGate>)
 
         // Revoked → sever (regardless of source).
-        assert!(g.should_sever_now(&[3u8; 32], Some("alice")));
-        assert!(g.should_sever_now(&[3u8; 32], None));
+        assert!(g.should_sever_now(&[3u8; 32].into(), Some("alice")));
+        assert!(g.should_sever_now(&[3u8; 32].into(), None));
         // Roster-resolved AND still active → KEEP.
-        assert!(!g.should_sever_now(&[2u8; 32], Some("alice")));
+        assert!(!g.should_sever_now(&[2u8; 32].into(), Some("alice")));
         // Was roster-resolved (roster_user Some) but now ABSENT from the roster → SEVER (the dropped
         // half M3a left open; [4;32] is in NO user entry).
-        assert!(g.should_sever_now(&[4u8; 32], Some("bob")));
+        assert!(g.should_sever_now(&[4u8; 32].into(), Some("bob")));
         // Pairing-only (roster_user None), not revoked, not in roster → KEEP (never severed by roster).
-        assert!(!g.should_sever_now(&[4u8; 32], None));
+        assert!(!g.should_sever_now(&[4u8; 32].into(), None));
     }
 
     // Test helper: a RosterView with the given (endpoint_byte, user_id) active devices + revoked

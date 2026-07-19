@@ -220,12 +220,11 @@ impl TrustGate for AllowlistGate {
     /// Resolve an inbound endpoint to a pairing-mode identity (petname only, no
     /// `user_id`/`groups` — spec §4.2, D4; group matching is M3), or refuse.
     ///
-    /// `EndpointId` is `mcpmesh_net`'s `[u8; 32]` alias, so it passes straight to
-    /// [`PeerStore::resolve`]. A store read that errors collapses to `None` = default-deny
-    /// (D5), logged at `warn!`: a gate read failing is operationally notable but must NEVER
-    /// fail open.
+    /// The store is keyed by the raw 32 bytes of the `EndpointId`. A store read that errors
+    /// collapses to `None` = default-deny, logged at `warn!`: a gate read failing is
+    /// operationally notable but must NEVER fail open.
     fn resolve(&self, endpoint: &EndpointId) -> Option<PeerIdentity> {
-        match self.store.resolve(endpoint) {
+        match self.store.resolve(endpoint.as_bytes()) {
             Ok(Some(e)) => Some(PeerIdentity {
                 endpoint: *endpoint,
                 user_id: e.user_id, // self-sovereign user_id from a verified pairing binding (else None)
@@ -277,12 +276,12 @@ mod tests {
         store.add(entry(known_eid, "bob", &["notes"])).unwrap();
         let gate = AllowlistGate::new(Arc::new(store));
         // Known endpoint resolves to a pairing-mode identity (petname only).
-        let id = gate.resolve(&known_eid).unwrap();
+        let id = gate.resolve(&known_eid.into()).unwrap();
         assert_eq!(id.name, "bob");
         assert_eq!(id.user_id, None);
         assert!(id.groups.is_empty());
         // Unknown endpoint is refused (default-deny).
-        assert!(gate.resolve(&[9u8; 32]).is_none());
+        assert!(gate.resolve(&[9u8; 32].into()).is_none());
     }
 
     #[test]

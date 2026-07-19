@@ -122,7 +122,12 @@ async fn dial_service_races_a_person_to_the_live_mirror_when_the_primary_is_dead
             })
             .unwrap();
         let mirror_gate: Arc<dyn TrustGate> = Arc::new(AllowlistGate::new(Arc::new(mirror_store)));
-        let _mirror_serve = serve(mirror_ep, mirror_gate, build_services(&mirror_cfg));
+        let _mirror_serve = serve(
+            mirror_ep,
+            mirror_gate,
+            build_services(&mirror_cfg),
+            Arc::new(mcpmesh_net::ConnRegistry::new()),
+        );
 
         // --- The DEAD primary: a valid endpoint_id no live endpoint holds (unreachable). ---
         let primary_dead = SigningKey::from_bytes(&[50u8; 32])

@@ -40,7 +40,7 @@ async fn concurrency_cap_refuses_with_retry_after_ms_and_spawns_no_child() {
             limiter: mcpmesh::limits::RateLimiter::unlimited_shared(),
         };
         let identity = Some(PeerIdentity {
-            endpoint: [1u8; 32],
+            endpoint: [1u8; 32].into(),
             name: "bob".into(),
             user_id: None,
             groups: vec![],

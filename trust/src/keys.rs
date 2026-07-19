@@ -1,14 +1,17 @@
-//! Ed25519 operator-local keys at rest as 32 raw secret bytes, 0600 (spec §4.1/§4.3/§13).
+//! Ed25519 operator-local keys at rest as 32 raw secret bytes, 0600.
 //!
 //! One file-io discipline (`load_or_generate_signing_key` / `mint_signing_key_at`) backs three
-//! semantically DISTINCT key types: [`DeviceKey`] (§4.1, per-device), [`OrgRootKey`] (§4.3, the
-//! operator's roster-signing anchor), and [`UserKey`] (§4.3, a person's device-binding key). The
+//! semantically DISTINCT key types: [`DeviceKey`] (per-device), [`OrgRootKey`] (the
+//! operator's roster-signing anchor), and [`UserKey`] (a person's device-binding key). The
 //! newtypes keep the io DRY while making the type system forbid signing a roster with a device key
 //! (a real security surface — a type confusion here would be a genuine bug).
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use std::path::Path;
 
+/// Why loading or minting a key file failed. `#[non_exhaustive]` so a future
+/// failure kind is not a breaking change — match with a wildcard arm.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum KeyError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
@@ -16,14 +19,14 @@ pub enum KeyError {
     Malformed(String),
 }
 
-/// Shared Ed25519 key-file discipline (spec §4.1/§4.3/§13): 0600, atomic, EEXIST-race-safe. The
-/// single implementation behind [`DeviceKey`] (§4.1), [`OrgRootKey`], and [`UserKey`] (§4.3) — one
+/// Shared Ed25519 key-file discipline: 0600, atomic, EEXIST-race-safe. The
+/// single implementation behind [`DeviceKey`], [`OrgRootKey`], and [`UserKey`] — one
 /// io path, three semantic types. Returns (key, created); created=true iff this call minted it.
 fn load_or_generate_signing_key(path: &Path) -> Result<(SigningKey, bool), KeyError> {
     // Bounded: an EEXIST publish race loops back to load the winner's key; anything
     // that keeps EEXISTing past the budget is surfaced rather than spun on.
     for _ in 0..4 {
-        // Reload trusts the stored mode; a loosened-permissions lint belongs to `mcpmesh doctor` (spec §13).
+        // Reload trusts the stored mode; a loosened-permissions lint belongs to `mcpmesh doctor`.
         match std::fs::read(path) {
             Ok(bytes) => {
                 let arr: [u8; 32] = bytes
@@ -49,7 +52,7 @@ fn load_or_generate_signing_key(path: &Path) -> Result<(SigningKey, bool), KeyEr
 }
 
 /// Mint via same-directory temp file (0600 at create), fsync, then publish with hard_link — the key
-/// file either exists complete or not at all (spec §13), and an existing key is never overwritten.
+/// file either exists complete or not at all, and an existing key is never overwritten.
 /// On Windows the key file inherits the user-profile ACL of %APPDATA% (owner-only by default);
 /// there is no mode bit to set.
 fn mint_signing_key_at(path: &Path) -> Result<SigningKey, KeyError> {
@@ -96,29 +99,29 @@ impl DeviceKey {
         self.0.verifying_key().to_bytes()
     }
 
-    // Q3 hardening note: this copy is not zeroized; dalek scrubs SigningKey on drop (default feature), the copy is the residual (spec P14 boundary).
+    // Hardening note: this copy is not zeroized; dalek scrubs SigningKey on drop (default feature), the copy is the residual.
     pub fn secret_bytes(&self) -> [u8; 32] {
         self.0.to_bytes()
     }
 
-    /// Short human fingerprint for status output (never the raw key — spec §1.5).
+    /// Short human fingerprint for status output (never the raw key — surface discipline).
     pub fn fingerprint(&self) -> String {
         let b = self.public_bytes();
         format!("{:02x}{:02x}{:02x}{:02x}", b[0], b[1], b[2], b[3])
     }
 }
 
-/// The operator's roster-signing key (spec §4.3 org root key). Only on the operator's node. Same
+/// The operator's roster-signing key (the org root key). Only on the operator's node. Same
 /// 0600/atomic/race-safe discipline as [`DeviceKey`]; a DISTINCT type so it can never be confused
 /// with a device or user key at a signing call site.
 ///
-/// **Highest-value secret in the system (spec P5).** Compromise = the ability to forge ANY roster —
-/// the sole trust anchor every joiner pins — so it is catastrophic by design (spec P4/P5). Posture:
+/// **Highest-value secret in the system.** Compromise = the ability to forge ANY roster —
+/// the sole trust anchor every joiner pins — so it is catastrophic by design. Posture:
 /// stored 0600, minted ONLY on the operator's node (never on a joiner), read ONLY by the local
-/// porcelain to sign in-process, and NEVER crossing the control API or any wire — the daemon is not
-/// an online signing oracle (P4/P5's offline-root requirement); only the PUBLIC half + finished
-/// signatures ever leave. Future hardening (offline/HSM storage, threshold signing) is spec Q4/P5;
-/// v1's single offline key + an operator runbook is the accepted posture.
+/// porcelain to sign in-process, and NEVER crossing the control API or any wire — the daemon is
+/// never an online signing oracle; only the PUBLIC half + finished signatures ever leave. Future
+/// hardening (offline/HSM storage, threshold signing) is deliberately out of scope for now: a
+/// single offline key + an operator runbook is the accepted posture.
 pub struct OrgRootKey(SigningKey);
 
 impl OrgRootKey {
@@ -139,9 +142,9 @@ impl OrgRootKey {
     }
 }
 
-/// A person's user key (spec §4.3): binds their devices, proves device additions. One per person,
+/// A person's user key: binds their devices, proves device additions. One per person,
 /// on their first device; never moves between machines. Same discipline; a DISTINCT type. Second-tier
-/// secret (compromise = bind devices as that person until the operator rotates — spec §4.6).
+/// secret (compromise = bind devices as that person until the operator rotates the user key).
 pub struct UserKey(SigningKey);
 
 impl UserKey {

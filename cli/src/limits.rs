@@ -264,7 +264,7 @@ mod tests {
     fn buckets_are_per_endpoint() {
         let t0 = Instant::now();
         let rl = RateLimiter::per_minute(60, 2); // burst 2, 60/min
-        let (a, b) = ([1u8; 32], [2u8; 32]);
+        let (a, b) = (EndpointId::from([1u8; 32]), EndpointId::from([2u8; 32]));
         assert!(rl.check(&a, t0).is_ok());
         assert!(rl.check(&a, t0).is_ok());
         assert!(rl.check(&a, t0).is_err(), "a exhausted its own bucket");
@@ -275,12 +275,12 @@ mod tests {
     fn map_self_prunes_idle_buckets() {
         let t0 = Instant::now();
         let rl = RateLimiter::per_minute(60, 60);
-        assert!(rl.check(&[1u8; 32], t0).is_ok());
-        assert!(rl.check(&[2u8; 32], t0).is_ok());
+        assert!(rl.check(&[1u8; 32].into(), t0).is_ok());
+        assert!(rl.check(&[2u8; 32].into(), t0).is_ok());
         assert_eq!(rl.tracked(), 2);
         // A check far past IDLE_TTL prunes the two idle buckets before inserting the third.
         let later = t0 + IDLE_TTL + Duration::from_secs(1);
-        assert!(rl.check(&[3u8; 32], later).is_ok());
+        assert!(rl.check(&[3u8; 32].into(), later).is_ok());
         assert_eq!(
             rl.tracked(),
             1,
@@ -293,7 +293,7 @@ mod tests {
         let t0 = Instant::now();
         let rl = RateLimiter::unlimited_shared();
         for _ in 0..10_000 {
-            assert!(rl.check(&[9u8; 32], t0).is_ok());
+            assert!(rl.check(&[9u8; 32].into(), t0).is_ok());
         }
     }
 
@@ -301,7 +301,7 @@ mod tests {
     fn rate_gate_admits_then_throttles_and_none_endpoint_is_unlimited() {
         let t = Instant::now();
         let limiter = Arc::new(RateLimiter::per_minute(60, 2));
-        let gate = RateGate::new(limiter, Some([5u8; 32]));
+        let gate = RateGate::new(limiter, Some([5u8; 32].into()));
         assert!(gate.admit_at(t).is_ok());
         assert!(gate.admit_at(t).is_ok());
         assert!(
@@ -324,7 +324,7 @@ mod tests {
         };
         let ml = MeshLimiters::from_config(&cfg);
         let t = Instant::now();
-        let eid = [7u8; 32];
+        let eid = EndpointId::from([7u8; 32]);
         // burst == rate == 5 → five admits, then throttle.
         for _ in 0..5 {
             assert!(ml.requests.check(&eid, t).is_ok());
@@ -355,7 +355,7 @@ mod tests {
             "pair-accept limiter engages: admitted {admitted}"
         );
         // The per-endpoint blob-conn limiter engages per endpoint.
-        let eid = [4u8; 32];
+        let eid = EndpointId::from([4u8; 32]);
         let mut blob_ok = 0;
         for _ in 0..1000 {
             if ml.admit_blob_conn_at(&eid, t) {

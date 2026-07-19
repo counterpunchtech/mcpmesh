@@ -82,7 +82,12 @@ async fn connect_proxy_round_trips_an_echo_service_over_the_mesh() {
             })
             .unwrap();
         let server_gate: Arc<dyn TrustGate> = Arc::new(AllowlistGate::new(Arc::new(server_store)));
-        let _server_handle = serve(server_ep, server_gate, build_services(&server_cfg));
+        let _server_handle = serve(
+            server_ep,
+            server_gate,
+            build_services(&server_cfg),
+            Arc::new(mcpmesh_net::ConnRegistry::new()),
+        );
 
         // --- The "daemon machine": resolves petname `tester` -> the server endpoint, dials. ---
         // Seed dial-by-id resolution: the daemon endpoint learns the server's addrs via a

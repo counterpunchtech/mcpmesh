@@ -79,8 +79,11 @@ pub fn install_roster_view_and_sever(
     // real swap (incl. a joiner's first serial-1 install, a legit trust event).
     let (org_id, serial) = (view.org_id().to_string(), view.serial());
     // Compute the sever sets from the NEW view (no gate lock → no registry↔gate lock cycle).
-    let revoked: HashSet<[u8; 32]> = view.revoked_endpoints().copied().collect();
-    let active_devices: HashSet<[u8; 32]> = view.device_endpoints().copied().collect();
+    // The trust view speaks raw 32-byte ids; net's sever rule speaks EndpointId — convert once here.
+    let revoked: HashSet<mcpmesh_net::EndpointId> =
+        view.revoked_endpoints().map(|b| (*b).into()).collect();
+    let active_devices: HashSet<mcpmesh_net::EndpointId> =
+        view.device_endpoints().map(|b| (*b).into()).collect();
     // (a) SWAP FIRST: hot-swap the RosterGate view so the composed gate + any concurrent
     //     check-register immediately see the new roster (the other half of the TOCTOU invariant).
     mesh.roster.install(view);

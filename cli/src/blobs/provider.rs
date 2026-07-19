@@ -227,13 +227,13 @@ fn spawn_gate_loop(
     audit: AuditSink,
 ) {
     tokio::spawn(async move {
-        let mut conns: HashMap<u64, [u8; 32]> = HashMap::new();
+        let mut conns: HashMap<u64, mcpmesh_net::EndpointId> = HashMap::new();
         while let Some(msg) = rx.recv().await {
             match msg {
                 ProviderMessage::ClientConnected(msg) => {
                     let res = match msg.endpoint_id {
                         Some(eid) => {
-                            conns.insert(msg.connection_id, *eid.as_bytes());
+                            conns.insert(msg.connection_id, (*eid.as_bytes()).into());
                             Ok(())
                         }
                         None => Err(AbortReason::Permission),
@@ -369,15 +369,15 @@ mod tests {
             // Two callers: alice (granted) and bob (rostered but ungranted for this scope).
             let alice_ep = ep().await;
             let bob_ep = ep().await;
-            let alice_id: EndpointId = *alice_ep.id().as_bytes();
-            let bob_id: EndpointId = *bob_ep.id().as_bytes();
+            let alice_id: EndpointId = alice_ep.id().into();
+            let bob_id: EndpointId = bob_ep.id().into();
 
             // Provider gate resolves BOTH (both pass the accept-time gate); scope grants only alice.
             let mut entries = std::collections::HashMap::new();
             entries.insert(
                 alice_id,
                 PeerIdentity {
-                    endpoint: [0u8; 32],
+                    endpoint: [0u8; 32].into(),
                     name: "alice".into(),
                     user_id: Some("alice".into()),
                     groups: vec!["team-eng".into()],
@@ -386,7 +386,7 @@ mod tests {
             entries.insert(
                 bob_id,
                 PeerIdentity {
-                    endpoint: [0u8; 32],
+                    endpoint: [0u8; 32].into(),
                     name: "bob".into(),
                     user_id: Some("bob".into()),
                     groups: vec!["team-eng".into()],
@@ -451,14 +451,14 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
             let carol_ep = ep().await; // pairing-mode: petname only
             let mallory_ep = ep().await; // resolved by the gate, but granted nothing
-            let carol_id: EndpointId = *carol_ep.id().as_bytes();
-            let mallory_id: EndpointId = *mallory_ep.id().as_bytes();
+            let carol_id: EndpointId = carol_ep.id().into();
+            let mallory_id: EndpointId = mallory_ep.id().into();
 
             let mut entries = std::collections::HashMap::new();
             entries.insert(
                 carol_id,
                 PeerIdentity {
-                    endpoint: [0u8; 32],
+                    endpoint: [0u8; 32].into(),
                     name: "carol".into(),
                     user_id: None, // no device→user binding — petname is the ONLY principal
                     groups: vec![],
@@ -467,7 +467,7 @@ mod tests {
             entries.insert(
                 mallory_id,
                 PeerIdentity {
-                    endpoint: [0u8; 32],
+                    endpoint: [0u8; 32].into(),
                     name: "mallory".into(),
                     user_id: None,
                     groups: vec![],
@@ -534,12 +534,12 @@ mod tests {
         use crate::audit::{AuditLog, AuditSink};
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
             let alice_ep = ep().await;
-            let alice_id: EndpointId = *alice_ep.id().as_bytes();
+            let alice_id: EndpointId = alice_ep.id().into();
             let mut entries = std::collections::HashMap::new();
             entries.insert(
                 alice_id,
                 PeerIdentity {
-                    endpoint: [0u8; 32],
+                    endpoint: [0u8; 32].into(),
                     name: "alice".into(),
                     user_id: Some("alice".into()),
                     groups: vec![],

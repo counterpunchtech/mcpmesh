@@ -43,7 +43,7 @@ async fn run_backend_pumps_frames_and_injects_identity() {
         };
         // The gate-resolved identity, threaded through run_over per-caller (Task 9).
         let identity = Some(PeerIdentity {
-            endpoint: [0u8; 32],
+            endpoint: [0u8; 32].into(),
             name: "bob".into(),
             user_id: None,
             groups: vec![],

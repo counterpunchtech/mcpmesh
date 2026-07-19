@@ -35,7 +35,7 @@ fn gate_and_register(
     conn: &iroh::endpoint::Connection,
     blob_conn_limit: bool,
 ) -> Option<mcpmesh_net::registry::Registration> {
-    let remote = *conn.remote_id().as_bytes();
+    let remote = mcpmesh_net::EndpointId::from(conn.remote_id());
     if mesh.gate.resolve(&remote).is_none() {
         conn.close(mcpmesh_net::CLOSE_UNAUTHORIZED.into(), b"unauthorized");
         return None;
@@ -70,11 +70,11 @@ fn gate_and_register(
 /// so the loop is defined in exactly one place; the reload path aborts the returned handle and
 /// spawns a fresh loop carrying the rebuilt `services`.
 ///
-/// Takes `Arc<MeshState>` (not the individual parts): the `mcpmesh/mcp/1` branch reads
-/// `mesh.gate`; the `mcpmesh/pair/1` branch hands the WHOLE `mesh` to the rendezvous, which needs
-/// `mesh.invites` + `mesh.store` to redeem AND the grant/reload machinery on `mesh` to authorize
-/// the paired peer (M2b T6). Only `services` is passed alongside because a hot-reload swaps the
-/// registry without rebuilding the rest of the mesh.
+/// Takes `Arc<MeshState>` (not the individual parts): the arms read the gate/limits/handles off
+/// it, and the `mcpmesh/pair/1` branch hands the rendezvous the narrow per-connection
+/// [`InviterCtx`](crate::pairing::rendezvous::InviterCtx) the mesh composes (`inviter_ctx` —
+/// store + invites + the grant hook into the reload machinery). Only `services` is passed
+/// alongside because a hot-reload swaps the registry without rebuilding the rest of the mesh.
 ///
 /// `pub` (like [`build_services`](crate::daemon::build_services)) so integration tests can drive the SAME accept loop the daemon
 /// runs against in-process endpoints, proving mesh vs. pair ALPN routing.
@@ -136,13 +136,15 @@ pub fn spawn_accept_loop(mesh: Arc<MeshState>, services: Arc<Services>) -> JoinH
                             conn.close(0u32.into(), b"pair rate limited");
                             return;
                         }
-                        // T5/T6: real inviter-side rendezvous. It gets the whole `mesh` so a
-                        // successful pair can also GRANT service access (config-append + reload)
-                        // via `grant_service_access`. The error is a transport/protocol error (a
+                        // The real inviter-side rendezvous, run against the narrow context the
+                        // mesh composes: store + invites + the grant hook, so a successful pair
+                        // can also GRANT service access (config-append + reload) without the
+                        // module seeing the mesh. The error is a transport/protocol error (a
                         // malformed hello, a dropped stream) or a grant failure — it carries NO
-                        // peer identity, so `%e` is no surface leak (spec §1.5). Logged at debug.
+                        // peer identity, so `%e` is no surface leak. Logged at debug.
                         if let Err(e) =
-                            pairing::rendezvous::handle_inviter_side(conn, mesh.clone()).await
+                            pairing::rendezvous::handle_inviter_side(conn, mesh.inviter_ctx())
+                                .await
                         {
                             tracing::debug!(%e, "pair rendezvous error");
                         }
@@ -153,7 +155,7 @@ pub fn spawn_accept_loop(mesh: Arc<MeshState>, services: Arc<Services>) -> JoinH
                         // pong and learns nothing (no presence leak, spec §1.5). THIS gate is the
                         // security boundary of the probe (mirrors the `gate.resolve` refusal in
                         // `gate_and_register`). The EndpointId is not logged (surface-leak discipline).
-                        let remote = *conn.remote_id().as_bytes();
+                        let remote = mcpmesh_net::EndpointId::from(conn.remote_id());
                         if mesh.gate.resolve(&remote).is_none() {
                             conn.close(mcpmesh_net::CLOSE_UNAUTHORIZED.into(), b"unauthorized");
                             return;

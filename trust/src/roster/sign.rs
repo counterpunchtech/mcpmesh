@@ -1,14 +1,14 @@
-//! JCS canonicalization (RFC 8785, [RECONCILE-A]) + Ed25519 org-root sign/verify (validation
+//! JCS canonicalization (RFC 8785) + Ed25519 org-root sign/verify (validation
 //! rule 1). Signature-critical: canonicalize the doc with `sig` REMOVED, sign/verify over those
-//! bytes. `sign`/`mint_signed` are production API — M3b's `org approve` signs the same way; M3a
-//! tests + M3b share the mint path.
+//! bytes. `sign`/`mint_signed` are production API — `org approve` signs the same way; tests
+//! share the same mint path.
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 
 use super::{Roster, RosterError, decode_b64u, encode_b64u};
 
 /// Canonical (RFC 8785 JCS) bytes of `value` with any top-level `"sig"` key removed. THE signing
 /// input. Removing `sig` before canonicalization is what makes the signature cover everything-but-
-/// itself (spec §4.3). [RECONCILE-A]: `serde_jcs::to_vec` is the pinned canonicalizer.
+/// itself. `serde_jcs::to_vec` is the pinned canonicalizer.
 pub fn canonical_bytes_without_sig(value: &serde_json::Value) -> Result<Vec<u8>, RosterError> {
     let mut v = value.clone();
     if let Some(obj) = v.as_object_mut() {
@@ -34,7 +34,7 @@ pub fn verify(roster: &Roster, root_pk: &VerifyingKey) -> Result<(), RosterError
 }
 
 /// Sign `roster` in place with the org root: canonicalize (with the existing `sig` ignored/removed),
-/// sign, set `roster.sig = b64u:<signature>`. Production API (operator-side, M3b `org approve`).
+/// sign, set `roster.sig = b64u:<signature>`. Production API (operator-side `org approve`).
 pub fn sign(root: &SigningKey, roster: &mut Roster) -> Result<(), RosterError> {
     use ed25519_dalek::Signer;
     let canon = canonical_bytes(roster)?;
@@ -43,13 +43,13 @@ pub fn sign(root: &SigningKey, roster: &mut Roster) -> Result<(), RosterError> {
     Ok(())
 }
 
-/// Convenience: sign a fresh roster body and return it. The MINT helper M3a tests + M3b reuse.
+/// Convenience: sign a fresh roster body and return it (the shared mint helper).
 pub fn mint_signed(root: &SigningKey, mut body: Roster) -> Roster {
     sign(root, &mut body).expect("mint signs a well-formed body");
     body
 }
 
-/// Domain string for the join-code device→user-key binding (spec §4.4). DISTINCT from the roster
+/// Domain string for the join-code device→user-key binding. DISTINCT from the roster
 /// `sig` and the SAS/fingerprint domains, so a signature can never be replayed across purposes.
 const DEVICE_BINDING_DOMAIN: &[u8] = b"mcpmesh/join/device-binding/1";
 
@@ -62,7 +62,7 @@ fn device_binding_preimage(user_pk: &[u8; 32], device_endpoint_id: &[u8; 32]) ->
     m
 }
 
-/// Sign a device→user-key binding with the USER key (the join code's `binding_sig`, spec §4.4).
+/// Sign a device→user-key binding with the USER key (the join code's `binding_sig`).
 /// Proves `device_endpoint_id` belongs to the holder of `user_key` WITHOUT trusting the transport —
 /// the human ceremony verifies the PERSON, this verifies the DEVICE. Returns raw 64-byte signature.
 pub fn sign_device_binding(user_key: &SigningKey, device_endpoint_id: &[u8; 32]) -> [u8; 64] {
@@ -72,7 +72,7 @@ pub fn sign_device_binding(user_key: &SigningKey, device_endpoint_id: &[u8; 32])
     user_key.sign(&msg).to_bytes()
 }
 
-/// Verify a device→user-key binding (`org approve`, spec §4.4). `user_pk` + `device_endpoint_id`
+/// Verify a device→user-key binding (`org approve`). `user_pk` + `device_endpoint_id`
 /// come from the join code; `sig` is its `binding_sig`. `verify_strict` (conservative, matches the
 /// roster `verify`). `Ok(())` iff the binding holds. Never panics on a malformed key/sig.
 pub fn verify_device_binding(

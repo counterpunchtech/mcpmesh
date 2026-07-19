@@ -249,7 +249,7 @@ mod tests {
                 limiter: crate::limits::RateLimiter::unlimited_shared(),
             };
             let identity = Some(PeerIdentity {
-                endpoint: [0u8; 32],
+                endpoint: [0u8; 32].into(),
                 name: "bob".into(),
                 user_id: None,
                 groups: vec![],
@@ -348,7 +348,7 @@ mod tests {
                 limiter: crate::limits::RateLimiter::unlimited_shared(),
             };
             let identity = Some(PeerIdentity {
-                endpoint: [0u8; 32],
+                endpoint: [0u8; 32].into(),
                 name: "bob".into(),
                 user_id: None,
                 groups: vec![],
@@ -420,7 +420,7 @@ mod tests {
                 limiter: crate::limits::RateLimiter::unlimited_shared(),
             };
             let identity = Some(PeerIdentity {
-                endpoint: [0u8; 32],
+                endpoint: [0u8; 32].into(),
                 name: "bob".into(),
                 user_id: None,
                 groups: vec![],
@@ -614,7 +614,7 @@ mod tests {
                 limiter: crate::limits::RateLimiter::unlimited_shared(),
             };
             let identity = Some(PeerIdentity {
-                endpoint: [0u8; 32],
+                endpoint: [0u8; 32].into(),
                 name: "bob".into(),
                 user_id: None,
                 groups: vec![],
@@ -704,7 +704,7 @@ mod tests {
                 limiter: crate::limits::RateLimiter::unlimited_shared(),
             };
             let identity = Some(PeerIdentity {
-                endpoint: [0u8; 32],
+                endpoint: [0u8; 32].into(),
                 name: "bob".into(),
                 user_id: None,
                 groups: vec![],
@@ -795,7 +795,7 @@ mod tests {
                 limiter: crate::limits::RateLimiter::unlimited_shared(),
             };
             let identity = Some(PeerIdentity {
-                endpoint: [0u8; 32],
+                endpoint: [0u8; 32].into(),
                 name: "bob".into(),
                 user_id: None,
                 groups: vec![],
