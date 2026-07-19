@@ -311,8 +311,75 @@ enum PeerCmd {
     },
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
+    match run(cli) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(err) => {
+            for line in error_lines(&err) {
+                eprintln!("{line}");
+            }
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// Render an error that is about to reach a human — the ONE rendering path every verb's
+/// failure flows through (issue #10). Pure so it is unit-testable.
+///
+/// A control-API failure prints its `message` as a plain sentence — NEVER the raw JSON-RPC
+/// error object (was previously `Error: control API error: {json}`), and known daemon
+/// failure shapes are translated to user language at this seam ([`control_error_lines`]).
+/// Everything else keeps the anyhow context chain (context layers that merely duplicated
+/// their root cause were dropped at the call sites instead).
+fn error_lines(err: &anyhow::Error) -> Vec<String> {
+    for cause in err.chain() {
+        if let Some(client::ClientError::Api(value)) = cause.downcast_ref::<client::ClientError>() {
+            return control_error_lines(value);
+        }
+    }
+    let mut lines = vec![format!("Error: {err}")];
+    let mut causes = err.chain().skip(1).peekable();
+    if causes.peek().is_some() {
+        lines.push(String::new());
+        lines.push("Caused by:".to_string());
+        for cause in causes {
+            lines.push(format!("    {cause}"));
+        }
+    }
+    lines
+}
+
+/// Render a control-API (JSON-RPC) error object for a human: unwrap `error.message`, mapping
+/// the known daemon failure shapes to user language (issue #10). The daemon's failed-dial
+/// pair message carries transport vocabulary ("dial the inviter on the pairing ALPN") that
+/// SECURITY.md bars from user-facing surfaces — this porcelain seam owns the translation.
+fn control_error_lines(error: &serde_json::Value) -> Vec<String> {
+    let message = error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if message.contains("dial the inviter") {
+        return vec![
+            "Error: could not reach the inviter's machine — are they online?".to_string(),
+            "(You cannot redeem your own invite on the machine that minted it — run \
+             `mcpmesh pair` on the other machine.)"
+                .to_string(),
+        ];
+    }
+    if message.is_empty() {
+        // A message-less error frame still never prints as raw JSON.
+        return vec![
+            "Error: the daemon reported an unexpected error — run 'mcpmesh doctor' to diagnose"
+                .to_string(),
+        ];
+    }
+    vec![format!("Error: {message}")]
+}
+
+/// Dispatch the parsed command — split from [`main`] so every verb's failure flows through
+/// the one rendering path ([`error_lines`]).
+fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.cmd {
         // The daemon owns its own runtime; dispatch it before the porcelain preamble.
         Some(Cmd::Internal {
@@ -738,8 +805,9 @@ fn run_join(
     use mcpmesh_trust::roster::encode_b64u;
     use mcpmesh_trust::roster::sign::sign_device_binding;
 
-    let invite = roster::enroll::OrgInviteCode::decode(&org_invite)
-        .context("the org invite is not a valid mcpmesh-org: code")?;
+    // No added context: the decode error is already the user-facing sentence ("not an
+    // mcpmesh-org: code (missing scheme)") — a wrapper here just repeated it (issue #10).
+    let invite = roster::enroll::OrgInviteCode::decode(&org_invite)?;
     // Confirm the pinned org root parses (so we can render its fingerprint for the ceremony).
     let root_pk = mcpmesh_trust::roster::decode_endpoint_id(&invite.org_root_pk)
         .context("org invite carries an invalid org_root_pk")?;
@@ -904,8 +972,8 @@ fn run_org_approve(
     use mcpmesh_trust::roster::sign::{sign, verify_device_binding};
     use mcpmesh_trust::roster::{decode_endpoint_id, mutate};
 
-    let jc = roster::enroll::JoinCode::decode(&join_code)
-        .context("the join code is not a valid mcpmesh-join: code")?;
+    // No added context — the decode error is already the user-facing sentence (issue #10).
+    let jc = roster::enroll::JoinCode::decode(&join_code)?;
     // [RECONCILE-E] verify the device→user-key binding (the device provably belongs to this user key)
     // BEFORE any mutation — a forged/corrupt code is rejected before the roster is touched.
     let user_pk = decode_endpoint_id(&jc.user_pk).context("join code has an invalid user_pk")?;
@@ -1022,8 +1090,8 @@ fn run_devices_add(device_code: String) -> anyhow::Result<()> {
     use mcpmesh_trust::roster::encode_b64u;
     use mcpmesh_trust::roster::sign::sign_device_binding;
 
-    let dc = roster::enroll::DeviceCode::decode(&device_code)
-        .context("not a valid mcpmesh-device: code")?;
+    // No added context — the decode error is already the user-facing sentence (issue #10).
+    let dc = roster::enroll::DeviceCode::decode(&device_code)?;
     let new_device_id = mcpmesh_trust::roster::decode_endpoint_id(&dc.device_endpoint_id)
         .context("device code has an invalid endpoint id")?;
 
@@ -2165,6 +2233,91 @@ mod tests {
         assert_eq!(
             render_frame(&v),
             "(lagged 7 events — reconnect for a fresh snapshot)"
+        );
+    }
+
+    /// Wrap a JSON-RPC error object the way every porcelain verb receives it: a
+    /// `ClientError::Api` converted into the verb's `anyhow::Result` by `?`.
+    fn api_error(value: serde_json::Value) -> anyhow::Error {
+        anyhow::Error::from(client::ClientError::Api(value))
+    }
+
+    #[test]
+    fn control_api_errors_render_the_message_never_the_json_object() {
+        // Issue #10 style 2: the raw error object must never reach a human — only its message.
+        let err = api_error(json!({"code": -32000, "message": "invite expired"}));
+        let lines = error_lines(&err);
+        assert_eq!(lines, vec!["Error: invite expired".to_string()]);
+        let rendered = lines.join("\n");
+        assert!(
+            !rendered.contains('{') && !rendered.contains("-32000"),
+            "no JSON-RPC object/code may leak: {rendered}"
+        );
+    }
+
+    #[test]
+    fn failed_pair_dial_renders_in_user_language() {
+        // The daemon-side message (its exact shape at v0.4.0) carries transport vocabulary;
+        // the porcelain seam maps it to the human explanation (issue #10).
+        let err = api_error(json!({
+            "code": -32000,
+            "message": "pair failed: dial the inviter on the pairing ALPN"
+        }));
+        let rendered = error_lines(&err).join("\n");
+        assert!(
+            rendered.contains("could not reach the inviter's machine")
+                && rendered.contains("are they online?"),
+            "the failure states what happened in user language: {rendered}"
+        );
+        assert!(
+            rendered.contains("cannot redeem your own invite on the machine that minted it"),
+            "the self-redeem case is explained: {rendered}"
+        );
+        for term in ["ALPN", "dial", "{"] {
+            assert!(!rendered.contains(term), "leaked '{term}': {rendered}");
+        }
+    }
+
+    #[test]
+    fn a_message_less_control_error_degrades_to_doctor_not_json() {
+        let err = api_error(json!({"code": -32000}));
+        let rendered = error_lines(&err).join("\n");
+        assert!(
+            rendered.contains("mcpmesh doctor") && !rendered.contains('{'),
+            "degrades to a next step, never raw JSON: {rendered}"
+        );
+    }
+
+    #[test]
+    fn non_control_errors_keep_their_context_chain() {
+        // The generic path renders like anyhow's chain: top line + Caused by. (Redundant
+        // layers were dropped at the call sites, not collapsed here.)
+        let err = anyhow::Error::from(std::io::Error::other("disk full"))
+            .context("write staged roster /tmp/x");
+        let lines = error_lines(&err);
+        assert_eq!(lines[0], "Error: write staged roster /tmp/x");
+        assert!(
+            lines.iter().any(|l| l == "Caused by:")
+                && lines.iter().any(|l| l.contains("disk full")),
+            "the cause survives: {lines:?}"
+        );
+        // …and a single-layer error is a single sentence.
+        let single = anyhow::anyhow!("bad --expires: unknown unit");
+        assert_eq!(
+            error_lines(&single),
+            vec!["Error: bad --expires: unknown unit".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_garbage_org_invite_is_a_single_sentence() {
+        // Issue #10 style 3 (the join-garbage two-line case): the decode error IS the user
+        // sentence; no context layer repeats it.
+        let err = roster::enroll::OrgInviteCode::decode("garbage").unwrap_err();
+        let lines = error_lines(&err);
+        assert_eq!(
+            lines,
+            vec!["Error: not an mcpmesh-org: code (missing scheme)".to_string()]
         );
     }
 }

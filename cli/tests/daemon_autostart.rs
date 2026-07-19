@@ -74,16 +74,18 @@ fn transport_vocab_violation(s: &str) -> Option<String> {
 /// and a `relay_mode = "disabled"` config keeps the endpoint localhost-only (no relay egress
 /// in CI). The config file is written under `XDG_CONFIG_HOME/mcpmesh/config.toml`.
 fn launch_in(dir: &Path) -> DaemonLaunch {
+    launch_with_config(dir, "[network]\nrelay_mode = \"disabled\"\n")
+}
+
+/// [`launch_in`] with explicit config contents — the seam for the autostart-failure tests,
+/// which need a config the daemon REFUSES to start on.
+fn launch_with_config(dir: &Path, config_toml: &str) -> DaemonLaunch {
     let runtime = dir.join("runtime");
     let config = dir.join("config");
     let data = dir.join("data");
     let config_mcpmesh = config.join("mcpmesh");
     std::fs::create_dir_all(&config_mcpmesh).unwrap();
-    std::fs::write(
-        config_mcpmesh.join("config.toml"),
-        "[network]\nrelay_mode = \"disabled\"\n",
-    )
-    .unwrap();
+    std::fs::write(config_mcpmesh.join("config.toml"), config_toml).unwrap();
     DaemonLaunch {
         exe: cargo_bin("mcpmesh"),
         socket: runtime.join("mcpmesh").join("mcpmesh.sock"),
@@ -422,6 +424,74 @@ async fn porcelain_autostarts_daemon_and_second_call_reuses_it() {
     })
     .await
     .expect("porcelain autostart test timed out");
+}
+
+/// Issue #7: a daemon that REFUSES to start (here: an invalid `[network]` config) must fail
+/// autostart FAST — not wait out the 10s connect window — and the error must replay the
+/// daemon's OWN reason plus the doctor next step (was previously a bare "Connection refused"
+/// after the full window).
+#[tokio::test(flavor = "multi_thread")]
+async fn autostart_failure_replays_the_daemons_reason_fast() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let tmp = tempfile::tempdir().unwrap();
+        // `relay_mode = "custom"` with no relay_urls: the daemon refuses to run (operator.md's
+        // refuse-rather-than-silently-fall-back policy).
+        let launch = launch_with_config(tmp.path(), "[network]\nrelay_mode = \"custom\"\n");
+
+        let start = Instant::now();
+        let err = ensure_daemon_with(&launch)
+            .await
+            .expect_err("a refusing daemon must fail autostart");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("the daemon failed to start"),
+            "the failure states what happened: {msg}"
+        );
+        assert!(
+            msg.contains("relay_urls"),
+            "the daemon's own reason is replayed: {msg}"
+        );
+        assert!(
+            msg.contains("run 'mcpmesh doctor' to diagnose"),
+            "the exact next command is named: {msg}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(8),
+            "a dead child must fail fast, not wait out the 10s window (took {:?})",
+            start.elapsed()
+        );
+    })
+    .await
+    .expect("autostart-failure test timed out");
+}
+
+/// The same failure through the PORCELAIN (`mcpmesh status` as a subprocess): non-zero exit,
+/// and stderr carries the daemon's reason + the doctor next step — the end-to-end shape a
+/// config-editing user actually sees (issue #7).
+#[tokio::test(flavor = "multi_thread")]
+async fn porcelain_surfaces_the_daemons_startup_error() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let tmp = tempfile::tempdir().unwrap();
+        let launch = launch_with_config(tmp.path(), "[network]\nrelay_mode = \"custom\"\n");
+
+        let out = run_status_cmd(&launch);
+        assert!(
+            !out.status.success(),
+            "status against a refusing daemon must exit non-zero"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("relay_urls") && stderr.contains("run 'mcpmesh doctor' to diagnose"),
+            "stderr replays the daemon's reason and the next step: {stderr}"
+        );
+        // The raw io kernel-speak of the pre-fix message must not be the story the user gets.
+        assert!(
+            stderr.contains("the daemon failed to start"),
+            "the failure is stated in plain language: {stderr}"
+        );
+    })
+    .await
+    .expect("porcelain startup-error test timed out");
 }
 
 /// Spec AC: "a non-porcelain client drives status over mcpmesh-local/1 and receives the API
