@@ -11,8 +11,8 @@
 //!    (temp config + temp store + a localhost endpoint) inside a `DaemonState`, seed a peer AND a
 //!    service `allow` listing it, then call the REAL `daemon::remove_peer` handler and assert on
 //!    the STORE + CONFIG (not `status` output — the T7 out-of-scope note): the PeerEntry is gone
-//!    AND the petname is stripped from every `[services.*].allow`. Idempotent re-removal + removal
-//!    of an absent peer are clean no-ops.
+//!    AND the petname is stripped from every `[services.*].allow`. Re-removal + removal of an
+//!    absent peer tear nothing down and are refused (no false success on a revocation surface).
 //!
 //! A full `pair <invite>` against a live inviter folds into Task 8's E2E; the `pair` OUTPUT shape
 //! (SAS line + `<peer>/<service>` mounts) is covered by `main.rs`'s unit tests over `pair_lines`.
@@ -55,7 +55,9 @@ fn unpair(petname: &str) -> PeerRemoveParams {
 
 /// A hermetic launch env: the built `mcpmesh` binary + a tempdir runtime/config/data (mirrors
 /// `daemon_autostart.rs::launch_in`). `relay_mode = "disabled"` keeps the daemon's endpoint
-/// localhost-only (no relay egress in CI). Returns (exe, socket, env-vars).
+/// localhost-only (no relay egress in CI). `[services.notes]` is pre-registered (stub backend)
+/// so `invite notes` passes the daemon's invite-time registration check the way a real serve'd
+/// setup would. Returns (exe, socket, env-vars).
 fn launch_in(
     dir: &Path,
 ) -> (
@@ -70,7 +72,9 @@ fn launch_in(
     std::fs::create_dir_all(&config_mcpmesh).unwrap();
     std::fs::write(
         config_mcpmesh.join("config.toml"),
-        "[network]\nrelay_mode = \"disabled\"\n",
+        format!(
+            "[network]\nrelay_mode = \"disabled\"\n\n[services.notes]\nrun = ['{STUB}']\nallow = []\n"
+        ),
     )
     .unwrap();
     let socket = runtime.join("mcpmesh").join("mcpmesh.sock");
@@ -175,6 +179,76 @@ async fn invite_with_no_services_is_an_error() {
     .expect("empty-invite test timed out");
 }
 
+/// `mcpmesh invite <unregistered>` is REFUSED by the daemon: an invite for a name with no
+/// `[services.*]` registration would redeem fine and only fail at connect time on the FRIEND's
+/// machine. Non-zero exit; the message names the missing service, lists what IS served (here:
+/// the pre-registered `notes`), and points at `mcpmesh status` — no wire vocabulary.
+#[tokio::test(flavor = "multi_thread")]
+async fn invite_for_an_unregistered_service_is_refused() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let tmp = tempfile::tempdir().unwrap();
+        let (exe, socket, env) = launch_in(tmp.path());
+
+        let out = run_cmd(&exe, &env, &["invite", "nosuchsvc"]);
+        assert!(
+            !out.status.success(),
+            "inviting an unregistered service must exit non-zero; stdout: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("no service named 'nosuchsvc'"),
+            "the refusal names the missing service: {stderr}"
+        );
+        assert!(
+            stderr.contains("you serve: notes") && stderr.contains("mcpmesh status"),
+            "the refusal lists what IS served and points at status: {stderr}"
+        );
+        // Nothing was minted: no `mcpmesh-invite:` artifact anywhere in the output.
+        assert!(
+            !String::from_utf8_lossy(&out.stdout).contains("mcpmesh-invite:"),
+            "no invite line may be printed on refusal"
+        );
+
+        shutdown_daemon(&socket).await;
+    })
+    .await
+    .expect("unregistered-invite test timed out");
+}
+
+/// `mcpmesh pair --remove <unknown>` is an ERROR, not a false success: `pair --remove` is a
+/// revocation surface, so a typo'd petname must exit non-zero with a pointer at `mcpmesh status`
+/// (the daemon reports that nothing was actually torn down). Drives the REAL porcelain + daemon.
+#[tokio::test(flavor = "multi_thread")]
+async fn pair_remove_of_an_unknown_petname_is_refused() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let tmp = tempfile::tempdir().unwrap();
+        let (exe, socket, env) = launch_in(tmp.path());
+
+        let out = run_cmd(&exe, &env, &["pair", "--remove", "nobody"]);
+        assert!(
+            !out.status.success(),
+            "removing an unknown peer must exit non-zero; stdout: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("no paired peer named 'nobody'")
+                && stderr.contains("'mcpmesh status' lists your peers"),
+            "the refusal names the petname and points at status: {stderr}"
+        );
+        // No false-success porcelain either.
+        assert!(
+            !String::from_utf8_lossy(&out.stdout).contains("Unpaired"),
+            "no 'Unpaired …' success line may be printed on refusal"
+        );
+
+        shutdown_daemon(&socket).await;
+    })
+    .await
+    .expect("unknown-petname remove test timed out");
+}
+
 // ─────────────────────────── pair --remove functional (in-process) ───────────────────────────
 
 /// A localhost-only endpoint advertising both ALPNs (matches the daemon's `build_endpoint` list),
@@ -203,7 +277,8 @@ fn seed_peer(store: &PeerStore, endpoint_id: [u8; 32], petname: &str, services: 
 /// `peer_remove` drops the peer's PeerEntry (identity) AND strips the petname from EVERY
 /// `[services.*].allow` (authorization) — asserted on the store + config directly (functional
 /// truth, not `status`). A different peer (carol) sharing a service is left untouched.
-/// Re-removal + removing an absent peer are clean idempotent no-ops.
+/// Re-removal + removing an absent peer tear nothing down, so both are ERRORS (revocation must
+/// never report false success) — and both leave the durable state untouched.
 #[tokio::test(flavor = "multi_thread")]
 async fn pair_remove_drops_the_peer_and_revokes_every_service_allow() {
     tokio::time::timeout(Duration::from_secs(30), async {
@@ -272,16 +347,26 @@ async fn pair_remove_drops_the_peer_and_revokes_every_service_allow() {
             "bob must be revoked from kb.allow, carol untouched"
         );
 
-        // ── Idempotent: re-removing bob is a clean no-op (revoke changed=false, store no-op) ──
-        daemon::remove_peer(&state, unpair("bob"))
+        // ── Re-removing bob tears nothing down (revoke changed=false, store no-op) → ERROR
+        //    with the status pointer, so a repeated/typo'd revocation never reads as success ──
+        let err = daemon::remove_peer(&state, unpair("bob"))
             .await
-            .expect("re-removing bob is a clean no-op");
-        // ── Idempotent: removing a never-present peer is a clean no-op ──
-        daemon::remove_peer(&state, unpair("ghost"))
+            .expect_err("re-removing an already-removed peer must error");
+        assert!(
+            err.to_string()
+                .contains("no paired peer named 'bob' — 'mcpmesh status' lists your peers"),
+            "the refusal names the petname and points at status: {err}"
+        );
+        // ── Removing a never-present peer is the same refusal ──
+        let err = daemon::remove_peer(&state, unpair("ghost"))
             .await
-            .expect("removing an absent peer is a clean no-op");
+            .expect_err("removing an absent peer must error");
+        assert!(
+            err.to_string().contains("no paired peer named 'ghost'"),
+            "the refusal names the petname: {err}"
+        );
 
-        // State is stable after the no-ops.
+        // State is stable after the refused removals.
         assert!(store.resolve(&bob_id).unwrap().is_none());
         assert!(store.resolve(&carol_id).unwrap().is_some());
         let cfg = Config::load(&config_path).unwrap();
@@ -355,9 +440,10 @@ async fn pair_remove_drops_a_peer_with_no_service_allow() {
 
 /// **M4b — `pair --remove` audits an unpair ONLY when something was actually torn down (§11.3).** The
 /// `trust(event="unpair")` record must fire on a REAL unpair (a removed PeerEntry and/or a revoked
-/// allow) but NOT on a no-op remove of a never-paired petname (both the revoke half — `changed=false`
-/// — and the store remove are idempotent no-ops). Installs a real AuditLog, removes a GHOST petname
-/// (→ ZERO unpair records) then removes bob (→ EXACTLY one `trust(event="unpair", target="bob")`).
+/// allow) but NOT on a remove of a never-paired petname (both the revoke half — `changed=false` —
+/// and the store remove tear nothing down, so the removal is REFUSED). Installs a real AuditLog,
+/// removes a GHOST petname (→ an error + ZERO unpair records) then removes bob (→ EXACTLY one
+/// `trust(event="unpair", target="bob")`).
 #[tokio::test(flavor = "multi_thread")]
 async fn pair_remove_audits_a_real_unpair_but_not_a_no_op() {
     use mcpmesh::audit::{AuditLog, AuditSink, now_ts};
@@ -398,17 +484,17 @@ async fn pair_remove_audits_a_real_unpair_but_not_a_no_op() {
         let month = &now_ts()[..7];
         let file = audit_dir.join(format!("{month}.jsonl"));
 
-        // ── A NO-OP remove of a never-paired petname must write NO unpair record ──
+        // ── A remove of a never-paired petname is REFUSED and must write NO unpair record ──
         daemon::remove_peer(&state, unpair("ghost"))
             .await
-            .expect("removing an absent peer is a clean no-op");
+            .expect_err("removing an absent peer must error");
         // Give the async audit writer ample time to have flushed a record IF one were emitted.
         tokio::time::sleep(Duration::from_millis(250)).await;
         let after_ghost = std::fs::read_to_string(&file).unwrap_or_default();
         assert_eq!(
             after_ghost.matches("\"event\":\"unpair\"").count(),
             0,
-            "a no-op remove of a never-paired petname must NOT write a phantom unpair record: \
+            "a refused remove of a never-paired petname must NOT write a phantom unpair record: \
              {after_ghost}"
         );
 
