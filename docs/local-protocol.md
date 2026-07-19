@@ -78,7 +78,7 @@ porcelain verb starts the daemon) or runs `mcpmesh internal daemon` itself.
 **The server speaks first.** Immediately on accept, the daemon writes one `Hello` frame:
 
 ```json
-{"api":"mcpmesh-local/1","api_version":"1.0","stack_version":"0.2.0"}
+{"api":"mcpmesh-local/1","api_version":"1.0","stack_version":"…"}
 ```
 
 A client MUST read this frame first and check `api == "mcpmesh-local/1"` before sending anything. A
@@ -162,11 +162,24 @@ Paths and files (`roster_install.path`, `org_join.user_key`, `blob_publish.path`
 `blob_fetch.dest_path`) are passed **as local paths, not bytes** — the same-uid daemon reads/writes
 them directly, which is within the trust boundary.
 
+### Reserved / internal methods
+
+The daemon answers two further methods that are **not** part of the stable surface; they are listed
+here only so a third-party implementer is not surprised to see them on the wire:
+
+- `shutdown` — asks the daemon to exit cleanly; used by the CLI's own lifecycle management.
+- `peer_add` — installs a peer directly from a raw `endpoint_id`, an internal stand-in for
+  populating trust without the pairing ceremony. This is a deliberate, documented exception to the
+  surface discipline described under [`StatusResult`](#statusresult): everywhere else, raw endpoint
+  identifiers never cross this socket.
+
+Do not build on either — they may change or disappear without an `api_version` bump.
+
 ### `StatusResult`
 
 ```json
 {
-  "stack_version": "0.2.0",
+  "stack_version": "…",
   "services": [{"name": "notes", "allow": ["bob"], "backend": "run"}],
   "peers":    [{"name": "bob", "services": ["notes"], "user_id": "b64u:…"}],
   "self_user_id": "b64u:…",
@@ -312,8 +325,10 @@ resume in sync.
 {"type": "lagged", "dropped": 12}
 ```
 
-`mcpmesh internal watch` is a thin reference consumer of this stream. Reference:
-[`cli/src/stream.rs`](../cli/src/stream.rs).
+Typed Rust bindings for these frames (`StreamFrame`, `ActiveSession`, and the audit record) ship in
+[`mcpmesh-local-api`](../local-api/src/protocol.rs), so a Rust consumer deserializes the stream
+instead of hand-parsing it. `mcpmesh internal watch` is a thin reference consumer of this stream.
+Reference: [`cli/src/stream.rs`](../cli/src/stream.rs).
 
 ## The identity contract
 
@@ -371,14 +386,16 @@ Reference: [`cli/src/backends/spawn.rs`](../cli/src/backends/spawn.rs) (`run`),
 
 | Code | Meaning |
 |---|---|
+| `-32600` | invalid request (the frame has no `method` field) |
+| `-32601` | unknown method |
 | `-32602` | invalid params (a required field missing or the wrong type) |
 | `-32603` | internal error |
-| `-32000` | daemon is in control-only mode with no mesh (e.g. `invite`/`pair` before a mesh exists) |
+| `-32000` | operation failed — `message` carries the detail. One common instance: the daemon is in control-only mode with no mesh (e.g. `invite`/`pair` before a mesh exists) |
 | `-32055` | *(session only)* peer unreachable |
 | `-32054` | *(session only)* session refused |
 
-`-32602` and `-32603` follow their JSON-RPC 2.0 meanings. Session errors (`-3205x`) appear inside a
-[session](#sessions), not as control-method responses, and carry `data.source = "mcpmesh"`.
+`-32600` through `-32603` follow their JSON-RPC 2.0 meanings. Session errors (`-3205x`) appear
+inside a [session](#sessions), not as control-method responses, and carry `data.source = "mcpmesh"`.
 
 ## Versioning
 
@@ -411,7 +428,8 @@ This document describes the surface; the code defines it.
 - Frame codec — [`codec/src/lib.rs`](../codec/src/lib.rs)
 - Endpoint/path resolution — [`local-api/src/paths.rs`](../local-api/src/paths.rs)
 - Identity injection — [`cli/src/backends/`](../cli/src/backends/)
-- Live event-stream frames — [`cli/src/stream.rs`](../cli/src/stream.rs)
+- Live event-stream frames — [`local-api/src/protocol.rs`](../local-api/src/protocol.rs)
+  (`mcpmesh internal watch` in [`cli/src/stream.rs`](../cli/src/stream.rs) is the reference consumer)
 
 The `mcpmesh-local-api` crate is [published to crates.io](https://crates.io/crates/mcpmesh-local-api):
 Rust clients can depend on it directly (`client` feature) rather than reimplementing the wire format.
