@@ -5,9 +5,9 @@ everything else bumps the PATCH.
 
 ## 1. Bump the version
 
-One version drives everything: `[workspace.package] version` in `Cargo.toml`, plus the four
-internal dep pins in `[workspace.dependencies]` (`mcpmesh-codec`/`-net`/`-trust`/`-local-api`
-— crates.io refuses version-less path deps, so the pins move with the version). Then:
+Edit `[workspace.package] version` and the four `mcpmesh-*` pins in `[workspace.dependencies]`
+of `Cargo.toml` to `X.Y.Z`. One version drives everything: the pins (`mcpmesh-codec`/`-net`/
+`-trust`/`-local-api`) move with it because crates.io refuses version-less path deps. Then:
 
     cargo update -w
     cargo test --workspace --locked
@@ -16,6 +16,10 @@ Gotcha: tests asserting the daemon's reported `stack_version` must compare again
 `mcpmesh::daemon::STACK_VERSION`, never a literal.
 
 ## 2. Tag
+
+Before tagging, run the two-machine smoke test — [`docs/dev-two-machine-smoke.md`](docs/dev-two-machine-smoke.md)
+is pre-release-mandatory (CI cannot exercise the real-NAT path). For a milestone release,
+also run the load soak in [`docs/load-soak.md`](docs/load-soak.md).
 
     git commit -am "release: X.Y.Z — <summary>"
     git push                        # wait for CI green
@@ -30,7 +34,13 @@ Publishes codec → local-api → trust → net → cli in dependency order from
 checkout. Resumable: versions already in the crates.io index are skipped, so an interrupted
 run just re-runs. Verify the crates.io pages + docs.rs builds afterwards.
 
-## 4. Homebrew formula
+## 4. GitHub release
+
+Every tag gets a titled GitHub Release (v0.5.0 onward all have one):
+
+    gh release create vX.Y.Z --title "mcpmesh X.Y.Z" --notes "<summary>"
+
+## 5. Homebrew formula
 
 Update the stable stanza in `Formula/mcpmesh.rb` — a post-tag commit on `main` (the tarball
 cannot contain its own hash):
