@@ -7,6 +7,10 @@ rust-version.workspace = true
 repository.workspace = true
 readme = "../README.md"
 description = "Share MCP servers with people you trust — peer to peer, default-deny, no accounts"
+# The spawn-backend test stub is a test-only helper the integration tests reach via
+# `CARGO_BIN_EXE_echo_mcp_stub`; excluding it from the package keeps `cargo install
+# mcpmesh` shipping exactly one binary. The local tree (and CI) still build it for tests.
+exclude = ["src/bin/echo_mcp_stub.rs"]
 
 [lints]
 workspace = true
