@@ -31,11 +31,15 @@ there is no magic in it.
 ### 0. Give the friend a world
 
 ```sh
-FRIEND_HOME=/tmp/mcpmesh-demo-friend
+FRIEND_HOME=$HOME/.mcpmesh-demo-friend
 mkdir -p $FRIEND_HOME/notes $FRIEND_HOME/runtime $FRIEND_HOME/.config/mcpmesh
 echo "It worked: this note reached you through the mesh." > $FRIEND_HOME/notes/hello.md
 printf '[identity]\nnickname = "demo-friend"\n' > $FRIEND_HOME/.config/mcpmesh/config.toml
 ```
+
+Keep this under `$HOME`, not `/tmp` or `$TMPDIR`. On macOS both resolve through a symlink
+(`/tmp` → `/private/tmp`), and the filesystem MCP server compares its allowed directory against a
+realpath-resolved argument — so every path in step 4 would come back "outside allowed directories".
 
 The `nickname` line names the friend. Without it they would introduce themselves by this machine's
 hostname — the same name *your* daemon uses, which makes for a confusing demo. (That key, and every
@@ -84,19 +88,25 @@ friend mcpmesh status      # "recent pairings: … code: tango-fig-cabbage"
 
 Matching words are what a real pairing ceremony checks.
 
-### 4. Prove a live frame end to end
+### 4. Prove a live exchange end to end
 
 Mount it in your AI client (`mcpmesh use demo-friend/notes` prints the steps), or prove the pipe
-with one raw MCP frame:
+with raw MCP frames — an `initialize`, then an actual tool call that reads the friend's note:
 
 ```sh
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"loopback-demo","version":"0.0.0"}}}' \
-  | mcpmesh connect demo-friend/notes | head -n 1
+{ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"loopback-demo","version":"0.0.0"}}}'
+  sleep 20
+  printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+  printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"'"$FRIEND_HOME"'/notes/hello.md"}}}'
+  sleep 12
+} | mcpmesh connect demo-friend/notes
 ```
 
-That `initialize` response came from the friend's notes server, dialed across the mesh — the same
-path a request from another machine would take. (The first dial can take a moment while `npx`
-fetches the server.)
+The reply to `id:2` carries the text of `hello.md`. That is the part worth watching: `initialize`
+alone only proves the session opened, whereas the tool call proves a real request travelled to the
+friend's server and their file content came back over the encrypted link — the same path a request
+from another machine would take. (The `sleep`s cover the first dial, which can take a moment while
+`npx` fetches the server.)
 
 ## Cleaning up
 

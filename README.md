@@ -52,7 +52,9 @@ Only one machine? Fake the friend. A daemon's whole world lives under `HOME` +
 machine exactly as two machines would (macOS/Linux):
 
 ```sh
-FH=/tmp/mcpmesh-friend; mkdir -p $FH/notes $FH/run && echo hi > $FH/notes/hello.md
+# A real (symlink-free) path — NOT /tmp or $TMPDIR: on macOS both resolve through a symlink
+# (/tmp → /private/tmp), and the filesystem MCP server then rejects every path you give it.
+FH=$HOME/.mcpmesh-demo-friend; mkdir -p $FH/notes $FH/run && echo hi > $FH/notes/hello.md
 
 # the "friend" serves a folder and mints a real invite under the scratch identity…
 HOME=$FH XDG_RUNTIME_DIR=$FH/run mcpmesh serve notes -- npx -y @modelcontextprotocol/server-filesystem $FH/notes
