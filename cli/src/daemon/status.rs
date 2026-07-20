@@ -193,6 +193,7 @@ mod tests {
                 services: Vec::new(),
                 paired_at: None,
                 user_id: None,
+                last_addr: None,
             })
             .unwrap();
 
@@ -240,6 +241,7 @@ mod tests {
                 services: Vec::new(),
                 paired_at: Some("1".into()),
                 user_id: Some("b64u:alicepk".into()),
+                last_addr: None,
             })
             .unwrap();
         mesh.store
@@ -249,6 +251,7 @@ mod tests {
                 services: Vec::new(),
                 paired_at: None,
                 user_id: None,
+                last_addr: None,
             })
             .unwrap();
 

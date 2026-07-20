@@ -73,6 +73,7 @@ async fn accept_loop_routes_mesh_alpn_to_a_gated_session() {
                 services: vec!["echo".into()],
                 paired_at: None,
                 user_id: None,
+                last_addr: None,
             })
             .unwrap();
         let gate: Arc<dyn TrustGate> = Arc::new(AllowlistGate::new(store.clone()));

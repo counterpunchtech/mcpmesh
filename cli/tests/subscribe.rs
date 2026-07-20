@@ -142,6 +142,7 @@ async fn subscribe_pushes_snapshot_then_live_session_events() {
                 services: vec!["echo".into()],
                 paired_at: None,
                 user_id: None,
+                last_addr: None,
             })
             .unwrap();
 
@@ -178,6 +179,7 @@ async fn subscribe_pushes_snapshot_then_live_session_events() {
                 services: vec!["echo".into()],
                 paired_at: None,
                 user_id: None,
+                last_addr: None,
             })
             .unwrap();
         let d_socket = dir.path().join("d.sock");

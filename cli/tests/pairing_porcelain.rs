@@ -270,6 +270,7 @@ fn seed_peer(store: &PeerStore, endpoint_id: [u8; 32], petname: &str, services: 
             services: services.iter().map(|s| s.to_string()).collect(),
             paired_at: Some("1751760000".into()),
             user_id: None,
+            last_addr: None,
         })
         .unwrap();
 }

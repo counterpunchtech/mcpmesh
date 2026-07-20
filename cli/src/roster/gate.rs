@@ -379,6 +379,7 @@ mod tests {
                     services: vec![],
                     paired_at: None,
                     user_id: None,
+                    last_addr: None,
                 })
                 .unwrap();
         }
@@ -425,6 +426,7 @@ mod tests {
                 services: vec![],
                 paired_at: None,
                 user_id: Some("b64u:BOB".into()),
+                last_addr: None,
             })
             .unwrap();
         let pairs = Arc::new(AllowlistGate::new(store));
@@ -480,6 +482,7 @@ mod tests {
                 services: vec![],
                 paired_at: None,
                 user_id: None,
+                last_addr: None,
             })
             .unwrap();
         let pairs = Arc::new(AllowlistGate::new(store));
@@ -521,6 +524,7 @@ mod tests {
                 services: vec![],
                 paired_at: None,
                 user_id: None,
+                last_addr: None,
             })
             .unwrap();
         let pairs = Arc::new(AllowlistGate::new(store));

@@ -81,6 +81,7 @@ fn seed_peer(store: &PeerStore, endpoint_id: [u8; 32], petname: &str) {
             services: vec![],
             paired_at: None,
             user_id: None,
+            last_addr: None,
         })
         .unwrap();
 }

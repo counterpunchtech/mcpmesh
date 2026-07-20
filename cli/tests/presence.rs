@@ -119,6 +119,7 @@ async fn dial_service_races_a_person_to_the_live_mirror_when_the_primary_is_dead
                 services: vec!["echo".into()],
                 paired_at: None,
                 user_id: None,
+                last_addr: None,
             })
             .unwrap();
         let mirror_gate: Arc<dyn TrustGate> = Arc::new(AllowlistGate::new(Arc::new(mirror_store)));

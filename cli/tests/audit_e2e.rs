@@ -54,6 +54,7 @@ async fn real_session_audits_with_hashed_args_and_all_event_classes() {
                     services: vec!["notes".into()],
                     paired_at: None,
                     user_id: None,
+                    last_addr: None,
                 })
                 .unwrap();
             store

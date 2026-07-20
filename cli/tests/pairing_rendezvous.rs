@@ -415,6 +415,7 @@ fn seed_peer(store: &PeerStore, endpoint_id: [u8; 32], petname: &str, services: 
             services: services.iter().map(|s| s.to_string()).collect(),
             paired_at: None,
             user_id: None,
+            last_addr: None,
         })
         .unwrap();
 }
@@ -624,6 +625,7 @@ async fn reverse_pairing_preserves_the_inviters_dial_directory_and_petname() {
                 services: vec!["notes".into()],
                 paired_at: Some("1000".into()),
                 user_id: Some("b64u:ALICE".into()),
+                last_addr: None,
             })
             .unwrap();
 
@@ -694,6 +696,7 @@ async fn repeat_grant_unions_the_redeemers_dial_directory_and_applies_the_new_pe
                 services: vec!["notes".into()],
                 paired_at: Some("1000".into()),
                 user_id: Some("b64u:ALICE".into()),
+                last_addr: None,
             })
             .unwrap();
 

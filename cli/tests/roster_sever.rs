@@ -164,6 +164,7 @@ async fn install_severs_a_revoked_roster_session_but_not_a_pairing_session() {
                 services: vec!["echo".into()],
                 paired_at: None,
                 user_id: None,
+                last_addr: None,
             })
             .unwrap();
         store
@@ -173,6 +174,7 @@ async fn install_severs_a_revoked_roster_session_but_not_a_pairing_session() {
                 services: vec!["echo".into()],
                 paired_at: None,
                 user_id: None,
+                last_addr: None,
             })
             .unwrap();
         let pairs = Arc::new(AllowlistGate::new(store.clone()));

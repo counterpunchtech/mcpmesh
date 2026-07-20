@@ -201,9 +201,11 @@ pub(crate) async fn add_peer(state: &DaemonState, params: PeerAddParams) -> Resu
         petname: petname.clone(),
         services: allow,
         // `internal peer add` is not a pairing write — leave the audit stamp unset
-        // (only the pair rendezvous records `paired_at`).
+        // (only the pair rendezvous records `paired_at`) and no pairing-proven dial hint
+        // (`last_addr` — discovery resolves this peer).
         paired_at: None,
         user_id: None,
+        last_addr: None,
     };
 
     // redb writes block + fsync — run on a blocking thread (the fs house rule).
@@ -850,6 +852,7 @@ mod tests {
             services: Vec::new(),
             paired_at: None,
             user_id: user_id.map(str::to_string),
+            last_addr: None,
         }
     }
 
