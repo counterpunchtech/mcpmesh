@@ -23,6 +23,34 @@
 | `.github/workflows/real-network.yml` (create) | The tier-2 (and later tier-3) jobs. Kept separate from `ci.yml` so a self-hosted runner outage can never affect the hermetic matrix. |
 | `docs/dev-two-machine-smoke.md` (modify) | Add a pointer to the new script clarifying which layer each covers. |
 
+### `set -e` discipline (found during Task 1 execution — applies to Tasks 3–7)
+
+The skeleton uses `set -eu`. The working prototype this is derived from used only
+`set -u`. That difference is load-bearing and was nearly missed:
+
+```sh
+$ sh -c 'set -eu; X=$(false); echo "reached: $X"'; echo "exit=$?"
+exit=1          # no output, no summary, script just stops
+```
+
+`set -e` is *wanted* during setup — if `mkdir` or the peer daemon fails to start,
+aborting is correct. It is *dangerous* around assertions, where a non-zero exit
+is a normal outcome we want to record as `FAIL`, not a reason to vanish.
+
+Every assertion in Tasks 3–7 must therefore be phrased so it cannot abort:
+
+```sh
+OUT=$(some-command 2>&1) || true          # capture, never abort
+if printf '%s' "$OUT" | grep -q expected; then ok "…"; else bad "…"; fi
+```
+
+`cmd && ok "…" || bad "…"` is also safe (the `||` arm always runs and returns 0),
+but the `if` form is clearer and is preferred.
+
+Additionally, Task 2's cleanup trap must print the summary, so that even an
+unexpected abort reports what had passed before it died rather than exiting
+silently.
+
 ### A note on TDD for a test harness
 
 The Iron Law still applies, but "write the failing test first" maps differently here: the artifact *is* a test. The equivalent discipline is **prove each assertion can fail before trusting it.** Every task that adds an assertion has a step that deliberately breaks the condition, runs the script, and confirms it reports FAIL. An assertion never observed failing is not an assertion — it is a comment.
