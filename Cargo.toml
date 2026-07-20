@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["codec", "net", "trust", "local-api", "cli"]
+members = ["codec", "net", "trust", "local-api", "cli", "xtask"]
 
 [workspace.package]
 version = "0.5.3"          # lockstep with the private monorepo this repo is mirrored from (see CONTRIBUTING.md)
