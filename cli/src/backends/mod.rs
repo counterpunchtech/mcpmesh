@@ -185,3 +185,119 @@ where
     let _ = transport.shutdown().await;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    //! Pins the pump's TEARDOWN DISCIPLINE (issue #25): transport EOF ends only the
+    //! REQUEST direction — Direction A closes the server's stdin and PARKS, and the
+    //! session ends solely when Direction B drains the server's output to EOF. The
+    //! pre-fix `select!` let Direction A's completion cancel B, dropping every reply
+    //! still inside the server — exactly what a one-shot client (request, then
+    //! immediate EOF) provokes. In-memory duplex on all four substrates (the
+    //! `proxy::pump_stdio` test pattern); the fake server deliberately withholds its
+    //! replies until it sees end-of-input, so a pump that tears down on transport EOF
+    //! can never pass.
+    //!
+    //! Plumbing invariant: each direction is a WHOLE `DuplexStream` used one-way (the
+    //! other way stays idle), never a `tokio::io::split` half — dropping a `WriteHalf`
+    //! does NOT drop the underlying stream (its `ReadHalf` keeps it alive), so a
+    //! split-based harness never delivers the EOFs this test is about.
+    use std::time::Duration;
+
+    use serde_json::json;
+    use tokio::io::duplex;
+    use tokio::time::timeout;
+
+    use super::*;
+    use crate::audit::{AuditSink, RequestAuditor};
+    use crate::limits::{RateGate, RateLimiter};
+
+    /// The client sends `initialize` + one request and then EOFs the transport; the
+    /// server replies to BOTH only after seeing its stdin close. Both replies must
+    /// still reach the peer (the old select!-cancel dropped them) and `pump` must
+    /// return Ok. Looped because the pre-fix loss was a scheduling coin flip
+    /// (`select!` polls branches in random order).
+    #[tokio::test]
+    async fn transport_eof_does_not_drop_replies_still_inside_the_server() {
+        timeout(Duration::from_secs(10), async {
+            for _ in 0..25 {
+                // Mesh transport, one whole DuplexStream per direction: peer→pump
+                // (dropping `peer_w` = the peer's EOF) and pump→peer.
+                let (mut peer_w, tr) = duplex(64 * 1024);
+                let (tw, peer_r) = duplex(64 * 1024);
+                let mut transport = NdjsonTransport::new(tr, tw, MAX_FRAME_BYTES);
+                // The server's stdio, likewise: pump→server stdin, server stdout→pump.
+                let (server_write, srv_stdin) = duplex(64 * 1024);
+                let (srv_stdout, server_read) = duplex(64 * 1024);
+
+                // The fake server: collect every inbound frame, reply ONLY after stdin
+                // EOF (so any teardown racing the drain is caught), then close stdout.
+                let server = tokio::spawn(async move {
+                    let mut srv_w = srv_stdout;
+                    let mut reader = FrameReader::new(srv_stdin, MAX_FRAME_BYTES);
+                    let mut seen = Vec::new();
+                    while let Ok(Some(Inbound::Frame(f))) = reader.next().await {
+                        seen.push(f);
+                    }
+                    // stdin EOF'd — the pump's Direction A closed it. Now echo each
+                    // frame back as its "reply" and close stdout (session end).
+                    for f in &seen {
+                        write_frame(&mut srv_w, &json!({"jsonrpc": "2.0", "id": f["id"]}))
+                            .await
+                            .unwrap();
+                    }
+                    seen.len()
+                });
+
+                let pump_task = tokio::spawn(async move {
+                    pump(
+                        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
+                        &mut transport,
+                        server_read,
+                        server_write,
+                        RequestAuditor::new(
+                            AuditSink::disabled(),
+                            Some("bob".into()),
+                            "echo".into(),
+                        ),
+                        RateGate::new(RateLimiter::unlimited_shared(), None),
+                    )
+                    .await
+                });
+
+                // The one-shot client shape: one request behind the initialize, then EOF.
+                write_frame(
+                    &mut peer_w,
+                    &json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{}}),
+                )
+                .await
+                .unwrap();
+                drop(peer_w);
+
+                // BOTH replies drain back to the peer, in order, then a clean EOF.
+                let mut peer_reader = FrameReader::new(peer_r, MAX_FRAME_BYTES);
+                for expect_id in [1, 2] {
+                    match peer_reader.next().await.unwrap() {
+                        Some(Inbound::Frame(f)) => assert_eq!(
+                            f["id"], expect_id,
+                            "the reply to request {expect_id} must survive transport EOF: {f}"
+                        ),
+                        other => panic!("expected the id={expect_id} reply, got {other:?}"),
+                    }
+                }
+                assert!(
+                    peer_reader.next().await.unwrap().is_none(),
+                    "after the server's output EOF the session closes cleanly"
+                );
+                assert_eq!(
+                    server.await.unwrap(),
+                    2,
+                    "the server saw initialize + request"
+                );
+                pump_task.await.unwrap().expect("pump returns Ok");
+            }
+        })
+        .await
+        .expect("pump drain test timed out");
+    }
+}

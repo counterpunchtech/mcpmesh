@@ -369,6 +369,112 @@ mod tests {
         assert_eq!(inject_service(json!("scalar"), "kb"), json!("scalar"));
     }
 
+    /// Pins `pipe_session`'s TEARDOWN DISCIPLINE (issue #25): control-side EOF ends only
+    /// the REQUEST direction — it half-closes toward the peer (`TransportWriter::shutdown`)
+    /// and PARKS, and the session ends solely when the peer closes. The pre-fix `select!`
+    /// let the control direction's completion cancel the mesh→control drain, resetting the
+    /// stream before the response (sometimes before the request itself) crossed the wire —
+    /// the one-shot pipe shape. The control side is in-memory duplex; the mesh side is a
+    /// REAL localhost iroh pair, because `SessionTransport` is concretely iroh-typed (an
+    /// honest subset: the fake peer echoes raw frames — no gate, no backend; the full
+    /// daemon-to-daemon path is `one_shot_connect.rs`). The peer deliberately withholds
+    /// its echo until it sees the dialer's half-close, so a `pipe_session` that tears down
+    /// on control EOF can never pass.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pipe_session_delivers_the_echo_after_control_eof() {
+        use mcpmesh_net::framing::{FrameReader, Inbound, write_frame};
+        use serde_json::json;
+        use tokio::io::duplex;
+
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            // The fake peer: a localhost accept side that collects frames until the
+            // dialer's half-close (recv EOF), THEN echoes them back and closes.
+            let server_ep = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .relay_mode(iroh::RelayMode::Disabled)
+                .alpns(vec![mcpmesh_net::ALPN_MCP.to_vec()])
+                .bind()
+                .await
+                .unwrap();
+            let server_addr = server_ep.addr();
+            // Holds the peer's connection open until the dialer has DRAINED the echo:
+            // `shutdown` only queues the FIN, and dropping the Connection/Endpoint right
+            // behind it sends CONNECTION_CLOSE, which discards the buffered echo — the
+            // test would then hang on transport loss instead of exercising the drain.
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+            let peer = tokio::spawn(async move {
+                let incoming = server_ep.accept().await.expect("one inbound connection");
+                let conn = incoming.await.expect("handshake");
+                // `accept_bi` fires only once the dialer's first frame flushes — pre-fix,
+                // the cancelled drain could reset the stream before even that.
+                let (send, recv) = conn.accept_bi().await.expect("session bi-stream");
+                let mut t = mcpmesh_net::SessionTransport::new(recv, send, 1024 * 1024);
+                let mut seen = Vec::new();
+                // Ok(None) = the dialer's clean half-close (its write half finished
+                // while its read half stays open — the shutdown() under test).
+                while let Ok(Some(f)) = t.recv_value().await {
+                    seen.push(f);
+                }
+                for f in &seen {
+                    t.send_value(f.clone()).await.unwrap();
+                }
+                t.shutdown().await.unwrap(); // finish the stream: the drain's clean end
+                let _ = done_rx.await; // keep conn + endpoint alive until the test is done
+                seen
+            });
+
+            let client_ep = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .relay_mode(iroh::RelayMode::Disabled)
+                .alpns(vec![mcpmesh_net::ALPN_MCP.to_vec()])
+                .bind()
+                .await
+                .unwrap();
+            let transport = connect(&client_ep, server_addr, "echo").await.unwrap();
+
+            // Control side, one whole DuplexStream per direction (dropping `ctl_in_w`
+            // is the control-side EOF; a split half would keep the stream alive).
+            let (mut ctl_in_w, ctl_in_r) = duplex(64 * 1024);
+            let (ctl_out_w, ctl_out_test_r) = duplex(64 * 1024);
+            let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
+            write_frame(&mut ctl_in_w, &init).await.unwrap();
+            drop(ctl_in_w);
+
+            let session = tokio::spawn(pipe_session(
+                transport,
+                "echo",
+                FrameReader::new(ctl_in_r, 1024 * 1024),
+                ctl_out_w,
+            ));
+
+            // The echo must reach the control writer BEFORE teardown: the peer only sent
+            // it after our half-close, so a request-direction-wins teardown drops it.
+            let mut ctl_out = FrameReader::new(ctl_out_test_r, 1024 * 1024);
+            match ctl_out.next().await.unwrap() {
+                Some(Inbound::Frame(f)) => {
+                    assert_eq!(f["id"], 1, "the echoed initialize answers our id: {f}");
+                    assert_eq!(
+                        f["params"]["_meta"]["mcpmesh/service"], "echo",
+                        "the peer saw the service-injected initialize (the one enumerated \
+                         edit), echoed verbatim: {f}"
+                    );
+                }
+                other => panic!("the echo must reach the control side, got {other:?}"),
+            }
+            assert!(
+                ctl_out.next().await.unwrap().is_none(),
+                "the peer closing ends the session cleanly (control-side EOF)"
+            );
+            session.await.unwrap().expect("pipe_session returns Ok");
+            let _ = done_tx.send(()); // release the peer's hold-open
+            assert_eq!(
+                peer.await.unwrap(),
+                vec![inject_service(init, "echo")],
+                "the peer received exactly the injected initialize before the half-close"
+            );
+        })
+        .await
+        .expect("pipe_session drain test timed out");
+    }
+
     #[tokio::test]
     async fn connect_with_timeout_fails_fast_on_an_unreachable_peer() {
         // A relay-disabled localhost endpoint dialing a random, unresolved id can never connect; the
