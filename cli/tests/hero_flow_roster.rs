@@ -284,6 +284,7 @@ async fn revoking_a_rostered_device_severs_its_live_session_and_a_stale_pair_ent
                 services: vec!["echo".into()],
                 paired_at: None,
                 user_id: None,
+                last_addr: None,
             })
             .unwrap();
         store
@@ -293,6 +294,7 @@ async fn revoking_a_rostered_device_severs_its_live_session_and_a_stale_pair_ent
                 services: vec!["echo".into()],
                 paired_at: None,
                 user_id: None,
+                last_addr: None,
             })
             .unwrap();
         let pairs = Arc::new(AllowlistGate::new(store.clone()));

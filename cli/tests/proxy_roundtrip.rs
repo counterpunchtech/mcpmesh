@@ -79,6 +79,7 @@ async fn connect_proxy_round_trips_an_echo_service_over_the_mesh() {
                 services: vec!["echo".into()],
                 paired_at: None,
                 user_id: None,
+                last_addr: None,
             })
             .unwrap();
         let server_gate: Arc<dyn TrustGate> = Arc::new(AllowlistGate::new(Arc::new(server_store)));
@@ -108,6 +109,7 @@ async fn connect_proxy_round_trips_an_echo_service_over_the_mesh() {
                 services: vec!["echo".into()],
                 paired_at: None,
                 user_id: None,
+                last_addr: None,
             })
             .unwrap();
 

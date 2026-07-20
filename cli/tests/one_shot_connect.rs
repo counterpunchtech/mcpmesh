@@ -12,10 +12,11 @@
 //! (including step 4 of the shipped loopback demo). The fix: end-of-input HALF-CLOSES
 //! toward the consumer and parks; only the drain direction may end a session.
 //!
-//! Harness: TWO REAL `mcpmesh` daemon subprocesses in isolated HOME/XDG worlds (the
-//! `pairing_porcelain.rs` hermetic-env pattern; `relay_mode = "disabled"` in both configs,
-//! so no relay and no discovery — the post-pair id-only dial resolves from iroh's
-//! in-process address cache left by the pairing dial). Alice serves `echo` backed by the
+//! Harness: TWO REAL `mcpmesh` daemon subprocesses in isolated HOME/XDG worlds (the shared
+//! `harness` module — the `pairing_porcelain.rs` hermetic-env pattern; `relay_mode =
+//! "disabled"` in both configs, so no relay and no discovery — the post-pair dial resolves
+//! from the pairing-persisted peer address and/or iroh's in-process address cache left by
+//! the pairing dial). Alice serves `echo` backed by the
 //! `echo_mcp_stub` binary (its path is baked into her config's `run` — the
 //! `CARGO_BIN_EXE_*` env exists only for THIS test binary, never for the daemon). Then
 //! the literal user flow: `invite` → `pair` → a one-shot `connect` that writes exactly one
@@ -32,70 +33,15 @@
 // cannot reconstruct without a forbidden windows twin — same posture as
 // `pairing_porcelain.rs`.
 #![cfg(unix)]
-use std::ffi::OsString;
-use std::path::Path;
-use std::process::Stdio;
-use std::time::{Duration, Instant};
+mod harness;
 
-use mcpmesh::client::connect_control;
+use std::process::Stdio;
+use std::time::Duration;
+
+use harness::{MCPMESH, STUB, run_cmd, shutdown_daemon, world};
 use mcpmesh_net::framing::write_frame;
 use serde_json::{Value, json};
 use tokio::time::timeout;
-
-/// The hermetic echo MCP stub serving Alice's `echo` (replies to `initialize` and
-/// `tools/call`, loops until stdin EOF — so only the fixed teardown discipline ends it).
-const STUB: &str = env!("CARGO_BIN_EXE_echo_mcp_stub");
-/// The real `mcpmesh` binary — every step below is the actual shipped porcelain.
-const MCPMESH: &str = env!("CARGO_BIN_EXE_mcpmesh");
-
-/// One hermetic daemon world: a tempdir-scoped HOME + XDG triple (runtime/config/data)
-/// and a config written from `config_body`. Mirrors `pairing_porcelain.rs::launch_in`;
-/// the porcelain subcommands auto-start the daemon inside this world. Returns
-/// (control socket path, env vars).
-fn world(dir: &Path, config_body: &str) -> (std::path::PathBuf, Vec<(OsString, OsString)>) {
-    let runtime = dir.join("runtime");
-    let config = dir.join("config");
-    let data = dir.join("data");
-    let config_mcpmesh = config.join("mcpmesh");
-    std::fs::create_dir_all(&config_mcpmesh).unwrap();
-    std::fs::write(config_mcpmesh.join("config.toml"), config_body).unwrap();
-    let socket = runtime.join("mcpmesh").join("mcpmesh.sock");
-    let env = vec![
-        (OsString::from("HOME"), dir.as_os_str().to_os_string()),
-        (OsString::from("XDG_RUNTIME_DIR"), runtime.into_os_string()),
-        (OsString::from("XDG_CONFIG_HOME"), config.into_os_string()),
-        (OsString::from("XDG_DATA_HOME"), data.into_os_string()),
-    ];
-    (socket, env)
-}
-
-/// Run one porcelain subcommand to completion inside a world (the auto-started daemon
-/// inherits the env and OUTLIVES the subcommand).
-fn run_cmd(env: &[(OsString, OsString)], args: &[&str]) -> std::process::Output {
-    let mut cmd = std::process::Command::new(MCPMESH);
-    cmd.args(args);
-    for (k, v) in env {
-        cmd.env(k, v);
-    }
-    cmd.output().expect("run mcpmesh subcommand")
-}
-
-async fn shutdown_daemon(socket: &Path) {
-    if let Ok(mut client) = connect_control(socket).await {
-        let _ = client.request_value(&json!({ "method": "shutdown" })).await;
-    }
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if connect_control(socket).await.is_err() {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "daemon still accepting connections after shutdown"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
 
 /// The full four-command flow with a ONE-SHOT client: serve (via config) → `invite` →
 /// `pair` → `printf <initialize> | mcpmesh connect alice/echo`. The one-shot connect must

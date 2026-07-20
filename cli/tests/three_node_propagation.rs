@@ -295,6 +295,7 @@ async fn revoked_device_cut_from_live_session_within_60s_across_nodes() {
                 services: vec!["echo".into()],
                 paired_at: None,
                 user_id: None,
+                last_addr: None,
             })
             .unwrap();
         let reg_o = Arc::new(ConnRegistry::new());

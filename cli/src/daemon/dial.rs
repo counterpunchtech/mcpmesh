@@ -33,11 +33,16 @@ use super::MeshState;
 ///    own gate still authorizes us on their side; racing adds NO new trust decision on our side beyond
 ///    "this endpoint is an active roster device of the named user."
 ///
-/// **Single-petname fallback.** Otherwise resolve the petname to its endpoint_id via the
-/// allowlist store, build an id-only [`iroh::EndpointAddr`], and dial — iroh's discovery (DNS/pkarr
-/// under the N0 preset) resolves addresses FROM the id. On LOCALHOST tests the connecting endpoint is
-/// seeded via a `MemoryLookup` on `endpoint.address_lookup()`, so the SAME id-only dial resolves
+/// **Single-petname fallback.** Otherwise resolve the petname to its stored [`PeerEntry`] via the
+/// allowlist store and dial an [`iroh::EndpointAddr`] carrying the entry's pairing-persisted
+/// `last_addr` hint when usable ([`stored_dial_addr`]) — else id-only. iroh merges provided direct
+/// addrs with what discovery (DNS/pkarr under the N0 preset) resolves FROM the id, so the hint makes
+/// a COLD daemon able to reach a paired peer even with discovery disabled (issue #27) without ever
+/// narrowing the discovery path. On LOCALHOST tests the connecting endpoint is
+/// seeded via a `MemoryLookup` on `endpoint.address_lookup()`, so the same dial resolves
 /// locally. The (blocking) redb read runs on `spawn_blocking` (never redb IO on a runtime worker).
+///
+/// [`PeerEntry`]: crate::allowlist::PeerEntry
 pub async fn dial_service(
     mesh: &Arc<MeshState>,
     peer: &str,
@@ -53,20 +58,39 @@ pub async fn dial_service(
                 .with_context(|| format!("dial {peer}/{service}"));
         }
     }
-    // Single-petname fallback: resolve the allowlist petname → endpoint_id → dial-by-id.
+    // Single-petname fallback: resolve the allowlist petname → its stored entry → dial by id
+    // WITH the pairing-persisted address hint attached (issue #27: a cold daemon must not
+    // depend on the in-process address cache or external discovery to reach a paired peer).
     let peer_owned = peer.to_string();
     let store = mesh.store.clone();
-    let id_bytes = tokio::task::spawn_blocking(move || store.endpoint_id_for(&peer_owned))
+    let entry = tokio::task::spawn_blocking(move || store.entry_for(&peer_owned))
         .await
         .context("join peer resolve")??
         .with_context(|| format!("peer '{peer}' is not in the allowlist"))?;
-    let endpoint_id = iroh::EndpointId::from_bytes(&id_bytes)
+    let endpoint_id = iroh::EndpointId::from_bytes(&entry.endpoint_id)
         .map_err(|e| anyhow::anyhow!("stored endpoint id for '{peer}' is invalid: {e}"))?;
-    // Dial by id: an address-less EndpointAddr that discovery resolves.
-    let addr = iroh::EndpointAddr::from(endpoint_id);
+    let addr = stored_dial_addr(entry.last_addr.as_deref(), endpoint_id);
     connect_with_timeout(&mesh.endpoint, addr, service, DIAL_TIMEOUT)
         .await
         .with_context(|| format!("dial {peer}/{service}"))
+}
+
+/// Assemble the single-petname dial [`iroh::EndpointAddr`]: the stored `endpoint_id` plus,
+/// when it is usable, the pairing-persisted `last_addr` hint (iroh merges provided direct
+/// addrs with whatever discovery resolves, so attaching the hint never narrows reachability).
+///
+/// Addresses are dial HINTS, never identity: the hint is attached only if it parses AND its
+/// embedded id EQUALS the stored `endpoint_id` — a stored address claiming a DIFFERENT id is
+/// ignored (identity stays pinned to the allowlist row; TLS still authenticates whoever
+/// answers). An unparseable/absent hint degrades to the bare-id, discovery-only dial.
+fn stored_dial_addr(last_addr: Option<&str>, endpoint_id: iroh::EndpointId) -> iroh::EndpointAddr {
+    if let Some(json) = last_addr
+        && let Ok(addr) = serde_json::from_str::<iroh::EndpointAddr>(json)
+        && addr.id == endpoint_id
+    {
+        return addr;
+    }
+    iroh::EndpointAddr::from(endpoint_id)
 }
 
 /// The person→device dial STAGGER: a live candidate is not blocked waiting on a
@@ -473,6 +497,44 @@ mod tests {
         })
         .await
         .expect("pipe_session drain test timed out");
+    }
+
+    /// `stored_dial_addr` attaches the persisted hint only when it parses AND names the
+    /// stored id; anything else degrades to the bare-id, discovery-only dial (addresses are
+    /// hints, never identity).
+    #[test]
+    fn stored_dial_addr_attaches_validates_and_degrades() {
+        // Real curve points (arbitrary raw bytes are not valid ed25519 public keys).
+        let id = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
+        let other = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
+        let sock: std::net::SocketAddr = "127.0.0.1:4444".parse().unwrap();
+        let stored = iroh::EndpointAddr::from_parts(id, [iroh::TransportAddr::Ip(sock)]);
+        let stored_json = serde_json::to_string(&stored).unwrap();
+
+        // Stored addr with the MATCHING id → attached verbatim (id + direct addrs).
+        let addr = stored_dial_addr(Some(&stored_json), id);
+        assert_eq!(addr, stored, "a matching-id hint is dialed as stored");
+
+        // No stored addr → bare id (discovery-only).
+        assert_eq!(stored_dial_addr(None, id), iroh::EndpointAddr::from(id));
+
+        // Unparseable stored addr → bare id (graceful degradation, never an error).
+        assert_eq!(
+            stored_dial_addr(Some("not json"), id),
+            iroh::EndpointAddr::from(id)
+        );
+
+        // Stored addr claiming a DIFFERENT id → IGNORED (bare id): an addr is a dial hint,
+        // never identity — a poisoned hint must not redirect the dial's identity pin.
+        let mismatched = serde_json::to_string(&iroh::EndpointAddr::from_parts(
+            other,
+            [iroh::TransportAddr::Ip(sock)],
+        ))
+        .unwrap();
+        assert_eq!(
+            stored_dial_addr(Some(&mismatched), id),
+            iroh::EndpointAddr::from(id)
+        );
     }
 
     #[tokio::test]

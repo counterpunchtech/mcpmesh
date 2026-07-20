@@ -60,6 +60,7 @@ async fn daemon_serves_run_service_and_injects_caller_identity_over_the_mesh() {
                 services: vec!["echo".into()],
                 paired_at: None,
                 user_id: None,
+                last_addr: None,
             })
             .unwrap();
         let gate: Arc<dyn TrustGate> = Arc::new(AllowlistGate::new(Arc::new(store)));
@@ -159,6 +160,7 @@ async fn hot_reload_serves_a_newly_registered_service_over_the_mesh() {
                     services: vec!["echo".into()],
                     paired_at: None,
                     user_id: None,
+                    last_addr: None,
                 })
                 .unwrap();
         }

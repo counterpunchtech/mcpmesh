@@ -28,7 +28,9 @@
 //! adding: the redeemer UNIONs a repeat grant into its dial directory and takes the new invite's
 //! suggested petname (rename-by-fresh-invite); the inviter PRESERVES its stored petname + dial
 //! directory (a reverse pairing must not wipe what an earlier redeem granted us) — and neither
-//! side ever downgrades a verified `user_id` to `None`. See the per-site comments for the rules.
+//! side ever downgrades a verified `user_id` to `None`, nor a stored `last_addr` (a fresh
+//! pairing REFRESHES the dial hint; a merge never replaces `Some` with `None`). See the
+//! per-site comments for the rules.
 //!
 //! This module deliberately never sees the daemon's state: the inviter side runs against the
 //! narrow [`InviterCtx`] the daemon assembles (peer store + invite ring + the grant hook), so
@@ -299,6 +301,28 @@ pub async fn handle_inviter_side(
             let petname = existing
                 .as_ref()
                 .map_or_else(|| hello.redeemer_petname.clone(), |e| e.petname.clone());
+            // The redeemer's OBSERVED transport address(es), from the live connection's
+            // path snapshot — the pairing-proven dial-back hint. Synthesized as an
+            // `EndpointAddr { id: <TLS-authenticated redeemer id>, addrs: <observed> }` and
+            // stored as an opaque JSON string (see `PeerEntry::last_addr` for why a string).
+            // Merge rule: a fresh observation REFRESHES the hint; an empty path snapshot
+            // (or a serialize failure) preserves the stored one — never downgrade `Some`
+            // to `None`.
+            let observed_addr = {
+                let addrs: Vec<iroh::TransportAddr> = conn
+                    .paths()
+                    .iter()
+                    .map(|p| p.remote_addr().clone())
+                    .collect();
+                if addrs.is_empty() {
+                    None
+                } else {
+                    serde_json::to_string(&iroh::EndpointAddr::from_parts(conn.remote_id(), addrs))
+                        .ok()
+                }
+            };
+            let last_addr =
+                observed_addr.or_else(|| existing.as_ref().and_then(|e| e.last_addr.clone()));
             let entry = PeerEntry {
                 endpoint_id: tls_id,
                 petname: petname.clone(),
@@ -315,6 +339,7 @@ pub async fn handle_inviter_side(
                 // the peer is stored petname-only).
                 user_id: verified_user_id(&hello.user_pk, &hello.binding_sig, &tls_id)
                     .or_else(|| existing.and_then(|e| e.user_id)),
+                last_addr,
             };
             // redb writes block + fsync — run on a blocking thread (mirrors `daemon::add_peer`'s
             // spawn_blocking + `.context(...)` + double-`?` join). A store write failure returns
@@ -515,13 +540,17 @@ pub async fn redeem_invite(
     //    invite is a deliberate feature (no unpair needed), so the new suggestion wins here;
     //  - user_id: the newly VERIFIED binding wins, else keep the existing proven id — a verified
     //    user_id is never downgraded to `None` by a binding-less re-pair;
-    //  - paired_at: now — this side stamps each redeem (each is a fresh ceremony we performed).
+    //  - paired_at: now — this side stamps each redeem (each is a fresh ceremony we performed);
+    //  - last_addr: the invite's `inviter_addr_json` — the pairing-PROVEN dialable address (we
+    //    just reached the inviter through it, id-verified). A fresh pairing always carries one,
+    //    so this REFRESHES the hint and can never downgrade a stored `Some` to `None`.
     // `endpoint_id` is `invite.inviter_id`, which we verified above equals the TLS id.
     // Resolve + merge + add run in ONE blocking closure (redb reads/writes block + fsync).
     let inviter_id = invite.inviter_id;
     let petname = invite.petname.clone();
     let granted = invite.services.clone();
     let paired_at = Some(epoch_now().to_string());
+    let last_addr = Some(invite.inviter_addr_json.clone());
     tokio::task::spawn_blocking(move || {
         let existing = store.resolve(&inviter_id)?;
         let mut services = existing
@@ -539,6 +568,7 @@ pub async fn redeem_invite(
             services,
             paired_at,
             user_id: inviter_user_id.or_else(|| existing.and_then(|e| e.user_id)),
+            last_addr,
         })
     })
     .await

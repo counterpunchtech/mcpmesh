@@ -49,6 +49,17 @@ pub struct PeerEntry {
     /// (roster mode already carries `user_id`).
     #[serde(default)]
     pub user_id: Option<String>,
+    /// The peer's last-known `iroh::EndpointAddr`, captured at pairing time, as a JSON
+    /// **string** — deliberately NOT a nested typed field. [`PeerStore::resolve`] fails
+    /// CLOSED on an undeserializable row, so nesting an iroh type here would let any future
+    /// iroh serde change poison trust rows and silently unpair peers; a string keeps the row
+    /// parseable forever, and an unparseable/stale address degrades gracefully to the
+    /// discovery-only dial at use time (mirrors why the invite carries `inviter_addr_json`
+    /// as a string). A dial HINT only, never identity: the dial site ignores a stored
+    /// address whose embedded id disagrees with `endpoint_id`. `None` for older rows and
+    /// `internal peer add`.
+    #[serde(default)]
+    pub last_addr: Option<String>,
 }
 
 /// The peer allowlist store over a redb database file (`state.redb`). Path-agnostic:
@@ -113,18 +124,15 @@ impl PeerStore {
         }
     }
 
-    /// Resolve a petname to its stored endpoint_id — the reverse of [`resolve`](Self::resolve)
+    /// Resolve a petname to its stored entry — the reverse of [`resolve`](Self::resolve)
     /// (which is keyed BY id). The connect proxy's `open_session` dial turns the
-    /// user-facing petname into the 32-byte routing key. Petnames are NOT unique (see
+    /// user-facing petname into the 32-byte routing key (plus the entry's `last_addr` dial
+    /// hint). Petnames are NOT unique (see
     /// [`remove`](Self::remove)); the FIRST match in key order wins. Fails OPEN on corrupt
     /// rows (it reuses [`list`](Self::list), which skips-and-logs them) — a poisoned row must
     /// not hide a resolvable peer.
-    pub fn endpoint_id_for(&self, petname: &str) -> Result<Option<[u8; 32]>> {
-        Ok(self
-            .list()?
-            .into_iter()
-            .find(|e| e.petname == petname)
-            .map(|e| e.endpoint_id))
+    pub fn entry_for(&self, petname: &str) -> Result<Option<PeerEntry>> {
+        Ok(self.list()?.into_iter().find(|e| e.petname == petname))
     }
 
     /// All allowlisted peers, in endpoint_id order (redb's key order).
@@ -251,6 +259,7 @@ mod tests {
             services: services.iter().map(|s| s.to_string()).collect(),
             paired_at: None,
             user_id: None,
+            last_addr: None,
         }
     }
 
@@ -406,6 +415,62 @@ mod tests {
         store.add(e).unwrap();
         let got = store.resolve(&eid).unwrap().unwrap();
         assert_eq!(got.paired_at.as_deref(), Some("1751760000"));
+    }
+
+    #[test]
+    fn old_row_without_last_addr_still_resolves_defaulting_to_none() {
+        // An entry written by a pre-`last_addr` binary carries NO `last_addr` key. The
+        // `#[serde(default)]` on the field must fill it with `None` so the row still
+        // deserializes (the module additive-only discipline) — not fail-closed as corrupt.
+        let dir = tempfile::tempdir().unwrap();
+        let store = PeerStore::open(&dir.path().join("state.redb")).unwrap();
+        let eid = [9u8; 32];
+        // Raw JSON in the exact immediate-predecessor shape (paired_at/user_id present,
+        // no `last_addr`), written straight to redb.
+        let old_shape = serde_json::json!({
+            "endpoint_id": eid.to_vec(),
+            "petname": "old",
+            "services": ["notes"],
+            "paired_at": "1751760000",
+            "user_id": null,
+        });
+        inject_raw(&store, &eid, &serde_json::to_vec(&old_shape).unwrap());
+        let got = store.resolve(&eid).unwrap().unwrap();
+        assert_eq!(got.petname, "old");
+        assert_eq!(got.last_addr, None); // #[serde(default)] supplied it
+    }
+
+    #[test]
+    fn last_addr_round_trips_when_set() {
+        // A pairing write stores the peer's last-known address as an opaque JSON string;
+        // it survives the add → resolve round-trip unchanged (byte-for-byte — the store
+        // never interprets it).
+        let dir = tempfile::tempdir().unwrap();
+        let store = PeerStore::open(&dir.path().join("state.redb")).unwrap();
+        let eid = [10u8; 32];
+        let mut e = entry(eid, "bob", &["notes"]);
+        e.last_addr = Some(r#"{"id":"whatever","addrs":[]}"#.into());
+        store.add(e).unwrap();
+        let got = store.resolve(&eid).unwrap().unwrap();
+        assert_eq!(
+            got.last_addr.as_deref(),
+            Some(r#"{"id":"whatever","addrs":[]}"#)
+        );
+    }
+
+    #[test]
+    fn entry_for_returns_the_full_entry() {
+        // The dial site reads the WHOLE entry (id + last_addr hint) by petname.
+        let dir = tempfile::tempdir().unwrap();
+        let store = PeerStore::open(&dir.path().join("state.redb")).unwrap();
+        let eid = [11u8; 32];
+        let mut e = entry(eid, "alice", &["echo"]);
+        e.last_addr = Some("{}".into());
+        store.add(e).unwrap();
+        let got = store.entry_for("alice").unwrap().unwrap();
+        assert_eq!(got.endpoint_id, eid);
+        assert_eq!(got.last_addr.as_deref(), Some("{}"));
+        assert!(store.entry_for("nobody").unwrap().is_none());
     }
 
     #[test]

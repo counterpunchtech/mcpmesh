@@ -97,6 +97,7 @@ async fn hero_flow_minus_pairing() {
                 services: vec!["files".into()],
                 paired_at: None,
                 user_id: None,
+                last_addr: None,
             })
             .unwrap();
         let alice_gate: Arc<dyn TrustGate> = Arc::new(AllowlistGate::new(Arc::new(alice_store)));
@@ -120,6 +121,7 @@ async fn hero_flow_minus_pairing() {
                 services: vec!["files".into()],
                 paired_at: None,
                 user_id: None,
+                last_addr: None,
             })
             .unwrap();
 

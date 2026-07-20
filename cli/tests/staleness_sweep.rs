@@ -94,6 +94,7 @@ async fn staleness_sweep_cuts_roster_session_but_not_pairing() {
                 services: vec!["echo".into()],
                 paired_at: None,
                 user_id: None,
+                last_addr: None,
             })
             .unwrap();
         let pairs = Arc::new(AllowlistGate::new(store.clone()));
