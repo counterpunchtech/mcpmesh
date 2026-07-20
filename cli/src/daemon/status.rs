@@ -124,8 +124,12 @@ pub(crate) fn presence_peers(mesh: &Arc<MeshState>) -> Vec<PresencePeer> {
 
 /// The `status`-facing view of the configured services (name, allow, backend KIND only — no
 /// command/path). Malformed entries are omitted (they are not served either).
-pub(crate) fn service_infos(cfg: &Config) -> Vec<ServiceInfo> {
-    cfg.services
+pub(crate) fn service_infos(
+    cfg: &Config,
+    ephemeral: &std::collections::HashMap<String, crate::daemon::EphemeralService>,
+) -> Vec<ServiceInfo> {
+    let mut out: Vec<ServiceInfo> = cfg
+        .services
         .iter()
         .filter_map(|(name, svc)| {
             let backend = match svc.backend_result() {
@@ -137,9 +141,25 @@ pub(crate) fn service_infos(cfg: &Config) -> Vec<ServiceInfo> {
                 name: name.clone(),
                 allow: svc.allow.clone(),
                 backend,
+                ephemeral: false,
             })
         })
-        .collect()
+        .collect();
+    // Ephemeral registrations (#36): in-memory only, flagged so a consumer knows they vanish on
+    // disconnect/restart. Same surface discipline — kind only, never the command/path.
+    for (name, eph) in ephemeral {
+        let backend = match &eph.backend {
+            mcpmesh_local_api::BackendSpec::Run { .. } => BackendKind::Run,
+            mcpmesh_local_api::BackendSpec::Socket { .. } => BackendKind::Socket,
+        };
+        out.push(ServiceInfo {
+            name: name.clone(),
+            allow: eph.allow.clone(),
+            backend,
+            ephemeral: true,
+        });
+    }
+    out
 }
 
 /// The `status`-facing view of known peers (nickname + granted services — never the

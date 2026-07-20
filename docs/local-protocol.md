@@ -142,7 +142,7 @@ Methods split into two groups by audience:
 
 | `method` | `params` | `result` |
 |---|---|---|
-| `register_service` | `{name, backend, allow}` — `backend` is `{"run":{"cmd":[…]}}` or `{"socket":{"path":"…"}}`; `allow` is a list of nicknames/groups | `{}` (ack) |
+| `register_service` | `{name, backend, allow, ephemeral?}` — `backend` is `{"run":{"cmd":[…]}}` or `{"socket":{"path":"…"}}`; `allow` is a list of nicknames/groups; `ephemeral:true` (#36) keeps the registration in memory only and unregisters it when THIS connection closes (see [Ephemeral registration](#ephemeral-registration)) | `{}` (ack) |
 | `status` | *(none)* | [`StatusResult`](#statusresult) |
 | `audit_summary` | *(none)* | `{per_peer:[[name,count],…], per_service:[[name,count],…], total_sessions}` — this node's **local** session tallies; nothing is transmitted |
 | `invite` | `{services:[…]}` | `{invite_line:"mcpmesh-invite:…", expires_at_epoch}` |
@@ -184,6 +184,26 @@ Both halves of the pairing ceremony therefore refuse a name that is already mean
 Re-pairing with a peer you already know always passes: the only entry holding the name is that
 peer's own, so renaming a peer by redeeming a fresh invite from them keeps working. To reuse a name
 for someone new, `peer_remove` the old holder first.
+
+### Ephemeral registration
+
+By default `register_service` **persists** the service into the daemon's on-disk config, so it
+survives restarts. That is the right model for a daemonized service, but awkward for an embedder
+that serves a `socket` backend from a fresh path each run: a persisted entry outlives the process
+and points at a dead socket, and there is no unregister, so stale entries accumulate.
+
+Pass `ephemeral: true` for a registration that instead:
+
+- lives **in daemon memory only** — never written to config, gone on daemon restart;
+- is **unregistered automatically when the control connection that registered it closes** (clean
+  close, error, or the client process exiting);
+- appears in `status` with `"ephemeral": true` so its transience is legible.
+
+The lifetime is the **connection's**, so an embedder must hold its control connection open for as
+long as it wants the service offered — register over a `ControlClient` and keep it alive, rather
+than the connect-register-disconnect pattern (which would tear the registration down immediately).
+An ephemeral name that collides with an existing persistent (config) service is refused. Everything
+else — the `allow` list, dialing, invites granting it — works identically to a persistent service.
 
 ### Reserved / internal methods
 

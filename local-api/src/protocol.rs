@@ -42,6 +42,11 @@ pub struct ServiceInfo {
     pub name: String,
     pub allow: Vec<String>,   // nicknames/groups (flat namespace)
     pub backend: BackendKind, // "run" | "socket" (kind only, never the command/path)
+    /// True if this registration is ephemeral (#36): in-memory only, tied to the registering
+    /// control connection's lifetime, absent from config, gone on restart. Additive — an older
+    /// daemon omits it and it reads as `false` (the persistent default).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ephemeral: bool,
 }
 
 /// A known peer as reported by `status` (nickname only — never the EndpointId).
@@ -150,6 +155,14 @@ pub struct RegisterServiceParams {
     pub name: String,
     pub backend: BackendSpec,
     pub allow: Vec<String>,
+    /// When true (#36), the registration is EPHEMERAL: kept in daemon memory only, never written
+    /// to the on-disk config, and automatically unregistered when the control connection that
+    /// registered it closes (and gone on daemon restart). For an embedder that serves a
+    /// `socket` backend from a fresh path each run, this removes the need to derive a stable
+    /// socket path solely to keep a persisted registration valid, and the stale-registration
+    /// accumulation that comes with no unregister. Default false = the persistent behavior.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ephemeral: bool,
 }
 
 /// Params of [`Request::Invite`]: the services the minted invite grants. Rejects unknown
@@ -897,6 +910,7 @@ mod tests {
                 cmd: vec!["notes-mcp".into()],
             },
             allow: vec!["alice".into()],
+            ephemeral: false,
         });
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(
@@ -1163,6 +1177,7 @@ mod tests {
                 name: "notes".into(),
                 allow: vec!["alice".into()],
                 backend: BackendKind::Run,
+                ephemeral: false,
             }],
             peers: vec![PeerInfo {
                 name: "alice".into(),

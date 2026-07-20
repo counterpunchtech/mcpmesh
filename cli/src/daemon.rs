@@ -65,7 +65,7 @@ pub use roster_install::{
 pub(crate) use boot::{NetPlan, net_plan};
 pub(crate) use handlers::{
     add_peer, blob_fetch, blob_grant, blob_list, blob_publish, mint_invite, open_session, redeem,
-    register_service,
+    register_service, unregister_ephemeral,
 };
 pub(crate) use roster_install::{install_roster, org_join, set_roster_url};
 pub(crate) use status::{peer_infos, presence_peers, roster_status, service_infos};
@@ -211,6 +211,22 @@ pub struct MeshState {
     /// authorization input (advisory presence only). std `Mutex` — held only for the tiny
     /// insert/clone, never across an await.
     pub(crate) reachability: std::sync::Mutex<std::collections::HashMap<[u8; 32], ReachEntry>>,
+    /// EPHEMERAL service registrations (#36): in-memory only, never written to config, torn down
+    /// when the registering control connection closes. Keyed by service name → its backend spec +
+    /// allow list. Overlaid onto the config-built registry on every hot-reload
+    /// ([`build_services_audited`]), so ephemeral services survive concurrent grants/renames.
+    /// Mutated only under `reload_lock` (like every other registry change). Lost on restart by
+    /// design — an embedder re-registers per boot.
+    pub(crate) ephemeral_services:
+        std::sync::Mutex<std::collections::HashMap<String, EphemeralService>>,
+}
+
+/// One ephemeral (connection-scoped) service registration (#36): the backend to serve and the
+/// nicknames/groups admitted to it. The in-memory analogue of a `[services.*]` config entry.
+#[derive(Clone)]
+pub struct EphemeralService {
+    pub backend: mcpmesh_local_api::BackendSpec,
+    pub allow: Vec<String>,
 }
 
 /// Cap on the [`MeshState::recent_pairings`] ring: enough for a burst of ceremonies (a person
@@ -269,6 +285,7 @@ impl MeshState {
             self_binding: std::sync::OnceLock::new(),
             recent_pairings: std::sync::Mutex::new(std::collections::VecDeque::new()),
             reachability: std::sync::Mutex::new(std::collections::HashMap::new()),
+            ephemeral_services: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -542,22 +559,24 @@ pub fn build_services_audited(
     audit: &AuditSink,
     limiters: &Arc<crate::limits::MeshLimiters>,
 ) -> Services {
+    build_services_with_ephemeral(cfg, audit, limiters, &HashMap::new())
+}
+
+/// [`build_services_audited`] plus an overlay of EPHEMERAL registrations (#36). The config
+/// `[services.*]` entries are built first, then each ephemeral entry is added. A name is refused
+/// at register time if it already exists in config, so a collision here should not occur; if one
+/// does, the ephemeral entry wins (last-writer) — but the guard is the register-time check.
+pub fn build_services_with_ephemeral(
+    cfg: &Config,
+    audit: &AuditSink,
+    limiters: &Arc<crate::limits::MeshLimiters>,
+    ephemeral: &HashMap<String, EphemeralService>,
+) -> Services {
     let mut map: HashMap<String, ServiceEntry> = HashMap::new();
     for (name, svc) in &cfg.services {
-        let backend: Arc<dyn SessionBackend> = match svc.backend_result() {
-            Ok(Backend::Run(cmd)) => Arc::new(SpawnBackend {
-                cmd: cmd.to_vec(),
-                concurrency: Arc::new(Semaphore::new(spawn_concurrency(cfg))),
-                service: name.clone(),
-                audit: audit.clone(),
-                limiter: limiters.requests.clone(),
-            }),
-            Ok(Backend::Socket(path)) => Arc::new(SocketBackend {
-                path: path.to_string(),
-                service: name.clone(),
-                audit: audit.clone(),
-                limiter: limiters.requests.clone(),
-            }),
+        let backend = match svc.backend_result() {
+            Ok(Backend::Run(cmd)) => session_backend_run(cmd, name, cfg, audit, limiters),
+            Ok(Backend::Socket(path)) => session_backend_socket(path, name, audit, limiters),
             Err(e) => {
                 tracing::warn!(service = %name, %e, "skipping malformed service");
                 continue;
@@ -571,7 +590,56 @@ pub fn build_services_audited(
             },
         );
     }
+    // Overlay ephemeral registrations (in-memory only). BackendSpec is the protocol's own backend
+    // shape; map it to the same SpawnBackend/SocketBackend the config path builds.
+    for (name, eph) in ephemeral {
+        let backend = match &eph.backend {
+            mcpmesh_local_api::BackendSpec::Run { cmd } => {
+                session_backend_run(cmd, name, cfg, audit, limiters)
+            }
+            mcpmesh_local_api::BackendSpec::Socket { path } => {
+                session_backend_socket(path, name, audit, limiters)
+            }
+        };
+        map.insert(
+            name.clone(),
+            ServiceEntry {
+                backend,
+                allow: eph.allow.clone(),
+            },
+        );
+    }
     Services::new(map)
+}
+
+fn session_backend_run(
+    cmd: &[String],
+    name: &str,
+    cfg: &Config,
+    audit: &AuditSink,
+    limiters: &Arc<crate::limits::MeshLimiters>,
+) -> Arc<dyn SessionBackend> {
+    Arc::new(SpawnBackend {
+        cmd: cmd.to_vec(),
+        concurrency: Arc::new(Semaphore::new(spawn_concurrency(cfg))),
+        service: name.to_string(),
+        audit: audit.clone(),
+        limiter: limiters.requests.clone(),
+    })
+}
+
+fn session_backend_socket(
+    path: &str,
+    name: &str,
+    audit: &AuditSink,
+    limiters: &Arc<crate::limits::MeshLimiters>,
+) -> Arc<dyn SessionBackend> {
+    Arc::new(SocketBackend {
+        path: path.to_string(),
+        service: name.to_string(),
+        audit: audit.clone(),
+        limiter: limiters.requests.clone(),
+    })
 }
 
 /// A short, human-glanceable fingerprint of an endpoint id: the first 8 chars of its base32

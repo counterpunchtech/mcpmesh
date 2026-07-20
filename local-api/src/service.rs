@@ -133,6 +133,11 @@ pub async fn register_service(
                     path: backend_sock.to_string_lossy().into_owned(),
                 },
                 allow: vec![],
+                // This helper connects → registers → disconnects, so it MUST be persistent: an
+                // ephemeral registration would be torn down the instant this connection closes.
+                // Ephemeral (#36) is for embedders that hold a ControlClient open for the
+                // service's lifetime (see ControlClient::register_service_with).
+                ephemeral: false,
             }))
             .await?;
         Ok(())

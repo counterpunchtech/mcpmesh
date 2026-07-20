@@ -102,6 +102,76 @@ async fn status(client: &mut ControlClient) -> StatusResult {
     serde_json::from_value(result).expect("StatusResult deserializes")
 }
 
+/// #36: an EPHEMERAL registration lives only while its control connection is open, is flagged in
+/// status, is NEVER written to the config file, and is gone once the connection closes.
+#[tokio::test(flavor = "multi_thread")]
+async fn ephemeral_service_is_connection_scoped_and_never_persisted() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let tmp = tempfile::tempdir().unwrap();
+        let launch = launch_in(tmp.path());
+        let config_file = tmp
+            .path()
+            .join("config")
+            .join("mcpmesh")
+            .join("config.toml");
+
+        // Connection A registers an ephemeral service and stays open.
+        let mut a = ensure_daemon_with(&launch).await.expect("bring daemon up");
+        a.request(Request::RegisterService(RegisterServiceParams {
+            name: "eph".into(),
+            backend: BackendSpec::Socket {
+                path: "/tmp/whatever.sock".into(),
+            },
+            allow: vec!["x".into()],
+            ephemeral: true,
+        }))
+        .await
+        .expect("ephemeral register acked");
+
+        // Connection B sees it in status, flagged ephemeral.
+        let mut b = connect_control(&launch.socket)
+            .await
+            .expect("second client");
+        let svc = status(&mut b)
+            .await
+            .services
+            .into_iter()
+            .find(|s| s.name == "eph")
+            .expect("ephemeral service appears in status");
+        assert!(svc.ephemeral, "status flags it ephemeral: {svc:?}");
+
+        // It was NEVER written to the on-disk config.
+        let cfg_text = std::fs::read_to_string(&config_file).unwrap_or_default();
+        assert!(
+            !cfg_text.contains("eph"),
+            "ephemeral service must not touch the config file, got:\n{cfg_text}"
+        );
+
+        // Closing connection A tears the registration down.
+        drop(a);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let still_there = status(&mut b)
+                .await
+                .services
+                .iter()
+                .any(|s| s.name == "eph");
+            if !still_there {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "ephemeral service still present 5s after its connection closed"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        shutdown_daemon(&launch.socket).await;
+    })
+    .await
+    .expect("ephemeral lifecycle test timed out");
+}
+
 /// #33: `mcpmesh up` is `ensure_daemon` with an explicit readiness deadline; the timeout seam
 /// brings a cold daemon up (fast no-op on the second call) and honors a custom deadline.
 #[tokio::test(flavor = "multi_thread")]
@@ -251,6 +321,7 @@ async fn register_service_and_peer_add_reflect_in_status() {
                     cmd: vec![STUB.to_string()],
                 },
                 allow: vec!["tester".into()],
+                ephemeral: false,
             }))
             .await
             .expect("register_service");
@@ -323,6 +394,7 @@ async fn concurrent_register_service_calls_all_persist() {
                 cmd: vec![STUB.to_string()],
             },
             allow: vec!["x".into()],
+            ephemeral: false,
         }));
         let reg_b = b.request(Request::RegisterService(RegisterServiceParams {
             name: "beta".into(),
@@ -330,6 +402,7 @@ async fn concurrent_register_service_calls_all_persist() {
                 cmd: vec![STUB.to_string()],
             },
             allow: vec!["y".into()],
+            ephemeral: false,
         }));
         let (ra, rb) = tokio::join!(reg_a, reg_b);
         ra.expect("register alpha");
@@ -577,6 +650,7 @@ async fn status_output_leaks_no_transport_vocabulary() {
                     cmd: vec![STUB.to_string()],
                 },
                 allow: vec!["bob".into()],
+                ephemeral: false,
             }))
             .await
             .expect("register_service");

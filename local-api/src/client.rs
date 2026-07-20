@@ -160,10 +160,26 @@ impl ControlClient {
         backend: BackendSpec,
         allow: Vec<String>,
     ) -> Result<(), ClientError> {
+        self.register_service_with(name, backend, allow, false)
+            .await
+    }
+
+    /// [`register_service`](Self::register_service) with an explicit `ephemeral` flag (#36). When
+    /// `ephemeral` is true the registration lives only in daemon memory and is unregistered
+    /// automatically when THIS control connection closes — no config write, nothing to clean up.
+    /// Ideal for an embedder serving a `socket` backend from a fresh path each run.
+    pub async fn register_service_with(
+        &mut self,
+        name: &str,
+        backend: BackendSpec,
+        allow: Vec<String>,
+        ephemeral: bool,
+    ) -> Result<(), ClientError> {
         self.request_ack(Request::RegisterService(RegisterServiceParams {
             name: name.to_string(),
             backend,
             allow,
+            ephemeral,
         }))
         .await
     }
@@ -472,6 +488,7 @@ mod tests {
                 name: "kb".into(),
                 allow: vec![],
                 backend: BackendKind::Socket,
+                ephemeral: false,
             }],
             peers: vec![],
             roster: None,

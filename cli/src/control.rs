@@ -135,66 +135,113 @@ async fn handle_conn(stream: LocalStream, state: Arc<DaemonState>) -> Result<()>
     };
     write_frame(&mut write_half, &serde_json::to_value(&hello)?).await?;
 
-    let mut reader = FrameReader::new(tokio::io::BufReader::new(read_half), MAX_FRAME_BYTES);
+    let reader = FrameReader::new(tokio::io::BufReader::new(read_half), MAX_FRAME_BYTES);
     // NOTE: control connections carry no framing-violation strike bound (unlike the
     // mesh path in net::endpoint). Acceptable — the peer is same-uid, already inside
     // the trust boundary; a strike/close budget lands if/when this surface widens.
-    loop {
-        match reader.next().await? {
-            None => return Ok(()), // client closed the connection
-            Some(Inbound::Violation(v)) => {
-                // A malformed/oversized request frame carries no recoverable id: answer a
-                // JSON-RPC parse error and keep the connection open for the next frame.
-                let resp = error(Value::Null, -32700, format!("invalid request frame: {v:?}"));
-                write_frame(&mut write_half, &resp).await?;
-            }
-            Some(Inbound::Frame(req)) => {
-                // NOTE: the "shutdown" method string is matched here and in `dispatch`;
-                // the small duplication is deliberate (the ack shape stays in `dispatch`).
-                if method_of(&req) == Some("shutdown") {
-                    // An explicit stop must ALWAYS stop: raise the shutdown signal FIRST
-                    // (unconditionally), THEN best-effort ack. A client that sends `shutdown`
-                    // and closes without reading the ack must still stop the daemon.
-                    state.shutdown.notify_one();
-                    let resp = dispatch(&req, &state);
-                    let _ = write_frame(&mut write_half, &resp).await;
-                    return Ok(());
+
+    // #36: names this connection registered EPHEMERALLY, torn down when it closes. Shared with
+    // the request loop via an Arc so the loop (which owns `reader`/`write_half`) can record into
+    // it while this frame keeps a handle to drain after the loop ends, on ANY exit path.
+    let ephemeral_registered = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let loop_state = state.clone();
+    let eph = ephemeral_registered.clone();
+    let outcome: Result<()> = async move {
+        let mut reader = reader;
+        let mut write_half = write_half;
+        loop {
+            match reader.next().await? {
+                None => return Ok(()), // client closed the connection
+                Some(Inbound::Violation(v)) => {
+                    // A malformed/oversized request frame carries no recoverable id: answer a
+                    // JSON-RPC parse error and keep the connection open for the next frame.
+                    let resp = error(Value::Null, -32700, format!("invalid request frame: {v:?}"));
+                    write_frame(&mut write_half, &resp).await?;
                 }
-                if method_of(&req) == Some("open_session") {
-                    // After this request the connection STOPS being JSON-RPC and becomes a raw
-                    // MCP byte pipe (protocol.rs `OpenSession`): hand the framed halves to the
-                    // daemon's dial + pipe, which consumes the connection for the session's
-                    // lifetime. The loop cannot continue — `reader`/`write_half` move away.
-                    // (A malformed params SHAPE — not merely absent fields, which default —
-                    // answers an error frame and keeps the connection JSON-RPC.)
-                    let params = req.get("params").cloned().unwrap_or(Value::Null);
-                    let p: OpenSessionParams = match params_of(&params) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            let id = req.get("id").cloned().unwrap_or(Value::Null);
-                            // Params shape error → -32602 (invalid params), matching `respond`.
-                            let resp = error(id, -32602, format!("open_session failed: {e}"));
-                            write_frame(&mut write_half, &resp).await?;
-                            continue;
-                        }
-                    };
-                    return crate::daemon::open_session(
-                        &state, &p.peer, &p.service, reader, write_half,
-                    )
-                    .await;
+                Some(Inbound::Frame(req)) => {
+                    // NOTE: the "shutdown" method string is matched here and in `dispatch`;
+                    // the small duplication is deliberate (the ack shape stays in `dispatch`).
+                    if method_of(&req) == Some("shutdown") {
+                        // An explicit stop must ALWAYS stop: raise the shutdown signal FIRST
+                        // (unconditionally), THEN best-effort ack. A client that sends `shutdown`
+                        // and closes without reading the ack must still stop the daemon.
+                        loop_state.shutdown.notify_one();
+                        let resp = dispatch(&req, &loop_state);
+                        let _ = write_frame(&mut write_half, &resp).await;
+                        return Ok(());
+                    }
+                    if method_of(&req) == Some("open_session") {
+                        // After this request the connection STOPS being JSON-RPC and becomes a raw
+                        // MCP byte pipe (protocol.rs `OpenSession`): hand the framed halves to the
+                        // daemon's dial + pipe, which consumes the connection for the session's
+                        // lifetime. The loop cannot continue — `reader`/`write_half` move away.
+                        // (A malformed params SHAPE — not merely absent fields, which default —
+                        // answers an error frame and keeps the connection JSON-RPC.)
+                        let params = req.get("params").cloned().unwrap_or(Value::Null);
+                        let p: OpenSessionParams = match params_of(&params) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                let id = req.get("id").cloned().unwrap_or(Value::Null);
+                                // Params shape error → -32602 (invalid params), matching `respond`.
+                                let resp = error(id, -32602, format!("open_session failed: {e}"));
+                                write_frame(&mut write_half, &resp).await?;
+                                continue;
+                            }
+                        };
+                        return crate::daemon::open_session(
+                            &loop_state,
+                            &p.peer,
+                            &p.service,
+                            reader,
+                            write_half,
+                        )
+                        .await;
+                    }
+                    if method_of(&req) == Some("subscribe") {
+                        // Like `open_session`, this upgrades the connection: after `subscribe` it
+                        // STOPS being request/response and becomes a one-way push stream of
+                        // `StreamFrame`s (`crate::stream`). The loop cannot continue — `write_half`
+                        // moves into the stream driver for the subscription's lifetime.
+                        return run_subscription(&loop_state, write_half).await;
+                    }
+                    let resp = handle_request(&req, &loop_state).await;
+                    // #36: remember a SUCCESSFUL ephemeral register_service so it is torn down
+                    // when this connection closes. Peeked from the request/response (register is a
+                    // normal request/response verb; only these upgrade paths above are special).
+                    if method_of(&req) == Some("register_service")
+                        && resp.get("result").is_some()
+                        && req
+                            .get("params")
+                            .and_then(|p| p.get("ephemeral"))
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false)
+                        && let Some(name) = req
+                            .get("params")
+                            .and_then(|p| p.get("name"))
+                            .and_then(|v| v.as_str())
+                    {
+                        eph.lock()
+                            .expect("ephemeral_registered lock not poisoned")
+                            .push(name.to_string());
+                    }
+                    write_frame(&mut write_half, &resp).await?;
                 }
-                if method_of(&req) == Some("subscribe") {
-                    // Like `open_session`, this upgrades the connection: after `subscribe` it STOPS
-                    // being request/response and becomes a one-way push stream of `StreamFrame`s
-                    // (`crate::stream`). The loop cannot continue — `write_half` moves into the
-                    // stream driver, which consumes the connection for the subscription's lifetime.
-                    return run_subscription(&state, write_half).await;
-                }
-                let resp = handle_request(&req, &state).await;
-                write_frame(&mut write_half, &resp).await?;
             }
         }
     }
+    .await;
+
+    // Teardown on ANY exit path (clean close, IO error, or the open_session/subscribe upgrades
+    // returning): unregister every service this connection registered ephemerally (#36). A no-op
+    // when it registered none.
+    if let Some(mesh) = state.mesh() {
+        let names = ephemeral_registered
+            .lock()
+            .expect("ephemeral_registered lock not poisoned")
+            .clone();
+        crate::daemon::unregister_ephemeral(mesh, &names).await;
+    }
+    outcome
 }
 
 /// Drive a live event stream over a subscribed control connection. Mirrors
@@ -482,8 +529,13 @@ pub(crate) fn status_result(state: &DaemonState) -> Result<StatusResult> {
             // current). A pure-pairing daemon (no mesh, or an empty roster gate) yields None → no
             // roster block.
             let roster = crate::daemon::roster_status(mesh, Some(&cfg));
+            let ephemeral = mesh
+                .ephemeral_services
+                .lock()
+                .expect("ephemeral_services lock not poisoned")
+                .clone();
             (
-                crate::daemon::service_infos(&cfg),
+                crate::daemon::service_infos(&cfg, &ephemeral),
                 crate::daemon::peer_infos(&mesh.store),
                 roster,
             )

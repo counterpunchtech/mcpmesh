@@ -30,7 +30,7 @@ use super::config_write::{
     write_service_to_config,
 };
 use super::status::service_infos;
-use super::{MeshState, build_services_audited, dial_service, pipe_session};
+use super::{MeshState, dial_service, pipe_session};
 
 /// A minted pairing invite lives at most 24h.
 const INVITE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -133,9 +133,22 @@ pub(crate) async fn blob_fetch(
 async fn reload_services_from_disk(mesh: &Arc<MeshState>, why: &str) -> Result<()> {
     let cfg = Config::load(&mesh.config_path)
         .map_err(|e| anyhow::anyhow!("reload config after {why}: {e}"))?;
+    // Overlay the in-memory ephemeral registrations (#36) so they survive every hot-reload —
+    // grants, renames, roster installs all funnel through here, so none of them drop an
+    // ephemeral service. The lock is held only for the tiny clone.
+    let ephemeral = mesh
+        .ephemeral_services
+        .lock()
+        .expect("ephemeral_services lock not poisoned")
+        .clone();
     reload_accept_loop(
         mesh,
-        build_services_audited(&cfg, &mesh.audit(), &mesh.limits()),
+        crate::daemon::build_services_with_ephemeral(
+            &cfg,
+            &mesh.audit(),
+            &mesh.limits(),
+            &ephemeral,
+        ),
     )
     .await;
     Ok(())
@@ -155,28 +168,80 @@ pub(crate) async fn register_service(
     // clobber each other's new service. Held until this function returns.
     let _reload = mesh.reload_lock.lock().await;
 
-    // 1. Atomic config write on a blocking thread.
-    let config_path = mesh.config_path.clone();
     let RegisterServiceParams {
         name,
         backend,
         allow,
+        ephemeral,
     } = params;
+
+    if ephemeral {
+        // #36: in-memory only. Refuse a name that already exists on disk — an ephemeral entry
+        // must not silently shadow (or be shadowed by) a persistent one, and unregistering it
+        // later must never touch config. A repeat ephemeral register of the same name updates it.
+        let cfg = Config::load(&mesh.config_path)
+            .map_err(|e| anyhow::anyhow!("config error in {}: {e}", mesh.config_path.display()))?;
+        if cfg.services.contains_key(&name) {
+            anyhow::bail!(
+                "service '{name}' is already registered persistently in config; \
+                 use a different name for an ephemeral registration"
+            );
+        }
+        mesh.ephemeral_services
+            .lock()
+            .expect("ephemeral_services lock not poisoned")
+            .insert(
+                name.clone(),
+                crate::daemon::EphemeralService {
+                    backend,
+                    allow: allow.clone(),
+                },
+            );
+        reload_services_from_disk(mesh, "register-ephemeral").await?;
+        tracing::info!(service = %name, "registered ephemeral service");
+        return Ok(());
+    }
+
+    // Persistent: atomic config write on a blocking thread, then hot-reload.
+    let config_path = mesh.config_path.clone();
     let (name_w, backend_w, allow_w) = (name.clone(), backend.clone(), allow.clone());
     blocking("join config write", move || {
         write_service_to_config(&config_path, &name_w, &backend_w, &allow_w)
     })
     .await??;
 
-    // 2/3. Reload config, rebuild the registry from the persisted truth, and hot-reload: abort the
-    //      old accept loop, spawn a fresh one on the same endpoint carrying the rebuilt registry
-    //      (a brief serving blip is acceptable). Shared with the pairing grant / revoke /
-    //      rename via [`reload_services_from_disk`] (DRY). `status` reads the config live, so the
-    //      new service is visible on the very next call.
+    // Reload config, rebuild the registry from the persisted truth, and hot-reload: abort the
+    // old accept loop, spawn a fresh one on the same endpoint carrying the rebuilt registry
+    // (a brief serving blip is acceptable). Shared with the pairing grant / revoke / rename via
+    // [`reload_services_from_disk`] (DRY). `status` reads the config live, so the new service is
+    // visible on the very next call.
     reload_services_from_disk(mesh, "register").await?;
 
     tracing::info!(service = %name, "registered/updated service");
     Ok(())
+}
+
+/// Unregister the named EPHEMERAL services (#36) and hot-reload so the accept loop stops offering
+/// them. Called when a control connection that registered ephemeral services closes. Persistent
+/// (config) services are never touched. A no-op if nothing was ephemerally registered by the
+/// connection. Takes `reload_lock`, like every registry mutation.
+pub(crate) async fn unregister_ephemeral(mesh: &Arc<MeshState>, names: &[String]) {
+    if names.is_empty() {
+        return;
+    }
+    let _reload = mesh.reload_lock.lock().await;
+    {
+        let mut map = mesh
+            .ephemeral_services
+            .lock()
+            .expect("ephemeral_services lock not poisoned");
+        for name in names {
+            map.remove(name);
+        }
+    }
+    if let Err(e) = reload_services_from_disk(mesh, "unregister-ephemeral").await {
+        tracing::warn!(%e, "reload after ephemeral unregister failed");
+    }
 }
 
 /// Handle a `peer_add` control request: write
@@ -494,7 +559,17 @@ pub(crate) async fn mint_invite(
     // name fails fast and never touches the invite registry.
     let cfg = Config::load(&mesh.config_path)
         .map_err(|e| anyhow::anyhow!("config error in {}: {e}", mesh.config_path.display()))?;
-    let served: Vec<String> = service_infos(&cfg).into_iter().map(|s| s.name).collect();
+    // Served names include EPHEMERAL registrations (#36) — an invite may grant an ephemeral
+    // service just like a persistent one.
+    let ephemeral = mesh
+        .ephemeral_services
+        .lock()
+        .expect("ephemeral_services lock not poisoned")
+        .clone();
+    let served: Vec<String> = service_infos(&cfg, &ephemeral)
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
     if let Some(msg) = unregistered_service_error(&services, &served) {
         anyhow::bail!(msg);
     }

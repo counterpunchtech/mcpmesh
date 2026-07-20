@@ -723,6 +723,7 @@ mod tests {
             name: name.into(),
             allow: allow.iter().map(|s| s.to_string()).collect(),
             backend: BackendKind::Run,
+            ephemeral: false,
         }
     }
 
