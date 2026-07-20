@@ -35,6 +35,17 @@
 //! | *(none)*  | The wire vocabulary ([`protocol`]) + endpoint resolution ([`paths`])    | serde only   |
 //! | `client`  | [`ControlClient`]: connect, typed request helpers, the typed [`client::StreamSubscription`] live stream | + tokio |
 //! | `service` | The plugin seam ([`service`]): local endpoint bind + same-user gate, `[services.*]` self-registration | + rustix, tracing |
+
+/// This crate's version — the mcpmesh release train the `mcpmesh` binary ships on.
+/// Embedders that bundle the daemon binary pin both to ONE version and use this const
+/// as the expected `stack_version` anchor for the daemon they spawned.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The canonical transport-vocabulary blocklist (spec §1.5/§17), shipped in-crate so
+/// embedders' surface-leak suites assert against the ONE canonical copy instead of
+/// forking it. JSON object with `substring_banned`, `token_banned`, `carve_outs`.
+pub const TRANSPORT_VOCABULARY: &str = include_str!("../fixtures/transport-vocabulary.json");
+
 /// Platform paths + endpoint resolution — featureless/std-only, so any consumer
 /// resolves the daemon endpoint from the ONE rule.
 pub mod paths;

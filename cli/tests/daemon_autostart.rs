@@ -26,23 +26,18 @@ use serde_json::json;
 const STUB: &str = env!("CARGO_BIN_EXE_echo_mcp_stub");
 
 /// Scan `s` against the CANONICAL transport-vocabulary blocklist (spec §1.5/§17) — the ONE
-/// shared fixture at `fixtures/transport-vocabulary.json`, also consumed by
-/// the host/kb/loc surface-leak suites. Returns the first banned term found, or `None`.
+/// canonical copy shipped as `mcpmesh_local_api::TRANSPORT_VOCABULARY`
+/// (`local-api/fixtures/transport-vocabulary.json`). Returns the first banned term found, or
+/// `None`.
 ///
-/// Matching semantics (mirrors the fixture's note + the kb suite): case-insensitive;
-/// `carve_outs` (spec-canonical identifiers that legitimately embed a banned substring) are
-/// neutralized first; `substring_banned` terms match anywhere; `token_banned` terms match as
-/// whole IDENTIFIER tokens (`_` is a word char, so a domain compound like `index_serial`
-/// never false-trips).
+/// Matching semantics (mirrors the fixture's note): case-insensitive; `carve_outs`
+/// (spec-canonical identifiers that legitimately embed a banned substring) are neutralized
+/// first; `substring_banned` terms match anywhere; `token_banned` terms match as whole
+/// IDENTIFIER tokens (`_` is a word char, so a domain compound like `index_serial` never
+/// false-trips).
 fn transport_vocab_violation(s: &str) -> Option<String> {
-    let fixture_path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../fixtures/transport-vocabulary.json"
-    );
-    let fixture: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(fixture_path).expect("read the canonical fixture"),
-    )
-    .expect("fixture parses");
+    let fixture: serde_json::Value =
+        serde_json::from_str(mcpmesh_local_api::TRANSPORT_VOCABULARY).expect("fixture parses");
     let terms = |key: &str| -> Vec<String> {
         fixture[key]
             .as_array()
@@ -576,9 +571,9 @@ async fn status_output_leaks_no_transport_vocabulary() {
         assert!(stdout.contains("files"), "service name renders: {stdout}");
         assert!(stdout.contains("bob"), "peer petname renders: {stdout}");
 
-        // The canonical §1.5/§17 transport-vocabulary blocklist — the SHARED fixture at
-        // fixtures/transport-vocabulary.json (its canonical copy; the host/kb/loc
-        // surface-leak suites load the same file). None of its terms may appear.
+        // The canonical §1.5/§17 transport-vocabulary blocklist — the ONE canonical copy
+        // shipped as `mcpmesh_local_api::TRANSPORT_VOCABULARY`
+        // (`local-api/fixtures/transport-vocabulary.json`). None of its terms may appear.
         if let Some(term) = transport_vocab_violation(&stdout) {
             panic!("status leaked transport vocabulary '{term}':\n{stdout}");
         }
