@@ -283,6 +283,14 @@ where
                 Ok(None) | Err(_) => break, // proxy closed / IO error
             }
         }
+        // The proxy half-closed (its AI client sent everything it will send) — that ends the
+        // REQUEST direction, never the session. Half-close toward the peer so its backend sees
+        // a clean end-of-input, then park: only the peer closing (`to_control` ending) may tear
+        // the session down, mirroring the proxy pump's drain discipline. Winning the select!
+        // here would cancel `to_control` and drop responses still in flight — the one-shot
+        // pipe case (`printf ... | mcpmesh connect ...`) hits exactly that race.
+        let _ = transport_writer.shutdown().await;
+        std::future::pending::<()>().await
     };
     // Direction B: mesh peer -> control. Carries the peer's responses AND any synthesized
     // -32054 refusal, verbatim. The `while let` exits on peer EOF / a severed

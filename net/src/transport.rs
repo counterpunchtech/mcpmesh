@@ -91,6 +91,18 @@ impl<W: AsyncWrite + Unpin> TransportWriter<W> {
     pub async fn send_value(&self, v: Value) -> std::io::Result<()> {
         send_locked(&self.writer, &v).await
     }
+
+    /// Half-close: finish the shared write half — a clean end-of-input toward the peer —
+    /// while the transport's read half stays open to drain responses still in flight. This
+    /// is the teardown discipline for a consumer with no more requests to send: closing the
+    /// whole transport instead would race away the reply to the final request.
+    pub async fn shutdown(&self) -> std::io::Result<()> {
+        use tokio::io::AsyncWriteExt;
+        if let Some(w) = self.writer.lock().await.as_mut() {
+            w.shutdown().await?;
+        }
+        Ok(())
+    }
 }
 
 /// The -32600 reply the rmcp `receive` path sends when a frame is valid JSON but

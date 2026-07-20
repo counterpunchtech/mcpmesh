@@ -87,6 +87,10 @@ where
     write_frame(&mut server_write, &initialize)
         .await
         .context("forward initialize to local MCP server")?;
+    // Wrapped so Direction A can DROP the write half at end-of-input: for a spawned child,
+    // `AsyncWriteExt::shutdown` on its stdin only flushes — the fd closes (and the child sees
+    // EOF) on drop; for a socket backend the drop sends the FIN just as shutdown would.
+    let mut server_write = Some(server_write);
 
     // The outbound direction sends through a cloned writer handle so it does not need
     // `&mut transport` (which the inbound direction holds for `recv_value`). This
@@ -122,7 +126,10 @@ where
                     // Proxied-request-line audit hook: hash args + record method/tool BEFORE
                     // forwarding. PRIVACY — sees raw args (the server needs them); stores only blake3.
                     auditor.on_request(&frame);
-                    if write_frame(&mut server_write, &frame).await.is_err() {
+                    let Some(w) = server_write.as_mut() else {
+                        break;
+                    };
+                    if write_frame(w, &frame).await.is_err() {
                         break; // server input closed — server is gone
                     }
                 }
@@ -130,6 +137,17 @@ where
                 Err(_) => break,   // transport IO error or framing violation
             }
         }
+        // The peer half-closed (no more requests) or the transport failed — either way this
+        // direction is done, but the SESSION is not: responses to already-forwarded requests
+        // may still be inside the server. Close the server's stdin so it sees end-of-input
+        // and can finish, then park: only Direction B draining to the server's output EOF may
+        // end the session. Winning the select! here would cancel B and drop those replies —
+        // the one-shot client (`printf ... | mcpmesh connect ...`) hits exactly that race.
+        if let Some(mut w) = server_write.take() {
+            use tokio::io::AsyncWriteExt;
+            let _ = w.shutdown().await;
+        } // dropped: the child's stdin fd closes / the socket FINs — the backend sees EOF
+        std::future::pending::<()>().await
     };
 
     // Direction B: local server → mesh transport. Owns the FrameReader and the cloned
@@ -155,7 +173,8 @@ where
         }
     };
 
-    // First direction to finish cancels the other, tearing down the session.
+    // Direction A parks after end-of-input instead of finishing, so B — the drain toward
+    // the peer — is the only branch that can end the session (on the server's output EOF).
     tokio::select! {
         () = to_server => {}
         () = to_transport => {}
