@@ -401,6 +401,10 @@ mod path_tests {
     // unit-test it directly with explicit inputs. `default_endpoint()` is still
     // exercised against the real env, asserting the shape that holds for any env.
 
+    // Feeds POSIX path literals (`/tmp`), which `Path::is_absolute` + `join` only treat as
+    // intended on unix — and the SUN_LEN socket-path concern is unix-only anyway (Windows uses a
+    // named pipe, whose isolation rides `windows_pipe_name`). Same gate as the runtime_dir tests.
+    #[cfg(unix)]
     #[test]
     fn profile_runtime_uses_the_short_socket_path_for_a_deep_root() {
         // #32: a shallow profile root keeps the socket beside its state (<root>/run); a DEEP root
