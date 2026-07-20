@@ -460,8 +460,24 @@ fn unregistered_service_error(requested: &[String], served: &[String]) -> Option
 /// machine — the worst place to discover the inviter's typo. Validated against the SAME view
 /// `status` renders ([`service_infos`], read live from disk like `status_result`), so the
 /// refusal's "you serve:" list always matches what `mcpmesh status` shows.
-pub(crate) async fn mint_invite(services: Vec<String>, mesh: &MeshState) -> Result<InviteResult> {
+pub(crate) async fn mint_invite(
+    services: Vec<String>,
+    app_label: Option<String>,
+    mesh: &MeshState,
+) -> Result<InviteResult> {
     use rand::RngCore;
+
+    // The opaque app label (#31) is capped: the invite line is a human-copied base32 artifact,
+    // so a caller cannot bloat it. mcpmesh never interprets the label — this bounds size only.
+    if let Some(label) = &app_label
+        && label.len() > crate::pairing::MAX_APP_LABEL_LEN
+    {
+        anyhow::bail!(
+            "app_label is {} bytes; the maximum is {}",
+            label.len(),
+            crate::pairing::MAX_APP_LABEL_LEN
+        );
+    }
 
     // An invite that grants nothing is useless, and a silently-empty list is exactly the
     // symptom of a param typo like `{service: "kb"}` (singular) slipping past validation
@@ -505,6 +521,7 @@ pub(crate) async fn mint_invite(services: Vec<String>, mesh: &MeshState) -> Resu
         nickname: mesh.self_nickname.clone(),
         services: services.clone(),
         expires_at_epoch,
+        app_label,
     };
     let invite_line = invite.encode();
     // Reap expired invites before minting so a long-lived daemon's registry can't grow

@@ -602,6 +602,9 @@ pub async fn redeem_invite(
         // `<peer>/<service>` for the "You can mount:" line. Same list written into our
         // dial-back `PeerEntry.services` above (a client-side dial directory).
         services: invite.services,
+        // The opaque app label the inviter attached (#31), echoed to the embedder verbatim.
+        // mcpmesh never interpreted it — it is display/metadata only.
+        app_label: invite.app_label,
     })
 }
 

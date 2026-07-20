@@ -136,6 +136,7 @@ fn decoy_invite(secret: [u8; 32]) -> Invite {
         nickname: "server".into(),
         services: vec!["x".into()],
         expires_at_epoch: FUTURE,
+        app_label: None,
     }
 }
 

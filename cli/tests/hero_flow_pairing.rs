@@ -212,6 +212,7 @@ async fn four_command_hero_flow() {
         let invite_value = alice_client
             .request(Request::Invite(InviteParams {
                 services: vec!["notes".into()],
+                app_label: None,
             }))
             .await
             .expect("invite over mcpmesh-local/1");

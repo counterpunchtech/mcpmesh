@@ -161,6 +161,11 @@ pub struct RegisterServiceParams {
 pub struct InviteParams {
     #[serde(default)]
     pub services: Vec<String>,
+    /// An OPAQUE, caller-chosen label carried through to the redeemer in the `pair` result (#31).
+    /// mcpmesh never interprets it (not a nickname, never resolved or authorized) — a per-pairing
+    /// metadata slot for the embedder (e.g. its own URN). Capped at the daemon; omit for none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_label: Option<String>,
 }
 
 /// Params of [`Request::Pair`]: the copyable `mcpmesh-invite:` line. Defaultable — an
@@ -489,6 +494,10 @@ pub struct PairResult {
     /// minted by an older daemon (which omits `services`) still deserializes — to an empty list.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub services: Vec<String>,
+    /// The opaque `app_label` the inviter attached at `invite` time (#31), echoed verbatim — or
+    /// absent if none was set. mcpmesh never interprets it; the embedder does. Additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_label: Option<String>,
 }
 
 /// The event class of an [`AuditRecord`] (the four audit event classes). An additive discriminant on
@@ -902,6 +911,7 @@ mod tests {
         // Request::Invite → `{ "method": "invite", "params": { "services": [...] } }`.
         let r = Request::Invite(InviteParams {
             services: vec!["notes".into(), "kb".into()],
+            app_label: None,
         });
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["method"], "invite");
@@ -947,6 +957,7 @@ mod tests {
             peer_nickname: "alice".into(),
             sas_code: "tango-fig-cabbage".into(),
             services: vec!["notes".into(), "kb".into()],
+            app_label: None,
         };
         let v = serde_json::to_value(&res).unwrap();
         assert_eq!(v["peer_nickname"], "alice");

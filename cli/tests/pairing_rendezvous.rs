@@ -68,6 +68,7 @@ fn make_invite(
         nickname: "alice".into(),
         services: services.iter().map(|s| s.to_string()).collect(),
         expires_at_epoch,
+        app_label: None,
     }
 }
 
@@ -710,6 +711,7 @@ async fn repeat_grant_unions_the_redeemers_dial_directory_and_applies_the_new_ni
             nickname: "alice".into(),
             services: vec!["kb".into(), "notes".into()],
             expires_at_epoch: FUTURE,
+            app_label: None,
         };
         invites.mint(invite.clone());
 
@@ -792,6 +794,7 @@ async fn redeem_refuses_an_invite_squatting_an_existing_peers_nickname() {
             nickname: "alice".into(),
             services: vec!["kb".into()],
             expires_at_epoch: FUTURE,
+            app_label: None,
         };
         invites.mint(invite.clone());
 
@@ -882,6 +885,7 @@ async fn paired_and_granted_peer_is_admitted_to_the_service_end_to_end() {
             nickname: "alice".into(),
             services: vec!["notes".into()],
             expires_at_epoch: FUTURE,
+            app_label: None,
         };
         invites.mint(invite.clone());
 
@@ -1046,6 +1050,7 @@ async fn pairing_exchanges_and_stores_each_sides_verified_user_id() {
             nickname: "alice".into(),
             services: vec![],
             expires_at_epoch: FUTURE,
+            app_label: None,
         };
         invites.mint(invite.clone());
 
@@ -1136,6 +1141,7 @@ async fn redeem_refuses_an_address_swap_and_writes_no_entry_p3() {
             nickname: "alice".into(),
             services: vec!["notes".into()],
             expires_at_epoch: FUTURE,
+            app_label: None,
         };
 
         let bob = redeemer_endpoint().await;

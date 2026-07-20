@@ -35,7 +35,18 @@ pub struct Invite {
     pub services: Vec<String>,
     /// Absolute expiry, epoch seconds; `≤ now + 24h`. The daemon enforces it.
     pub expires_at_epoch: u64,
+    /// An OPAQUE, caller-chosen application label the inviter attaches at `invite` time, echoed
+    /// to the redeemer in the `pair` result (#31). mcpmesh NEVER interprets it: it is never a
+    /// nickname, never resolved by `open_session`, never an `allow` authorization token — purely
+    /// a per-pairing metadata slot (e.g. the inviter's app-level URN, a manifest hint). Additive:
+    /// `#[serde(default)]` so an old invite line decodes to `None` and an old daemon ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_label: Option<String>,
 }
+
+/// The maximum length of [`Invite::app_label`], in bytes. The invite line is a human-copied
+/// base32 artifact, so the opaque label is kept modest; the daemon rejects a longer one at mint.
+pub const MAX_APP_LABEL_LEN: usize = 256;
 
 impl Invite {
     /// One `mcpmesh-invite:<payload>` line. Payload = base32(no-pad) of the JSON-serialized
@@ -166,6 +177,7 @@ mod tests {
             nickname: "alice".into(),
             services: vec!["notes".into()],
             expires_at_epoch,
+            app_label: None,
         }
     }
 
@@ -180,6 +192,29 @@ mod tests {
         assert!(Invite::decode("mcpmesh-invite:!!!not-valid").is_err());
         // A line missing the scheme is rejected.
         assert!(Invite::decode("notaninvite").is_err());
+    }
+
+    #[test]
+    fn invite_carries_an_opaque_app_label_additively() {
+        // #31: an inviter-attached opaque label round-trips through the invite line.
+        let mut inv = sample_invite(9, 1_800_000_000);
+        inv.app_label = Some("urn:kb-mesh:node:abc123".into());
+        let back = Invite::decode(&inv.encode()).unwrap();
+        assert_eq!(back.app_label.as_deref(), Some("urn:kb-mesh:node:abc123"));
+        assert_eq!(back, inv);
+
+        // An OLD invite line (JSON without the field) decodes to None — additive both ways.
+        let no_label = sample_invite(9, 1_800_000_000);
+        assert!(no_label.app_label.is_none());
+        let json = serde_json::to_vec(&no_label).unwrap();
+        // The serialized form omits the field entirely (skip_serializing_if), so it reads like a
+        // pre-#31 invite; it still decodes.
+        assert!(!String::from_utf8_lossy(&json).contains("app_label"));
+        let line = format!(
+            "mcpmesh-invite:{}",
+            data_encoding::BASE32_NOPAD.encode(&json)
+        );
+        assert_eq!(Invite::decode(&line).unwrap().app_label, None);
     }
 
     #[test]

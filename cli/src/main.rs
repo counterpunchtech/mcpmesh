@@ -84,6 +84,10 @@ enum Cmd {
         /// One or more service names the redeemer is granted (space-separated). At least one is
         /// required — an invite granting nothing is useless.
         services: Vec<String>,
+        /// An opaque application label carried through to the redeemer's pair result. mcpmesh
+        /// never interprets it — a slot for an embedding app to pass its own identity/metadata.
+        #[arg(long, value_name = "text")]
+        label: Option<String>,
     },
     /// Redeem an invite to access a peer's services, or unpair a peer.
     ///
@@ -370,7 +374,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         }) => run_internal_id(),
         Some(Cmd::Serve { name, allow, cmd }) => run_serve(name, allow, cmd),
         Some(Cmd::Connect { target }) => run_connect(target),
-        Some(Cmd::Invite { services }) => run_invite(services),
+        Some(Cmd::Invite { services, label }) => run_invite(services, label),
         Some(Cmd::Pair { invite, remove }) => run_pair(invite, remove),
         Some(Cmd::Use { target }) => run_use(target),
         Some(Cmd::Join {
@@ -496,12 +500,12 @@ fn run_connect(target: String) -> anyhow::Result<()> {
 ///
 /// Empty `services` is an ERROR: an invite that grants nothing is useless, and erroring here is
 /// friendlier than minting a dead invite the redeemer can do nothing with.
-fn run_invite(services: Vec<String>) -> anyhow::Result<()> {
+fn run_invite(services: Vec<String>, label: Option<String>) -> anyhow::Result<()> {
     if services.is_empty() {
         anyhow::bail!("specify at least one service to grant (e.g. `mcpmesh invite notes`)");
     }
     with_daemon(async move |mut client| {
-        let invite = client.invite(services.clone()).await?;
+        let invite = client.invite_with(services.clone(), label).await?;
         for line in render::invite_lines(&invite, &services, util::epoch_now_u64()) {
             println!("{line}");
         }

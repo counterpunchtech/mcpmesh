@@ -310,7 +310,7 @@ async fn handle_request(req: &Value, state: &DaemonState) -> Value {
                 id,
                 "invite",
                 with_params(&params, |p: InviteParams| {
-                    crate::daemon::mint_invite(p.services, mesh)
+                    crate::daemon::mint_invite(p.services, p.app_label, mesh)
                 })
                 .await,
             )

@@ -171,8 +171,24 @@ impl ControlClient {
     /// Mint a one-time pairing invite granting `services`; return the copyable
     /// `mcpmesh-invite:` line + its expiry.
     pub async fn invite(&mut self, services: Vec<String>) -> Result<InviteResult, ClientError> {
-        self.request_typed(Request::Invite(InviteParams { services }), "invite result")
-            .await
+        self.invite_with(services, None).await
+    }
+
+    /// [`invite`](Self::invite) with an opaque `app_label` (#31) carried through to the redeemer's
+    /// `pair` result. mcpmesh never interprets the label; the embedder does (e.g. its own URN).
+    pub async fn invite_with(
+        &mut self,
+        services: Vec<String>,
+        app_label: Option<String>,
+    ) -> Result<InviteResult, ClientError> {
+        self.request_typed(
+            Request::Invite(InviteParams {
+                services,
+                app_label,
+            }),
+            "invite result",
+        )
+        .await
     }
 
     /// Redeem a pairing invite; return the inviter's suggested nickname, the display-only SAS
