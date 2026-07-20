@@ -23,7 +23,7 @@ pub struct Config {
 }
 
 /// A `[services.<name>]` entry: exactly one backend kind (`run` xor `socket`) plus the
-/// petnames/groups admitted to it. The xor is validated at access time via
+/// nicknames/groups admitted to it. The xor is validated at access time via
 /// [`ServiceCfg::backend_result`] rather than at parse time, so a malformed entry is a
 /// per-service error, not a whole-config load failure.
 #[derive(Debug, Default, Deserialize)]
@@ -33,7 +33,7 @@ pub struct ServiceCfg {
     pub run: Option<Vec<String>>,
     /// `socket`: dial this local UDS (an already-running MCP server).
     pub socket: Option<String>,
-    /// Petnames/groups admitted to this service (one flat namespace).
+    /// Nicknames/groups admitted to this service (one flat namespace).
     pub allow: Vec<String>,
 }
 
@@ -67,7 +67,7 @@ pub struct IdentityCfg {
     /// This device's suggested name for itself, carried in a minted pairing invite.
     /// `None` → the daemon defaults to a short fingerprint of the endpoint id.
     /// Additive (`#[serde(default)]` at the struct level).
-    pub petname: Option<String>,
+    pub nickname: Option<String>,
     /// Roster mode: the org id this node joined (pinned at install/join).
     pub org_id: Option<String>,
     /// Roster mode: the pinned org-root public key, `b64u:`. The single trust anchor

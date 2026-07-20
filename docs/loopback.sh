@@ -21,11 +21,11 @@ FRIEND_RUN="$FRIEND_HOME/runtime"
 friend() { HOME="$FRIEND_HOME" XDG_RUNTIME_DIR="$FRIEND_RUN" "$@"; }
 
 # The friend's world: a folder of notes to share, and a name they go by
-# (without a petname the friend would introduce themselves by this machine's
+# (without a nickname the friend would introduce themselves by this machine's
 # hostname — same as yours, which makes a confusing demo).
 mkdir -p "$FRIEND_HOME/notes" "$FRIEND_RUN" "$FRIEND_HOME/.config/mcpmesh"
 echo "It worked: this note reached you through the mesh." > "$FRIEND_HOME/notes/hello.md"
-printf '[identity]\npetname = "demo-friend"\n' > "$FRIEND_HOME/.config/mcpmesh/config.toml"
+printf '[identity]\nnickname = "demo-friend"\n' > "$FRIEND_HOME/.config/mcpmesh/config.toml"
 
 # 1. The friend's daemon, in the background. (Yours auto-starts when you pair.)
 echo "==> starting the demo friend's daemon"

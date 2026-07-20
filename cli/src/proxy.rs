@@ -48,7 +48,7 @@ pub fn split_target(target: &str) -> Result<(String, String)> {
 /// Rendered rather than `serde_json`-serialized so the keys keep their conventional
 /// `command`-then-`args` order (a `serde_json::Value` sorts them alphabetically, which reads
 /// backwards in a config file). The two interpolated NAMES still go through `serde_json`, so a
-/// petname carrying a quote or a backslash can never produce broken JSON.
+/// nickname carrying a quote or a backslash can never produce broken JSON.
 fn mcp_servers_entry(peer: &str, service: &str) -> String {
     let name = serde_json::to_string(&format!("{peer}-{service}")).expect("a string serializes");
     let target = serde_json::to_string(&format!("{peer}/{service}")).expect("a string serializes");
@@ -80,7 +80,7 @@ fn claude_desktop_config_path() -> String {
 /// Every line is either a sentence or a command to copy: the Claude Code invocation, the Claude
 /// Desktop config path + entry + restart step, and the generic stdio command any other MCP client
 /// takes. It opens with the trust boundary ("runs on their machine") — this is the mount-time
-/// moment that line exists for. Surface-clean (no transport vocabulary): petnames, service
+/// moment that line exists for. Surface-clean (no transport vocabulary): nicknames, service
 /// names, and the `mcpmesh connect` command only — never an endpoint id.
 ///
 /// Empty `services` renders NOTHING (no dangling "add this to your config" with no entry under it).
@@ -145,7 +145,7 @@ pub async fn run(peer: String, service: String) -> Result<()> {
 
 /// The one stderr line a human at a terminal gets when their `connect` session ended on a
 /// mesh-synthesized refusal (issue #10). Pure so it is unit-testable. Surface-clean:
-/// the peer petname + porcelain commands only.
+/// the peer nickname + porcelain commands only.
 fn unreachable_hint_line(peer: &str) -> String {
     format!(
         "peer unreachable — is {peer} online? ('mcpmesh status' shows reachability). \
@@ -263,8 +263,8 @@ mod tests {
     }
 
     #[test]
-    fn mcp_servers_entry_escapes_an_exotic_petname() {
-        // A petname carrying a quote must not produce broken JSON (it is rendered, not serialized).
+    fn mcp_servers_entry_escapes_an_exotic_nickname() {
+        // A nickname carrying a quote must not produce broken JSON (it is rendered, not serialized).
         let doc: Value =
             serde_json::from_str(&format!("{{{}}}", mcp_servers_entry(r#"a"b"#, "notes"))).unwrap();
         assert_eq!(

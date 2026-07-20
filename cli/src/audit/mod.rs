@@ -99,7 +99,7 @@ pub fn filter_records<'a>(
 /// over an injected record slice — the reconciliation test below asserts this equals a direct count
 /// over `read_all_records` (the same JSONL `internal audit` reads). LOCAL-only: the caller reads the
 /// daemon's own `default_audit_dir()`; this fn never touches the network. Surface-clean: the
-/// keys are the record's petnames / service names, never endpoints/transport vocabulary.
+/// keys are the record's nicknames / service names, never endpoints/transport vocabulary.
 pub fn summarize_sessions(records: &[AuditRecord]) -> AuditSummaryResult {
     use std::collections::BTreeMap;
     let mut per_peer: BTreeMap<String, u64> = BTreeMap::new();

@@ -40,8 +40,8 @@ async fn real_session_audits_with_hashed_args_and_all_event_classes() {
         let server_ep = local_endpoint().await;
         let server_addr = server_ep.addr();
 
-        // Trust the caller endpoint (the connecting side) as petname "bob". `PeerEntry` is a struct
-        // literal (allowlist.rs) — fields are `endpoint_id` / `petname` / `services` / `paired_at`
+        // Trust the caller endpoint (the connecting side) as nickname "bob". `PeerEntry` is a struct
+        // literal (allowlist.rs) — fields are `endpoint_id` / `nickname` / `services` / `paired_at`
         // (mirrors proxy_roundtrip.rs); there is no `PeerEntry::new`.
         let caller_ep = local_endpoint().await;
         let caller_id = *caller_ep.id().as_bytes();
@@ -50,7 +50,7 @@ async fn real_session_audits_with_hashed_args_and_all_event_classes() {
             store
                 .add(PeerEntry {
                     endpoint_id: caller_id,
-                    petname: "bob".into(),
+                    nickname: "bob".into(),
                     services: vec!["notes".into()],
                     paired_at: None,
                     user_id: None,

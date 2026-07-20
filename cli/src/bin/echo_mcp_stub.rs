@@ -7,7 +7,7 @@
 //! echoing `params.arguments.text` AND the injected identity env — `MCPMESH_PEER_NAME`
 //! (`peer_name`), `MCPMESH_PEER_USER` (`peer_user`, roster mode only) and
 //! `MCPMESH_PEER_GROUPS` (`peer_groups`, comma-joined) — so the tests prove the full
-//! identity env injection (roster user_id + groups, not just the petname). It loops until
+//! identity env injection (roster user_id + groups, not just the nickname). It loops until
 //! stdin EOF.
 //!
 //! Crude string extraction is deliberate: the test controls the exact wire shape,

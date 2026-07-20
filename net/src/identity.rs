@@ -69,9 +69,9 @@ pub struct PeerIdentity {
 }
 
 impl PeerIdentity {
-    /// A pairing-mode identity by petname. `endpoint` is zeroed here and STAMPED by the gate's
+    /// A pairing-mode identity by nickname. `endpoint` is zeroed here and STAMPED by the gate's
     /// `resolve` from the queried key (test/bootstrap constructor — production always resolves).
-    pub fn petname(name: &str) -> Self {
+    pub fn nickname(name: &str) -> Self {
         Self {
             endpoint: EndpointId::from_bytes([0u8; 32]),
             name: name.into(),
@@ -146,7 +146,7 @@ mod tests {
 
     #[test]
     fn static_gate_resolves_known_and_refuses_unknown() {
-        let gate = StaticGate::new([(id(1), PeerIdentity::petname("bob"))]);
+        let gate = StaticGate::new([(id(1), PeerIdentity::nickname("bob"))]);
         let got = gate.resolve(&id(1)).expect("known endpoint resolves");
         assert_eq!(got.name, "bob");
         assert_eq!(

@@ -27,7 +27,7 @@ use super::accept::spawn_accept_loop;
 use super::roster_install::{
     respawn_poll_loop, roster_confirmed_path, spawn_staleness_sweep, warn_if_degraded_grace,
 };
-use super::{MeshState, STACK_VERSION, build_services_audited, default_self_petname};
+use super::{MeshState, STACK_VERSION, build_services_audited, default_self_nickname};
 
 /// Run the daemon. On unix, acquires the per-uid flock singleton (another holder → exit 0);
 /// on Windows the control-endpoint bind in `serve_forever` is the singleton. Then binds the
@@ -217,13 +217,13 @@ async fn serve_forever(socket: &Path) -> Result<()> {
     //    `mesh.clone()`, then set the handle. The invite registry starts empty (`invite`
     //    mints into it).
     let invites = Arc::new(LiveInvites::new());
-    // The petname we suggest for ourselves in invites + advertise to peers: config override, else the
+    // The nickname we suggest for ourselves in invites + advertise to peers: config override, else the
     // machine hostname (friendly: peers see `jetson`, not `96246d3f`), else the endpoint fingerprint.
-    let self_petname = cfg
+    let self_nickname = cfg
         .identity
-        .petname
+        .nickname
         .clone()
-        .unwrap_or_else(|| default_self_petname(&our_id));
+        .unwrap_or_else(|| default_self_nickname(&our_id));
     // The live-connection registry: threaded into the accept loop's mesh handler
     // (CHECK-register on accept) so a roster install can sever its live sessions. `roster`
     // (the hot-swappable roster gate) + `gate` (the composed gate over it) were built above.
@@ -240,7 +240,7 @@ async fn serve_forever(socket: &Path) -> Result<()> {
         gate,
         store,
         invites,
-        self_petname,
+        self_nickname,
         config_path,
         roster,
         conn_registry,

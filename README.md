@@ -141,7 +141,7 @@ One redemption pairs the two machines **both ways** 🔄 — each side now knows
 device. Access stays one-way until granted: right now Bob can reach `alice/notes`, and Alice can
 reach nothing of Bob's.
 
-> ℹ️ "alice" here is *Bob's* petname for Alice — suggested by the invite, local to Bob. Names in
+> ℹ️ "alice" here is *Bob's* nickname for Alice — suggested by the invite, local to Bob. Names in
 > mcpmesh are always **your** names for **your** peers, never global identities.
 
 ### 3️⃣ Both sides confirm the code 🗣️
@@ -239,7 +239,7 @@ confirmations that make it safe) is in the 📘 [operator runbook](docs/operator
 | `mcpmesh-local-api` | The local control API (`mcpmesh-local/1`) clients and plugins build on |
 
 🪪 **Identity is self-sovereign:** devices hold keys that never leave the machine, people are verified
-device→user bindings, and the names you see are petnames *you* chose. By default connections
+device→user bindings, and the names you see are nicknames *you* chose. By default connections
 bootstrap via iroh's public relays; `relay_mode = "custom"` / `discovery_mode = "custom"` in the
 [config](docs/config.md) let you self-host both, and `"disabled"` runs fully hermetic
 (LAN/localhost only). `mcpmesh doctor` validates whatever combination you configure.

@@ -9,7 +9,7 @@ Every table and key the daemon reads from `config.toml`, with its default. The f
 > **You rarely hand-edit this file.** The porcelain writes it: `serve` writes `[services.<name>]`,
 > each pairing appends the new peer to the granted `allow` lists, and `org create` / `join` pin the
 > `[identity]` and `[roster]` anchors. Hand-editing is for the tunables — `[network]` self-hosting,
-> `[limits]`, the `[roster]` timing knobs, and `[identity].petname`. Restart the daemon after
+> `[limits]`, the `[roster]` timing knobs, and `[identity].nickname`. Restart the daemon after
 > editing (`mcpmesh status` auto-starts it), and run `mcpmesh doctor` to lint what you changed.
 
 **Loading rules.** A missing file means all defaults (a fresh machine needs no config). A malformed
@@ -26,7 +26,7 @@ falls back to that key's default — a typo never disables a freshness bound.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `petname` | this machine's short hostname (else a short fingerprint of the device identity) | The name this device suggests for itself in the invites it mints — what your peers will call you unless they rename you. Set it when your hostname isn't the name you want to go by. |
+| `nickname` | this machine's short hostname (else a short fingerprint of the device identity) | The name this device suggests for itself in the invites it mints — what your peers will call you unless they rename you. Set it when your hostname isn't the name you want to go by. |
 | `device_key` | `<config-dir>/device.key` | Path to this device's private key. Minted on first run, `0600`, never leaves the machine. |
 | `org_id` | *(unset)* | Roster mode: the org this node joined. Pinned by `org create` / `join` — do not hand-edit. |
 | `org_root_pk` | *(unset)* | Roster mode: the pinned org-root public key (`b64u:…`) — the single trust anchor roster signatures verify against. Pinned on first install / `join` — do not hand-edit. |
@@ -82,7 +82,7 @@ the service's public name (`mcpmesh serve notes …` writes `[services.notes]`).
 |---|---|---|
 | `run` | *(unset)* | The command to spawn per session — an ordinary stdio MCP server, e.g. `["npx", "-y", "@modelcontextprotocol/server-filesystem", "/home/alice/notes"]`. |
 | `socket` | *(unset)* | The local endpoint of an **already-running** MCP server the daemon dials instead of spawning (how plugin daemons register themselves). |
-| `allow` | `[]` | The petnames/groups admitted to this service. Pairing appends to it; `mcpmesh pair --remove` prunes it. |
+| `allow` | `[]` | The nicknames/groups admitted to this service. Pairing appends to it; `mcpmesh pair --remove` prunes it. |
 
 Exactly **one** of `run` / `socket` per service — both or neither makes that one service error
 (surfaced when it is dialed; the rest of the config still loads). Peers themselves are *not* in the
@@ -95,7 +95,7 @@ here.
 
 ```toml
 [identity]
-petname = "alice-laptop"
+nickname = "alice-laptop"
 
 [network]                  # self-hosted infrastructure (omit for the public defaults)
 relay_mode     = "custom"

@@ -106,7 +106,7 @@ async fn dial_service_races_a_person_to_the_live_mirror_when_the_primary_is_dead
         let client_ep = local_endpoint().await;
         let client_id = *client_ep.id().as_bytes();
 
-        // The mirror's gate authorizes the client (petname "client") for the echo service.
+        // The mirror's gate authorizes the client (nickname "client") for the echo service.
         let mirror_cfg = Config::from_toml_str(&format!(
             "[services.echo]\nrun = ['{STUB}']\nallow = [\"client\"]\n"
         ))
@@ -115,7 +115,7 @@ async fn dial_service_races_a_person_to_the_live_mirror_when_the_primary_is_dead
         mirror_store
             .add(PeerEntry {
                 endpoint_id: client_id,
-                petname: "client".into(),
+                nickname: "client".into(),
                 services: vec!["echo".into()],
                 paired_at: None,
                 user_id: None,

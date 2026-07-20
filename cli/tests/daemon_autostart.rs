@@ -231,7 +231,7 @@ async fn register_service_and_peer_add_reflect_in_status() {
         client
             .request_value(&json!({
                 "method": "peer_add",
-                "params": {"petname": "tester", "endpoint_id": endpoint_id, "allow": ["echo"]}
+                "params": {"nickname": "tester", "endpoint_id": endpoint_id, "allow": ["echo"]}
             }))
             .await
             .expect("peer_add");
@@ -556,7 +556,7 @@ async fn status_output_leaks_no_transport_vocabulary() {
         client
             .request_value(&json!({
                 "method": "peer_add",
-                "params": {"petname": "bob", "endpoint_id": endpoint_id, "allow": ["files"]}
+                "params": {"nickname": "bob", "endpoint_id": endpoint_id, "allow": ["files"]}
             }))
             .await
             .expect("peer_add");
@@ -569,7 +569,7 @@ async fn status_output_leaks_no_transport_vocabulary() {
         // Sanity: the service + peer DID render (by plain name), so the absences below are
         // meaningful — status actually produced content.
         assert!(stdout.contains("files"), "service name renders: {stdout}");
-        assert!(stdout.contains("bob"), "peer petname renders: {stdout}");
+        assert!(stdout.contains("bob"), "peer nickname renders: {stdout}");
 
         // The canonical §1.5/§17 transport-vocabulary blocklist — the ONE canonical copy
         // shipped as `mcpmesh_local_api::TRANSPORT_VOCABULARY`

@@ -8,7 +8,7 @@
 //!
 //! The proof of injection is end-to-end: the served child is `echo_mcp_stub`, which echoes
 //! back `getenv("MCPMESH_PEER_NAME")` as `result.peer_name`. The connecting peer resolves (at
-//! the gate) to petname `tester`; asserting `peer_name == "tester"` at the far end proves the
+//! the gate) to nickname `tester`; asserting `peer_name == "tester"` at the far end proves the
 //! gate-resolved identity threaded through `SessionBackend::run` all the way into the child's
 //! environment across the mesh.
 use std::sync::Arc;
@@ -39,7 +39,7 @@ async fn daemon_serves_run_service_and_injects_caller_identity_over_the_mesh() {
     timeout(Duration::from_secs(60), async {
         let dir = tempfile::tempdir().unwrap();
 
-        // Config: one `run` service `echo` = the hermetic stub, admitting petname `tester`.
+        // Config: one `run` service `echo` = the hermetic stub, admitting nickname `tester`.
         // A TOML literal string ('..') for the path avoids any escape concerns.
         let cfg = Config::from_toml_str(&format!(
             "[services.echo]\nrun = ['{STUB}']\nallow = [\"tester\"]\n"
@@ -56,7 +56,7 @@ async fn daemon_serves_run_service_and_injects_caller_identity_over_the_mesh() {
         store
             .add(PeerEntry {
                 endpoint_id: client_id,
-                petname: "tester".into(),
+                nickname: "tester".into(),
                 services: vec!["echo".into()],
                 paired_at: None,
                 user_id: None,
@@ -111,7 +111,7 @@ async fn daemon_serves_run_service_and_injects_caller_identity_over_the_mesh() {
         // gate-resolved identity flowed through run() into the spawned child's environment.
         assert_eq!(
             call_res["result"]["peer_name"], "tester",
-            "the child's MCPMESH_PEER_NAME carried the gate-resolved petname across the mesh"
+            "the child's MCPMESH_PEER_NAME carried the gate-resolved nickname across the mesh"
         );
     })
     .await
@@ -156,7 +156,7 @@ async fn hot_reload_serves_a_newly_registered_service_over_the_mesh() {
             store
                 .add(PeerEntry {
                     endpoint_id: *c.id().as_bytes(),
-                    petname: "tester".into(),
+                    nickname: "tester".into(),
                     services: vec!["echo".into()],
                     paired_at: None,
                     user_id: None,

@@ -113,9 +113,9 @@ pub struct MeshState {
     /// `mcpmesh/pair/1` branch redeems against it; shared with every spawned pair handler.
     pub(crate) invites: Arc<LiveInvites>,
     /// This device's suggested name for itself, carried in a minted invite.
-    /// Resolved once at startup: config `identity.petname`, else a short base32 fingerprint
+    /// Resolved once at startup: config `identity.nickname`, else a short base32 fingerprint
     /// of the endpoint id. The redeemer stores it as its local name for us.
-    pub(crate) self_petname: String,
+    pub(crate) self_nickname: String,
     /// The daemon's own ALPN-dispatch accept loop (see [`spawn_accept_loop`]). Hot-reload
     /// takes it, `.abort()`s it, and installs a fresh loop with the rebuilt registry — a brief
     /// serving blip is acceptable.
@@ -206,7 +206,7 @@ pub struct MeshState {
     pub(crate) recent_pairings:
         std::sync::Mutex<std::collections::VecDeque<mcpmesh_local_api::RecentPairing>>,
     /// On-demand reachability probe cache (pairing-mode liveness). Keyed by endpoint-id INTERNALLY;
-    /// [`probe_peer`] writes it and [`reachability_of`] reads it (projecting to the PETNAME —
+    /// [`probe_peer`] writes it and [`reachability_of`] reads it (projecting to the NICKNAME —
     /// never the id). In-memory + ephemeral: never persisted, lost on restart, never an
     /// authorization input (advisory presence only). std `Mutex` — held only for the tiny
     /// insert/clone, never across an await.
@@ -226,7 +226,7 @@ impl MeshState {
     ///
     /// `pub` so integration tests can build one; the fields stay `pub(crate)`.
     // The mesh half genuinely has 12 collaborators to assemble (endpoint, gate, store, invites,
-    // petname, config, roster, registry — plus roster mode's gossip/blobs handles + the two topic
+    // nickname, config, roster, registry — plus roster mode's gossip/blobs handles + the two topic
     // subscriptions); a params-struct would only rename the same fields, and this signature is
     // pinned by the integration tests that assemble hermetic meshes. The four roster-transport
     // params are `None`/empty in a pure-pairing daemon.
@@ -236,7 +236,7 @@ impl MeshState {
         gate: Arc<dyn TrustGate>,
         store: Arc<PeerStore>,
         invites: Arc<LiveInvites>,
-        self_petname: String,
+        self_nickname: String,
         config_path: PathBuf,
         roster: Arc<RosterGate>,
         conn_registry: Arc<ConnRegistry>,
@@ -250,7 +250,7 @@ impl MeshState {
             gate,
             store,
             invites,
-            self_petname,
+            self_nickname,
             accept_task: tokio::sync::Mutex::new(None),
             poll_loop: tokio::sync::Mutex::new(None),
             reload_lock: tokio::sync::Mutex::new(()),
@@ -277,7 +277,7 @@ impl MeshState {
     /// is dropped once the ring holds [`RECENT_PAIRINGS_CAP`].
     pub(crate) fn record_pairing(
         &self,
-        peer_petname: String,
+        peer_nickname: String,
         sas_code: String,
         paired_at_epoch: u64,
     ) {
@@ -289,7 +289,7 @@ impl MeshState {
             ring.pop_front();
         }
         ring.push_back(mcpmesh_local_api::RecentPairing {
-            peer_petname,
+            peer_nickname,
             sas_code,
             paired_at_epoch,
         });
@@ -407,12 +407,12 @@ impl MeshState {
             invites: self.invites.clone(),
             config_path: self.config_path.clone(),
             self_binding: self.self_binding(),
-            grant: Box::new(move |petname, services| {
+            grant: Box::new(move |nickname, services| {
                 let mesh = grant_mesh.clone();
-                Box::pin(async move { grant_service_access(&mesh, &petname, &services).await })
+                Box::pin(async move { grant_service_access(&mesh, &nickname, &services).await })
             }),
-            record_pairing: Box::new(move |petname, sas, paired_at| {
-                record_mesh.record_pairing(petname, sas, paired_at);
+            record_pairing: Box::new(move |nickname, sas, paired_at| {
+                record_mesh.record_pairing(nickname, sas, paired_at);
             }),
         }
     }
@@ -575,27 +575,27 @@ pub fn build_services_audited(
 }
 
 /// A short, human-glanceable fingerprint of an endpoint id: the first 8 chars of its base32
-/// (`EndpointId`'s `Display`) form. The default self-petname when config sets none (
-/// "suggested petname"). Not security-bearing — the id itself is the routing key.
+/// (`EndpointId`'s `Display`) form. The default self-nickname when config sets none (
+/// "suggested nickname"). Not security-bearing — the id itself is the routing key.
 fn short_fingerprint(id: &iroh::EndpointId) -> String {
     id.to_string().chars().take(8).collect()
 }
 
-/// A friendly default display name for this node when the config sets no `petname`: the machine's
+/// A friendly default display name for this node when the config sets no `nickname`: the machine's
 /// short hostname, else the endpoint fingerprint. So a freshly-started daemon advertises `jetson`
-/// instead of `96246d3f` out of the box (a config `petname` still wins; a peer's stored petname is
+/// instead of `96246d3f` out of the box (a config `nickname` still wins; a peer's stored nickname is
 /// captured at pairing time from whatever the peer suggests here).
-fn default_self_petname(id: &iroh::EndpointId) -> String {
-    hostname_petname().unwrap_or_else(|| short_fingerprint(id))
+fn default_self_nickname(id: &iroh::EndpointId) -> String {
+    hostname_nickname().unwrap_or_else(|| short_fingerprint(id))
 }
 
-/// This machine's `hostname`, sanitized into a petname, or `None` if the command fails or is empty.
-fn hostname_petname() -> Option<String> {
+/// This machine's `hostname`, sanitized into a nickname, or `None` if the command fails or is empty.
+fn hostname_nickname() -> Option<String> {
     let out = std::process::Command::new("hostname").output().ok()?;
     sanitize_hostname(&String::from_utf8_lossy(&out.stdout))
 }
 
-/// Sanitize a raw hostname into a petname: the short name (before the first `.`), lowercased, keeping
+/// Sanitize a raw hostname into a nickname: the short name (before the first `.`), lowercased, keeping
 /// only `[a-z0-9-]`; `None` if the result is empty. Pure — the fallible `hostname` call is separate.
 fn sanitize_hostname(raw: &str) -> Option<String> {
     let short = raw
@@ -619,7 +619,7 @@ fn sanitize_hostname(raw: &str) -> Option<String> {
 /// outbound); production assembles its own `MeshState` inline in `serve_forever`.
 pub fn serving_state(endpoint: iroh::Endpoint, store: Arc<PeerStore>) -> Arc<DaemonState> {
     let gate: Arc<dyn TrustGate> = Arc::new(AllowlistGate::new(store.clone()));
-    let self_petname = short_fingerprint(&endpoint.id());
+    let self_nickname = short_fingerprint(&endpoint.id());
     // No accept loop is spawned here (this seam only dials OUTBOUND via `open_session`), so the
     // mesh's `accept_task` stays empty.
     let mesh = MeshState::new(
@@ -627,7 +627,7 @@ pub fn serving_state(endpoint: iroh::Endpoint, store: Arc<PeerStore>) -> Arc<Dae
         gate,
         store,
         Arc::new(LiveInvites::new()),
-        self_petname,
+        self_nickname,
         // Test-only dial seam (no roster install runs through it): a HOME-less env
         // degrades to an empty config path rather than failing the seam.
         paths::default_config_path().unwrap_or_default(),
@@ -694,7 +694,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sanitize_hostname_makes_a_friendly_petname() {
+    fn sanitize_hostname_makes_a_friendly_nickname() {
         assert_eq!(sanitize_hostname("jetson\n").as_deref(), Some("jetson"));
         assert_eq!(
             sanitize_hostname("Johns-MacBook-Pro.local").as_deref(),

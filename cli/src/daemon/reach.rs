@@ -31,7 +31,7 @@ pub const REACH_TTL_SECS: i64 = 20;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Probe one peer over [`ALPN_PING`] and cache the result. Dials the peer BY ID (an id-only
-/// [`iroh::EndpointAddr`], exactly like `dial::dial_service`'s single-petname fallback — discovery resolves
+/// [`iroh::EndpointAddr`], exactly like `dial::dial_service`'s single-nickname fallback — discovery resolves
 /// the address from the id; hermetic localhost tests seed a `MemoryLookup`), sends one ping frame,
 /// reads the pong, and measures RTT (dial + round-trip). Writes the outcome into the in-memory
 /// `MeshState::reachability` cache and returns it. Reachable ⇔ a pong arrived within
@@ -83,17 +83,17 @@ async fn probe_once(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> Result<()> 
 /// each `probe_peer` writes its own cache entry, read by the NEXT call).
 ///
 /// Surface discipline: the cache is keyed by endpoint-id INTERNALLY, but every returned
-/// [`mcpmesh_local_api::PeerReachability`] carries only the peer's PETNAME — never the endpoint-id.
+/// [`mcpmesh_local_api::PeerReachability`] carries only the peer's NICKNAME — never the endpoint-id.
 pub fn reachability_of(mesh: &Arc<MeshState>) -> Vec<mcpmesh_local_api::PeerReachability> {
     let now = epoch_now_i64();
-    // (petname, endpoint_id) for every paired peer — reuse the allowlist store's peer scan
+    // (nickname, endpoint_id) for every paired peer — reuse the allowlist store's peer scan
     // (fail-open: a corrupt row is skipped, not fatal). The store IS the paired-peer set.
     let peers: Vec<(String, [u8; 32])> = mesh
         .store
         .list()
         .unwrap_or_default()
         .into_iter()
-        .map(|e| (e.petname, e.endpoint_id))
+        .map(|e| (e.nickname, e.endpoint_id))
         .collect();
     let cache = mesh
         .reachability
@@ -102,7 +102,7 @@ pub fn reachability_of(mesh: &Arc<MeshState>) -> Vec<mcpmesh_local_api::PeerReac
         .clone();
     let mut stale: Vec<[u8; 32]> = Vec::new();
     let mut out = Vec::with_capacity(peers.len());
-    for (petname, eid) in peers {
+    for (nickname, eid) in peers {
         match cache.get(&eid) {
             Some(e) => {
                 let age = (now - e.probed_at).max(0);
@@ -110,7 +110,7 @@ pub fn reachability_of(mesh: &Arc<MeshState>) -> Vec<mcpmesh_local_api::PeerReac
                     stale.push(eid);
                 }
                 out.push(mcpmesh_local_api::PeerReachability {
-                    name: petname,
+                    name: nickname,
                     reachable: e.reachable,
                     rtt_ms: e.rtt_ms,
                     age_secs: Some(age as u64),
@@ -119,7 +119,7 @@ pub fn reachability_of(mesh: &Arc<MeshState>) -> Vec<mcpmesh_local_api::PeerReac
             None => {
                 stale.push(eid);
                 out.push(mcpmesh_local_api::PeerReachability {
-                    name: petname,
+                    name: nickname,
                     reachable: false,
                     rtt_ms: None,
                     age_secs: None, // never probed → consumer shows "checking…"

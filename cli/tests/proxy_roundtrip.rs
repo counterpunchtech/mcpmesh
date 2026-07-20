@@ -57,7 +57,7 @@ async fn connect_proxy_round_trips_an_echo_service_over_the_mesh() {
     timeout(Duration::from_secs(60), async {
         let dir = tempfile::tempdir().unwrap();
 
-        // --- The "server machine": serves an echo `run` service to petname `daemon`. ---
+        // --- The "server machine": serves an echo `run` service to nickname `daemon`. ---
         let server_ep = local_endpoint().await;
         let server_id = *server_ep.id().as_bytes();
         let server_addr = server_ep.addr();
@@ -75,7 +75,7 @@ async fn connect_proxy_round_trips_an_echo_service_over_the_mesh() {
         server_store
             .add(PeerEntry {
                 endpoint_id: daemon_id,
-                petname: "daemon".into(),
+                nickname: "daemon".into(),
                 services: vec!["echo".into()],
                 paired_at: None,
                 user_id: None,
@@ -90,7 +90,7 @@ async fn connect_proxy_round_trips_an_echo_service_over_the_mesh() {
             Arc::new(mcpmesh_net::ConnRegistry::new()),
         );
 
-        // --- The "daemon machine": resolves petname `tester` -> the server endpoint, dials. ---
+        // --- The "daemon machine": resolves nickname `tester` -> the server endpoint, dials. ---
         // Seed dial-by-id resolution: the daemon endpoint learns the server's addrs via a
         // MemoryLookup (the localhost stand-in for DNS/pkarr discovery).
         let mem = MemoryLookup::new();
@@ -105,7 +105,7 @@ async fn connect_proxy_round_trips_an_echo_service_over_the_mesh() {
         daemon_store
             .add(PeerEntry {
                 endpoint_id: server_id,
-                petname: "tester".into(),
+                nickname: "tester".into(),
                 services: vec!["echo".into()],
                 paired_at: None,
                 user_id: None,
@@ -156,7 +156,7 @@ async fn connect_proxy_round_trips_an_echo_service_over_the_mesh() {
         );
 
         // tools/call → the payload is echoed verbatim, and MCPMESH_PEER_NAME carried the
-        // gate-resolved petname (`daemon`) into the child across the mesh.
+        // gate-resolved nickname (`daemon`) into the child across the mesh.
         write_frame(
             &mut child_in,
             &json!({

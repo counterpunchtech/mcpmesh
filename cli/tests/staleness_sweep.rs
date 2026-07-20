@@ -90,7 +90,7 @@ async fn staleness_sweep_cuts_roster_session_but_not_pairing() {
         store
             .add(PeerEntry {
                 endpoint_id: bob_id,
-                petname: "bob".into(),
+                nickname: "bob".into(),
                 services: vec!["echo".into()],
                 paired_at: None,
                 user_id: None,

@@ -35,17 +35,17 @@ pub enum BackendKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceInfo {
     pub name: String,
-    pub allow: Vec<String>,   // petnames/groups (flat namespace)
+    pub allow: Vec<String>,   // nicknames/groups (flat namespace)
     pub backend: BackendKind, // "run" | "socket" (kind only, never the command/path)
 }
 
-/// A known peer as reported by `status` (petname only — never the EndpointId).
+/// A known peer as reported by `status` (nickname only — never the EndpointId).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerInfo {
     pub name: String,
     pub services: Vec<String>,
     /// The peer's PROVEN self-sovereign `user_id` (`b64u:<user_pk>`) if it presented a verified
-    /// device->user binding at pairing (roster peers carry it too), else `None` (petname-only). This
+    /// device->user binding at pairing (roster peers carry it too), else `None` (nickname-only). This
     /// is a surface-clean identity (an opaque user id, NOT an EndpointId). Additive:
     /// `#[serde(default, skip_serializing_if = "Option::is_none")]` so older payloads round-trip.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -53,10 +53,10 @@ pub struct PeerInfo {
 }
 
 /// Advisory reachability of a paired peer (pairing-mode liveness). Surface-clean:
-/// a petname + a bool + latency/age NUMBERS — never an endpoint-id, key, or transport path.
+/// a nickname + a bool + latency/age NUMBERS — never an endpoint-id, key, or transport path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerReachability {
-    pub name: String,    // the peer's petname
+    pub name: String,    // the peer's nickname
     pub reachable: bool, // result of the last probe (false if never probed)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rtt_ms: Option<u64>, // last measured round-trip, if reachable
@@ -93,12 +93,12 @@ pub struct PresencePeer {
 /// the pairing ceremony is "both humans compare the code": the redeemer sees it in its
 /// [`PairResult`]; this is the inviter's porcelain surface for the same words. DISPLAY-ONLY
 /// ceremony state: held in-memory by the daemon (a small ring), lost on restart, NEVER an
-/// authorization input or trust data. Surface-clean: a petname + the SAS wordlist words +
+/// authorization input or trust data. Surface-clean: a nickname + the SAS wordlist words +
 /// an epoch — never an EndpointId.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecentPairing {
-    /// The peer's petname as stored by the inviter (its local name for the redeemer).
-    pub peer_petname: String,
+    /// The peer's nickname as stored by the inviter (its local name for the redeemer).
+    pub peer_nickname: String,
     /// The display-only SAS words (e.g. `"tango-fig-cabbage"`) — the same code the redeemer's
     /// `PairResult.sas_code` carried. Never checked programmatically.
     pub sas_code: String,
@@ -162,28 +162,28 @@ pub struct PairParams {
     pub invite_line: String,
 }
 
-/// Params of [`Request::PeerRemove`]: the petname to unpair.
+/// Params of [`Request::PeerRemove`]: the nickname to unpair.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerRemoveParams {
-    pub petname: String,
+    pub nickname: String,
 }
 
 /// Params of [`Request::PeerRename`]: the contact to rename — every device sharing `user_id`
-/// when given, else the single provisional `petname` entry — and the new nickname `to`.
+/// when given, else the single provisional `nickname` entry — and the new nickname `to`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerRenameParams {
     #[serde(default)]
     pub user_id: Option<String>,
     #[serde(default)]
-    pub petname: Option<String>,
+    pub nickname: Option<String>,
     pub to: String,
 }
 
 /// Params of [`Request::PeerAdd`] (reserved/internal — see the variant): a raw `endpoint_id`
-/// (iroh base32) plus the petname and service allow list to install it under.
+/// (iroh base32) plus the nickname and service allow list to install it under.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerAddParams {
-    pub petname: String,
+    pub nickname: String,
     pub endpoint_id: String,
     #[serde(default)]
     pub allow: Vec<String>,
@@ -277,20 +277,20 @@ pub enum Request {
     ///
     /// `PeerEntry` — the durable allowlist row — lives in the daemon crate.
     Pair(PairParams),
-    /// Remove a paired peer by petname (`mcpmesh pair --remove`). The daemon drops the
-    /// peer's `PeerEntry` (identity) AND revokes its access by removing the petname from every
+    /// Remove a paired peer by nickname (`mcpmesh pair --remove`). The daemon drops the
+    /// peer's `PeerEntry` (identity) AND revokes its access by removing the nickname from every
     /// `[services.*].allow` (authorization) — the inverse of the pairing grant. Idempotent: a
-    /// petname with no entry / no allow membership is a clean no-op. Live in-flight sessions are
+    /// nickname with no entry / no allow membership is a clean no-op. Live in-flight sessions are
     /// NOT severed here: existing sessions run to completion; the peer only loses the
     /// ability to establish NEW authorized sessions. Tag `"peer_remove"` (snake_case);
     /// `method_of` reads the `method` string generically (no per-variant arm).
     ///
     /// `PeerEntry` — the durable allowlist row — lives in the daemon crate.
     PeerRemove(PeerRemoveParams),
-    /// Rename a contact's nickname (petname) authoritatively. Renames the
+    /// Rename a contact's nickname (nickname) authoritatively. Renames the
     /// PERSON — every `PeerEntry` sharing `user_id` when given (one op for all their devices), else the
-    /// single `petname` entry (a provisional, no-`user_id` contact) — to `to`, AND rewrites the old
-    /// petname → `to` in every `[services.*].allow` so grants follow the rename. Refuses (error frame)
+    /// single `nickname` entry (a provisional, no-`user_id` contact) — to `to`, AND rewrites the old
+    /// nickname → `to` in every `[services.*].allow` so grants follow the rename. Refuses (error frame)
     /// when `to` is empty or already names/grants a DIFFERENT identity — the same collision guard the
     /// pairing rendezvous uses, so a rename can't inherit another peer's access. Tag `"peer_rename"`;
     /// host-privileged like the other pair ops.
@@ -329,7 +329,7 @@ pub enum Request {
     /// Tag `"blob_publish"`.
     BlobPublish(BlobPublishParams),
     /// Grant a scope to a principal — any flat-namespace entry: a group name, a user_id, or a
-    /// petname (the shared `principal_set` expansion). Tag
+    /// nickname (the shared `principal_set` expansion). Tag
     /// `"blob_grant"`.
     BlobGrant(BlobGrantParams),
     /// List the daemon's blob scopes (name → hashes + grants). Tag `"blob_list"`.
@@ -406,7 +406,7 @@ pub struct BlobFetchResult {
 
 /// Result of [`Request::AuditSummary`]: LOCAL per-peer / per-service session counts
 /// aggregated from this node's OWN audit log — NEVER transmitted (local-only). Surface-clean:
-/// peer names are petnames / user_ids (NEVER EndpointIds), service names are the registered
+/// peer names are nicknames / user_ids (NEVER EndpointIds), service names are the registered
 /// service names (NEVER transport vocabulary). A "session" is one `SessionOpen` record. `per_peer` /
 /// `per_service` are sorted ascending by name (deterministic). Tuples mirror kb's
 /// `InsightResponse::per_peer_contribution` — `["bob", 2]` on the wire.
@@ -415,7 +415,7 @@ pub struct BlobFetchResult {
 /// `#[serde(default, skip_serializing_if = ...)]` so older payloads still deserialize.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditSummaryResult {
-    /// Sessions opened per peer (petname). A session with no attributed peer is NOT counted here (no
+    /// Sessions opened per peer (nickname). A session with no attributed peer is NOT counted here (no
     /// peer to attribute) but IS in `total_sessions`.
     pub per_peer: Vec<(String, u64)>,
     /// Sessions opened per registered service name.
@@ -441,7 +441,7 @@ pub struct InviteResult {
     pub expires_at_epoch: u64,
 }
 
-/// Result of a [`Request::Pair`] request: the inviter's suggested petname (the
+/// Result of a [`Request::Pair`] request: the inviter's suggested nickname (the
 /// redeemer's local name for the new peer) plus the display-only short authentication
 /// code (SAS) — a few words the human reads aloud to a second channel to
 /// catch a whole-invite forgery / address-swap MITM. The SAS is a pairing-ceremony
@@ -451,8 +451,8 @@ pub struct InviteResult {
 /// `#[serde(default, skip_serializing_if = ...)]` so older payloads still deserialize.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairResult {
-    /// The inviter's suggested petname (from the invite) — the redeemer's local name for it.
-    pub peer_petname: String,
+    /// The inviter's suggested nickname (from the invite) — the redeemer's local name for it.
+    pub peer_nickname: String,
     /// The display-only short authentication code (e.g. `"tango-fig-42"`), shown on both
     /// sides for the out-of-band human check. Never sent on the wire, never checked
     /// programmatically.
@@ -527,7 +527,7 @@ pub struct AuditRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event: Option<String>,
     /// A reference, NEVER content: a blob hash (`BlobFetch`) or a trust-event target such as a
-    /// petname or `org/serial` (`Trust`).
+    /// nickname or `org/serial` (`Trust`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
 }
@@ -636,7 +636,7 @@ impl AuditRecord {
 }
 
 /// One live mesh session, in a [`StreamFrame::Snapshot`]. Surface-clean: `peer` is the
-/// user_id-or-petname the audit records carry, never an endpoint-id. `opened_at` is epoch seconds.
+/// user_id-or-nickname the audit records carry, never an endpoint-id. `opened_at` is epoch seconds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActiveSession {
     pub peer: String,
@@ -858,15 +858,15 @@ mod tests {
             Some("pair")
         );
 
-        // PairResult carries the inviter's suggested petname + the display-only SAS words +
+        // PairResult carries the inviter's suggested nickname + the display-only SAS words +
         // the granted services (the porcelain renders each as `<peer>/<service>`).
         let res = PairResult {
-            peer_petname: "alice".into(),
+            peer_nickname: "alice".into(),
             sas_code: "tango-fig-cabbage".into(),
             services: vec!["notes".into(), "kb".into()],
         };
         let v = serde_json::to_value(&res).unwrap();
-        assert_eq!(v["peer_petname"], "alice");
+        assert_eq!(v["peer_nickname"], "alice");
         assert_eq!(v["sas_code"], "tango-fig-cabbage");
         assert_eq!(v["services"][0], "notes");
         assert_eq!(v["services"][1], "kb");
@@ -875,11 +875,11 @@ mod tests {
         // Additive-only: a PairResult minted by an older daemon (no `services` key) still
         // deserializes — the `#[serde(default)]` fills it with an empty list.
         let old_shape = serde_json::json!({
-            "peer_petname": "alice",
+            "peer_nickname": "alice",
             "sas_code": "tango-fig-cabbage",
         });
         let back: PairResult = serde_json::from_value(old_shape).unwrap();
-        assert_eq!(back.peer_petname, "alice");
+        assert_eq!(back.peer_nickname, "alice");
         assert!(back.services.is_empty());
     }
 
@@ -991,40 +991,40 @@ mod tests {
 
     #[test]
     fn peer_remove_request_roundtrip() {
-        // Request::PeerRemove → `{ "method": "peer_remove", "params": { "petname": "..." } }`.
+        // Request::PeerRemove → `{ "method": "peer_remove", "params": { "nickname": "..." } }`.
         let r = Request::PeerRemove(PeerRemoveParams {
-            petname: "bob".into(),
+            nickname: "bob".into(),
         });
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["method"], "peer_remove");
-        assert_eq!(v["params"]["petname"], "bob");
+        assert_eq!(v["params"]["nickname"], "bob");
         assert_eq!(serde_json::from_value::<Request>(v).unwrap(), r);
         // method_of resolves the tag generically (no per-variant arm).
         assert_eq!(
-            method_of(&serde_json::json!({"method": "peer_remove", "params": {"petname": "bob"}})),
+            method_of(&serde_json::json!({"method": "peer_remove", "params": {"nickname": "bob"}})),
             Some("peer_remove")
         );
     }
 
     /// The reserved/internal `peer_add` rides the SAME typed vocabulary as every other method —
-    /// `{ "method": "peer_add", "params": { petname, endpoint_id, allow } }` — with `allow`
+    /// `{ "method": "peer_add", "params": { nickname, endpoint_id, allow } }` — with `allow`
     /// defaulting to empty when absent.
     #[test]
     fn peer_add_request_roundtrip() {
         let r = Request::PeerAdd(PeerAddParams {
-            petname: "bob".into(),
+            nickname: "bob".into(),
             endpoint_id: "96246d3f".into(),
             allow: vec!["notes".into()],
         });
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["method"], "peer_add");
-        assert_eq!(v["params"]["petname"], "bob");
+        assert_eq!(v["params"]["nickname"], "bob");
         assert_eq!(v["params"]["endpoint_id"], "96246d3f");
         assert_eq!(v["params"]["allow"][0], "notes");
         assert_eq!(serde_json::from_value::<Request>(v).unwrap(), r);
         // An absent allow list deserializes to empty (the server-side tolerance).
         let p: PeerAddParams =
-            serde_json::from_value(serde_json::json!({"petname": "bob", "endpoint_id": "x"}))
+            serde_json::from_value(serde_json::json!({"nickname": "bob", "endpoint_id": "x"}))
                 .unwrap();
         assert!(p.allow.is_empty());
     }
@@ -1034,7 +1034,7 @@ mod tests {
         // By user_id (renames all of a person's devices in one op).
         let r = Request::PeerRename(PeerRenameParams {
             user_id: Some("b64u:BOB".into()),
-            petname: None,
+            nickname: None,
             to: "Bobby".into(),
         });
         let v = serde_json::to_value(&r).unwrap();
@@ -1042,10 +1042,10 @@ mod tests {
         assert_eq!(v["params"]["user_id"], "b64u:BOB");
         assert_eq!(v["params"]["to"], "Bobby");
         assert_eq!(serde_json::from_value::<Request>(v).unwrap(), r);
-        // A provisional contact is renamed by petname; omitted user_id defaults to None.
+        // A provisional contact is renamed by nickname; omitted user_id defaults to None.
         assert_eq!(
             method_of(
-                &serde_json::json!({"method": "peer_rename", "params": {"petname": "carol", "to": "Carol"}})
+                &serde_json::json!({"method": "peer_rename", "params": {"nickname": "carol", "to": "Carol"}})
             ),
             Some("peer_rename")
         );
@@ -1094,7 +1094,7 @@ mod tests {
         assert_eq!(serde_json::from_value::<StatusResult>(v).unwrap(), s);
 
         // A payload minted by an older daemon (no `roster`/`presence`/identity keys) still
-        // deserializes — the identity fields default to None / a petname-only peer.
+        // deserializes — the identity fields default to None / a nickname-only peer.
         let old_shape = serde_json::json!({
             "stack_version": "0.1.0",
             "services": [],
@@ -1154,7 +1154,7 @@ mod tests {
     }
 
     /// The `recent_pairings` status field is ADDITIVE: a populated list round-trips with
-    /// the flat `{peer_petname, sas_code, paired_at_epoch}` shape (petname + SAS words + epoch —
+    /// the flat `{peer_nickname, sas_code, paired_at_epoch}` shape (nickname + SAS words + epoch —
     /// never an EndpointId), an empty list is dropped from the wire, and a payload minted by an
     /// older daemon (no key at all) still deserializes to empty.
     #[test]
@@ -1167,14 +1167,14 @@ mod tests {
             presence: vec![],
             self_user_id: None,
             recent_pairings: vec![RecentPairing {
-                peer_petname: "bob".into(),
+                peer_nickname: "bob".into(),
                 sas_code: "tango-fig-cabbage".into(),
                 paired_at_epoch: 1_800_000_000,
             }],
             reachability: vec![],
         };
         let v = serde_json::to_value(&s).unwrap();
-        assert_eq!(v["recent_pairings"][0]["peer_petname"], "bob");
+        assert_eq!(v["recent_pairings"][0]["peer_nickname"], "bob");
         assert_eq!(v["recent_pairings"][0]["sas_code"], "tango-fig-cabbage");
         assert_eq!(v["recent_pairings"][0]["paired_at_epoch"], 1_800_000_000u64);
         assert_eq!(serde_json::from_value::<StatusResult>(v).unwrap(), s);
@@ -1329,7 +1329,7 @@ mod tests {
             Some("audit_summary")
         );
 
-        // AuditSummaryResult carries LOCAL per-peer / per-service session counts (petnames + service
+        // AuditSummaryResult carries LOCAL per-peer / per-service session counts (nicknames + service
         // names only — never endpoints/transport terms) + a total. Tuples mirror kb's
         // InsightResponse.per_peer_contribution: `["bob", 2]` on the wire.
         let res = AuditSummaryResult {

@@ -83,7 +83,7 @@ async fn hero_flow_minus_pairing() {
 
         // ── ALICE (serving side): the daemon's own build_services + serve composition. ──
         // `[services.files] run=echo_mcp_stub, allow=["bob"]`; the REAL AllowlistGate over a
-        // real store that grants petname `bob` (Bob's dialing endpoint id) the `files` service
+        // real store that grants nickname `bob` (Bob's dialing endpoint id) the `files` service
         // — the M2a stand-in for what `pair` will later write.
         let alice_cfg = Config::from_toml_str(&format!(
             "[services.files]\nrun = ['{STUB}']\nallow = [\"bob\"]\n"
@@ -93,7 +93,7 @@ async fn hero_flow_minus_pairing() {
         alice_store
             .add(PeerEntry {
                 endpoint_id: bob_id,
-                petname: "bob".into(),
+                nickname: "bob".into(),
                 services: vec!["files".into()],
                 paired_at: None,
                 user_id: None,
@@ -104,7 +104,7 @@ async fn hero_flow_minus_pairing() {
         let _alice_handle = serve(alice_ep, alice_gate, build_services(&alice_cfg), Arc::new(mcpmesh_net::ConnRegistry::new()));
 
         // ── BOB (consuming side): an in-process daemon with the REAL control server. ──
-        // Bob's store resolves petname `alice` → Alice's endpoint id (the M2a trust stand-in),
+        // Bob's store resolves nickname `alice` → Alice's endpoint id (the M2a trust stand-in),
         // and Bob's endpoint is seeded with Alice's addr so the id-only dial resolves locally.
         let mem = MemoryLookup::new();
         mem.add_endpoint_info(alice_addr.clone());
@@ -117,7 +117,7 @@ async fn hero_flow_minus_pairing() {
         bob_store
             .add(PeerEntry {
                 endpoint_id: alice_id,
-                petname: "alice".into(),
+                nickname: "alice".into(),
                 services: vec!["files".into()],
                 paired_at: None,
                 user_id: None,
@@ -138,7 +138,7 @@ async fn hero_flow_minus_pairing() {
         // Bob's AI-client stand-in runs the REAL `mcpmesh connect alice/files` subprocess
         // against Bob's control socket. It drives initialize + tools/call; the served child
         // on Alice answers byte-faithfully, and MCPMESH_PEER_NAME carries the gate-resolved
-        // petname `bob` into that child — identity threaded gate → run → child env, end to
+        // nickname `bob` into that child — identity threaded gate → run → child env, end to
         // end through the proxy across the mesh.
         // ─────────────────────────────────────────────────────────────────────────────
         let mut child = Command::new(MCPMESH)

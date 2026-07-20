@@ -117,7 +117,7 @@ pub(crate) fn write_roster_url(path: &Path, url: &str) -> Result<()> {
 
 /// Upsert `[services.<name>]` (atomic, surgical RMW), updating the backend while UNIONING the
 /// incoming `allow` into any grants already on disk. Registration OWNS the backend; the allowlist
-/// is co-owned by the pairing grant (`grant_service_access` appends petnames). A re-registration
+/// is co-owned by the pairing grant (`grant_service_access` appends nicknames). A re-registration
 /// therefore must never DROP an existing allow entry — otherwise a service that re-registers on
 /// every startup (kb does, always with an EMPTY allow) would silently revoke every paired peer.
 /// So: keep the existing allow, append incoming names not already present (an explicit
@@ -142,7 +142,7 @@ pub(crate) fn write_service_to_config(
     };
 
     // Union the incoming allow with any grants already on disk (see the fn doc): a re-registration
-    // updates the backend but must never silently drop a petname a prior pairing appended.
+    // updates the backend but must never silently drop a nickname a prior pairing appended.
     let mut merged_allow: Vec<String> = services
         .get(name)
         .and_then(toml::Value::as_table)
@@ -181,16 +181,16 @@ pub(crate) fn write_service_to_config(
     write_config_doc(path, &doc)
 }
 
-/// Append `petname` to each `[services.<svc>].allow` in the config at `path`, idempotently,
+/// Append `nickname` to each `[services.<svc>].allow` in the config at `path`, idempotently,
 /// and atomically rewrite the file. Returns whether the config actually CHANGED (so the caller
 /// can skip a pointless reload).
 ///
 /// A service NOT present in config is logged + skipped: a pairing grant authorizes into an
-/// existing service, it never creates one. An already-present petname is a no-op for that
+/// existing service, it never creates one. An already-present nickname is a no-op for that
 /// service (idempotent re-pair). Returns `Ok(false)` with no write when nothing changed.
 pub(crate) fn append_allow_to_config(
     path: &Path,
-    petname: &str,
+    nickname: &str,
     services: &[String],
 ) -> Result<bool> {
     let existing = read_config_for_rmw(path)?;
@@ -224,10 +224,10 @@ pub(crate) fn append_allow_to_config(
             );
         };
         // Idempotent: append only if not already granted.
-        if allow_arr.iter().any(|v| v.as_str() == Some(petname)) {
+        if allow_arr.iter().any(|v| v.as_str() == Some(nickname)) {
             continue;
         }
-        allow_arr.push(toml::Value::String(petname.to_string()));
+        allow_arr.push(toml::Value::String(nickname.to_string()));
         changed = true;
     }
 
@@ -237,7 +237,7 @@ pub(crate) fn append_allow_to_config(
     Ok(changed)
 }
 
-/// Remove `petname` from EVERY `[services.<svc>].allow` in the config at `path`, and atomically
+/// Remove `nickname` from EVERY `[services.<svc>].allow` in the config at `path`, and atomically
 /// rewrite the file. Returns whether the config actually CHANGED (so the caller can skip a
 /// pointless reload). The exact inverse of [`append_allow_to_config`].
 ///
@@ -247,7 +247,7 @@ pub(crate) fn append_allow_to_config(
 /// unpair on any error — so bailing on one weird entry would leave the peer LESS restricted (the
 /// opposite of fail-safe). A genuinely unparseable config still errors (exceptional corruption,
 /// same as the grant path). No `[services]` table → nothing to revoke (`Ok(false)`).
-pub(crate) fn remove_allow_from_config(path: &Path, petname: &str) -> Result<bool> {
+pub(crate) fn remove_allow_from_config(path: &Path, nickname: &str) -> Result<bool> {
     let existing = read_config_for_rmw(path)?;
     let mut doc: toml::Table = toml::from_str(&existing)
         .with_context(|| format!("parse existing config {}", path.display()))?;
@@ -266,7 +266,7 @@ pub(crate) fn remove_allow_from_config(path: &Path, petname: &str) -> Result<boo
             continue;
         };
         let before = allow_arr.len();
-        allow_arr.retain(|v| v.as_str() != Some(petname));
+        allow_arr.retain(|v| v.as_str() != Some(nickname));
         if allow_arr.len() != before {
             changed = true;
         }
@@ -360,7 +360,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
-            "[network]\nrelay_mode = \"disabled\"\n\n[identity]\npetname = \"mydev\"\n\n\
+            "[network]\nrelay_mode = \"disabled\"\n\n[identity]\nnickname = \"mydev\"\n\n\
              [services.notes]\nrun = [\"notes-mcp\"]\nallow = [\"alice\"]\n",
         )
         .unwrap();
@@ -380,8 +380,8 @@ mod tests {
         assert_eq!(identity["org_root_pk"].as_str(), Some("b64u:ANCHOR"));
         assert_eq!(identity["user_id"].as_str(), Some("alice"));
         assert_eq!(identity["user_key"].as_str(), Some("/home/alice/user.key"));
-        // Every pre-existing key is preserved (surgical): petname, the network table, the service.
-        assert_eq!(identity["petname"].as_str(), Some("mydev"));
+        // Every pre-existing key is preserved (surgical): nickname, the network table, the service.
+        assert_eq!(identity["nickname"].as_str(), Some("mydev"));
         assert_eq!(
             doc["network"]["relay_mode"].as_str(),
             Some("disabled"),
@@ -415,11 +415,11 @@ mod tests {
         assert_eq!(doc["network"]["relay_mode"].as_str(), Some("disabled"));
         // No [roster] table yet → it is created from scratch, other tables untouched.
         let path2 = dir.path().join("c2.toml");
-        std::fs::write(&path2, "[identity]\npetname = \"x\"\n").unwrap();
+        std::fs::write(&path2, "[identity]\nnickname = \"x\"\n").unwrap();
         write_roster_url(&path2, "https://h/r").unwrap();
         let doc2: toml::Table = toml::from_str(&std::fs::read_to_string(&path2).unwrap()).unwrap();
         assert_eq!(doc2["roster"]["url"].as_str(), Some("https://h/r"));
-        assert_eq!(doc2["identity"]["petname"].as_str(), Some("x"));
+        assert_eq!(doc2["identity"]["nickname"].as_str(), Some("x"));
     }
 
     /// `write_identity_user_id` surgically upserts `[identity].user_id`, preserving other keys.
@@ -427,11 +427,11 @@ mod tests {
     fn write_identity_user_id_is_surgical() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        std::fs::write(&path, "[identity]\npetname = \"dev\"\norg_id = \"acme\"\n").unwrap();
+        std::fs::write(&path, "[identity]\nnickname = \"dev\"\norg_id = \"acme\"\n").unwrap();
         write_identity_user_id(&path, "b64u:USER").unwrap();
         let doc: toml::Table = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(doc["identity"]["user_id"].as_str(), Some("b64u:USER"));
-        assert_eq!(doc["identity"]["petname"].as_str(), Some("dev"));
+        assert_eq!(doc["identity"]["nickname"].as_str(), Some("dev"));
         assert_eq!(doc["identity"]["org_id"].as_str(), Some("acme"));
     }
 
@@ -454,7 +454,7 @@ mod tests {
         );
     }
 
-    /// `append_allow_to_config` / `remove_allow_from_config` grant + revoke a petname in a service's
+    /// `append_allow_to_config` / `remove_allow_from_config` grant + revoke a nickname in a service's
     /// `allow`, are idempotent, and return `false` (no write) when there is nothing to change.
     #[test]
     fn allow_config_append_and_remove_round_trip() {
@@ -481,12 +481,12 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        // Revoking an absent petname → no change (false).
+        // Revoking an absent nickname → no change (false).
         assert!(!remove_allow_from_config(&path, "nobody").unwrap());
 
         // No [services] table at all → both grant + revoke are false (nothing to touch).
         let empty = dir.path().join("empty.toml");
-        std::fs::write(&empty, "[identity]\npetname = \"x\"\n").unwrap();
+        std::fs::write(&empty, "[identity]\nnickname = \"x\"\n").unwrap();
         assert!(!append_allow_to_config(&empty, "bob", &["kb".to_string()]).unwrap());
         assert!(!remove_allow_from_config(&empty, "bob").unwrap());
     }

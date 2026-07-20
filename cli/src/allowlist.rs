@@ -1,7 +1,7 @@
 //! The pair allowlist, persisted in state.redb. Populated by `mcpmesh internal peer add` /
 //! config import AND by the pair rendezvous — deliberately the SAME store, so a hand-added
 //! peer and a paired peer are indistinguishable to the gate. Entry:
-//! `{ endpoint_id, petname, services }`.
+//! `{ endpoint_id, nickname, services }`.
 //!
 //! redb 2.x shape (reconciled against docs.rs/redb 2.6.3): one table `peers` defined as
 //! `TableDefinition<&[u8], &[u8]>` — keyed by the 32-byte endpoint_id passed as a `&[u8]`
@@ -26,13 +26,13 @@ use std::sync::Arc;
 /// pattern for a table definition.
 const PEERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("peers");
 
-/// One pair-allowlist entry. `endpoint_id` is the routing key; `petname` is
+/// One pair-allowlist entry. `endpoint_id` is the routing key; `nickname` is
 /// the local human name the gate resolves peers to; `services` is the set the peer
 /// was granted at pairing time. Durable on-disk JSON — see the module additive-only note.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PeerEntry {
     pub endpoint_id: [u8; 32],
-    pub petname: String,
+    pub nickname: String,
     pub services: Vec<String>,
     /// When this entry was written by the pair rendezvous, as epoch-seconds-as-`String`
     /// (the daemon supplies it from `SystemTime` — no date crate).
@@ -45,7 +45,7 @@ pub struct PeerEntry {
     /// presented at pairing and verified against its TLS-authenticated endpoint (see
     /// `mcpmesh_trust::binding`). `None` for a peer that presented no binding (backward-compatible) or
     /// an `internal peer add`. Resolved into `PeerIdentity.user_id` so kb audiences can key on the
-    /// USER, not just the per-device petname — first-class multi-device identity in pairing mode
+    /// USER, not just the per-device nickname — first-class multi-device identity in pairing mode
     /// (roster mode already carries `user_id`).
     #[serde(default)]
     pub user_id: Option<String>,
@@ -124,15 +124,15 @@ impl PeerStore {
         }
     }
 
-    /// Resolve a petname to its stored entry — the reverse of [`resolve`](Self::resolve)
+    /// Resolve a nickname to its stored entry — the reverse of [`resolve`](Self::resolve)
     /// (which is keyed BY id). The connect proxy's `open_session` dial turns the
-    /// user-facing petname into the 32-byte routing key (plus the entry's `last_addr` dial
-    /// hint). Petnames are NOT unique (see
+    /// user-facing nickname into the 32-byte routing key (plus the entry's `last_addr` dial
+    /// hint). Nicknames are NOT unique (see
     /// [`remove`](Self::remove)); the FIRST match in key order wins. Fails OPEN on corrupt
     /// rows (it reuses [`list`](Self::list), which skips-and-logs them) — a poisoned row must
     /// not hide a resolvable peer.
-    pub fn entry_for(&self, petname: &str) -> Result<Option<PeerEntry>> {
-        Ok(self.list()?.into_iter().find(|e| e.petname == petname))
+    pub fn entry_for(&self, nickname: &str) -> Result<Option<PeerEntry>> {
+        Ok(self.list()?.into_iter().find(|e| e.nickname == nickname))
     }
 
     /// All allowlisted peers, in endpoint_id order (redb's key order).
@@ -162,22 +162,22 @@ impl PeerStore {
         Ok(out)
     }
 
-    /// Remove every entry whose `petname` matches (for `pair --remove`). The table is
+    /// Remove every entry whose `nickname` matches (for `pair --remove`). The table is
     /// keyed by endpoint_id, so this scans within one write txn — find matching keys, then
     /// delete them — keeping the read+delete atomic. No-op if nothing matches.
     ///
-    /// NOTE: petnames are NOT unique (population is `internal peer add` +
+    /// NOTE: nicknames are NOT unique (population is `internal peer add` +
     /// `pair`, neither of which enforces uniqueness), so this deletes ALL entries whose
-    /// petname matches — a conscious decision, revisited if a uniqueness invariant lands.
+    /// nickname matches — a conscious decision, revisited if a uniqueness invariant lands.
     ///
     /// Fails OPEN on a corrupt row (as [`list`](Self::list)): a row that will not
-    /// deserialize can't match the petname, so it is skipped and logged — unpairing the
+    /// deserialize can't match the nickname, so it is skipped and logged — unpairing the
     /// other peers must still work.
     ///
-    /// Returns whether ANY entry was actually deleted — `false` for an absent petname (a no-op) — so
+    /// Returns whether ANY entry was actually deleted — `false` for an absent nickname (a no-op) — so
     /// callers can distinguish a real removal from a no-op (the `unpair` audit event fires
     /// only on an actual tear-down).
-    pub fn remove(&self, petname: &str) -> Result<bool> {
+    pub fn remove(&self, nickname: &str) -> Result<bool> {
         let txn = self.db.begin_write()?;
         let removed = {
             let mut table = txn.open_table(PEERS)?;
@@ -186,7 +186,7 @@ impl PeerStore {
                 for row in table.iter()? {
                     let (k, val) = row?;
                     match serde_json::from_slice::<PeerEntry>(val.value()) {
-                        Ok(entry) if entry.petname == petname => v.push(k.value().to_vec()),
+                        Ok(entry) if entry.nickname == nickname => v.push(k.value().to_vec()),
                         Ok(_) => {}
                         Err(e) => {
                             let kb = k.value();
@@ -225,7 +225,7 @@ impl AllowlistGate {
 }
 
 impl TrustGate for AllowlistGate {
-    /// Resolve an inbound endpoint to a pairing-mode identity (petname only; groups are a
+    /// Resolve an inbound endpoint to a pairing-mode identity (nickname only; groups are a
     /// roster-mode concept), or refuse.
     ///
     /// The store is keyed by the raw 32 bytes of the `EndpointId`. A store read that errors
@@ -236,7 +236,7 @@ impl TrustGate for AllowlistGate {
             Ok(Some(e)) => Some(PeerIdentity {
                 endpoint: *endpoint,
                 user_id: e.user_id, // self-sovereign user_id from a verified pairing binding (else None)
-                name: e.petname,
+                name: e.nickname,
                 groups: vec![],
             }),
             Ok(None) => None,
@@ -252,10 +252,10 @@ impl TrustGate for AllowlistGate {
 mod tests {
     use super::*;
 
-    fn entry(eid: [u8; 32], petname: &str, services: &[&str]) -> PeerEntry {
+    fn entry(eid: [u8; 32], nickname: &str, services: &[&str]) -> PeerEntry {
         PeerEntry {
             endpoint_id: eid,
-            petname: petname.into(),
+            nickname: nickname.into(),
             services: services.iter().map(|s| s.to_string()).collect(),
             paired_at: None,
             user_id: None,
@@ -276,7 +276,7 @@ mod tests {
     }
 
     #[test]
-    fn gate_resolves_known_petname_refuses_unknown() {
+    fn gate_resolves_known_nickname_refuses_unknown() {
         use mcpmesh_net::TrustGate;
         use std::sync::Arc;
         let dir = tempfile::tempdir().unwrap();
@@ -284,7 +284,7 @@ mod tests {
         let known_eid = [7u8; 32];
         store.add(entry(known_eid, "bob", &["notes"])).unwrap();
         let gate = AllowlistGate::new(Arc::new(store));
-        // Known endpoint resolves to a pairing-mode identity (petname only).
+        // Known endpoint resolves to a pairing-mode identity (nickname only).
         let id = gate.resolve(&known_eid.into()).unwrap();
         assert_eq!(id.name, "bob");
         assert_eq!(id.user_id, None);
@@ -299,7 +299,7 @@ mod tests {
         let store = PeerStore::open(&dir.path().join("state.redb")).unwrap();
         let eid = [7u8; 32];
         store.add(entry(eid, "bob", &["notes"])).unwrap();
-        assert_eq!(store.resolve(&eid).unwrap().unwrap().petname, "bob");
+        assert_eq!(store.resolve(&eid).unwrap().unwrap().nickname, "bob");
         assert!(store.resolve(&[9u8; 32]).unwrap().is_none());
         assert_eq!(store.list().unwrap().len(), 1);
     }
@@ -317,7 +317,7 @@ mod tests {
         } // store dropped → file closed
         let store = PeerStore::open(&path).unwrap();
         let got = store.resolve(&eid).unwrap().unwrap();
-        assert_eq!(got.petname, "alice");
+        assert_eq!(got.nickname, "alice");
         assert_eq!(got.services, vec!["notes".to_string(), "kb".to_string()]);
     }
 
@@ -331,7 +331,7 @@ mod tests {
         store.add(entry(eid, "bob-renamed", &["kb"])).unwrap();
         let all = store.list().unwrap();
         assert_eq!(all.len(), 1);
-        assert_eq!(all[0].petname, "bob-renamed");
+        assert_eq!(all[0].nickname, "bob-renamed");
         assert_eq!(all[0].services, vec!["kb".to_string()]);
     }
 
@@ -341,16 +341,16 @@ mod tests {
         let store = PeerStore::open(&dir.path().join("state.redb")).unwrap();
         let eid = [3u8; 32];
         store.add(entry(eid, "carol", &[])).unwrap();
-        // Removing an absent petname is a clean no-op (does not touch carol) and reports `false`.
+        // Removing an absent nickname is a clean no-op (does not touch carol) and reports `false`.
         assert!(
             !store.remove("nobody").unwrap(),
-            "removing an absent petname removes nothing"
+            "removing an absent nickname removes nothing"
         );
         assert!(store.resolve(&eid).unwrap().is_some());
         // Removing the match deletes it and reports `true`.
         assert!(
             store.remove("carol").unwrap(),
-            "removing a present petname reports the deletion"
+            "removing a present nickname reports the deletion"
         );
         assert!(store.resolve(&eid).unwrap().is_none());
     }
@@ -370,8 +370,8 @@ mod tests {
     }
 
     #[test]
-    fn remove_deletes_all_entries_sharing_a_petname() {
-        // Petnames are not unique: two distinct endpoint_ids under the same petname are
+    fn remove_deletes_all_entries_sharing_a_nickname() {
+        // Nicknames are not unique: two distinct endpoint_ids under the same nickname are
         // both removed (remove-all-matching).
         let dir = tempfile::tempdir().unwrap();
         let store = PeerStore::open(&dir.path().join("state.redb")).unwrap();
@@ -393,12 +393,12 @@ mod tests {
         // Raw JSON in the exact legacy shape (no `paired_at`), written straight to redb.
         let old_shape = serde_json::json!({
             "endpoint_id": eid.to_vec(),
-            "petname": "old",
+            "nickname": "old",
             "services": ["notes"],
         });
         inject_raw(&store, &eid, &serde_json::to_vec(&old_shape).unwrap());
         let got = store.resolve(&eid).unwrap().unwrap();
-        assert_eq!(got.petname, "old");
+        assert_eq!(got.nickname, "old");
         assert_eq!(got.services, vec!["notes".to_string()]);
         assert_eq!(got.paired_at, None); // #[serde(default)] supplied it
     }
@@ -429,14 +429,14 @@ mod tests {
         // no `last_addr`), written straight to redb.
         let old_shape = serde_json::json!({
             "endpoint_id": eid.to_vec(),
-            "petname": "old",
+            "nickname": "old",
             "services": ["notes"],
             "paired_at": "1751760000",
             "user_id": null,
         });
         inject_raw(&store, &eid, &serde_json::to_vec(&old_shape).unwrap());
         let got = store.resolve(&eid).unwrap().unwrap();
-        assert_eq!(got.petname, "old");
+        assert_eq!(got.nickname, "old");
         assert_eq!(got.last_addr, None); // #[serde(default)] supplied it
     }
 
@@ -460,7 +460,7 @@ mod tests {
 
     #[test]
     fn entry_for_returns_the_full_entry() {
-        // The dial site reads the WHOLE entry (id + last_addr hint) by petname.
+        // The dial site reads the WHOLE entry (id + last_addr hint) by nickname.
         let dir = tempfile::tempdir().unwrap();
         let store = PeerStore::open(&dir.path().join("state.redb")).unwrap();
         let eid = [11u8; 32];
@@ -484,10 +484,10 @@ mod tests {
         // list() fails OPEN: skips the corrupt row, still returns the good one.
         let all = store.list().unwrap();
         assert_eq!(all.len(), 1);
-        assert_eq!(all[0].petname, "good");
+        assert_eq!(all[0].nickname, "good");
         // resolve() fails CLOSED on the corrupt key (deny), OK on the good key.
         assert!(store.resolve(&bad).unwrap().is_none());
-        assert_eq!(store.resolve(&good).unwrap().unwrap().petname, "good");
+        assert_eq!(store.resolve(&good).unwrap().unwrap().nickname, "good");
         // remove() also fails OPEN: a corrupt row can't match, and removing the good one
         // still works despite the corrupt row present.
         store.remove("good").unwrap();

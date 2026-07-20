@@ -28,7 +28,7 @@ fn first_run_mints_key_second_run_reuses_it() {
         "first run mints the device key"
     );
     // It is the real base32 endpoint id: it round-trips through iroh's `EndpointId` parser
-    // (the exact encoding `internal peer add <petname> <id>` accepts on the other machine).
+    // (the exact encoding `internal peer add <nickname> <id>` accepts on the other machine).
     assert!(
         id1.parse::<iroh::EndpointId>().is_ok(),
         "internal id prints a parseable endpoint id: {id1}"

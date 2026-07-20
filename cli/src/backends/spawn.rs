@@ -134,7 +134,7 @@ impl SpawnBackend {
         let child_stdout = child.stdout.take().expect("stdout piped above");
 
         // Session lifecycle audit: attribute to the gate-resolved identity (roster
-        // user_id if present, else petname). The cap-refusal path above returns before this, so a
+        // user_id if present, else nickname). The cap-refusal path above returns before this, so a
         // refused session is not recorded as opened.
         let peer = identity
             .as_ref()

@@ -7,7 +7,7 @@
 //! ── AC-clause → sub-test mapping (DECLARED; mirrors M2b's T8 decomposition) ──
 //!   * **"group-based allow works"** →
 //!     [`group_based_allow_admits_a_rostered_caller_and_injects_full_identity`]: a service that
-//!     admits a GROUP (`allow = ["team-eng"]`, NOT a user_id or petname) admits a rostered caller
+//!     admits a GROUP (`allow = ["team-eng"]`, NOT a user_id or nickname) admits a rostered caller
 //!     resolved into that group, and the served child sees the full §6.3 identity env
 //!     (`MCPMESH_PEER_NAME` + `MCPMESH_PEER_USER` + `MCPMESH_PEER_GROUPS`).
 //!   * **"revoked device cut from live sessions — including one holding a stale pair entry"** →
@@ -161,14 +161,14 @@ async fn wait_for_len(registry: &ConnRegistry, target: usize) {
 }
 
 /// **(AC: group-based allow works.)** A service that admits a GROUP (`allow = ["team-eng"]` — not a
-/// user_id, not a petname) admits a rostered caller resolved into that group, over a REAL session,
+/// user_id, not a nickname) admits a rostered caller resolved into that group, over a REAL session,
 /// and the served child sees the full §6.3 identity env: `MCPMESH_PEER_NAME` = user_id,
 /// `MCPMESH_PEER_USER` = user_id, `MCPMESH_PEER_GROUPS` = the comma-joined groups.
 #[tokio::test(flavor = "multi_thread")]
 async fn group_based_allow_admits_a_rostered_caller_and_injects_full_identity() {
     timeout(Duration::from_secs(60), async {
         let dir = tempfile::tempdir().unwrap();
-        // The service admits a GROUP, not a user_id or petname (the AC's "group-based allow works").
+        // The service admits a GROUP, not a user_id or nickname (the AC's "group-based allow works").
         let cfg = Config::from_toml_str(&format!(
             "[services.echo]\nrun = ['{STUB}']\nallow = [\"team-eng\"]\n"
         ))
@@ -262,7 +262,7 @@ async fn revoking_a_rostered_device_severs_its_live_session_and_a_stale_pair_ent
  {
     timeout(Duration::from_secs(60), async {
         let dir = tempfile::tempdir().unwrap();
-        // echo admits the roster GROUP `team-eng` (alice) AND the pairing petname `bob`.
+        // echo admits the roster GROUP `team-eng` (alice) AND the pairing nickname `bob`.
         let cfg = Config::from_toml_str(&format!(
             "[services.echo]\nrun = ['{STUB}']\nallow = [\"team-eng\", \"bob\"]\n"
         ))
@@ -280,7 +280,7 @@ async fn revoking_a_rostered_device_severs_its_live_session_and_a_stale_pair_ent
         store
             .add(PeerEntry {
                 endpoint_id: alice_id,
-                petname: "alice-stale".into(),
+                nickname: "alice-stale".into(),
                 services: vec!["echo".into()],
                 paired_at: None,
                 user_id: None,
@@ -290,7 +290,7 @@ async fn revoking_a_rostered_device_severs_its_live_session_and_a_stale_pair_ent
         store
             .add(PeerEntry {
                 endpoint_id: bob_id,
-                petname: "bob".into(),
+                nickname: "bob".into(),
                 services: vec!["echo".into()],
                 paired_at: None,
                 user_id: None,

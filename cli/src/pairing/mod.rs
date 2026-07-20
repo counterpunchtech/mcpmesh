@@ -29,8 +29,8 @@ pub struct Invite {
     /// The inviter's iroh `EndpointAddr` as `serde_json` — dialable, so pairing needs NO
     /// discovery (works on localhost).
     pub inviter_addr_json: String,
-    /// Suggested petname for the inviter (the redeemer's local name for it).
-    pub petname: String,
+    /// Suggested nickname for the inviter (the redeemer's local name for it).
+    pub nickname: String,
     /// Services the redeemer is granted (may dial on the inviter).
     pub services: Vec<String>,
     /// Absolute expiry, epoch seconds; `≤ now + 24h`. The daemon enforces it.
@@ -163,7 +163,7 @@ mod tests {
             secret: [secret; 32],
             inviter_id: [3u8; 32],
             inviter_addr_json: "{\"id\":\"abc\",\"addrs\":[]}".into(),
-            petname: "alice".into(),
+            nickname: "alice".into(),
             services: vec!["notes".into()],
             expires_at_epoch,
         }

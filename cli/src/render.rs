@@ -3,7 +3,7 @@
 //! testable without a daemon.
 //!
 //! Output discipline (the SECURITY.md bar): no transport vocabulary, raw endpoint ids, keys,
-//! or protocol names ever reach a human. Petnames, service names, plain status words, and
+//! or protocol names ever reach a human. Nicknames, service names, plain status words, and
 //! numbers only — the deliberate exceptions are the opaque copyable artifacts (`mcpmesh-invite:`
 //! lines and friends) and the short device/org fingerprints.
 
@@ -123,14 +123,14 @@ pub fn invite_lines(invite: &InviteResult, services: &[String], now: u64) -> Vec
 /// Render the `mcpmesh pair` success output: the SAS, the ceremony as the next step, what the
 /// pairing just unlocked, and EXACTLY how to use it from an AI client (the block
 /// [`proxy::client_instruction_lines`] owns). Pure so it is unit-testable. Surface-clean: it
-/// carries only the peer petname, the display-only SAS, the local `<peer>/<service>` mount names,
+/// carries only the peer nickname, the display-only SAS, the local `<peer>/<service>` mount names,
 /// and the `mcpmesh connect` command — NEVER a raw endpoint id (the daemon never sends one in a
 /// `PairResult`).
 ///
 /// The ceremony line comes FIRST and says "next" deliberately: confirming the code is what makes
 /// the pairing authentic, and it must happen before the service is used, not after.
 pub fn pair_lines(result: &PairResult) -> Vec<String> {
-    let peer = &result.peer_petname;
+    let peer = &result.peer_nickname;
     let mut lines = vec![
         format!("Paired with {peer} — code: {}", result.sas_code),
         format!(
@@ -252,7 +252,7 @@ pub fn render_status(
                 peer.services.join(", ")
             };
             // Append the peer's proven self-sovereign user_id when it presented a verified binding at
-            // pairing — otherwise the peer is petname-only (nothing extra to show).
+            // pairing — otherwise the peer is nickname-only (nothing extra to show).
             match &peer.user_id {
                 Some(user_id) => {
                     println!("  {} · services: {services} · {user_id}", peer.name)
@@ -276,7 +276,7 @@ pub fn render_status(
     // The recent-pairings block (the pairing-ceremony surface): the INVITER's half of "both humans
     // compare the code" — each pairing this daemon accepted since it started, newest first, with
     // the SAME display-only SAS the redeemer's `pair` printed. In-memory on the daemon (a restart
-    // clears it); empty → nothing prints. Surface-clean: petname + SAS words + a friendly
+    // clears it); empty → nothing prints. Surface-clean: nickname + SAS words + a friendly
     // age ONLY — never an endpoint id.
     if !status.recent_pairings.is_empty() {
         println!();
@@ -317,10 +317,10 @@ pub fn render_status(
     }
 }
 
-/// Render the reachability block of `status`: one line per paired peer, `  <petname> · <state>`
+/// Render the reachability block of `status`: one line per paired peer, `  <nickname> · <state>`
 /// with the last RTT when online. Pure so it is unit-testable. A never-probed peer reads
 /// "checking…" — a refresh is already in flight, and a bare ellipsis would read as a rendering
-/// glitch rather than a state (issue #12). Surface-clean: petname + a status word + a latency
+/// glitch rather than a state (issue #12). Surface-clean: nickname + a status word + a latency
 /// NUMBER only.
 pub fn reachability_lines(reachability: &[PeerReachability]) -> Vec<String> {
     reachability
@@ -376,7 +376,7 @@ pub fn use_target_error(peer: &str, service: &str, peers: &[PeerInfo]) -> Option
 }
 
 /// Render the `status` next-steps footer: the exact command for each thing this node can do from
-/// where it currently is. Pure so it is unit-testable. Surface-clean: petnames + service
+/// where it currently is. Pure so it is unit-testable. Surface-clean: nicknames + service
 /// names + porcelain commands only.
 ///
 /// Each step is offered only when it is genuinely the user's next move, so a fully configured node
@@ -425,8 +425,8 @@ pub fn next_steps_lines(status: &StatusResult) -> Vec<String> {
 }
 
 /// Render the recent-pairings block of `status`: one line per completed inviter-side pairing,
-/// `  <petname> · code: <sas> · <age>`. Pure so it is unit-testable. Surface-clean:
-/// the peer petname, the display-only SAS words (the pairing-ceremony artifact, like
+/// `  <nickname> · code: <sas> · <age>`. Pure so it is unit-testable. Surface-clean:
+/// the peer nickname, the display-only SAS words (the pairing-ceremony artifact, like
 /// [`pair_lines`]'s), and a friendly age ONLY — a `RecentPairing` carries no endpoint id, so the
 /// lines can't either.
 pub fn recent_pairing_lines(pairings: &[RecentPairing], now: u64) -> Vec<String> {
@@ -435,7 +435,7 @@ pub fn recent_pairing_lines(pairings: &[RecentPairing], now: u64) -> Vec<String>
         .map(|p| {
             format!(
                 "  {} · code: {} · {}",
-                p.peer_petname,
+                p.peer_nickname,
                 p.sas_code,
                 friendly_age(p.paired_at_epoch, now)
             )
@@ -513,7 +513,7 @@ fn kind_label(kind: AuditKind) -> &'static str {
 /// Render one typed `subscribe` stream frame to a display line. Pure so the rendering is
 /// unit-testable without a live daemon. Optional record fields degrade to an empty piece (a bare
 /// trust event has no peer/service — never a dangling separator). Surface-clean: only
-/// petnames/service names/user_ids/numbers appear — the stream carries no endpoint id.
+/// nicknames/service names/user_ids/numbers appear — the stream carries no endpoint id.
 pub fn render_frame(frame: &StreamFrame) -> String {
     match frame {
         StreamFrame::Snapshot {
@@ -609,7 +609,7 @@ mod tests {
     #[test]
     fn pair_lines_render_the_sas_and_mount_targets() {
         let result = PairResult {
-            peer_petname: "alice".into(),
+            peer_nickname: "alice".into(),
             sas_code: "tango-fig-42".into(),
             services: vec!["notes".into()],
         };
@@ -638,7 +638,7 @@ mod tests {
     #[test]
     fn pair_lines_join_multiple_mount_targets_as_peer_slash_service() {
         let result = PairResult {
-            peer_petname: "alice".into(),
+            peer_nickname: "alice".into(),
             sas_code: "a-b-c".into(),
             services: vec!["notes".into(), "kb".into()],
         };
@@ -657,12 +657,12 @@ mod tests {
 
     #[test]
     fn pair_lines_leak_no_endpoint_id() {
-        // The pair porcelain shows the petname, the SAS, and the local `<peer>/<service>`
+        // The pair porcelain shows the nickname, the SAS, and the local `<peer>/<service>`
         // mount names — all permitted pairing artifacts. It must NEVER contain a raw base32
         // endpoint id. A PairResult carries none, so the rendered lines can't either; assert it.
         let alice_id = iroh::SecretKey::from_bytes(&[7u8; 32]).public().to_string();
         let result = PairResult {
-            peer_petname: "alice".into(),
+            peer_nickname: "alice".into(),
             sas_code: "tango-fig-42".into(),
             services: vec!["notes".into()],
         };
@@ -681,7 +681,7 @@ mod tests {
     fn pair_lines_tolerate_an_empty_service_grant() {
         // Defensive shape: no dangling "You can mount:" when services is empty.
         let result = PairResult {
-            peer_petname: "alice".into(),
+            peer_nickname: "alice".into(),
             sas_code: "a-b-c".into(),
             services: vec![],
         };
@@ -1066,15 +1066,15 @@ mod tests {
     }
 
     #[test]
-    fn recent_pairing_lines_render_petname_code_and_age() {
+    fn recent_pairing_lines_render_nickname_code_and_age() {
         let pairings = vec![
             RecentPairing {
-                peer_petname: "bob".into(),
+                peer_nickname: "bob".into(),
                 sas_code: "tango-fig-cabbage".into(),
                 paired_at_epoch: 1_000_000,
             },
             RecentPairing {
-                peer_petname: "carol".into(),
+                peer_nickname: "carol".into(),
                 sas_code: "anchor-bean-cable".into(),
                 paired_at_epoch: 1_000_000 - 5 * 60,
             },
@@ -1086,12 +1086,12 @@ mod tests {
 
     #[test]
     fn recent_pairing_lines_leak_no_endpoint_id_or_transport_vocabulary() {
-        // The recent-pairings block carries the petname, the SAS words, and a friendly age
+        // The recent-pairings block carries the nickname, the SAS words, and a friendly age
         // ONLY. A RecentPairing carries no endpoint id, so the lines can't either — assert it,
         // and assert no transport vocabulary.
         let bob_id = iroh::SecretKey::from_bytes(&[7u8; 32]).public().to_string();
         let pairings = vec![RecentPairing {
-            peer_petname: "bob".into(),
+            peer_nickname: "bob".into(),
             sas_code: "tango-fig-cabbage".into(),
             paired_at_epoch: 100,
         }];

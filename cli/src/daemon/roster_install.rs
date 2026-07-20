@@ -520,7 +520,7 @@ mod tests {
     use mcpmesh_trust::roster::encode_b64u;
 
     /// `org_join` validates the pk BEFORE writing (garbage never lands), pins the four identity keys
-    /// (preserving `petname`), and flips `roster_status` from `None` (pure-pairing) to `"pending"`
+    /// (preserving `nickname`), and flips `roster_status` from `None` (pure-pairing) to `"pending"`
     /// with serial 0 + the pinned org-root fingerprint.
     #[tokio::test(flavor = "multi_thread")]
     async fn org_join_pins_and_status_reports_pending() {
@@ -528,7 +528,7 @@ mod tests {
         let config_path = dir.path().join("config.toml");
         std::fs::write(
             &config_path,
-            "[network]\nrelay_mode = \"disabled\"\n\n[identity]\npetname = \"mydev\"\n",
+            "[network]\nrelay_mode = \"disabled\"\n\n[identity]\nnickname = \"mydev\"\n",
         )
         .unwrap();
         let mesh = hermetic_mesh(config_path.clone()).await;
@@ -589,7 +589,7 @@ mod tests {
             }
         );
 
-        // The four identity keys are pinned; the pre-existing petname is preserved.
+        // The four identity keys are pinned; the pre-existing nickname is preserved.
         let cfg = Config::load(&config_path).unwrap();
         assert_eq!(cfg.identity.org_id.as_deref(), Some("acme"));
         assert_eq!(cfg.identity.org_root_pk.as_deref(), Some(pk_str.as_str()));
@@ -598,7 +598,7 @@ mod tests {
             cfg.identity.user_key.as_deref(),
             Some(Path::new("/home/alice/user.key"))
         );
-        assert_eq!(cfg.identity.petname.as_deref(), Some("mydev"));
+        assert_eq!(cfg.identity.nickname.as_deref(), Some("mydev"));
 
         // Status is now "pending": org pinned, NO roster installed → serial 0 + the fingerprint.
         let status = live_status(&mesh).expect("pinned org surfaces a pending status");

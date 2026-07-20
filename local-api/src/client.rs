@@ -175,7 +175,7 @@ impl ControlClient {
             .await
     }
 
-    /// Redeem a pairing invite; return the inviter's suggested petname, the display-only SAS
+    /// Redeem a pairing invite; return the inviter's suggested nickname, the display-only SAS
     /// code, and the granted services.
     pub async fn pair(&mut self, invite_line: &str) -> Result<PairResult, ClientError> {
         self.request_typed(
@@ -187,28 +187,28 @@ impl ControlClient {
         .await
     }
 
-    /// Unpair a peer by petname: drops its identity row AND its every-`allow` membership
+    /// Unpair a peer by nickname: drops its identity row AND its every-`allow` membership
     /// (idempotent; live sessions are not severed). The daemon acks; the ack body is discarded.
-    pub async fn peer_remove(&mut self, petname: &str) -> Result<(), ClientError> {
+    pub async fn peer_remove(&mut self, nickname: &str) -> Result<(), ClientError> {
         self.request_ack(Request::PeerRemove(PeerRemoveParams {
-            petname: petname.to_string(),
+            nickname: nickname.to_string(),
         }))
         .await
     }
 
     /// Rename a contact's nickname to `to` — every device sharing `user_id` when given, else the
-    /// single provisional `petname` entry — carrying its grants along. The daemon refuses (a
+    /// single provisional `nickname` entry — carrying its grants along. The daemon refuses (a
     /// [`ClientError::Api`]) when `to` is empty or already names a different identity. The daemon
     /// acks; the ack body is discarded.
     pub async fn peer_rename(
         &mut self,
         user_id: Option<String>,
-        petname: Option<String>,
+        nickname: Option<String>,
         to: &str,
     ) -> Result<(), ClientError> {
         self.request_ack(Request::PeerRename(PeerRenameParams {
             user_id,
-            petname,
+            nickname,
             to: to.to_string(),
         }))
         .await
@@ -308,7 +308,7 @@ impl ControlClient {
     }
 
     /// Grant a scope to a principal — any flat-namespace entry: a group name, a user_id,
-    /// or a petname (the shared `principal_set` expansion).
+    /// or a nickname (the shared `principal_set` expansion).
     /// The daemon acks; the ack body is discarded (a JSON-RPC error surfaces as
     /// `ClientError::Api`). Granting a scope to your own user_id reaches ALL of that
     /// person's devices.
@@ -721,7 +721,7 @@ mod tests {
                 Inbound::Violation(_) => panic!("violation"),
             };
             assert_eq!(req["method"], "peer_remove");
-            assert_eq!(req["params"]["petname"], "bob");
+            assert_eq!(req["params"]["nickname"], "bob");
             write_frame(
                 &mut writer,
                 &serde_json::json!({"jsonrpc":"2.0","id":1,"result":{}}),

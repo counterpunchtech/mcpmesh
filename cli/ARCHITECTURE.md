@@ -30,7 +30,7 @@ step — `mcpmesh` is a single self-hosting binary.
 | `daemon/accept.rs` | the ALPN-dispatch accept loop + the shared gate-and-register discipline |
 | `daemon/handlers.rs` | control verbs: register/peer add/remove/rename, invite/pair, blobs, open_session |
 | `daemon/roster_install.rs` | the single roster install pipeline (validate → persist → swap → sever) |
-| `daemon/dial.rs` | outbound: petname/person resolution, staggered race dial, the session pipe |
+| `daemon/dial.rs` | outbound: nickname/person resolution, staggered race dial, the session pipe |
 | `daemon/reach.rs` | trust-gated reachability probe + its advisory cache |
 | `daemon/status.rs` | live `status` projections (services, peers, roster, presence) |
 | `daemon/config_write.rs` | surgical, atomic `config.toml` read-modify-write helpers |

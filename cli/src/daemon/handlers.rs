@@ -187,7 +187,7 @@ pub(crate) async fn register_service(
 pub(crate) async fn add_peer(state: &DaemonState, params: PeerAddParams) -> Result<()> {
     let mesh = state.mesh_required()?;
     let PeerAddParams {
-        petname,
+        nickname,
         endpoint_id,
         allow,
     } = params;
@@ -198,7 +198,7 @@ pub(crate) async fn add_peer(state: &DaemonState, params: PeerAddParams) -> Resu
         .map_err(|e| anyhow::anyhow!("peer_add: endpoint_id is not a valid EndpointId: {e}"))?;
     let entry = PeerEntry {
         endpoint_id: *endpoint_id.as_bytes(),
-        petname: petname.clone(),
+        nickname: nickname.clone(),
         services: allow,
         // `internal peer add` is not a pairing write — leave the audit stamp unset
         // (only the pair rendezvous records `paired_at`) and no pairing-proven dial hint
@@ -212,7 +212,7 @@ pub(crate) async fn add_peer(state: &DaemonState, params: PeerAddParams) -> Resu
     let store = mesh.store.clone();
     blocking("join peer add", move || store.add(entry)).await??;
 
-    tracing::info!(peer = %petname, "added peer to allowlist");
+    tracing::info!(peer = %nickname, "added peer to allowlist");
     Ok(())
 }
 
@@ -222,7 +222,7 @@ pub(crate) async fn add_peer(state: &DaemonState, params: PeerAddParams) -> Resu
 /// **Fail-safe teardown order (DECLARED).** The pairing grant writes, in order, (1) the
 /// [`PeerEntry`] (identity — who the peer is) then (2) the config `allow` append (authorization —
 /// what it may open). Removal is that grant's LIFO inverse: undo (2) FIRST via
-/// `revoke_service_access` (strip the petname from every `[services.*].allow`, the
+/// `revoke_service_access` (strip the nickname from every `[services.*].allow`, the
 /// security-relevant half), THEN undo (1) via [`PeerStore::remove`] (drop the identity row). This
 /// leaves the peer MORE restricted, never less, at every partial-failure point:
 ///  - revoke fails → we abort BEFORE touching the store: the peer is unchanged (still fully
@@ -235,8 +235,8 @@ pub(crate) async fn add_peer(state: &DaemonState, params: PeerAddParams) -> Resu
 /// allow name that also trips the pairing collision guard on a later re-pair; revoke-first avoids
 /// that.)
 ///
-/// **Unknown petname is an error (DECLARED).** When NEITHER half tears anything down (no allow
-/// stripped, no PeerEntry deleted) the petname matches no paired peer, and the removal FAILS with
+/// **Unknown nickname is an error (DECLARED).** When NEITHER half tears anything down (no allow
+/// stripped, no PeerEntry deleted) the nickname matches no paired peer, and the removal FAILS with
 /// a pointer at `mcpmesh status` — false success on a revocation surface would make a typo read
 /// as a completed cut-off. Each half stays individually idempotent, so retrying a
 /// partially-failed removal (allow stripped, identity row still present) still finishes clean.
@@ -251,50 +251,50 @@ pub(crate) async fn add_peer(state: &DaemonState, params: PeerAddParams) -> Resu
 /// config (which the `pair --remove` tests assert on), and `status` now reads exactly that.
 pub async fn remove_peer(state: &DaemonState, params: PeerRemoveParams) -> Result<()> {
     let mesh = state.mesh_required()?;
-    let petname = params.petname;
+    let nickname = params.nickname;
 
     // (2)⁻¹ AUTHORIZATION: revoke first (the security-relevant half). Propagate its error so a
     // failure aborts before we touch the identity row (see the fail-safe reasoning above). Capture
     // whether an allow was actually stripped — one half of the actual-removal signal.
-    let revoked = revoke_service_access(mesh, &petname).await?;
+    let revoked = revoke_service_access(mesh, &nickname).await?;
 
-    // (1)⁻¹ IDENTITY: drop the PeerEntry (removes ALL entries sharing this petname — petnames are
+    // (1)⁻¹ IDENTITY: drop the PeerEntry (removes ALL entries sharing this nickname — nicknames are
     // not unique). redb writes block + fsync — run on a blocking thread. Capture
     // whether a PeerEntry was actually deleted — the other half of the actual-removal signal.
     let store = mesh.store.clone();
-    let petname_w = petname.clone();
-    let removed = blocking("join peer remove", move || store.remove(&petname_w)).await??;
+    let nickname_w = nickname.clone();
+    let removed = blocking("join peer remove", move || store.remove(&nickname_w)).await??;
 
-    // Actual-removal signal: neither an allow stripped NOR a PeerEntry deleted means the petname
+    // Actual-removal signal: neither an allow stripped NOR a PeerEntry deleted means the nickname
     // matches no paired peer. `pair --remove` is a REVOCATION surface — reporting success here
     // would let a typo ("alice" vs "Alice") read as a completed cut-off — so an all-no-op removal
     // is an ERROR, not a silent success. Retry-after-partial-failure still completes: with the
     // allow already stripped but the identity row still present, `removed` comes back true.
     if !revoked && !removed {
-        anyhow::bail!("no paired peer named '{petname}' — 'mcpmesh status' lists your peers");
+        anyhow::bail!("no paired peer named '{nickname}' — 'mcpmesh status' lists your peers");
     }
 
-    tracing::info!(peer = %petname, "unpaired peer");
+    tracing::info!(peer = %nickname, "unpaired peer");
     // Trust event: an unpair — reached only when something was ACTUALLY torn down (a
     // stripped allow OR a deleted PeerEntry; the all-no-op case errored above), so a refused
-    // remove of a never-paired petname writes NO phantom `unpair` record. Petname only.
+    // remove of a never-paired nickname writes NO phantom `unpair` record. Nickname only.
     mesh.audit().record(AuditRecord::trust(
         now_ts(),
         "unpair".into(),
-        Some(petname.clone()),
+        Some(nickname.clone()),
     ));
     Ok(())
 }
 
-/// The vetted plan for a rename: the target [`PeerEntry`]s (the person) and their current petnames.
+/// The vetted plan for a rename: the target [`PeerEntry`]s (the person) and their current nicknames.
 struct RenamePlan {
     targets: Vec<PeerEntry>,
-    old_petnames: std::collections::BTreeSet<String>,
+    old_nicknames: std::collections::BTreeSet<String>,
 }
 
 /// Identify the person's entries and run the rename COLLISION GUARD (privilege-escalation defense,
-/// mirroring pairing's `petname_collision`). The person is every entry sharing `user_id` (renames all
-/// their devices in one op), else the single entry named `petname` (a provisional contact). Returns
+/// mirroring pairing's `nickname_collision`). The person is every entry sharing `user_id` (renames all
+/// their devices in one op), else the single entry named `nickname` (a provisional contact). Returns
 /// `Ok(None)` when every target is already named `to` (a no-op), `Ok(Some(plan))` when the rename is
 /// safe, or `Err` when no contact matches or `to` would inherit a DIFFERENT identity's access.
 /// Blocking (redb + config read) — call on a blocking thread.
@@ -302,7 +302,7 @@ fn rename_plan(
     store: &PeerStore,
     config_path: &Path,
     user_id: Option<&str>,
-    petname: Option<&str>,
+    nickname: Option<&str>,
     to: &str,
 ) -> Result<Option<RenamePlan>> {
     let all = store.list()?;
@@ -310,14 +310,14 @@ fn rename_plan(
         .iter()
         .filter(|e| match user_id {
             Some(u) => e.user_id.as_deref() == Some(u),
-            None => Some(e.petname.as_str()) == petname,
+            None => Some(e.nickname.as_str()) == nickname,
         })
         .cloned()
         .collect();
     if targets.is_empty() {
         anyhow::bail!("peer_rename: no matching contact");
     }
-    if targets.iter().all(|e| e.petname == to) {
+    if targets.iter().all(|e| e.nickname == to) {
         return Ok(None); // already named `to` — a no-op
     }
 
@@ -327,28 +327,29 @@ fn rename_plan(
     // DIFFERENT contact — renaming onto it would let this person assume that identity's grants.
     if all
         .iter()
-        .any(|e| e.petname == to && !target_ids.contains(&e.endpoint_id))
+        .any(|e| e.nickname == to && !target_ids.contains(&e.endpoint_id))
     {
         anyhow::bail!("the nickname \"{to}\" is already used by another contact");
     }
     // (b) orphan-allow: `to` sits in some service allow but backs NO peer — a pre-provisioned grant
     // the renamed peer would inherit. (If a target is already named `to`, a backing peer exists.)
-    let backed_by_peer = all.iter().any(|e| e.petname == to);
-    if !backed_by_peer && crate::pairing::rendezvous::petname_in_any_service_allow(config_path, to)?
+    let backed_by_peer = all.iter().any(|e| e.nickname == to);
+    if !backed_by_peer
+        && crate::pairing::rendezvous::nickname_in_any_service_allow(config_path, to)?
     {
         anyhow::bail!("the nickname \"{to}\" is already granted access — pick another");
     }
 
-    let old_petnames = targets.iter().map(|e| e.petname.clone()).collect();
+    let old_nicknames = targets.iter().map(|e| e.nickname.clone()).collect();
     Ok(Some(RenamePlan {
         targets,
-        old_petnames,
+        old_nicknames,
     }))
 }
 
 /// Handle a `peer_rename` control request (the Contacts rename). Renames a contact's
-/// nickname (petname) authoritatively — all the person's `PeerEntry`s to `to`, and rewrites the old
-/// petname → `to` in every `[services.*].allow` so grants follow — then reloads so the new name
+/// nickname (nickname) authoritatively — all the person's `PeerEntry`s to `to`, and rewrites the old
+/// nickname → `to` in every `[services.*].allow` so grants follow — then reloads so the new name
 /// admits. Guarded against renaming onto another identity's name/grant. Held entirely under
 /// `reload_lock` (like grant/revoke/register) so guard→mutate→reload is one atomic critical section.
 pub async fn rename_peer(state: &DaemonState, params: PeerRenameParams) -> Result<()> {
@@ -358,9 +359,9 @@ pub async fn rename_peer(state: &DaemonState, params: PeerRenameParams) -> Resul
         anyhow::bail!("peer_rename: the new nickname is empty");
     }
     let PeerRenameParams {
-        user_id, petname, ..
+        user_id, nickname, ..
     } = params;
-    if user_id.is_none() && petname.is_none() {
+    if user_id.is_none() && nickname.is_none() {
         anyhow::bail!("peer_rename: no contact identified");
     }
 
@@ -370,7 +371,7 @@ pub async fn rename_peer(state: &DaemonState, params: PeerRenameParams) -> Resul
 
     let store = mesh.store.clone();
     let config_path = mesh.config_path.clone();
-    let (uid_c, pn_c, to_c) = (user_id.clone(), petname.clone(), to.clone());
+    let (uid_c, pn_c, to_c) = (user_id.clone(), nickname.clone(), to.clone());
     let plan = blocking("join rename plan", move || {
         rename_plan(
             &store,
@@ -383,32 +384,32 @@ pub async fn rename_peer(state: &DaemonState, params: PeerRenameParams) -> Resul
     .await??;
     let RenamePlan {
         targets,
-        old_petnames,
+        old_nicknames,
     } = match plan {
         Some(p) => p,
         None => return Ok(()), // no-op: already named `to`
     };
 
-    // Mutate on a blocking thread: rewrite each old petname → `to` in the config allow lists, then
-    // upsert each target `PeerEntry` (same endpoint_id, new petname).
+    // Mutate on a blocking thread: rewrite each old nickname → `to` in the config allow lists, then
+    // upsert each target `PeerEntry` (same endpoint_id, new nickname).
     let store = mesh.store.clone();
     let config_path = mesh.config_path.clone();
     let to_c = to.clone();
     blocking("join rename mutate", move || {
-        for old in &old_petnames {
+        for old in &old_nicknames {
             if old != &to_c {
                 rename_allow_in_config(&config_path, old, &to_c)?;
             }
         }
         for mut e in targets {
-            e.petname = to_c.clone();
+            e.nickname = to_c.clone();
             store.add(e)?;
         }
         anyhow::Ok(())
     })
     .await??;
 
-    // Reload so the rebuilt `Services` admit under the new petname (select_service reads the allow
+    // Reload so the rebuilt `Services` admit under the new nickname (select_service reads the allow
     // baked in at build time).
     reload_services_from_disk(mesh, "rename").await?;
     tracing::info!(to = %to, "renamed contact");
@@ -443,7 +444,7 @@ fn unregistered_service_error(requested: &[String], served: &[String]) -> Option
 /// Mint a one-time pairing invite granting `services`.
 ///
 /// Builds an [`Invite`] { 32 CSPRNG-byte secret, our endpoint id + dialable address, our
-/// suggested petname, the granted services, a `≤ now + 24h` expiry }, registers it in the
+/// suggested nickname, the granted services, a `≤ now + 24h` expiry }, registers it in the
 /// live registry so the accept loop's `mcpmesh/pair/1` branch will redeem it, and returns the
 /// copyable `mcpmesh-invite:` line. Logs a trust event carrying NO secret and NO peer
 /// id — an invite has no peer yet; the redeemer is only known once it dials the rendezvous.
@@ -490,7 +491,7 @@ pub(crate) async fn mint_invite(services: Vec<String>, mesh: &MeshState) -> Resu
         secret,
         inviter_id,
         inviter_addr_json,
-        petname: mesh.self_petname.clone(),
+        nickname: mesh.self_nickname.clone(),
         services: services.clone(),
         expires_at_epoch,
     };
@@ -512,15 +513,15 @@ pub(crate) async fn mint_invite(services: Vec<String>, mesh: &MeshState) -> Resu
 /// Handle a `pair` control request: dial the inviter named by
 /// `invite_line` on `mcpmesh/pair/1`, verify its TLS identity binds the invite's `inviter_id`
 /// (the address-swap defense), prove the secret, write OUR dial-back [`PeerEntry`], and return
-/// the inviter's petname + the display-only SAS. Delegates to
-/// [`crate::pairing::rendezvous::redeem_invite`], threading our own endpoint + self-petname +
+/// the inviter's nickname + the display-only SAS. Delegates to
+/// [`crate::pairing::rendezvous::redeem_invite`], threading our own endpoint + self-nickname +
 /// store. The inviter-side authorization (adding US to its service `allow`) happens on ITS
 /// daemon inside its rendezvous handler — see [`grant_service_access`].
 pub(crate) async fn redeem(state: &DaemonState, invite_line: String) -> Result<PairResult> {
     let mesh = state.mesh_required()?;
     crate::pairing::rendezvous::redeem_invite(
         mesh.endpoint.clone(),
-        mesh.self_petname.clone(),
+        mesh.self_nickname.clone(),
         invite_line,
         mesh.store.clone(),
         mesh.self_binding(),
@@ -529,12 +530,12 @@ pub(crate) async fn redeem(state: &DaemonState, invite_line: String) -> Result<P
 }
 
 /// Grant a freshly-paired peer AUTHORIZATION to the services its invite named: append
-/// `redeemer_petname` to each service's config `[services.<svc>].allow` (idempotently) and
+/// `redeemer_nickname` to each service's config `[services.<svc>].allow` (idempotently) and
 /// hot-reload so the running registry admits it. This is the load-bearing half of pairing.
 ///
 /// Why it is separate from (and necessary alongside) the [`PeerEntry`] the rendezvous writes:
 /// the [`AllowlistGate`](crate::allowlist::AllowlistGate) only RESOLVES an inbound endpoint to
-/// a petname (identity); `select_service` then ADMITS that petname only if the
+/// a nickname (identity); `select_service` then ADMITS that nickname only if the
 /// service's config `allow` names it — and that allow is baked into the [`Services`](mcpmesh_net::Services) snapshot
 /// at [`build_services`](crate::daemon::build_services) time. So a PeerEntry makes the peer KNOWN; only appending to `allow`
 /// + reloading makes it AUTHORIZED. Without this the peer is known-but-forbidden.
@@ -551,7 +552,7 @@ pub(crate) async fn redeem(state: &DaemonState, invite_line: String) -> Result<P
 /// + the live rebuilt `Services` are the functional truth.)
 pub async fn grant_service_access(
     mesh: &Arc<MeshState>,
-    redeemer_petname: &str,
+    redeemer_nickname: &str,
     services: &[String],
 ) -> Result<()> {
     // SAME serialization as register_service: hold the whole append→reload→swap section.
@@ -559,10 +560,10 @@ pub async fn grant_service_access(
 
     // 1. Idempotent allow-append on a blocking thread (config IO blocks).
     let config_path = mesh.config_path.clone();
-    let petname = redeemer_petname.to_string();
+    let nickname = redeemer_nickname.to_string();
     let services_w = services.to_vec();
     let changed = blocking("join grant config write", move || {
-        append_allow_to_config(&config_path, &petname, &services_w)
+        append_allow_to_config(&config_path, &nickname, &services_w)
     })
     .await??;
 
@@ -573,58 +574,58 @@ pub async fn grant_service_access(
         reload_services_from_disk(mesh, "grant").await?;
     }
 
-    // Trust event: NO secret, NO endpoint id (petname only).
-    tracing::info!(peer = %redeemer_petname, ?services, changed, "granted service access");
-    // Trust event: a pairing grant. Petname only — NO secret, NO endpoint id.
+    // Trust event: NO secret, NO endpoint id (nickname only).
+    tracing::info!(peer = %redeemer_nickname, ?services, changed, "granted service access");
+    // Trust event: a pairing grant. Nickname only — NO secret, NO endpoint id.
     mesh.audit().record(AuditRecord::trust(
         now_ts(),
         "pair".into(),
-        Some(redeemer_petname.to_string()),
+        Some(redeemer_nickname.to_string()),
     ));
     Ok(())
 }
 
-/// Revoke a peer's AUTHORIZATION: remove `petname` from EVERY service's config
+/// Revoke a peer's AUTHORIZATION: remove `nickname` from EVERY service's config
 /// `[services.<svc>].allow` and hot-reload so the running registry stops admitting it. The exact
-/// INVERSE of [`grant_service_access`] (which appends the petname to the named services' allow),
+/// INVERSE of [`grant_service_access`] (which appends the nickname to the named services' allow),
 /// and the authorization half of [`remove_peer`].
 ///
 /// Serialized against [`register_service`] / [`grant_service_access`] via `mesh.reload_lock` (the
 /// SAME lock — a concurrent config mutation must not read the same base config and clobber this
 /// removal). Reuses [`remove_allow_from_config`]'s atomic write and [`reload_accept_loop`]'s
 /// abort/respawn (DRY — the same helper the grant uses). Reloads ONLY when the removal actually
-/// changed the config (an absent petname is a no-op with no serving blip). Idempotent: revoking a
-/// petname not present in any allow returns `Ok(())` with `changed == false` and no reload.
+/// changed the config (an absent nickname is a no-op with no serving blip). Idempotent: revoking a
+/// nickname not present in any allow returns `Ok(())` with `changed == false` and no reload.
 ///
 /// (Like [`grant_service_access`], the cached `status` snapshot is not refreshed here — but
 /// `status` reads the config + store LIVE (control.rs `status_result`), so the removal shows up
 /// immediately. The durable allow-removal + the live rebuilt `Services` are the functional truth.)
-pub(crate) async fn revoke_service_access(mesh: &Arc<MeshState>, petname: &str) -> Result<bool> {
+pub(crate) async fn revoke_service_access(mesh: &Arc<MeshState>, nickname: &str) -> Result<bool> {
     // SAME serialization as register_service / grant: hold the whole remove→reload→swap section.
     let _reload = mesh.reload_lock.lock().await;
 
     // 1. Idempotent allow-removal on a blocking thread (config IO blocks).
     let config_path = mesh.config_path.clone();
-    let petname_w = petname.to_string();
+    let nickname_w = nickname.to_string();
     let changed = blocking("join revoke config write", move || {
-        remove_allow_from_config(&config_path, &petname_w)
+        remove_allow_from_config(&config_path, &nickname_w)
     })
     .await??;
 
     // 2/3. Reload + hot-swap ONLY when the allow actually changed (else the running registry
     //      already excludes the peer). A real removal MUST reload for `select_service` — which
-    //      reads the allow baked into `Services` at build time — to stop admitting the petname.
+    //      reads the allow baked into `Services` at build time — to stop admitting the nickname.
     if changed {
         reload_services_from_disk(mesh, "revoke").await?;
     }
 
     // Return whether an allow was actually stripped so `remove_peer` audits an `unpair` only
-    // on a real tear-down (petname only — NO secret, NO endpoint id).
-    tracing::info!(peer = %petname, changed, "revoked service access");
+    // on a real tear-down (nickname only — NO secret, NO endpoint id).
+    tracing::info!(peer = %nickname, changed, "revoked service access");
     Ok(changed)
 }
 
-/// Handle an `open_session` control request: resolve the petname, dial the named
+/// Handle an `open_session` control request: resolve the nickname, dial the named
 /// service over the mesh, and pipe that session to/from the control connection — which, after
 /// this request, STOPS being JSON-RPC and becomes a raw MCP byte pipe (protocol.rs
 /// `OpenSession`). On any dial-ESTABLISHMENT failure (peer not allowlisted, malformed stored
@@ -660,7 +661,7 @@ where
             // it (no session_open/close). Emit an error record HERE — exactly once, ONLY on
             // this failure branch (the Ok arm pipes the session instead) — so the telemetry
             // stream shows the attempted-and-failed reach. `peer` is the caller's
-            // petname/user_id, never an endpoint-id.
+            // nickname/user_id, never an endpoint-id.
             mesh.audit().record(
                 AuditRecord::session_open(now_ts(), Some(peer.to_string()), service.to_string())
                     .with_status("error"),
@@ -736,13 +737,13 @@ mod tests {
     }
 
     /// `rename_peer` renames ALL of a person's devices (matched by user_id) to the new nickname AND
-    /// rewrites the old petname → new in every service allow, so grants FOLLOW the rename. The happy
+    /// rewrites the old nickname → new in every service allow, so grants FOLLOW the rename. The happy
     /// path also drives `build_services_audited` + `reload_accept_loop` under `reload_lock`.
     /// The typed `peer_rename` params, as the control dispatcher hands them to `rename_peer`.
     fn rename_params(user_id: Option<&str>, to: &str) -> PeerRenameParams {
         PeerRenameParams {
             user_id: user_id.map(str::to_string),
-            petname: None,
+            nickname: None,
             to: to.into(),
         }
     }
@@ -776,7 +777,7 @@ mod tests {
             .list()
             .unwrap()
             .into_iter()
-            .map(|e| e.petname)
+            .map(|e| e.nickname)
             .collect();
         assert!(
             names.iter().all(|n| n == "Alice"),
@@ -817,7 +818,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        // Neither user_id nor petname identifies a contact.
+        // Neither user_id nor nickname identifies a contact.
         assert!(rename_peer(&state, rename_params(None, "X")).await.is_err());
         // No matching contact.
         assert!(
@@ -837,7 +838,7 @@ mod tests {
             .list()
             .unwrap()
             .into_iter()
-            .map(|e| e.petname)
+            .map(|e| e.nickname)
             .collect();
         assert!(
             names.contains("alice") && names.contains("bob"),
@@ -845,10 +846,10 @@ mod tests {
         );
     }
 
-    fn rename_entry(id: u8, petname: &str, user_id: Option<&str>) -> PeerEntry {
+    fn rename_entry(id: u8, nickname: &str, user_id: Option<&str>) -> PeerEntry {
         PeerEntry {
             endpoint_id: [id; 32],
-            petname: petname.into(),
+            nickname: nickname.into(),
             services: Vec::new(),
             paired_at: None,
             user_id: user_id.map(str::to_string),
@@ -878,7 +879,7 @@ mod tests {
             .unwrap();
         assert_eq!(plan.targets.len(), 2);
         assert_eq!(
-            plan.old_petnames,
+            plan.old_nicknames,
             ["bob-laptop".to_string(), "bob-phone".to_string()]
                 .into_iter()
                 .collect()
@@ -888,7 +889,7 @@ mod tests {
         assert!(rename_plan(&store, &cfg, Some("b64u:BOB"), None, "carol").is_err());
         // GUARD (b) orphan-allow: "orphan" sits in kb.allow but backs no peer → refused.
         assert!(rename_plan(&store, &cfg, Some("b64u:BOB"), None, "orphan").is_err());
-        // A provisional contact (no user_id) renames by petname to a fresh name.
+        // A provisional contact (no user_id) renames by nickname to a fresh name.
         store.add(rename_entry(4, "dave", None)).unwrap();
         assert_eq!(
             rename_plan(&store, &cfg, None, Some("dave"), "Dave")

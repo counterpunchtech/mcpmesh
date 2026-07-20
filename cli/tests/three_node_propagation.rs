@@ -13,7 +13,7 @@
 //!   * gossip-propagation TIMING → within 60s B installs serial 2 (received → fetched → validated →
 //!     installed via `spawn_receive_loop`/`on_announce`) AND severs A's live mesh session — the cut is
 //!     a real transport EOF DRIVEN by B's gossip-received revocation, not a client-side timeout.
-//!   * the stale-pair-entry revocation-wins clause → B genuinely holds a pair ALLOW for A (a petname
+//!   * the stale-pair-entry revocation-wins clause → B genuinely holds a pair ALLOW for A (a nickname
 //!     in the served service's `allow`), yet a fresh A dial post-revocation is refused PRE-MCP
 //!     (revocation wins over the pair entry, §4.1(1)) — the (pairs ∪ roster) composition exercised.
 use std::path::{Path, PathBuf};
@@ -267,8 +267,8 @@ async fn revoked_device_cut_from_live_session_within_60s_across_nodes() {
         let (v2_bytes, v2_o) = mint_signed_roster(&root, 2, &users1, &[bytes_a]);
 
         // Configs (pinned org root). B additionally serves `echo`, admitting BOTH the roster user_id
-        // "alice" AND the stale pair petname "alice-pair" — so the pair entry is a GENUINE allow-path
-        // that revocation must override (not merely a masked petname).
+        // "alice" AND the stale pair nickname "alice-pair" — so the pair entry is a GENUINE allow-path
+        // that revocation must override (not merely a masked nickname).
         let cfg_o_path = dir_o.path().join("config.toml");
         let cfg_a_path = dir_a.path().join("config.toml");
         let cfg_b_path = dir_b.path().join("config.toml");
@@ -284,14 +284,14 @@ async fn revoked_device_cut_from_live_session_within_60s_across_nodes() {
         std::fs::write(dir_b.path().join("roster.json"), &v1_bytes).unwrap();
 
         // Stores + registries. B holds a STALE PAIR entry for A's endpoint — the (pairs ∪ roster)
-        // composition; the petname is in echo's `allow`, so absent revocation the pair entry admits A.
+        // composition; the nickname is in echo's `allow`, so absent revocation the pair entry admits A.
         let store_o = Arc::new(PeerStore::open(&dir_o.path().join("state.redb")).unwrap());
         let store_a = Arc::new(PeerStore::open(&dir_a.path().join("state.redb")).unwrap());
         let store_b = Arc::new(PeerStore::open(&dir_b.path().join("state.redb")).unwrap());
         store_b
             .add(PeerEntry {
                 endpoint_id: bytes_a,
-                petname: "alice-pair".into(),
+                nickname: "alice-pair".into(),
                 services: vec!["echo".into()],
                 paired_at: None,
                 user_id: None,
@@ -419,7 +419,7 @@ async fn revoked_device_cut_from_live_session_within_60s_across_nodes() {
             "A's live session must be CUT (EOF/close) by B's gossip-received revocation, got a frame: {alice_after:?}"
         );
 
-        // 5. The stale-pair revocation-wins clause: B STILL holds a pair ALLOW for A (petname in
+        // 5. The stale-pair revocation-wins clause: B STILL holds a pair ALLOW for A (nickname in
         //    echo's `allow`), yet a FRESH A dial post-revocation is refused PRE-MCP — revocation wins
         //    over the pair entry (§4.1(1)). The (pairs ∪ roster) composition, cross-node.
         match connect(&alice_dialer, b_addr, "echo").await {

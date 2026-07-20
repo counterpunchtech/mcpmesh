@@ -1,7 +1,7 @@
 //! Issue #27 regression: a COLD daemon must reach a paired peer from the PERSISTED pairing
 //! address alone.
 //!
-//! The bug this pins: `dial_service`'s single-petname path dialed by bare id
+//! The bug this pins: `dial_service`'s single-nickname path dialed by bare id
 //! (`iroh::EndpointAddr::from(endpoint_id)`) and never persisted or attached the
 //! invite-proven direct addresses from pairing. With `relay_mode = "disabled"` (no relay,
 //! no discovery), the only thing that made the post-pair dial work was iroh's IN-PROCESS
@@ -44,14 +44,14 @@ async fn cold_daemon_dials_a_paired_peer_from_the_persisted_address() {
         let (alice_socket, alice_env) = world(
             alice_dir.path(),
             &format!(
-                "[identity]\npetname = \"alice\"\n\n[network]\nrelay_mode = \"disabled\"\n\n\
+                "[identity]\nnickname = \"alice\"\n\n[network]\nrelay_mode = \"disabled\"\n\n\
                  [services.echo]\nrun = ['{STUB}']\nallow = []\n"
             ),
         );
         // Bob: dials only — no services, just the hermetic network posture.
         let (bob_socket, bob_env) = world(
             bob_dir.path(),
-            "[identity]\npetname = \"bob\"\n\n[network]\nrelay_mode = \"disabled\"\n",
+            "[identity]\nnickname = \"bob\"\n\n[network]\nrelay_mode = \"disabled\"\n",
         );
 
         // ── invite (Alice) ── auto-starts her daemon; capture the copyable invite line.

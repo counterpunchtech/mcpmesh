@@ -1,5 +1,5 @@
 //! THE principal-set expansion: the ONE definition of a resolved caller's flat
-//! authorization identity — `groups ∪ {petname} ∪ {user_id}`, empty components skipped,
+//! authorization identity — `groups ∪ {nickname} ∪ {user_id}`, empty components skipped,
 //! default-deny (no identity ⇒ empty set ⇒ nothing matches).
 //!
 //! WHY THIS LIVES HERE: three enforcement sites consume this
@@ -17,8 +17,8 @@ use std::collections::BTreeSet;
 /// Expand a resolved peer identity into its flat principal set:
 /// `groups ∪ {name} ∪ {user_id}`. Borrowed — callers match `allow`/grant entries against it.
 ///
-/// - `name` is the device petname (pairing mode) or roster display handle — a legitimate
-///   grant target (petnames, user_ids, and group names share one flat namespace).
+/// - `name` is the device nickname (pairing mode) or roster display handle — a legitimate
+///   grant target (nicknames, user_ids, and group names share one flat namespace).
 /// - `user_id` is the person's verified id (roster, or a pairing device→user binding);
 ///   `None` for an unbound pairing peer.
 /// - Empty strings are never principals (an absent value must not become a matchable "").
@@ -63,10 +63,10 @@ mod tests {
         assert!(principal_set(None, None, &[]).is_empty());
     }
 
-    /// A pairing-mode peer (petname only, no user binding) IS a principal by its petname —
-    /// the flat namespace deliberately includes petnames.
+    /// A pairing-mode peer (nickname only, no user binding) IS a principal by its nickname —
+    /// the flat namespace deliberately includes nicknames.
     #[test]
-    fn pairing_mode_petname_is_a_principal() {
+    fn pairing_mode_nickname_is_a_principal() {
         let set = principal_set(Some("carol"), None, &[]);
         assert_eq!(set, BTreeSet::from(["carol"]));
     }

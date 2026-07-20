@@ -10,7 +10,7 @@
 //!     subprocess `mcpmesh …`): the resulting `roster.json` VERIFIES against the org root (`sign::verify`)
 //!     and carries alice/team-eng/the joiner's device at serial 2 — no roster hand-editing anywhere.
 //!   * **"group-based allow works"** → Phase B step 4: the porcelain-produced serial-2 roster admits
-//!     alice via the `team-eng` GROUP arm (`allow = ["team-eng"]`, not a user_id/petname); the served
+//!     alice via the `team-eng` GROUP arm (`allow = ["team-eng"]`, not a user_id/nickname); the served
 //!     child sees the §6.3 identity env (`MCPMESH_PEER_USER=alice` + `MCPMESH_PEER_GROUPS` ∋ `team-eng`).
 //!   * **"revoked device cut from live sessions"** → Phase B step 5: the porcelain-produced serial-3
 //!     roster (`org revoke alice/laptop`) installed into the in-process operator mesh SEVERS alice's

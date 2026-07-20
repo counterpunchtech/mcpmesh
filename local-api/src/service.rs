@@ -79,10 +79,10 @@ pub use crate::transport::{bind_uds, check_peer_uid, ensure_private_dir};
 /// `user_id` is the person's self-sovereign id (`b64u:<user_pk>`, present once a device→user
 /// binding is verified — pairing OR roster). Including it means content shared to a PERSON
 /// reaches ALL their devices (each presents the same verified user_id under a distinct
-/// petname), whereas `name` (the petname) scopes to one device and `groups` to a roster set —
+/// nickname), whereas `name` (the nickname) scopes to one device and `groups` to a roster set —
 /// three legitimate granularities.
 ///
-/// If authz is ever re-keyed on `endpoint_id` instead of the display petname (a planned
+/// If authz is ever re-keyed on `endpoint_id` instead of the display nickname (a planned
 /// identity hardening), that change lands HERE, once.
 pub fn peer_audiences(peer: &Value) -> Vec<String> {
     // The expansion itself is THE shared `principal_set` (crate::principals — the flat
@@ -206,9 +206,9 @@ pub fn required_string_array(params: &Value, key: &str) -> Result<Vec<String>, (
 }
 
 /// Extract the friendly people directory from an mcpmesh `status` result (`share_targets`):
-/// one entry per paired peer — the owner's petname for it + its verified `user_id` (or
+/// one entry per paired peer — the owner's nickname for it + its verified `user_id` (or
 /// null). Pure over the JSON so it is unit-tested without a live mcpmesh. Surface-clean:
-/// petname + user_id only, never a transport id / service list.
+/// nickname + user_id only, never a transport id / service list.
 pub fn people_from_status(status: &Value) -> Vec<Value> {
     status["peers"]
         .as_array()
@@ -270,7 +270,7 @@ mod tests {
     }
 
     #[test]
-    fn people_from_status_extracts_petname_and_user_id() {
+    fn people_from_status_extracts_nickname_and_user_id() {
         let status = json!({"peers":[
             {"name":"bob","services":["kb"],"user_id":"b64u:CGnYVhFY"},
             {"name":"carol","services":[]}

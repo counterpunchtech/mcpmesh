@@ -69,7 +69,7 @@ async fn accept_loop_routes_mesh_alpn_to_a_gated_session() {
         store
             .add(PeerEntry {
                 endpoint_id: *client.id().as_bytes(),
-                petname: "tester".into(),
+                nickname: "tester".into(),
                 services: vec!["echo".into()],
                 paired_at: None,
                 user_id: None,
@@ -79,7 +79,7 @@ async fn accept_loop_routes_mesh_alpn_to_a_gated_session() {
         let gate: Arc<dyn TrustGate> = Arc::new(AllowlistGate::new(store.clone()));
 
         // Run the daemon's OWN accept loop on a dual-ALPN endpoint. The pair branch never fires
-        // here (mesh dial only), so `config_path`/petname are inert.
+        // here (mesh dial only), so `config_path`/nickname are inert.
         let server = dual_alpn_endpoint().await;
         let addr = server.addr();
         let mesh = MeshState::new(
@@ -133,7 +133,7 @@ fn decoy_invite(secret: [u8; 32]) -> Invite {
         secret,
         inviter_id: [0xEEu8; 32],
         inviter_addr_json: "{}".into(),
-        petname: "server".into(),
+        nickname: "server".into(),
         services: vec!["x".into()],
         expires_at_epoch: FUTURE,
     }
@@ -198,7 +198,7 @@ async fn accept_loop_routes_pair_alpn_to_the_gate_exempt_rendezvous() {
         let hello = json!({
             "secret": vec![0u8; 32],
             "redeemer_id": client.id().as_bytes().to_vec(),
-            "redeemer_petname": "stranger",
+            "redeemer_nickname": "stranger",
         });
         write_frame(&mut send, &hello).await.expect("send hello");
         let _ = send.finish();
@@ -273,7 +273,7 @@ async fn accept_loop_pair_alpn_with_no_live_invite_is_closed_early() {
                     let hello = json!({
                         "secret": vec![0u8; 32],
                         "redeemer_id": client_id.to_vec(),
-                        "redeemer_petname": "stranger",
+                        "redeemer_nickname": "stranger",
                     });
                     let _ = write_frame(&mut send, &hello).await;
                     let _ = send.finish();
@@ -300,10 +300,10 @@ async fn accept_loop_pair_alpn_with_no_live_invite_is_closed_early() {
     .expect("no-live-invite accept-gate test timed out");
 }
 
-/// A pairing grant emits exactly one `trust(event="pair")` audit record for the redeemer petname
+/// A pairing grant emits exactly one `trust(event="pair")` audit record for the redeemer nickname
 /// (spec §11.3 trust-event class — pair). Builds a hermetic serving `MeshState`, installs a real
 /// temp-dir `AuditLog` via `set_audit`, and drives `grant_service_access`; the hook fires on
-/// `mesh.audit()` and lands one pair record targeted at the petname. No secret material is written.
+/// `mesh.audit()` and lands one pair record targeted at the nickname. No secret material is written.
 #[tokio::test]
 async fn trust_mutations_emit_audit_events() {
     use mcpmesh::audit::{AuditLog, AuditSink};

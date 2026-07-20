@@ -68,7 +68,7 @@ async fn test_endpoint() -> anyhow::Result<iroh::Endpoint> {
 
 /// A one-service registry: `name`, an `EchoBackend`, and the `allow` list that
 /// admits callers to it. Used to build the tests' `echo` service (allow=["bob"],
-/// matching the petname the gate resolves) and the per-service-allow test.
+/// matching the nickname the gate resolves) and the per-service-allow test.
 fn service_with_allow(name: &str, allow: Vec<String>) -> mcpmesh_net::Services {
     let mut services = HashMap::new();
     services.insert(
@@ -81,7 +81,7 @@ fn service_with_allow(name: &str, allow: Vec<String>) -> mcpmesh_net::Services {
     mcpmesh_net::Services::new(services)
 }
 
-/// The `echo` service, admitting the petname (`"bob"`) the tests' gate resolves.
+/// The `echo` service, admitting the nickname (`"bob"`) the tests' gate resolves.
 fn echo_services() -> mcpmesh_net::Services {
     service_with_allow("echo", vec!["bob".into()])
 }
@@ -92,7 +92,10 @@ async fn known_peer_completes_initialize_and_echo() -> anyhow::Result<()> {
         let server = test_endpoint().await?;
         let client = test_endpoint().await?;
         let client_id = EndpointId::from(client.id());
-        let gate = Arc::new(StaticGate::new([(client_id, PeerIdentity::petname("bob"))]));
+        let gate = Arc::new(StaticGate::new([(
+            client_id,
+            PeerIdentity::nickname("bob"),
+        )]));
         let addr = server.addr();
         let _handle = serve(server, gate, echo_services(), Arc::new(ConnRegistry::new()));
 
@@ -125,7 +128,10 @@ async fn unknown_service_gets_32054_with_marker() -> anyhow::Result<()> {
         let server = test_endpoint().await?;
         let client = test_endpoint().await?;
         let client_id = EndpointId::from(client.id());
-        let gate = Arc::new(StaticGate::new([(client_id, PeerIdentity::petname("bob"))]));
+        let gate = Arc::new(StaticGate::new([(
+            client_id,
+            PeerIdentity::nickname("bob"),
+        )]));
         let addr = server.addr();
         let _handle = serve(server, gate, echo_services(), Arc::new(ConnRegistry::new()));
 
@@ -176,7 +182,7 @@ async fn unknown_endpoint_is_refused_before_mcp() -> anyhow::Result<()> {
 }
 
 /// Per-service `allow` is enforced, not just registry membership: `notes` allows
-/// only `"bob"`, but the connecting peer resolves (at the gate) to petname
+/// only `"bob"`, but the connecting peer resolves (at the gate) to nickname
 /// `"carol"` — trusted enough to pass the gate, yet not admitted by `notes`. She
 /// must get the same `-32054`/`data.source: "mcpmesh"` refusal an unknown service
 /// gets (the indistinguishability rule). Mirrors `known_peer_completes...`, changing only
@@ -187,11 +193,11 @@ async fn peer_not_in_service_allow_is_refused() -> anyhow::Result<()> {
         let server = test_endpoint().await?;
         let client = test_endpoint().await?;
         let client_id = EndpointId::from(client.id());
-        // Carol is trusted at the gate (resolves to a petname) but absent from
+        // Carol is trusted at the gate (resolves to a nickname) but absent from
         // `notes`' allow — so `caller_allowed` for her is empty.
         let gate = Arc::new(StaticGate::new([(
             client_id,
-            PeerIdentity::petname("carol"),
+            PeerIdentity::nickname("carol"),
         )]));
         let addr = server.addr();
         let _handle = serve(
@@ -318,7 +324,7 @@ async fn two_machine_serve() -> anyhow::Result<()> {
     let allow_bytes = EndpointId::from(allow_id);
     let gate = Arc::new(StaticGate::new([(
         allow_bytes,
-        PeerIdentity::petname("smoke-peer"),
+        PeerIdentity::nickname("smoke-peer"),
     )]));
 
     // Best-effort: wait for a relay connection so the printed addr carries a relay

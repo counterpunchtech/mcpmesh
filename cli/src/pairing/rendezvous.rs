@@ -5,10 +5,10 @@
 //!
 //! **The two writes that make a pairing functional (the load-bearing fact).**
 //! Admitting a paired peer to a service needs TWO independent facts on the inviter:
-//!  1. a [`PeerEntry`] `{ endpoint_id → petname }` so the [`AllowlistGate`] RESOLVES the peer's
-//!     mesh dial to its petname (identity/trust); and
-//!  2. the peer's petname in the service's config `[services.<svc>].allow`, so `select_service`
-//!     ADMITS that resolved petname (authorization) — this allow is baked into the [`Services`]
+//!  1. a [`PeerEntry`] `{ endpoint_id → nickname }` so the [`AllowlistGate`] RESOLVES the peer's
+//!     mesh dial to its nickname (identity/trust); and
+//!  2. the peer's nickname in the service's config `[services.<svc>].allow`, so `select_service`
+//!     ADMITS that resolved nickname (authorization) — this allow is baked into the [`Services`]
 //!     snapshot at `build_services` time, so it takes effect only after a RELOAD.
 //!
 //! A [`PeerEntry`] alone leaves the peer KNOWN-BUT-FORBIDDEN. [`handle_inviter_side`]
@@ -26,7 +26,7 @@
 //! **Second pairings MERGE, never clobber.** `PeerStore::add` is a replace-on-endpoint_id upsert
 //! (a contract other callers rely on), so BOTH rendezvous write sites resolve-then-merge before
 //! adding: the redeemer UNIONs a repeat grant into its dial directory and takes the new invite's
-//! suggested petname (rename-by-fresh-invite); the inviter PRESERVES its stored petname + dial
+//! suggested nickname (rename-by-fresh-invite); the inviter PRESERVES its stored nickname + dial
 //! directory (a reverse pairing must not wipe what an earlier redeem granted us) — and neither
 //! side ever downgrades a verified `user_id` to `None`, nor a stored `last_addr` (a fresh
 //! pairing REFRESHES the dial hint; a merge never replaces `Some` with `None`). See the
@@ -55,7 +55,7 @@ use crate::pairing::{Invite, LiveInvites, Redeem};
 use crate::util::epoch_now_u64 as epoch_now;
 
 /// Frame cap for the pair rendezvous. The redeemer's hello is a tiny JSON object (two 32-byte
-/// arrays + a short petname), so a small cap is ample and bounds a hostile stranger's frame
+/// arrays + a short nickname), so a small cap is ample and bounds a hostile stranger's frame
 /// (the pair ALPN accepts strangers by design).
 const MAX_PAIR_FRAME: usize = 64 * 1024;
 
@@ -67,14 +67,14 @@ const REASON_MALFORMED: &str = "malformed request";
 const REASON_ID_MISMATCH: &str = "id mismatch";
 
 /// The redeemer's first (and only) frame: the secret it is redeeming plus its self-claimed id
-/// and suggested petname. `[u8; 32]` fields serde-round-trip as JSON arrays (same as `Invite`).
+/// and suggested nickname. `[u8; 32]` fields serde-round-trip as JSON arrays (same as `Invite`).
 /// The claimed `redeemer_id` is NOT trusted — the TLS-authenticated `conn.remote_id()` is
 /// authoritative and must match it.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct RedeemerHello {
     secret: [u8; 32],
     redeemer_id: [u8; 32],
-    redeemer_petname: String,
+    redeemer_nickname: String,
     /// Optional self-sovereign identity: the redeemer's user public key (`b64u`) and a device→user
     /// binding signature over ITS OWN endpoint (`b64u`), proving this device belongs to that user
     /// (`mcpmesh_trust::binding`). `#[serde(default)]` so a peer with no user key OMITS them
@@ -93,7 +93,7 @@ struct RedeemerHello {
 enum PairReply {
     Ok {
         inviter_id: [u8; 32],
-        inviter_petname: String,
+        inviter_nickname: String,
         /// The inviter's optional self-sovereign identity — same shape/semantics as
         /// [`RedeemerHello`]'s, verified by the redeemer against the invite's `inviter_id`.
         #[serde(default)]
@@ -118,7 +118,7 @@ pub struct SelfBinding {
     pub sig: String,
 }
 
-/// The inviter-side AUTHORIZATION hook: `(petname, services)` → append the petname to each granted
+/// The inviter-side AUTHORIZATION hook: `(nickname, services)` → append the nickname to each granted
 /// service's config `allow` and hot-reload the serving registry so the peer is actually admitted.
 /// Boxed so this module never depends on the daemon's config/reload machinery — the daemon hands
 /// the hook in via [`InviterCtx`].
@@ -128,7 +128,7 @@ pub type GrantFn = Box<
         + Sync,
 >;
 
-/// The ceremony-surface hook: `(peer_petname, sas_code, paired_at_epoch)` → park the completed
+/// The ceremony-surface hook: `(peer_nickname, sas_code, paired_at_epoch)` → park the completed
 /// pairing where `status` can show the inviter's human the short authentication code. Display-only
 /// state, never a trust input.
 pub type RecordPairingFn = Box<dyn Fn(String, String, u64) + Send + Sync>;
@@ -149,7 +149,7 @@ pub struct InviterCtx {
     pub store: Arc<PeerStore>,
     /// The in-RAM ring of outstanding invites the redeemed secret is looked up in.
     pub invites: Arc<LiveInvites>,
-    /// The daemon's config path — read (not written) by the petname-collision guard.
+    /// The daemon's config path — read (not written) by the nickname-collision guard.
     pub config_path: PathBuf,
     /// This daemon's own identity presentation, if it has a user key.
     pub self_binding: Option<SelfBinding>,
@@ -164,7 +164,7 @@ pub struct InviterCtx {
 /// `None` (a backward-compatible pre-binding peer). A PRESENT-but-INVALID binding is rejected (a
 /// `warn` + `None`): a peer asserting a `user_id` must PROVE ownership of that user key AND that the
 /// binding is for its authenticated endpoint (`binding::verify_presented`'s two invariants), so an
-/// unprovable id is never stored. It does not FAIL the pairing — identity is ADDITIVE to the petname
+/// unprovable id is never stored. It does not FAIL the pairing — identity is ADDITIVE to the nickname
 /// trust grant, and an invalid binding conveys no privilege (it cannot forge a `user_id`), so the
 /// pairing still succeeds with `user_id: None` rather than burning the invite on a crypto hiccup.
 fn verified_user_id(
@@ -195,7 +195,7 @@ fn verified_user_id(
 /// match the claimed one), redeem the secret against the live registry, and on success write
 /// the [`PeerEntry`] trust grant, GRANT service authorization ([`InviterCtx::grant`]), reply
 /// with our identity, and log the short authentication code (SAS). Every attempt is logged; no
-/// peer EndpointId is ever logged (the surface discipline: porcelain and logs speak petnames).
+/// peer EndpointId is ever logged (the surface discipline: porcelain and logs speak nicknames).
 ///
 /// Takes an [`InviterCtx`]: the redeem reads `ctx.invites` + `ctx.store`, and the authorization
 /// grant runs through the `ctx.grant` hook the daemon supplied (see the [`InviterCtx`] doc for
@@ -236,36 +236,36 @@ pub async fn handle_inviter_side(
             // preserve what that entry already knows instead of replace-clobbering it.
             //
             // Identity-confusion guard (privilege-escalation defense) — BEFORE any write/grant,
-            // and only for a NEW peer. The redeemer's self-asserted petname becomes BOTH its
-            // resolved identity (the gate maps endpoint_id → petname) AND the string appended to
+            // and only for a NEW peer. The redeemer's self-asserted nickname becomes BOTH its
+            // resolved identity (the gate maps endpoint_id → nickname) AND the string appended to
             // config `allow`, so a name that matches an EXISTING identity would let the redeemer
             // assume that identity's access (beyond `invite.services`). Refuse: (a) a name held
             // by a DIFFERENT store peer (impersonation), or (b) a name backed by NO store peer
             // but already sitting in some service's config `allow` (an orphan pre-provisioned
             // grant). For an EXISTING same-id entry the self-suggested name is DISCARDED entirely
-            // (the stored petname is preserved below), so no authority can derive from the
+            // (the stored nickname is preserved below), so no authority can derive from the
             // suggestion and the guard has nothing to guard — same-id re-pairs keep passing.
             // Blocking (redb + config read) → spawn_blocking.
             let store_c = ctx.store.clone();
             let config_path_c = ctx.config_path.clone();
-            let petname_c = hello.redeemer_petname.clone();
+            let nickname_c = hello.redeemer_nickname.clone();
             let (existing, collides) = tokio::task::spawn_blocking(move || {
                 let existing = store_c.resolve(&tls_id)?;
                 let collides = existing.is_none()
-                    && petname_collision(&store_c, &config_path_c, &petname_c, &tls_id)?;
+                    && nickname_collision(&store_c, &config_path_c, &nickname_c, &tls_id)?;
                 anyhow::Ok((existing, collides))
             })
             .await
-            .context("join petname collision check")??;
+            .context("join nickname collision check")??;
             if collides {
                 // Generic wire reason (no oracle — same as every other failure); the specific
-                // cause is logged SERVER-side with the petname (a pairing artifact, not a
+                // cause is logged SERVER-side with the nickname (a pairing artifact, not a
                 // surface leak) — NO endpoint id, NO secret. The invite is already burned by
                 // try_redeem; a deliberate collision attack does not deserve preservation, and an
                 // accidental collision is rare + re-mintable.
                 tracing::warn!(
-                    petname = %hello.redeemer_petname,
-                    "pairing refused: petname collision"
+                    nickname = %hello.redeemer_nickname,
+                    "pairing refused: nickname collision"
                 );
                 let _ = send_reply(
                     &mut send,
@@ -278,15 +278,15 @@ pub async fn handle_inviter_side(
             }
 
             // (1) TRUST/identity grant: record who this peer is so the AllowlistGate RESOLVES
-            // its later mesh dial to this petname. `endpoint_id` is the TLS-authenticated id.
+            // its later mesh dial to this nickname. `endpoint_id` is the TLS-authenticated id.
             //
-            // For a NEW peer: the redeemer's suggested petname, `services = []` — the INVITER's
+            // For a NEW peer: the redeemer's suggested nickname, `services = []` — the INVITER's
             // dial-back entry carries NO service grants (the asymmetric grant);
             // `PeerEntry.services` is a dial-directory, never an admission input, so this is the
             // correct encoding, not a functional lever. (Authorization is fact (2) below.)
             //
             // For an EXISTING same-id entry, MERGE — a second pairing must not clobber it:
-            //  - petname: PRESERVE the stored name. The inviter's chosen name for a peer is never
+            //  - nickname: PRESERVE the stored name. The inviter's chosen name for a peer is never
             //    renamed by the OTHER side's self-suggestion (a rename is the inviter's own act —
             //    `peer_rename` / re-REDEEMING a fresh invite on the naming side).
             //  - services: PRESERVE the dial directory. If we previously REDEEMED an invite from
@@ -298,9 +298,9 @@ pub async fn handle_inviter_side(
             //  - paired_at: keep the ORIGINAL stamp — the entry records when trust with this peer
             //    was FIRST established on this side (the re-pair itself is auditable via the
             //    trust event); stamp `now` only when the entry never had one (`internal peer add`).
-            let petname = existing
+            let nickname = existing
                 .as_ref()
-                .map_or_else(|| hello.redeemer_petname.clone(), |e| e.petname.clone());
+                .map_or_else(|| hello.redeemer_nickname.clone(), |e| e.nickname.clone());
             // The redeemer's OBSERVED transport address(es), from the live connection's
             // path snapshot — the pairing-proven dial-back hint. Synthesized as an
             // `EndpointAddr { id: <TLS-authenticated redeemer id>, addrs: <observed> }` and
@@ -325,7 +325,7 @@ pub async fn handle_inviter_side(
                 observed_addr.or_else(|| existing.as_ref().and_then(|e| e.last_addr.clone()));
             let entry = PeerEntry {
                 endpoint_id: tls_id,
-                petname: petname.clone(),
+                nickname: nickname.clone(),
                 services: existing
                     .as_ref()
                     .map(|e| e.services.clone())
@@ -336,7 +336,7 @@ pub async fn handle_inviter_side(
                     .or_else(|| Some(now.to_string())),
                 // The redeemer's PROVEN self-sovereign user_id, verified against its TLS id —
                 // falling back to the already-proven stored id, else `None` (no/invalid binding:
-                // the peer is stored petname-only).
+                // the peer is stored nickname-only).
                 user_id: verified_user_id(&hello.user_pk, &hello.binding_sig, &tls_id)
                     .or_else(|| existing.and_then(|e| e.user_id)),
                 last_addr,
@@ -352,14 +352,14 @@ pub async fn handle_inviter_side(
                 .context("join pair store write")??;
 
             // (2) AUTHORIZATION grant (the load-bearing step): append the redeemer's EFFECTIVE
-            // petname — the one the entry stores and the gate will resolve its dials to (for an
+            // nickname — the one the entry stores and the gate will resolve its dials to (for an
             // existing peer that is the PRESERVED name, not the self-suggestion) — to each
             // granted service's config `[services.<svc>].allow` and RELOAD, so `select_service`
             // actually admits it. Fail-closed: propagate a grant failure so the pair FAILS
             // rather than silently leaving the peer known-but-forbidden. The invite is already
             // burned (try_redeem removed it), so on failure the redeemer must re-mint —
             // acceptable, and correct: no half-authorized peer.
-            (ctx.grant)(petname.clone(), invite.services.clone()).await?;
+            (ctx.grant)(nickname.clone(), invite.services.clone()).await?;
 
             // Audit + completion notice — AFTER the durable trust write AND the durable grant,
             // BEFORE the network reply: the SAS (order-independent over both ids + the secret;
@@ -367,12 +367,12 @@ pub async fn handle_inviter_side(
             // Ordering it ahead of the reply means a committed pairing can never exist
             // un-audited (a reply-write failure must not swallow the notice).
             let sas = short_auth_code(&invite.inviter_id, &tls_id, &hello.secret);
-            tracing::info!(peer = %petname, code = %sas, "paired");
+            tracing::info!(peer = %nickname, code = %sas, "paired");
             // Park the SAS in the daemon's in-memory recent-pairings ring so the INVITER's human
             // can read it via `mcpmesh status` and compare it with the redeemer's (who got the
             // same words in its PairResult). Display-only ceremony state, lost on restart by
             // design; NOT trust data.
-            (ctx.record_pairing)(petname, sas, now);
+            (ctx.record_pairing)(nickname, sas, now);
 
             // The pairing is now durable + authorized + audited, so the reply is best-effort:
             // reply with OUR identity (both fields from the redeemed invite — no extra daemon
@@ -388,7 +388,7 @@ pub async fn handle_inviter_side(
                 &mut send,
                 &PairReply::Ok {
                     inviter_id: invite.inviter_id,
-                    inviter_petname: invite.petname.clone(),
+                    inviter_nickname: invite.nickname.clone(),
                     user_pk: inviter_pk,
                     binding_sig: inviter_sig,
                 },
@@ -450,12 +450,12 @@ async fn send_reply(
 /// Redeemer-side dial (`mcpmesh pair <invite>`): decode the invite, dial the inviter it
 /// names on `mcpmesh/pair/1`, VERIFY the TLS-authenticated peer id binds the invite's `inviter_id`
 /// (the address-swap defense) BEFORE revealing the secret, prove the secret, and — on the
-/// inviter's `Ok` — write OUR dial-back [`PeerEntry`] and return the inviter's petname + the SAS.
+/// inviter's `Ok` — write OUR dial-back [`PeerEntry`] and return the inviter's nickname + the SAS.
 ///
 /// Asymmetric grant: OUR entry for the inviter carries `services = invite.services` — the
 /// services we were granted and may DIAL on it (a client-side directory). The inviter's entry for
 /// US carries no service grants (written on its side). The authorization that actually admits us
-/// to those services is the inviter appending our petname to its config `allow` — done in ITS
+/// to those services is the inviter appending our nickname to its config `allow` — done in ITS
 /// [`handle_inviter_side`] via [`grant_service_access`], not here.
 ///
 /// Fail-closed: the identity check happens BEFORE `open_bi`/sending the secret, so a redeemer
@@ -464,7 +464,7 @@ async fn send_reply(
 /// [`grant_service_access`]: crate::daemon::grant_service_access
 pub async fn redeem_invite(
     endpoint: iroh::Endpoint,
-    self_petname: String,
+    self_nickname: String,
     invite_line: String,
     store: Arc<PeerStore>,
     self_binding: Option<SelfBinding>,
@@ -504,7 +504,7 @@ pub async fn redeem_invite(
     let hello = RedeemerHello {
         secret: invite.secret,
         redeemer_id: *endpoint.id().as_bytes(),
-        redeemer_petname: self_petname,
+        redeemer_nickname: self_nickname,
         user_pk: redeemer_pk,
         binding_sig: redeemer_sig,
     };
@@ -531,12 +531,12 @@ pub async fn redeem_invite(
         } => verified_user_id(user_pk, binding_sig, &invite.inviter_id),
     };
 
-    // Our dial-back entry: the inviter, named by the invite's suggested petname, granting the
+    // Our dial-back entry: the inviter, named by the invite's suggested nickname, granting the
     // services WE may dial on it (the asymmetric grant) — MERGED with any existing entry for this
     // inviter (a repeat grant: Alice grants notes, later invites again granting kb):
     //  - services: UNION(existing, invite.services) — the client-side dial directory ACCUMULATES
     //    grants (dedup; stable order: existing entries first, new grants appended);
-    //  - petname: the NEW invite's suggested petname — renaming a peer by redeeming a fresh
+    //  - nickname: the NEW invite's suggested nickname — renaming a peer by redeeming a fresh
     //    invite is a deliberate feature (no unpair needed), so the new suggestion wins here;
     //  - user_id: the newly VERIFIED binding wins, else keep the existing proven id — a verified
     //    user_id is never downgraded to `None` by a binding-less re-pair;
@@ -547,7 +547,7 @@ pub async fn redeem_invite(
     // `endpoint_id` is `invite.inviter_id`, which we verified above equals the TLS id.
     // Resolve + merge + add run in ONE blocking closure (redb reads/writes block + fsync).
     let inviter_id = invite.inviter_id;
-    let petname = invite.petname.clone();
+    let nickname = invite.nickname.clone();
     let granted = invite.services.clone();
     let paired_at = Some(epoch_now().to_string());
     let last_addr = Some(invite.inviter_addr_json.clone());
@@ -564,7 +564,7 @@ pub async fn redeem_invite(
         }
         store.add(PeerEntry {
             endpoint_id: inviter_id,
-            petname,
+            nickname,
             services,
             paired_at,
             user_id: inviter_user_id.or_else(|| existing.and_then(|e| e.user_id)),
@@ -579,7 +579,7 @@ pub async fn redeem_invite(
     let self_id = *endpoint.id().as_bytes();
     let sas_code = short_auth_code(&invite.inviter_id, &self_id, &invite.secret);
     Ok(PairResult {
-        peer_petname: invite.petname,
+        peer_nickname: invite.nickname,
         sas_code,
         // The services WE were granted (from the invite) — the porcelain renders each as
         // `<peer>/<service>` for the "You can mount:" line. Same list written into our
@@ -589,48 +589,48 @@ pub async fn redeem_invite(
 }
 
 /// Identity-confusion guard for pairing (a privilege-escalation defense). Returns `true` = REFUSE when
-/// a redeemer's self-asserted `petname` would let it assume an EXISTING identity's access:
-///  - **(a) impersonation** — a store peer with this petname exists under a DIFFERENT
+/// a redeemer's self-asserted `nickname` would let it assume an EXISTING identity's access:
+///  - **(a) impersonation** — a store peer with this nickname exists under a DIFFERENT
 ///    `endpoint_id` than the redeemer's authenticated `tls_id`; or
-///  - **(b) orphan-allow** — NO store peer has this petname AND the name already appears in some
+///  - **(b) orphan-allow** — NO store peer has this nickname AND the name already appears in some
 ///    config `[services.*].allow` (a pre-provisioned grant the redeemer would inherit).
 ///
 /// A same-id re-pair (every same-name entry shares `tls_id`) passes both: that peer's own name is
 /// neither impersonation nor an orphan — which is precisely why (b) is gated on there being NO
 /// backing store peer. Blocking (redb read + config file read) — call on a blocking thread.
-fn petname_collision(
+fn nickname_collision(
     store: &PeerStore,
     config_path: &Path,
-    petname: &str,
+    nickname: &str,
     tls_id: &[u8; 32],
 ) -> anyhow::Result<bool> {
     let same_name: Vec<PeerEntry> = store
         .list()?
         .into_iter()
-        .filter(|e| e.petname == petname)
+        .filter(|e| e.nickname == nickname)
         .collect();
     // (a) impersonation: any same-name entry belongs to a DIFFERENT endpoint.
     if same_name.iter().any(|e| &e.endpoint_id != tls_id) {
         return Ok(true);
     }
     // (b) orphan-allow: an unbacked name already sitting in some service's config allow.
-    if same_name.is_empty() && petname_in_any_service_allow(config_path, petname)? {
+    if same_name.is_empty() && nickname_in_any_service_allow(config_path, nickname)? {
         return Ok(true);
     }
     Ok(false)
 }
 
-/// Does `petname` appear in ANY config `[services.*].allow`? Reads the CURRENT config on disk (the
+/// Does `nickname` appear in ANY config `[services.*].allow`? Reads the CURRENT config on disk (the
 /// same file the grant appends to). A missing/empty config → `false` (nothing granted yet). Shared
 /// with the daemon's rename collision guard (`rename_plan`).
-pub(crate) fn petname_in_any_service_allow(
+pub(crate) fn nickname_in_any_service_allow(
     config_path: &Path,
-    petname: &str,
+    nickname: &str,
 ) -> anyhow::Result<bool> {
     let cfg = crate::config::Config::load(config_path)
-        .map_err(|e| anyhow::anyhow!("load config for petname collision check: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("load config for nickname collision check: {e}"))?;
     Ok(cfg
         .services
         .values()
-        .any(|svc| svc.allow.iter().any(|a| a == petname)))
+        .any(|svc| svc.allow.iter().any(|a| a == nickname)))
 }

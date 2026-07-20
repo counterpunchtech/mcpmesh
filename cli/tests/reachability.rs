@@ -6,7 +6,7 @@
 //! and drive the REAL [`probe_peer`] / [`reachability_of`] the daemon exposes. Proves:
 //!
 //!  1. A probe of a PAIRED peer → reachable, with a measured RTT.
-//!  2. [`reachability_of`] projects the cache to the peer's PETNAME (never the endpoint-id, §1.5)
+//!  2. [`reachability_of`] projects the cache to the peer's NICKNAME (never the endpoint-id, §1.5)
 //!     and never blocks the caller.
 //!  3. A probe from an UNPAIRED endpoint → NOT reachable — the responder's trust gate closes the
 //!     connection with NO pong (no presence leak; the SECURITY property of the probe).
@@ -73,11 +73,11 @@ fn seed_lookup(dialer: &iroh::Endpoint, target_addr: iroh::EndpointAddr) {
         .add(mem);
 }
 
-fn seed_peer(store: &PeerStore, endpoint_id: [u8; 32], petname: &str) {
+fn seed_peer(store: &PeerStore, endpoint_id: [u8; 32], nickname: &str) {
     store
         .add(PeerEntry {
             endpoint_id,
-            petname: petname.into(),
+            nickname: nickname.into(),
             services: vec![],
             paired_at: None,
             user_id: None,
@@ -152,13 +152,13 @@ async fn ping_probe_reports_paired_peer_reachable_stranger_and_down_peer_not() {
             "a reachable probe records a round-trip time"
         );
 
-        // 2. reachability_of projects the cache to the PETNAME (never the endpoint-id, §1.5) and
+        // 2. reachability_of projects the cache to the NICKNAME (never the endpoint-id, §1.5) and
         //    returns the cached result immediately (non-blocking).
         let list = reachability_of(&b_mesh);
         let alice = list
             .iter()
             .find(|r| r.name == "alice")
-            .expect("reachability_of surfaces the paired peer by petname");
+            .expect("reachability_of surfaces the paired peer by nickname");
         assert!(alice.reachable, "the cached probe result is surfaced");
         assert!(alice.rtt_ms.is_some(), "the cached RTT is surfaced");
 
@@ -188,7 +188,7 @@ async fn ping_probe_reports_paired_peer_reachable_stranger_and_down_peer_not() {
 /// Task 5: the `status` control response surfaces paired-peer reachability. Drives the REAL
 /// `status` request over `mcpmesh-local/1` (a raw `connect_control` client, like
 /// `daemon_autostart.rs`) against an in-process daemon whose probe cache was just populated, and
-/// asserts the paired peer appears BY PETNAME in `status.reachability` (§1.5: name + numbers only,
+/// asserts the paired peer appears BY NICKNAME in `status.reachability` (§1.5: name + numbers only,
 /// never an endpoint-id).
 #[tokio::test(flavor = "multi_thread")]
 async fn status_includes_reachability() {
@@ -244,7 +244,7 @@ async fn status_includes_reachability() {
 
         assert!(
             status.reachability.iter().any(|r| r.name == "alice"),
-            "status.reachability must surface the paired peer by petname: {:?}",
+            "status.reachability must surface the paired peer by nickname: {:?}",
             status.reachability
         );
 

@@ -142,7 +142,7 @@ pub(crate) fn service_infos(cfg: &Config) -> Vec<ServiceInfo> {
         .collect()
 }
 
-/// The `status`-facing view of known peers (petname + granted services — never the
+/// The `status`-facing view of known peers (nickname + granted services — never the
 /// EndpointId). Fails open on a corrupt store row (see [`PeerStore::list`]).
 pub(crate) fn peer_infos(store: &PeerStore) -> Vec<PeerInfo> {
     store
@@ -150,10 +150,10 @@ pub(crate) fn peer_infos(store: &PeerStore) -> Vec<PeerInfo> {
         .unwrap_or_default()
         .into_iter()
         .map(|e| PeerInfo {
-            name: e.petname,
+            name: e.nickname,
             services: e.services,
             // The peer's proven self-sovereign user_id (from a verified pairing binding), or `None`
-            // for a petname-only / `internal peer add` peer. A surface-clean opaque id, not a key.
+            // for a nickname-only / `internal peer add` peer. A surface-clean opaque id, not a key.
             user_id: e.user_id,
         })
         .collect()
@@ -189,7 +189,7 @@ mod tests {
         mesh.store
             .add(PeerEntry {
                 endpoint_id: [9u8; 32],
-                petname: "alice".into(),
+                nickname: "alice".into(),
                 services: Vec::new(),
                 paired_at: None,
                 user_id: None,
@@ -218,7 +218,7 @@ mod tests {
 
     /// Status surfaces self-sovereign identity (the adopted device->user binding): the daemon's OWN
     /// `self_user_id` (from its self-binding) and each paired peer's PROVEN `user_id` (from its
-    /// `PeerEntry`). A peer that presented no binding stays petname-only (`user_id: None`).
+    /// `PeerEntry`). A peer that presented no binding stays nickname-only (`user_id: None`).
     #[tokio::test]
     async fn status_surfaces_self_and_peer_user_ids() {
         let dir = tempfile::tempdir().unwrap();
@@ -233,11 +233,11 @@ mod tests {
             user_pk: "b64u:selfpk".into(),
             sig: "b64u:selfsig".into(),
         }));
-        // One peer that proved a self-sovereign user_id at pairing, one legacy petname-only peer.
+        // One peer that proved a self-sovereign user_id at pairing, one legacy nickname-only peer.
         mesh.store
             .add(PeerEntry {
                 endpoint_id: [1u8; 32],
-                petname: "alice".into(),
+                nickname: "alice".into(),
                 services: Vec::new(),
                 paired_at: Some("1".into()),
                 user_id: Some("b64u:alicepk".into()),
@@ -247,7 +247,7 @@ mod tests {
         mesh.store
             .add(PeerEntry {
                 endpoint_id: [2u8; 32],
-                petname: "legacy".into(),
+                nickname: "legacy".into(),
                 services: Vec::new(),
                 paired_at: None,
                 user_id: None,
@@ -280,7 +280,7 @@ mod tests {
             .expect("legacy in status");
         assert!(
             legacy.user_id.is_none(),
-            "a petname-only peer stays user_id: None"
+            "a nickname-only peer stays user_id: None"
         );
     }
 
@@ -298,9 +298,9 @@ mod tests {
         }
         let recent = mesh.recent_pairings();
         assert_eq!(recent.len(), 8, "the ring is capped at 8");
-        assert_eq!(recent[0].peer_petname, "peer9", "newest first");
+        assert_eq!(recent[0].peer_nickname, "peer9", "newest first");
         assert_eq!(
-            recent[7].peer_petname, "peer2",
+            recent[7].peer_nickname, "peer2",
             "the two oldest were dropped"
         );
 

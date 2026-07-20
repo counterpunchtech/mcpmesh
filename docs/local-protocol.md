@@ -142,13 +142,13 @@ Methods split into two groups by audience:
 
 | `method` | `params` | `result` |
 |---|---|---|
-| `register_service` | `{name, backend, allow}` — `backend` is `{"run":{"cmd":[…]}}` or `{"socket":{"path":"…"}}`; `allow` is a list of petnames/groups | `{}` (ack) |
+| `register_service` | `{name, backend, allow}` — `backend` is `{"run":{"cmd":[…]}}` or `{"socket":{"path":"…"}}`; `allow` is a list of nicknames/groups | `{}` (ack) |
 | `status` | *(none)* | [`StatusResult`](#statusresult) |
 | `audit_summary` | *(none)* | `{per_peer:[[name,count],…], per_service:[[name,count],…], total_sessions}` — this node's **local** session tallies; nothing is transmitted |
 | `invite` | `{services:[…]}` | `{invite_line:"mcpmesh-invite:…", expires_at_epoch}` |
-| `pair` | `{invite_line}` | `{peer_petname, sas_code, services:[…]}` |
-| `peer_remove` | `{petname}` | `{}` (ack) |
-| `peer_rename` | `{to, user_id?, petname?}` — rename a person by `user_id`, else a provisional contact by `petname` | `{}` (ack) |
+| `pair` | `{invite_line}` | `{peer_nickname, sas_code, services:[…]}` |
+| `peer_remove` | `{nickname}` | `{}` (ack) |
+| `peer_rename` | `{to, user_id?, nickname?}` — rename a person by `user_id`, else a provisional contact by `nickname` | `{}` (ack) |
 | `open_session` | `{peer, service}` | *no response frame — see [Sessions](#sessions)* |
 | `subscribe` | *(none)* | *no response frame — a one-way live stream; see [Live event stream](#live-event-stream)* |
 | `roster_install` | `{path, org_root_pk?}` — `path` is a local file the daemon reads; `org_root_pk` pins the root on first install | `{org_id, serial, severed}` |
@@ -186,7 +186,7 @@ Do not build on either — they may change or disappear without an `api_version`
   "self_user_id": "b64u:…",
   "roster":   {"org_id":"…","serial":42,"state":"approved","org_root_fingerprint":"tango-fig-cabbage"},
   "presence": [{"user_id":"b64u:…","device_label":"laptop","role":"primary","online":true}],
-  "recent_pairings": [{"peer_petname":"bob","sas_code":"tango-fig-cabbage","paired_at_epoch":1751760000}],
+  "recent_pairings": [{"peer_nickname":"bob","sas_code":"tango-fig-cabbage","paired_at_epoch":1751760000}],
   "reachability": [{"name":"bob","reachable":true,"rtt_ms":42,"age_secs":3}]
 }
 ```
@@ -198,7 +198,7 @@ never the command or path.
 `reachability` is **advisory** — an on-demand liveness read of your paired peers, populated by a
 probe cache the daemon refreshes lazily. It is empty until the first probe completes. A `status`
 call kicks off a background refresh for any peer whose entry is stale or missing, but **never blocks
-on a probe**. Each entry is a **petname** (`name`, never an endpoint-id), a `reachable` bool (the
+on a probe**. Each entry is a **nickname** (`name`, never an endpoint-id), a `reachable` bool (the
 last probe result), `rtt_ms` (the last measured round-trip, present only when reachable), and
 `age_secs` (how long ago the entry was measured). `age_secs` is **absent** for a peer that has never
 been probed — render that as "checking…", not "offline".
@@ -209,7 +209,7 @@ Under the hood the daemon measures reachability with a trust-gated, peer-facing 
 the probe leaks no presence to strangers. (This ALPN is a peer-transport detail; you never speak it
 over this local socket — you read its result in `reachability`.)
 
-Note the surface discipline that runs through every response: names are **petnames and self-sovereign
+Note the surface discipline that runs through every response: names are **nicknames and self-sovereign
 `user_id`s** (opaque `b64u:` identifiers spanning a person's devices), never raw endpoint
 identifiers, keys, or transport addresses. If you are keying authorization, key on `user_id`.
 
@@ -267,7 +267,7 @@ immediately without replaying history. It carries the currently-open sessions an
 }
 ```
 
-Each `active_sessions` entry is one live session: the caller's petname/`user_id` (`peer`), the
+Each `active_sessions` entry is one live session: the caller's nickname/`user_id` (`peer`), the
 mounted `service`, and `opened_at` (epoch seconds). This list is the starting state — a client keeps
 its session view current by applying subsequent `session_open`/`session_close` events to it. Only a
 `session_open` **without** an error status opens a real session: a `session_open` carrying
@@ -301,20 +301,20 @@ shape.
 an RFC3339-millis UTC timestamp. Every field beyond `ts` and `kind` is optional and present only
 when it applies:
 
-- `peer` — the caller's petname/`user_id` (absent on a local-only event with no remote peer).
+- `peer` — the caller's nickname/`user_id` (absent on a local-only event with no remote peer).
 - `service` — the mounted service name.
 - On a `request` (one proxied MCP line): `method` (the MCP method, e.g. `tools/call`), `tool` (the
   tool **name** only, for a `tools/call`), `args_hash` (a `"blake3:…"` digest of the arguments —
   **never** the raw arguments), `bytes_out` (a byte **count** of the response, never its content),
   `status` (`"ok"` \| `"error"`), and `latency_ms`.
 - On a `blob_fetch` or `trust`: `target` — the blob's `"blake3:…"` hash, or the trust operation's
-  target (a petname or `org/serial`) — and, on a `trust`, `event` (the trust verb: `pair`, `unpair`,
+  target (a nickname or `org/serial`) — and, on a `trust`, `event` (the trust verb: `pair`, `unpair`,
   `roster_install`, `revoke`).
 
 A **failed dial** surfaces as a `session_open` with `status: "error"` — it reached no backend, so it
 is otherwise never session-audited; this frame records the attempted-and-failed reach.
 
-Upholding the surface discipline: a record carries names, counts, and a status — a petname/`user_id`,
+Upholding the surface discipline: a record carries names, counts, and a status — a nickname/`user_id`,
 a service name, a method/tool name, an argument **digest**, and byte/latency **numbers** — never raw
 arguments, response content, endpoint-ids, or keys.
 
@@ -346,7 +346,7 @@ process reads at startup:
 
 | Variable | Meaning |
 |---|---|
-| `MCPMESH_PEER_NAME` | the caller's petname (your local name for them) |
+| `MCPMESH_PEER_NAME` | the caller's nickname (your local name for them) |
 | `MCPMESH_PEER_USER` | the caller's verified self-sovereign `user_id` (`b64u:…`), spanning all their devices. **Absent** when a pairing peer presented no device→user binding |
 | `MCPMESH_PEER_GROUPS` | comma-joined roster groups (may be empty) |
 
@@ -372,7 +372,7 @@ presented no binding.
 
 ### Using it well
 
-- **Authorize on `user_id`, not the petname.** The petname is *your* local label; the `user_id` is
+- **Authorize on `user_id`, not the nickname.** The nickname is *your* local label; the `user_id` is
   the cryptographically verified identity, and it is the same across all of that person's devices.
 - **The tool surface is the disclosure policy.** `search_notes(query)` grants something categorically
   narrower than `read_file(path)` over the same data. Design the tools you expose as the permission

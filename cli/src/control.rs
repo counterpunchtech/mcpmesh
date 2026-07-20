@@ -277,7 +277,7 @@ async fn handle_request(req: &Value, state: &DaemonState) -> Value {
                 .await
                 .map(unit),
         ),
-        // Unpair a peer: the petname to drop.
+        // Unpair a peer: the nickname to drop.
         // `remove_peer` revokes the peer's service authorization AND drops its identity row
         // (the inverse of the pairing grant) — see its fail-safe ordering.
         Some("peer_remove") => respond(
@@ -288,7 +288,7 @@ async fn handle_request(req: &Value, state: &DaemonState) -> Value {
                 .map(unit),
         ),
         // Rename a contact's nickname (Contacts rename): the person's `user_id` (or a
-        // provisional `petname`) + the new nickname `to`. `rename_peer` guards the collision
+        // provisional `nickname`) + the new nickname `to`. `rename_peer` guards the collision
         // (no inheriting another identity's grants), rewrites allow lists, and reloads.
         Some("peer_rename") => respond(
             id,
@@ -498,7 +498,7 @@ pub(crate) fn status_result(state: &DaemonState) -> Result<StatusResult> {
     // Advisory reachability of paired peers, from the on-demand probe cache (spec: pairing-mode
     // liveness). Mirrors the `presence` read above: cached values returned immediately, with any
     // stale/missing entry refreshed on a background probe `reachability_of` spawns — status stays a
-    // non-blocking hot path. Surface-clean: petnames + numbers only.
+    // non-blocking hot path. Surface-clean: nicknames + numbers only.
     let reachability = state
         .mesh()
         .map(crate::daemon::reachability_of)
@@ -634,8 +634,8 @@ mod tests {
     #[tokio::test]
     async fn malformed_params_answer_an_invalid_params_error() {
         let st = control_only();
-        // Wrong field type (petname must be a string).
-        let r = handle_request(&req("peer_remove", json!({ "petname": 42 })), &st).await;
+        // Wrong field type (nickname must be a string).
+        let r = handle_request(&req("peer_remove", json!({ "nickname": 42 })), &st).await;
         assert_eq!(r["error"]["code"], -32000);
         assert!(
             r["error"]["message"]

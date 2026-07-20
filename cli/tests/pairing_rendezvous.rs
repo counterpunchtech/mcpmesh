@@ -65,17 +65,17 @@ fn make_invite(
         secret,
         inviter_id,
         inviter_addr_json: "{}".into(), // unused by the inviter side; T6 dials it
-        petname: "alice".into(),
+        nickname: "alice".into(),
         services: services.iter().map(|s| s.to_string()).collect(),
         expires_at_epoch,
     }
 }
 
-fn hello_frame(secret: &[u8; 32], redeemer_id: &[u8; 32], petname: &str) -> Value {
+fn hello_frame(secret: &[u8; 32], redeemer_id: &[u8; 32], nickname: &str) -> Value {
     json!({
         "secret": secret.to_vec(),
         "redeemer_id": redeemer_id.to_vec(),
-        "redeemer_petname": petname,
+        "redeemer_nickname": nickname,
     })
 }
 
@@ -118,7 +118,7 @@ async fn setup() -> (
 }
 
 /// Like [`setup`], but writes `config_toml` to the inviter's `config_path` first (so the
-/// petname-collision orphan-allow check + the grant can read real `[services.*].allow` entries)
+/// nickname-collision orphan-allow check + the grant can read real `[services.*].allow` entries)
 /// and ALSO returns that `config_path` so a test can re-read it after a grant. The store is the
 /// SAME `Arc` the accept-loop handler reads, so a test can pre-seed peers into it.
 async fn setup_full(
@@ -189,7 +189,7 @@ async fn happy_path_writes_the_trust_grant_and_returns_the_inviter_identity() {
 
         // The reply is PairReply::Ok carrying the inviter's identity (from the redeemed invite).
         assert_eq!(reply["result"], "ok", "expected Ok reply, got {reply}");
-        assert_eq!(reply["inviter_petname"], "alice");
+        assert_eq!(reply["inviter_nickname"], "alice");
         let reply_inviter_id: Vec<u64> = reply["inviter_id"]
             .as_array()
             .unwrap()
@@ -202,7 +202,7 @@ async fn happy_path_writes_the_trust_grant_and_returns_the_inviter_identity() {
         );
 
         // The TRUST/identity grant: a PeerEntry keyed by the TLS-authenticated redeemer id (P3),
-        // stamped paired_at, named by the redeemer's petname. Per §4.2's ASYMMETRIC grant, the
+        // stamped paired_at, named by the redeemer's nickname. Per §4.2's ASYMMETRIC grant, the
         // INVITER's entry for the redeemer carries NO service grants (`services == []`) — it is a
         // dial-back identity row, not a client-side dial directory. (T6 corrected this from T5's
         // earlier `invite.services`; `PeerEntry.services` is never an admission input, so this is
@@ -211,7 +211,7 @@ async fn happy_path_writes_the_trust_grant_and_returns_the_inviter_identity() {
             .resolve(&redeemer_id)
             .unwrap()
             .expect("a PeerEntry must be written for the redeemer");
-        assert_eq!(entry.petname, "bob");
+        assert_eq!(entry.nickname, "bob");
         assert!(
             entry.services.is_empty(),
             "the inviter's dial-back entry carries no service grants (§4.2): {:?}",
@@ -400,18 +400,18 @@ async fn malformed_hello_is_refused_without_panicking_and_writes_no_entry() {
 
 // ---------------------------------------------------------------------------------------------
 // Identity-confusion / privilege-escalation guard (T6 security fold-in). The redeemer's
-// self-asserted petname becomes BOTH its resolved identity and the string appended to config
+// self-asserted nickname becomes BOTH its resolved identity and the string appended to config
 // `allow`, so a name that matches an existing identity would let it assume that identity's
 // access. `handle_inviter_side` refuses such names BEFORE writing the PeerEntry / granting.
 // These five cases lock in the security property AND that legitimate re-pairing still works.
 // ---------------------------------------------------------------------------------------------
 
 /// A pre-seeded store peer (the `internal peer add` shape — no `paired_at`).
-fn seed_peer(store: &PeerStore, endpoint_id: [u8; 32], petname: &str, services: &[&str]) {
+fn seed_peer(store: &PeerStore, endpoint_id: [u8; 32], nickname: &str, services: &[&str]) {
     store
         .add(PeerEntry {
             endpoint_id,
-            petname: petname.into(),
+            nickname: nickname.into(),
             services: services.iter().map(|s| s.to_string()).collect(),
             paired_at: None,
             user_id: None,
@@ -420,10 +420,10 @@ fn seed_peer(store: &PeerStore, endpoint_id: [u8; 32], petname: &str, services: 
         .unwrap();
 }
 
-/// Case 1 — a fresh, unique petname not present in any store peer or any config allow is ALLOWED
+/// Case 1 — a fresh, unique nickname not present in any store peer or any config allow is ALLOWED
 /// (the guard must not break the normal first-pair path).
 #[tokio::test]
-async fn collision_guard_allows_a_fresh_unique_petname() {
+async fn collision_guard_allows_a_fresh_unique_nickname() {
     timeout(Duration::from_secs(60), async {
         let (redeemer, addr, store, invites, inviter_id, config_path) =
             setup_full(&format!("[services.notes]\nrun = ['{STUB}']\nallow = []\n")).await;
@@ -443,7 +443,7 @@ async fn collision_guard_allows_a_fresh_unique_petname() {
             .resolve(&redeemer_id)
             .unwrap()
             .expect("bob entry written");
-        assert_eq!(entry.petname, "bob");
+        assert_eq!(entry.nickname, "bob");
         let cfg = Config::load(&config_path).unwrap();
         assert_eq!(
             cfg.services.get("notes").unwrap().allow,
@@ -597,20 +597,20 @@ async fn collision_guard_refuses_an_orphan_allow_name() {
 // ---------------------------------------------------------------------------------------------
 // Second-pairing MERGE semantics (the "reverse pairing clobbers the dial directory" fix).
 // `PeerStore::add` is a replace-on-endpoint_id upsert, so the rendezvous write sites must
-// resolve-then-merge: the inviter PRESERVES its stored petname + dial directory + proven
-// user_id; the redeemer UNIONs a repeat grant and takes the new invite's suggested petname.
+// resolve-then-merge: the inviter PRESERVES its stored nickname + dial directory + proven
+// user_id; the redeemer UNIONs a repeat grant and takes the new invite's suggested nickname.
 // ---------------------------------------------------------------------------------------------
 
-/// Reverse pairing preserves the inviter's dial directory, petname, and proven user_id.
+/// Reverse pairing preserves the inviter's dial directory, nickname, and proven user_id.
 ///
 /// The user story: Alice invited Bob first (Bob redeemed → BOB's alice-entry carries
 /// `services = ["notes"]`, his chosen name "alice", her proven user_id). Later BOB invites Alice
 /// back (to grant her his "code" service). Bob is now the INVITER: his side's write must MERGE
 /// into his existing alice-entry, not replace it with the fresh `{services: []}` dial-back row —
-/// and the authorization grant must admit her STORED petname (the name his gate resolves her
+/// and the authorization grant must admit her STORED nickname (the name his gate resolves her
 /// dials to), not her self-suggestion.
 #[tokio::test]
-async fn reverse_pairing_preserves_the_inviters_dial_directory_and_petname() {
+async fn reverse_pairing_preserves_the_inviters_dial_directory_and_nickname() {
     timeout(Duration::from_secs(60), async {
         let (redeemer, addr, store, invites, inviter_id, config_path) =
             setup_full(&format!("[services.code]\nrun = ['{STUB}']\nallow = []\n")).await;
@@ -621,7 +621,7 @@ async fn reverse_pairing_preserves_the_inviters_dial_directory_and_petname() {
         store
             .add(PeerEntry {
                 endpoint_id: alice_id,
-                petname: "alice".into(),
+                nickname: "alice".into(),
                 services: vec!["notes".into()],
                 paired_at: Some("1000".into()),
                 user_id: Some("b64u:ALICE".into()),
@@ -648,8 +648,8 @@ async fn reverse_pairing_preserves_the_inviters_dial_directory_and_petname() {
             .unwrap()
             .expect("the alice entry survives the reverse pairing");
         assert_eq!(
-            entry.petname, "alice",
-            "the inviter's chosen petname must not be renamed by the redeemer's self-suggestion"
+            entry.nickname, "alice",
+            "the inviter's chosen nickname must not be renamed by the redeemer's self-suggestion"
         );
         assert_eq!(
             entry.services,
@@ -666,12 +666,12 @@ async fn reverse_pairing_preserves_the_inviters_dial_directory_and_petname() {
             Some("1000"),
             "the original pairing stamp is kept on the inviter side"
         );
-        // The authorization grant admits her STORED petname — the name the gate resolves her to.
+        // The authorization grant admits her STORED nickname — the name the gate resolves her to.
         let cfg = Config::load(&config_path).unwrap();
         assert_eq!(
             cfg.services.get("code").unwrap().allow,
             vec!["alice".to_string()],
-            "the grant must target the stored petname, not the self-suggestion"
+            "the grant must target the stored nickname, not the self-suggestion"
         );
     })
     .await
@@ -679,10 +679,10 @@ async fn reverse_pairing_preserves_the_inviters_dial_directory_and_petname() {
 }
 
 /// A REPEAT grant on the REDEEMER side UNIONs the dial directory (dedup, stable order: existing
-/// first, new appended), applies the NEW invite's suggested petname (rename-by-a-fresh-invite is
+/// first, new appended), applies the NEW invite's suggested nickname (rename-by-a-fresh-invite is
 /// a deliberate feature), and never clobbers a verified user_id to None.
 #[tokio::test]
-async fn repeat_grant_unions_the_redeemers_dial_directory_and_applies_the_new_petname() {
+async fn repeat_grant_unions_the_redeemers_dial_directory_and_applies_the_new_nickname() {
     timeout(Duration::from_secs(60), async {
         let (redeemer, addr, _store, invites, inviter_id, _cfg) = setup_full("").await;
         // The redeemer ALREADY paired with this inviter once: notes granted, her user_id proven,
@@ -692,7 +692,7 @@ async fn repeat_grant_unions_the_redeemers_dial_directory_and_applies_the_new_pe
         bob_store
             .add(PeerEntry {
                 endpoint_id: inviter_id,
-                petname: "alice-old".into(),
+                nickname: "alice-old".into(),
                 services: vec!["notes".into()],
                 paired_at: Some("1000".into()),
                 user_id: Some("b64u:ALICE".into()),
@@ -701,13 +701,13 @@ async fn repeat_grant_unions_the_redeemers_dial_directory_and_applies_the_new_pe
             .unwrap();
 
         // A SECOND invite from the SAME inviter: re-grants notes (dedup) plus kb, and suggests a
-        // NEW petname. The inviter presents no binding (no self_binding installed in setup_full).
+        // NEW nickname. The inviter presents no binding (no self_binding installed in setup_full).
         let secret = [32u8; 32];
         let invite = Invite {
             secret,
             inviter_id,
             inviter_addr_json: serde_json::to_string(&addr).unwrap(),
-            petname: "alice".into(),
+            nickname: "alice".into(),
             services: vec!["kb".into(), "notes".into()],
             expires_at_epoch: FUTURE,
         };
@@ -722,15 +722,15 @@ async fn repeat_grant_unions_the_redeemers_dial_directory_and_applies_the_new_pe
         )
         .await
         .expect("the second redeem succeeds");
-        assert_eq!(result.peer_petname, "alice");
+        assert_eq!(result.peer_nickname, "alice");
 
         let entry = bob_store
             .resolve(&inviter_id)
             .unwrap()
             .expect("the alice entry survives the repeat grant");
         assert_eq!(
-            entry.petname, "alice",
-            "the NEW invite's suggested petname is applied (rename-by-fresh-invite)"
+            entry.nickname, "alice",
+            "the NEW invite's suggested nickname is applied (rename-by-fresh-invite)"
         );
         assert_eq!(
             entry.services,
@@ -804,7 +804,7 @@ async fn paired_and_granted_peer_is_admitted_to_the_service_end_to_end() {
             secret,
             inviter_id: alice_id,
             inviter_addr_json: serde_json::to_string(&alice_addr).unwrap(),
-            petname: "alice".into(),
+            nickname: "alice".into(),
             services: vec!["notes".into()],
             expires_at_epoch: FUTURE,
         };
@@ -824,7 +824,7 @@ async fn paired_and_granted_peer_is_admitted_to_the_service_end_to_end() {
         )
         .await
         .expect("redeem_invite dials, verifies the inviter id, sends the secret, succeeds");
-        assert_eq!(result.peer_petname, "alice");
+        assert_eq!(result.peer_nickname, "alice");
         // The PairResult carries the granted services (from the invite) so the porcelain can print
         // the "You can mount: alice/notes" line without re-decoding the invite (M2b T7).
         assert_eq!(result.services, vec!["notes".to_string()]);
@@ -835,7 +835,7 @@ async fn paired_and_granted_peer_is_admitted_to_the_service_end_to_end() {
             .resolve(&alice_id)
             .unwrap()
             .expect("bob's store has an alice entry");
-        assert_eq!(bob_side.petname, "alice");
+        assert_eq!(bob_side.nickname, "alice");
         assert_eq!(bob_side.services, vec!["notes".to_string()]);
         assert!(bob_side.paired_at.is_some());
         // Alice's bob-entry: services == [] (dial-back identity only), paired_at set.
@@ -843,7 +843,7 @@ async fn paired_and_granted_peer_is_admitted_to_the_service_end_to_end() {
             .resolve(&bob_id)
             .unwrap()
             .expect("alice's store has a bob entry");
-        assert_eq!(alice_side.petname, "bob");
+        assert_eq!(alice_side.nickname, "bob");
         assert!(
             alice_side.services.is_empty(),
             "alice's dial-back entry carries no service grants (§4.2): {:?}",
@@ -916,7 +916,7 @@ async fn paired_and_granted_peer_is_admitted_to_the_service_end_to_end() {
 /// **Self-sovereign identity adoption (device->user binding), end to end.** When BOTH sides present
 /// a device->user binding at pairing, each stores the OTHER's PROVEN `user_id` on its `PeerEntry`,
 /// verified against the TLS-authenticated endpoint (never a self-asserted id) — so kb audiences can
-/// later key on the USER, not just the per-device petname. Backward-compat (no binding → `user_id:
+/// later key on the USER, not just the per-device nickname. Backward-compat (no binding → `user_id:
 /// None`) is covered by the other redeem tests here, which all pass `None`.
 #[tokio::test]
 async fn pairing_exchanges_and_stores_each_sides_verified_user_id() {
@@ -967,7 +967,7 @@ async fn pairing_exchanges_and_stores_each_sides_verified_user_id() {
             secret,
             inviter_id: alice_id,
             inviter_addr_json: serde_json::to_string(&alice_addr).unwrap(),
-            petname: "alice".into(),
+            nickname: "alice".into(),
             services: vec![],
             expires_at_epoch: FUTURE,
         };
@@ -1056,7 +1056,7 @@ async fn redeem_refuses_an_address_swap_and_writes_no_entry_p3() {
             secret: [7u8; 32],
             inviter_id: named_inviter_id,
             inviter_addr_json: serde_json::to_string(&mallory_addr).unwrap(),
-            petname: "alice".into(),
+            nickname: "alice".into(),
             services: vec!["notes".into()],
             expires_at_epoch: FUTURE,
         };

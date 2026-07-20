@@ -164,7 +164,7 @@ impl TrustGate for RosterGate {
 ///  1. the installed roster's `revoked_endpoints` are consulted FIRST — a revoked endpoint is
 ///     refused even if a pair entry exists (revocation wins over pairing, across all ALPNs);
 ///  2. an endpoint present (active) in the roster resolves to its ROSTER identity even if a pair
-///     entry exists (roster masks the pair petname);
+///     entry exists (roster masks the pair nickname);
 ///  3. otherwise fall through to the pair entry (pairing mode continues untouched).
 ///
 /// With an empty roster this is exactly the plain `AllowlistGate` behavior (falls through for
@@ -204,7 +204,7 @@ impl TrustGate for ComposedGate {
             return Some(id);
         }
         // (3) fall through to pairing (also the DegradedStopped path: RosterGate::resolve returns
-        //     None when stopped, so a rostered-AND-paired peer falls through to its PAIR petname —
+        //     None when stopped, so a rostered-AND-paired peer falls through to its PAIR nickname —
         //     see the DegradedStopped×paired test + DECLARE below).
         self.pairs.resolve(endpoint)
     }
@@ -370,12 +370,12 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(PeerStore::open(&dir.path().join("state.redb")).unwrap());
-        // Pair entries for FOUR endpoints (petname == "p-<n>").
+        // Pair entries for FOUR endpoints (nickname == "p-<n>").
         for n in [2u8, 3, 4, 5] {
             store
                 .add(PeerEntry {
                     endpoint_id: [n; 32],
-                    petname: format!("p-{n}"),
+                    nickname: format!("p-{n}"),
                     services: vec![],
                     paired_at: None,
                     user_id: None,
@@ -390,7 +390,7 @@ mod tests {
         roster.install(view_with(&[(2u8, "alice")], &[3u8])); // helper below
         let composed = ComposedGate::new(roster, pairs);
 
-        // (a) rostered + paired → the ROSTER identity (masks the pair petname).
+        // (a) rostered + paired → the ROSTER identity (masks the pair nickname).
         let id = composed.resolve(&[2u8; 32].into()).expect("resolves");
         assert_eq!(id.user_id.as_deref(), Some("alice"));
         assert_eq!(id.name, "alice"); // NOT "p-2"
@@ -422,7 +422,7 @@ mod tests {
         store
             .add(PeerEntry {
                 endpoint_id: [7u8; 32],
-                petname: "bob-laptop".into(),
+                nickname: "bob-laptop".into(),
                 services: vec![],
                 paired_at: None,
                 user_id: Some("b64u:BOB".into()),
@@ -478,7 +478,7 @@ mod tests {
         store
             .add(PeerEntry {
                 endpoint_id: [2u8; 32],
-                petname: "p-2".into(),
+                nickname: "p-2".into(),
                 services: vec![],
                 paired_at: None,
                 user_id: None,
@@ -496,7 +496,7 @@ mod tests {
 
         // DECLARE (intended behavior): a stale (DegradedStopped) org roster stops granting ROSTER
         // identity, but LOCAL pairing is independent of org-roster freshness — so the peer falls
-        // through to its PAIR petname "p-2" (not refused). Revocation still wins over this (step 1,
+        // through to its PAIR nickname "p-2" (not refused). Revocation still wins over this (step 1,
         // is_revoked is honored even when stopped) — a revoked-and-paired peer is still refused.
         let id = composed
             .resolve(&[2u8; 32].into())
@@ -520,7 +520,7 @@ mod tests {
         store
             .add(PeerEntry {
                 endpoint_id: [3u8; 32],
-                petname: "p-3".into(),
+                nickname: "p-3".into(),
                 services: vec![],
                 paired_at: None,
                 user_id: None,

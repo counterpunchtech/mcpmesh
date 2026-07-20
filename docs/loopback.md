@@ -34,10 +34,10 @@ there is no magic in it.
 FRIEND_HOME=/tmp/mcpmesh-demo-friend
 mkdir -p $FRIEND_HOME/notes $FRIEND_HOME/runtime $FRIEND_HOME/.config/mcpmesh
 echo "It worked: this note reached you through the mesh." > $FRIEND_HOME/notes/hello.md
-printf '[identity]\npetname = "demo-friend"\n' > $FRIEND_HOME/.config/mcpmesh/config.toml
+printf '[identity]\nnickname = "demo-friend"\n' > $FRIEND_HOME/.config/mcpmesh/config.toml
 ```
 
-The `petname` line names the friend. Without it they would introduce themselves by this machine's
+The `nickname` line names the friend. Without it they would introduce themselves by this machine's
 hostname — the same name *your* daemon uses, which makes for a confusing demo. (That key, and every
 other config key, is documented in the [configuration reference](config.md).)
 

@@ -142,7 +142,7 @@ async fn wait_for_len(registry: &ConnRegistry, target: usize) {
 async fn install_severs_a_revoked_roster_session_but_not_a_pairing_session() {
     timeout(Duration::from_secs(60), async {
         let dir = tempfile::tempdir().unwrap();
-        // One `echo` service admits BOTH the roster user_id "alice" and the pairing petname "bob".
+        // One `echo` service admits BOTH the roster user_id "alice" and the pairing nickname "bob".
         let cfg = Config::from_toml_str(&format!(
             "[services.echo]\nrun = ['{STUB}']\nallow = [\"alice\", \"bob\"]\n"
         ))
@@ -160,7 +160,7 @@ async fn install_severs_a_revoked_roster_session_but_not_a_pairing_session() {
         store
             .add(PeerEntry {
                 endpoint_id: alice_id,
-                petname: "alice-stale".into(),
+                nickname: "alice-stale".into(),
                 services: vec!["echo".into()],
                 paired_at: None,
                 user_id: None,
@@ -170,7 +170,7 @@ async fn install_severs_a_revoked_roster_session_but_not_a_pairing_session() {
         store
             .add(PeerEntry {
                 endpoint_id: bob_id,
-                petname: "bob".into(),
+                nickname: "bob".into(),
                 services: vec!["echo".into()],
                 paired_at: None,
                 user_id: None,

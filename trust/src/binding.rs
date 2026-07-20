@@ -1,10 +1,10 @@
 //! Self-sovereign device→user binding for PAIRING mode (no org roster).
 //!
 //! Roster mode already gives a peer a first-class `user_id` (an org root signs a roster of
-//! devices→user_id+groups). Pairing mode did not — every device was just a petname. This module
+//! devices→user_id+groups). Pairing mode did not — every device was just a nickname. This module
 //! closes that gap WITHOUT an org: a peer proves its endpoint belongs to a self-minted [`UserKey`]
 //! by presenting a device→user binding at pairing, so multiple devices sharing one `UserKey` resolve
-//! to the SAME `user_id` and kb audiences can key on the user rather than the per-device petname.
+//! to the SAME `user_id` and kb audiences can key on the user rather than the per-device nickname.
 //!
 //! The idea is adopted from an earlier internal device-cert design; the crypto is mcpmesh's OWN — this is a thin
 //! wrapper over [`crate::roster::sign::sign_device_binding`]/[`verify_device_binding`] (domain

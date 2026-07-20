@@ -46,7 +46,7 @@ enum Cmd {
     Serve {
         /// Service name — how peers address it (`connect <peer>/<name>`).
         name: String,
-        /// Comma-separated petnames/groups admitted to this service.
+        /// Comma-separated nicknames/groups admitted to this service.
         #[arg(long)]
         allow: Option<String>,
         /// The command to run per session, after `--` (a stdio MCP server).
@@ -74,14 +74,14 @@ enum Cmd {
     },
     /// Redeem an invite to access a peer's services, or unpair a peer.
     ///
-    /// Auto-starts the daemon. `--remove <petname>` drops the peer's trust entry and
+    /// Auto-starts the daemon. `--remove <nickname>` drops the peer's trust entry and
     /// revokes its access to YOUR services; it does NOT cut sessions already in
     /// flight (those run to completion), only the ability to open new ones.
     Pair {
         /// The `mcpmesh-invite:...` string to redeem. Omit when using `--remove`.
         invite: Option<String>,
-        /// Unpair a peer by petname instead of redeeming an invite.
-        #[arg(long, value_name = "petname")]
+        /// Unpair a peer by nickname instead of redeeming an invite.
+        #[arg(long, value_name = "nickname")]
         remove: Option<String>,
     },
     /// Print the steps to use a peer's service from your AI client.
@@ -207,7 +207,7 @@ enum Internal {
     /// Print this machine's full endpoint id.
     ///
     /// The raw-id surface deliberately kept OUT of plain `status`: the OTHER
-    /// machine's `internal peer add <petname> <id>` parses exactly this. Derived
+    /// machine's `internal peer add <nickname> <id>` parses exactly this. Derived
     /// locally from the device key (the id is deterministic; no daemon round-trip).
     Id,
     /// Peer allowlist management — an internal stand-in for pairing (prefer `mcpmesh pair`).
@@ -314,13 +314,13 @@ enum RosterCmd {
 
 #[derive(Subcommand)]
 enum PeerCmd {
-    /// Add a peer to the allowlist by petname + endpoint id.
+    /// Add a peer to the allowlist by nickname + endpoint id.
     ///
     /// Routes through the daemon (which owns the open store), so it auto-starts
     /// the daemon if needed.
     Add {
         /// Local human name the gate resolves this peer to.
-        petname: String,
+        nickname: String,
         /// The peer's endpoint id (from that machine's `internal id`).
         endpoint_id: String,
         /// Comma-separated services recorded as this peer's grant. NOTE: this list is
@@ -396,12 +396,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 Internal::Peer {
                     command:
                         PeerCmd::Add {
-                            petname,
+                            nickname,
                             endpoint_id,
                             allow,
                         },
                 },
-        }) => run_peer_add(petname, endpoint_id, allow),
+        }) => run_peer_add(nickname, endpoint_id, allow),
         Some(Cmd::Internal {
             command:
                 Internal::Roster {
@@ -432,8 +432,8 @@ fn run_serve(name: String, allow: Option<String>, cmd: Vec<String>) -> anyhow::R
             .await?;
         println!("serving '{name}'");
         // The next exact instruction. Nothing is shared until someone is granted access, so the
-        // invite is ALWAYS the next step — `--allow` names petnames, but only a redeemed invite
-        // (or a roster) makes a petname resolve to a real peer.
+        // invite is ALWAYS the next step — `--allow` names nicknames, but only a redeemed invite
+        // (or a roster) makes a nickname resolve to a real peer.
         println!(
             "Next: run `mcpmesh invite {name}` to mint a one-time invite, and send it to the \
              person you want to share it with."
@@ -472,7 +472,7 @@ fn run_invite(services: Vec<String>) -> anyhow::Result<()> {
     })
 }
 
-/// `mcpmesh pair <invite>` / `mcpmesh pair --remove <petname>`: auto-start the daemon, then either
+/// `mcpmesh pair <invite>` / `mcpmesh pair --remove <nickname>`: auto-start the daemon, then either
 /// redeem an invite (printing the SAS + mountable `<peer>/<service>` targets) or unpair a peer.
 /// Exactly one of the invite arg / `--remove` must be given.
 ///
@@ -481,10 +481,10 @@ fn run_invite(services: Vec<String>) -> anyhow::Result<()> {
 fn run_pair(invite: Option<String>, remove: Option<String>) -> anyhow::Result<()> {
     match (invite, remove) {
         (Some(_), Some(_)) => {
-            anyhow::bail!("provide an invite to redeem OR --remove <petname>, not both")
+            anyhow::bail!("provide an invite to redeem OR --remove <nickname>, not both")
         }
         (None, None) => {
-            anyhow::bail!("provide an invite to redeem, or --remove <petname> to unpair")
+            anyhow::bail!("provide an invite to redeem, or --remove <nickname> to unpair")
         }
         (Some(invite_line), None) => with_daemon(async move |mut client| {
             let paired = client.pair(&invite_line).await?;
@@ -493,12 +493,12 @@ fn run_pair(invite: Option<String>, remove: Option<String>) -> anyhow::Result<()
             }
             Ok(())
         }),
-        (None, Some(petname)) => with_daemon(async move |mut client| {
-            client.peer_remove(&petname).await?;
+        (None, Some(nickname)) => with_daemon(async move |mut client| {
+            client.peer_remove(&nickname).await?;
             // Sessions already in flight are NOT severed (they run to completion) — only new
-            // authorized sessions are blocked from here on. The petname just stops resolving
+            // authorized sessions are blocked from here on. The nickname just stops resolving
             // + being admitted.
-            println!("Unpaired {petname}.");
+            println!("Unpaired {nickname}.");
             Ok(())
         }),
     }
@@ -522,19 +522,23 @@ fn run_use(target: String) -> anyhow::Result<()> {
     })
 }
 
-/// `mcpmesh internal peer add <petname> <endpoint_id> [--allow a,b]`: auto-start the daemon and
+/// `mcpmesh internal peer add <nickname> <endpoint_id> [--allow a,b]`: auto-start the daemon and
 /// write the peer entry through it (redb is single-process; the daemon owns the open store).
-fn run_peer_add(petname: String, endpoint_id: String, allow: Option<String>) -> anyhow::Result<()> {
+fn run_peer_add(
+    nickname: String,
+    endpoint_id: String,
+    allow: Option<String>,
+) -> anyhow::Result<()> {
     let allow = split_csv(allow);
     with_daemon(async move |mut client| {
         client
             .request(mcpmesh::Request::PeerAdd(PeerAddParams {
-                petname: petname.clone(),
+                nickname: nickname.clone(),
                 endpoint_id,
                 allow,
             }))
             .await?;
-        println!("added peer '{petname}'");
+        println!("added peer '{nickname}'");
         Ok(())
     })
 }
@@ -638,7 +642,7 @@ fn run_internal_audit(command: AuditCmd) -> anyhow::Result<()> {
 /// line from the server's `Hello`, this device's own short fingerprint, then the services and
 /// known peers in plain language. Surface-leak discipline (the SECURITY.md bar): the output
 /// carries NO transport vocabulary — services show only the backend KIND (never the
-/// command/path), peers only their petname (never the endpoint id), and the device's own
+/// command/path), peers only their nickname (never the endpoint id), and the device's own
 /// identity appears only as a short fingerprint, never the raw id.
 fn run_status() -> anyhow::Result<()> {
     // The device's own short fingerprint (the deliberate identity carve-out from the raw-id
@@ -666,7 +670,7 @@ fn run_status() -> anyhow::Result<()> {
 /// surface — the dogfood window on the mesh. Auto-starts the daemon, opens the stream (the same
 /// connection-upgrade as `open_session`, one-way after the request), and loops printing frames
 /// until the stream ends or the process is interrupted. Surface-clean: the output carries only
-/// the petnames/user_ids/service names/numbers the frames themselves carry — never a raw
+/// the nicknames/user_ids/service names/numbers the frames themselves carry — never a raw
 /// endpoint id (the frames don't carry one).
 fn run_watch() -> anyhow::Result<()> {
     with_daemon(async move |client| {
@@ -680,7 +684,7 @@ fn run_watch() -> anyhow::Result<()> {
 }
 
 /// `mcpmesh internal id`: print this machine's full endpoint id — the same encoding
-/// `internal peer add <petname> <endpoint_id>` parses. This is the doctor-class raw-id surface
+/// `internal peer add <nickname> <endpoint_id>` parses. This is the doctor-class raw-id surface
 /// (deliberately NOT in plain `status`): a human on machine A copies A's id and runs
 /// `internal peer add A <id>` on machine B. Derived LOCALLY from the device key — the id is
 /// deterministic (`SecretKey::from_bytes(device.secret).public()`, and `EndpointId` is a

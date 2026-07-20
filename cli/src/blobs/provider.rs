@@ -167,7 +167,7 @@ impl AppBlobs {
     }
 
     /// Grant a scope to a principal — any flat-namespace entry: a group name, a user_id,
-    /// or a petname — persisted single-writer.
+    /// or a nickname — persisted single-writer.
     pub fn grant(&self, scope: &str, principal: &str) -> Result<()> {
         self.scopes.grant(scope, principal)
     }
@@ -213,7 +213,7 @@ impl AppBlobs {
 ///    (the accept-time gate already vetted the endpoint; the GET hook is the per-hash boundary). A
 ///    missing endpoint id (never on an authenticated conn) is denied defensively.
 ///  - `GetRequestReceived`: resolve the endpoint via the trust gate to its identity and ALLOW iff a
-///    scope contains the hash AND grants one of the caller's principals — `groups ∪ {petname} ∪
+///    scope contains the hash AND grants one of the caller's principals — `groups ∪ {nickname} ∪
 ///    {user_id}`, the shared `principal_set` — else `Permission`, BEFORE any bytes (the
 ///    Intercept path blocks the transfer on the provider's `rx.await??`).
 ///  - get_many/observe/push (all routed through `mask.get`): DENY
@@ -251,14 +251,14 @@ fn spawn_gate_loop(
                     let allow = msg.request.ranges.is_blob()
                         && identity.as_ref().is_some_and(|identity| {
                             // The grant namespace is THE flat principal set —
-                            // groups ∪ {petname} ∪ {user_id} — via the ONE shared
+                            // groups ∪ {nickname} ∪ {user_id} — via the ONE shared
                             // `principal_set` (same expansion as the mesh allow check and
-                            // the plugin seam). The petname is deliberately INCLUDED: a
+                            // the plugin seam). The nickname is deliberately INCLUDED: a
                             // pairing-mode peer (no user binding) granted a scope by its
-                            // petname can fetch, matching service `allow` semantics; a
+                            // nickname can fetch, matching service `allow` semantics; a
                             // plugin's attachment scopes may grant by audience strings,
-                            // which include petnames. Excluding it silently broke
-                            // petname-audience attachments once. Default-deny is untouched:
+                            // which include nicknames. Excluding it silently broke
+                            // nickname-audience attachments once. Default-deny is untouched:
                             // an unlisted principal still gets `Permission` before any bytes.
                             let principals: HashSet<&str> = mcpmesh_local_api::principal_set(
                                 Some(&identity.name),
@@ -270,7 +270,7 @@ fn spawn_gate_loop(
                             scopes.snapshot().allows(&hash_hex, &principals)
                         });
                     // Audit the fetch: peer + hash + status (ok/denied). A COUNT/ref only —
-                    // never blob content. Attributes to the resolved user_id/petname, or "unknown".
+                    // never blob content. Attributes to the resolved user_id/nickname, or "unknown".
                     let peer = identity
                         .as_ref()
                         .map(|i| i.user_id.clone().unwrap_or_else(|| i.name.clone()));
@@ -443,14 +443,14 @@ mod tests {
     }
 
     /// Regression — the blob-scope grant namespace is the FULL flat principal set,
-    /// petname included: a PAIRING-MODE peer (petname only, `user_id: None`, no groups)
-    /// granted a scope by its petname CAN fetch; a resolved-but-unlisted peer is still
+    /// nickname included: a PAIRING-MODE peer (nickname only, `user_id: None`, no groups)
+    /// granted a scope by its nickname CAN fetch; a resolved-but-unlisted peer is still
     /// denied (default-deny holds). Pins the ruling that aligned this gate with the mesh
-    /// `allow` semantics (petnames were previously — wrongly — excluded here).
+    /// `allow` semantics (nicknames were previously — wrongly — excluded here).
     #[tokio::test]
-    async fn pairing_mode_petname_grant_admits_and_unlisted_peer_stays_denied() {
+    async fn pairing_mode_nickname_grant_admits_and_unlisted_peer_stays_denied() {
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            let carol_ep = ep().await; // pairing-mode: petname only
+            let carol_ep = ep().await; // pairing-mode: nickname only
             let mallory_ep = ep().await; // resolved by the gate, but granted nothing
             let carol_id: EndpointId = carol_ep.id().into();
             let mallory_id: EndpointId = mallory_ep.id().into();
@@ -461,7 +461,7 @@ mod tests {
                 PeerIdentity {
                     endpoint: [0u8; 32].into(),
                     name: "carol".into(),
-                    user_id: None, // no device→user binding — petname is the ONLY principal
+                    user_id: None, // no device→user binding — nickname is the ONLY principal
                     groups: vec![],
                 },
             );
@@ -491,12 +491,12 @@ mod tests {
             provider.spawn_accept(&provider_ep);
 
             let src = pdir.path().join("attach.bin");
-            std::fs::write(&src, b"petname-scoped bytes").unwrap();
+            std::fs::write(&src, b"nickname-scoped bytes").unwrap();
             let (ticket, _hash) = provider
                 .publish_scope("kb-attach-carol", &src)
                 .await
                 .unwrap();
-            // Grant by PETNAME — the kb attachment-scope shape (audience strings include petnames).
+            // Grant by NICKNAME — the kb attachment-scope shape (audience strings include nicknames).
             provider.grant("kb-attach-carol", "carol").unwrap();
 
             let cdir = tempfile::tempdir().unwrap();
@@ -506,10 +506,10 @@ mod tests {
             let hash = carol
                 .fetch(&ticket)
                 .await
-                .expect("a pairing-mode peer granted by petname fetches");
+                .expect("a pairing-mode peer granted by nickname fetches");
             assert_eq!(
                 &carol.read_bytes(hash).await.unwrap()[..],
-                b"petname-scoped bytes"
+                b"nickname-scoped bytes"
             );
 
             // DEFAULT-DENY: mallory resolves at accept time but holds no grant → Permission.
@@ -525,7 +525,7 @@ mod tests {
             );
         })
         .await
-        .expect("petname-grant test timed out");
+        .expect("nickname-grant test timed out");
     }
 
     /// A served GET records a `blob_fetch` audit line attributed to the authenticated peer, with the

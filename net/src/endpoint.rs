@@ -101,7 +101,7 @@ pub trait SessionBackend: Send + Sync + 'static {
 }
 
 /// One registered service: the backend that answers it plus the `allow` list of
-/// callers admitted to it (petnames/user_ids/groups — a flat namespace).
+/// callers admitted to it (nicknames/user_ids/groups — a flat namespace).
 /// `run_session` matches the resolved peer identity against `allow` to compute
 /// the caller's admitted service set.
 pub struct ServiceEntry {
@@ -246,7 +246,7 @@ pub async fn run_mesh_connection(
 }
 
 /// Does this service's `allow` list admit the resolved caller? The flat authorization namespace:
-/// a petname (`identity.name`), a roster user_id, or a group name. Extracted so the exact
+/// a nickname (`identity.name`), a roster user_id, or a group name. Extracted so the exact
 /// predicate `run_session` uses is unit-testable.
 ///
 /// The expansion itself is THE shared `mcpmesh_local_api::principal_set` — the same implementation
@@ -284,8 +284,8 @@ async fn run_session(
     };
 
     // caller_allowed = services whose `allow` admits this resolved identity (the flat allow
-    // namespace is petnames, user_ids, and group names). `caller_admits` checks all three arms:
-    // petname (`identity.name`), roster user_id (`identity.user_id`, None in pairing mode), and
+    // namespace is nicknames, user_ids, and group names). `caller_admits` checks all three arms:
+    // nickname (`identity.name`), roster user_id (`identity.user_id`, None in pairing mode), and
     // group — so a roster caller named only by its user_id is admitted. The roster's flat-namespace
     // disjointness rule guarantees a group and a user_id never collide, so checking all three is safe.
     let allowed: Vec<String> = services
@@ -516,10 +516,10 @@ mod tests {
         .expect("strike-out test timed out");
     }
 
-    /// `caller_admits` implements the flat namespace: petname (name) OR user_id OR group. This
+    /// `caller_admits` implements the flat namespace: nickname (name) OR user_id OR group. This
     /// calls the PRODUCTION function so activating the user_id arm is a real red→green change.
     #[test]
-    fn caller_admits_by_petname_user_id_or_group() {
+    fn caller_admits_by_nickname_user_id_or_group() {
         let allow = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
         // A roster identity: name == user_id == "alice", groups team-eng+all.
@@ -555,7 +555,7 @@ mod tests {
             "user_id arm admits independent of name"
         );
 
-        // A pairing identity (user_id None) is admitted only by its petname/groups.
+        // A pairing identity (user_id None) is admitted only by its nickname/groups.
         let pairing = PeerIdentity {
             endpoint: EndpointId::from_bytes([0u8; 32]),
             name: "bob".into(),

@@ -117,7 +117,7 @@ impl SocketBackend {
         }
 
         // Session lifecycle audit: attribute to the gate-resolved identity — the roster
-        // user_id when present, else the petname (endpoint_id-keyed authenticated name, never a
+        // user_id when present, else the nickname (endpoint_id-keyed authenticated name, never a
         // self-asserted one). `None` only on a hypothetical no-identity path.
         let peer = identity
             .as_ref()

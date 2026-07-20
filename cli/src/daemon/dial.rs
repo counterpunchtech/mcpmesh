@@ -1,4 +1,4 @@
-//! The daemon's OUTBOUND dial machinery plus the session pipe: petname/person →
+//! The daemon's OUTBOUND dial machinery plus the session pipe: nickname/person →
 //! endpoint resolution, the staggered person→device race, the explicit dial timeout, and the
 //! control↔mesh byte pipe with its service-name injection. Split out of `daemon.rs`
 //! mechanically — no API change; `daemon` re-exports the public entry points.
@@ -14,7 +14,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use super::MeshState;
 
 /// Resolve `peer` to a session over the mesh, preferring the roster PERSON→DEVICE path
-/// and falling back to the single-petname path.
+/// and falling back to the single-nickname path.
 ///
 /// **Person→device (roster mode).** When `peer` names a roster USER that has active devices
 /// (`mesh.roster.view().devices_for_user(peer)` non-empty), its devices are dialed as a STAGGERED
@@ -33,7 +33,7 @@ use super::MeshState;
 ///    own gate still authorizes us on their side; racing adds NO new trust decision on our side beyond
 ///    "this endpoint is an active roster device of the named user."
 ///
-/// **Single-petname fallback.** Otherwise resolve the petname to its stored [`PeerEntry`] via the
+/// **Single-nickname fallback.** Otherwise resolve the nickname to its stored [`PeerEntry`] via the
 /// allowlist store and dial an [`iroh::EndpointAddr`] carrying the entry's pairing-persisted
 /// `last_addr` hint when usable ([`stored_dial_addr`]) — else id-only. iroh merges provided direct
 /// addrs with what discovery (DNS/pkarr under the N0 preset) resolves FROM the id, so the hint makes
@@ -58,7 +58,7 @@ pub async fn dial_service(
                 .with_context(|| format!("dial {peer}/{service}"));
         }
     }
-    // Single-petname fallback: resolve the allowlist petname → its stored entry → dial by id
+    // Single-nickname fallback: resolve the allowlist nickname → its stored entry → dial by id
     // WITH the pairing-persisted address hint attached (issue #27: a cold daemon must not
     // depend on the in-process address cache or external discovery to reach a paired peer).
     let peer_owned = peer.to_string();
@@ -75,7 +75,7 @@ pub async fn dial_service(
         .with_context(|| format!("dial {peer}/{service}"))
 }
 
-/// Assemble the single-petname dial [`iroh::EndpointAddr`]: the stored `endpoint_id` plus,
+/// Assemble the single-nickname dial [`iroh::EndpointAddr`]: the stored `endpoint_id` plus,
 /// when it is usable, the pairing-persisted `last_addr` hint (iroh merges provided direct
 /// addrs with whatever discovery resolves, so attaching the hint never narrows reachability).
 ///
@@ -99,11 +99,11 @@ const DIAL_STAGGER: Duration = Duration::from_millis(500);
 
 /// The explicit application-level dial timeout. Defense-in-depth over iroh's
 /// transport idle timeouts — SYMMETRIC across both dial paths (the person→device race AND the
-/// single-petname fallback) so a dead/stalling peer fails a dial in a bounded, asserted window.
+/// single-nickname fallback) so a dead/stalling peer fails a dial in a bounded, asserted window.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// `connect` with an explicit timeout. On elapse → a typed Err (the caller surfaces
-/// `-32055 unreachable` upstream). Used by BOTH `dial_one` and the single-petname `dial_service`.
+/// `-32055 unreachable` upstream). Used by BOTH `dial_one` and the single-nickname `dial_service`.
 pub(crate) async fn connect_with_timeout(
     endpoint: &iroh::Endpoint,
     addr: iroh::EndpointAddr,

@@ -109,7 +109,7 @@ async fn four_command_hero_flow() {
         // ══════════════════════════════════════════════════════════════════════════════════
         // COMMAND 1 — `serve`: ALICE is a REAL serving daemon (own ALPN-dispatch accept loop +
         // control API). `[services.notes] run=echo_stub, allow=[]` (local-only until a pairing
-        // grant), gated by the REAL AllowlistGate over a real PeerStore. self_petname "alice".
+        // grant), gated by the REAL AllowlistGate over a real PeerStore. self_nickname "alice".
         // ══════════════════════════════════════════════════════════════════════════════════
         let alice_ep = dual_alpn_endpoint().await;
         let alice_id = *alice_ep.id().as_bytes();
@@ -148,7 +148,7 @@ async fn four_command_hero_flow() {
         let alice_control = tokio::spawn(serve_control(alice_listener, alice_state));
 
         // ── BOB: a REAL daemon (control API) that DIALS. No accept loop — Bob only redeems and
-        // connects outbound. self_petname "bob" (becomes Alice's local name for Bob). Bob's
+        // connects outbound. self_nickname "bob" (becomes Alice's local name for Bob). Bob's
         // endpoint is seeded with Alice's addr so the post-pair id-only mesh dial resolves on
         // localhost (the DECLARED discovery stand-in; see the module header). Bob's control socket
         // is bound where a subprocess with XDG_RUNTIME_DIR=<bob_dir> resolves it. ──
@@ -242,7 +242,7 @@ async fn four_command_hero_flow() {
             .expect("pair over mcpmesh-local/1");
         let paired: PairResult =
             serde_json::from_value(pair_value).expect("typed PairResult decodes");
-        assert_eq!(paired.peer_petname, "alice", "Bob's local name for the inviter");
+        assert_eq!(paired.peer_nickname, "alice", "Bob's local name for the inviter");
         assert_eq!(
             paired.services,
             vec!["notes".to_string()],
@@ -267,7 +267,7 @@ async fn four_command_hero_flow() {
         );
 
         // ── The INVITER's ceremony surface (§4.2 "both humans compare the code"): Alice's
-        // `status` now carries the completed pairing under `recent_pairings`, petname'd "bob",
+        // `status` now carries the completed pairing under `recent_pairings`, nickname'd "bob",
         // with the SAME sas_code Bob's PairResult reported — so Alice's human can read the code
         // without grepping daemon logs. Display-only + in-memory (a restart clears it). ──
         let status_after = alice_client
@@ -280,7 +280,7 @@ async fn four_command_hero_flow() {
             .recent_pairings
             .first()
             .expect("the inviter's status must surface the completed pairing");
-        assert_eq!(recent.peer_petname, "bob", "the pairing is listed under Bob's petname");
+        assert_eq!(recent.peer_nickname, "bob", "the pairing is listed under Bob's nickname");
         assert_eq!(
             recent.sas_code, paired.sas_code,
             "the inviter's status shows the SAME code the redeemer's pair printed"
@@ -293,14 +293,14 @@ async fn four_command_hero_flow() {
             .resolve(&alice_id)
             .unwrap()
             .expect("Bob's store has an alice entry");
-        assert_eq!(bob_side.petname, "alice");
+        assert_eq!(bob_side.nickname, "alice");
         assert_eq!(bob_side.services, vec!["notes".to_string()]);
         assert!(bob_side.paired_at.is_some());
         let alice_side = alice_store
             .resolve(&bob_id)
             .unwrap()
             .expect("Alice's store has a bob dial-back entry");
-        assert_eq!(alice_side.petname, "bob");
+        assert_eq!(alice_side.nickname, "bob");
         assert!(
             alice_side.services.is_empty(),
             "Alice's dial-back entry carries no service grants (§4.2): {:?}",
@@ -322,7 +322,7 @@ async fn four_command_hero_flow() {
 
         // ══════════════════════════════════════════════════════════════════════════════════
         // COMMAND 4 — `connect` (clause 3, THE PAYOFF): the REAL `mcpmesh connect alice/notes`
-        // subprocess drives its stdio against Bob's control socket. Bob's daemon resolves petname
+        // subprocess drives its stdio against Bob's control socket. Bob's daemon resolves nickname
         // `alice` → Alice's id (written by pairing), dials her `notes` by id (MemoryLookup resolves
         // it on localhost), Alice's gate resolves Bob → `bob`, `select_service` ADMITS `bob` (now in
         // allow, live after the grant's reload), the echo child answers, and MCPMESH_PEER_NAME=bob is

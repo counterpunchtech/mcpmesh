@@ -138,7 +138,7 @@ async fn subscribe_pushes_snapshot_then_live_session_events() {
         server_store
             .add(PeerEntry {
                 endpoint_id: daemon_id,
-                petname: "daemon".into(),
+                nickname: "daemon".into(),
                 services: vec!["echo".into()],
                 paired_at: None,
                 user_id: None,
@@ -175,7 +175,7 @@ async fn subscribe_pushes_snapshot_then_live_session_events() {
         daemon_store
             .add(PeerEntry {
                 endpoint_id: server_id,
-                petname: "tester".into(),
+                nickname: "tester".into(),
                 services: vec!["echo".into()],
                 paired_at: None,
                 user_id: None,
