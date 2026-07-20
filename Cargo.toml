@@ -3,7 +3,7 @@ resolver = "3"
 members = ["codec", "net", "trust", "local-api", "cli", "xtask"]
 
 [workspace.package]
-version = "0.5.3"          # lockstep with the private monorepo this repo is mirrored from (see CONTRIBUTING.md)
+version = "0.5.3"          # the release-train version: all five crates publish in lockstep (see RELEASING.md)
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.95.0"
