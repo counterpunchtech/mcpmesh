@@ -450,9 +450,14 @@ pub struct AuditSummaryResult {
 /// transport-vocabulary blocklist, so this is NOT a transport-vocab leak) plus its
 /// absolute expiry in epoch seconds (≤ now + 24h).
 ///
-/// Additive-only: any future field (e.g. the computed SAS, once the inviter side
-/// surfaces it) MUST land as `#[serde(default, skip_serializing_if = ...)]` so older
-/// payloads still deserialize.
+/// `invite` returns BEFORE any redemption, so the SAS — which is derived from the redeemer's
+/// endpoint id, unknown until they redeem — cannot appear here. The inviter reads its side of
+/// the SAS from [`StatusResult::recent_pairings`] once a redemption completes (a `trust`/`pair`
+/// frame on the live [`StreamFrame`] stream signals that moment). See the "embedding the pairing
+/// ceremony" note in `docs/local-protocol.md` (#35).
+///
+/// Additive-only: any future field MUST land as `#[serde(default, skip_serializing_if = ...)]`
+/// so older payloads still deserialize.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InviteResult {
     /// The `mcpmesh-invite:<base32>` line, copied out-of-band to the redeemer.

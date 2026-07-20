@@ -235,6 +235,25 @@ Note the surface discipline that runs through every response: names are **nickna
 `user_id`s** (opaque `b64u:` identifiers spanning a person's devices), never raw endpoint
 identifiers, keys, or transport addresses. If you are keying authorization, key on `user_id`.
 
+### Embedding the pairing ceremony (both sides of the SAS)
+
+The safety code (SAS) — the words the two humans read aloud to confirm the pairing is authentic —
+is surfaced to **both** ends of a pairing through this protocol, so an embedder can render the whole
+ceremony without ever shelling out to `mcpmesh status`:
+
+- **Redeemer** (the side calling `pair`): the SAS is the `sas_code` in the [`pair`
+  result](#methods), returned the moment redemption completes.
+- **Inviter** (the side that called `invite`): `invite` returns *before* anyone redeems, and the
+  SAS is derived from the redeemer's identity, so it cannot appear in the `invite` result. Instead
+  it lands in **`status.recent_pairings`** — a structured, newest-first list of
+  `{peer_nickname, sas_code, paired_at_epoch}` — as soon as the redemption completes. Poll `status`,
+  or (cheaper) hold a [`subscribe`](#live-event-stream) stream open and wait for the `trust` event
+  with `event: "pair"` naming the peer, then read that peer's `sas_code` from `recent_pairings`.
+
+Both sides then display the same words for the out-of-band human check. `recent_pairings` is an
+in-memory ring (the last few completions), cleared on daemon restart — it is a display aid for the
+ceremony, never trust state, and the SAS is deliberately kept out of the durable audit log.
+
 ## Sessions
 
 `open_session` is special: it is the one method that turns the control connection into a **raw MCP

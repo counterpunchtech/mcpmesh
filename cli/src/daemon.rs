@@ -693,6 +693,28 @@ pub(crate) mod testutil {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn recent_pairings_surfaces_the_inviter_side_sas() {
+        // #35: the inviter learns its side of the SAS from status.recent_pairings — the
+        // `record_pairing` sink the accept-loop calls on a completed redemption. Newest-first,
+        // carrying the SAS words for the out-of-band human check, so an embedder renders the
+        // whole ceremony without shelling out to `mcpmesh status`.
+        let dir = tempfile::tempdir().unwrap();
+        let mesh = super::testutil::hermetic_mesh(dir.path().join("config.toml")).await;
+        assert!(mesh.recent_pairings().is_empty(), "no pairings yet");
+
+        mesh.record_pairing("bob".into(), "tango-fig-cabbage".into(), 1000);
+        mesh.record_pairing("carol".into(), "delta-hop-iron".into(), 2000);
+
+        let recent = mesh.recent_pairings();
+        assert_eq!(recent.len(), 2);
+        // Newest first, each carrying the SAS the inviter reads aloud.
+        assert_eq!(recent[0].peer_nickname, "carol");
+        assert_eq!(recent[0].sas_code, "delta-hop-iron");
+        assert_eq!(recent[1].peer_nickname, "bob");
+        assert_eq!(recent[1].sas_code, "tango-fig-cabbage");
+    }
+
     #[test]
     fn sanitize_hostname_makes_a_friendly_nickname() {
         assert_eq!(sanitize_hostname("jetson\n").as_deref(), Some("jetson"));
