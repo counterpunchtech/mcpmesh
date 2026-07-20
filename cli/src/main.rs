@@ -53,6 +53,19 @@ enum Cmd {
         #[arg(last = true, required = true)]
         cmd: Vec<String>,
     },
+    /// Ensure the daemon is running and ready, then print its control-socket path.
+    ///
+    /// For embedders and scripts: a first-class, synchronous "bring the daemon up"
+    /// that blocks until it actually accepts connections (or is already running → a
+    /// fast no-op), prints the endpoint path on success, and exits non-zero with a
+    /// useful message on failure (bad config, permissions, socket in use). Unlike
+    /// bringing the daemon up as a side effect of `status`, readiness here is the
+    /// command's contract, not something to infer by probing.
+    Up {
+        /// Seconds to wait for a freshly-started daemon to become ready (default 10).
+        #[arg(long, value_name = "secs")]
+        timeout: Option<u64>,
+    },
     /// The stdio proxy an AI client runs to reach a peer's service.
     ///
     /// Auto-starts the daemon, opens the session, and pipes MCP frames
@@ -418,8 +431,32 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             command: Internal::Watch,
         }) => run_watch(),
         Some(Cmd::Doctor) => doctor::run_doctor(),
+        Some(Cmd::Up { timeout }) => run_up(timeout),
         Some(Cmd::Status) | None => run_status(),
     }
+}
+
+/// `mcpmesh up [--timeout N]`: bring the daemon up synchronously and print its control-socket
+/// path. Readiness is the contract — `ensure_daemon_with_timeout` returns only once the daemon
+/// answers its `Hello`, so a script needs no post-hoc socket probe. A start failure surfaces the
+/// daemon's own captured reason and exits non-zero (via the normal error path). The socket path
+/// goes to stdout alone, so `SOCK=$(mcpmesh up)` is a clean one-liner.
+fn run_up(timeout: Option<u64>) -> anyhow::Result<()> {
+    let launch = mcpmesh::client::DaemonLaunch::ambient()?;
+    let ready = timeout
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(mcpmesh::client::DEFAULT_READY_TIMEOUT);
+    let socket = launch.socket.clone();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async move {
+        // Connects if live (fast no-op), else spawns and blocks until it answers Hello.
+        let _client = mcpmesh::client::ensure_daemon_with_timeout(&launch, ready).await?;
+        Ok::<(), anyhow::Error>(())
+    })?;
+    println!("{}", socket.display());
+    Ok(())
 }
 
 /// `mcpmesh serve <name> [--allow a,b] -- <cmd...>`: auto-start the daemon and register the

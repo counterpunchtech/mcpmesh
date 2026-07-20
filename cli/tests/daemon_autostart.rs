@@ -17,7 +17,9 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use assert_cmd::cargo::cargo_bin;
-use mcpmesh::client::{ControlClient, DaemonLaunch, connect_control, ensure_daemon_with};
+use mcpmesh::client::{
+    ControlClient, DaemonLaunch, connect_control, ensure_daemon_with, ensure_daemon_with_timeout,
+};
 use mcpmesh::daemon::STACK_VERSION;
 use mcpmesh::{Request, StatusResult};
 use mcpmesh_local_api::{BackendSpec, RegisterServiceParams};
@@ -98,6 +100,33 @@ async fn status(client: &mut ControlClient) -> StatusResult {
         .await
         .expect("status request");
     serde_json::from_value(result).expect("StatusResult deserializes")
+}
+
+/// #33: `mcpmesh up` is `ensure_daemon` with an explicit readiness deadline; the timeout seam
+/// brings a cold daemon up (fast no-op on the second call) and honors a custom deadline.
+#[tokio::test(flavor = "multi_thread")]
+async fn ensure_daemon_with_timeout_brings_up_and_reuses() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let tmp = tempfile::tempdir().unwrap();
+        let launch = launch_in(tmp.path());
+
+        // Cold start with a generous explicit deadline → daemon comes up and Hello is read.
+        let first = ensure_daemon_with_timeout(&launch, Duration::from_secs(15))
+            .await
+            .expect("up brings the daemon up");
+        assert_eq!(first.hello().api, "mcpmesh-local/1");
+        assert!(launch.socket.exists(), "up bound the control socket");
+
+        // Already live → a tiny deadline still succeeds via the fast-path connect (the deadline
+        // bounds only the post-spawn poll, which never runs here).
+        let _second = ensure_daemon_with_timeout(&launch, Duration::from_millis(1))
+            .await
+            .expect("up is a fast no-op when the daemon is already live");
+
+        shutdown_daemon(&launch.socket).await;
+    })
+    .await
+    .expect("up timeout-seam test timed out");
 }
 
 /// Poll until the socket stops accepting connections (the daemon has exited).

@@ -42,8 +42,22 @@ pub async fn ensure_daemon() -> Result<ControlClient> {
     ensure_daemon_with(&DaemonLaunch::ambient()?).await
 }
 
+/// The default readiness deadline for auto-start: a cold start binds in ~3-4s under load;
+/// 10s leaves comfortable headroom on loaded/CI hosts. `mcpmesh up --timeout` overrides it.
+pub const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// [`ensure_daemon`] with an explicit launch spec (the testable seam).
 pub async fn ensure_daemon_with(launch: &DaemonLaunch) -> Result<ControlClient> {
+    ensure_daemon_with_timeout(launch, DEFAULT_READY_TIMEOUT).await
+}
+
+/// [`ensure_daemon_with`] with an explicit readiness deadline — the seam `mcpmesh up --timeout`
+/// drives. `ready_timeout` bounds only the poll-connect window AFTER a spawn; the fast path (a
+/// live daemon already owns the socket) returns immediately regardless.
+pub async fn ensure_daemon_with_timeout(
+    launch: &DaemonLaunch,
+    ready_timeout: Duration,
+) -> Result<ControlClient> {
     // Pre-flight (unix): a control-socket path longer than `sockaddr_un.sun_path` can NEVER
     // bind, so spawning a daemon and polling the connect window would only bury the cause in
     // kernel-speak ("path must be shorter than SUN_LEN", per issue #10). Refuse now, naming
@@ -61,7 +75,7 @@ pub async fn ensure_daemon_with(launch: &DaemonLaunch) -> Result<ControlClient> 
     // converges on it. The bound is generous (a cold start under machine load binds in
     // ~3-4s; 10s leaves comfortable headroom on loaded/CI hosts) — the happy path returns
     // sub-second via the fast-path probe above, so only a genuinely stuck start waits it out.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + ready_timeout;
     let mut backoff = Duration::from_millis(20);
     loop {
         match connect_control(&launch.socket).await {
@@ -84,10 +98,11 @@ pub async fn ensure_daemon_with(launch: &DaemonLaunch) -> Result<ControlClient> 
                     if !stderr.is_empty() {
                         anyhow::bail!("{}", autostart_failure_message(&stderr));
                     }
-                    return Err(anyhow::Error::from(e).context(
-                        "the daemon did not accept connections within 10s — run \
+                    return Err(anyhow::Error::from(e).context(format!(
+                        "the daemon did not accept connections within {}s — run \
                          'mcpmesh doctor' to diagnose",
-                    ));
+                        ready_timeout.as_secs()
+                    )));
                 }
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_millis(200));
