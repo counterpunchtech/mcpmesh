@@ -719,6 +719,7 @@ async fn repeat_grant_unions_the_redeemers_dial_directory_and_applies_the_new_ni
             invite.encode(),
             bob_store.clone(),
             None,
+            &bob_dir.path().join("config.toml"),
         )
         .await
         .expect("the second redeem succeeds");
@@ -751,6 +752,80 @@ async fn repeat_grant_unions_the_redeemers_dial_directory_and_applies_the_new_ni
     })
     .await
     .expect("repeat-grant union test timed out");
+}
+
+/// **Redeemer-side nickname collision (name squatting).** The mirror of the inviter-side
+/// impersonation guard. Bob already trusts "alice" (endpoint A). He then redeems an invite from a
+/// DIFFERENT endpoint (Mallory) whose suggested nickname is also "alice". Applying that suggestion
+/// would point the name Bob's gate resolves — and his `[services.*].allow` authorizes — at
+/// Mallory's endpoint, silently handing her every grant Bob made to the real alice. That would
+/// break the invariant that redeeming an invite grants the redeemed-from side NOTHING, so the
+/// redeem must be REFUSED and Bob's existing alice-entry left untouched.
+#[tokio::test]
+async fn redeem_refuses_an_invite_squatting_an_existing_peers_nickname() {
+    timeout(Duration::from_secs(60), async {
+        let (redeemer, addr, _store, invites, mallory_id, _cfg) = setup_full("").await;
+
+        // Bob's store: the REAL alice, under a different endpoint id than the inviter he's about
+        // to redeem from.
+        let bob_dir = tempfile::tempdir().unwrap();
+        let bob_store = Arc::new(PeerStore::open(&bob_dir.path().join("state.redb")).unwrap());
+        let real_alice_id = [0xA1u8; 32];
+        assert_ne!(real_alice_id, mallory_id);
+        bob_store
+            .add(PeerEntry {
+                endpoint_id: real_alice_id,
+                nickname: "alice".into(),
+                services: vec!["notes".into()],
+                paired_at: Some("1000".into()),
+                user_id: Some("b64u:ALICE".into()),
+                last_addr: None,
+            })
+            .unwrap();
+
+        // Mallory's invite suggests the name Bob already uses for alice.
+        let secret = [33u8; 32];
+        let invite = Invite {
+            secret,
+            inviter_id: mallory_id,
+            inviter_addr_json: serde_json::to_string(&addr).unwrap(),
+            nickname: "alice".into(),
+            services: vec!["kb".into()],
+            expires_at_epoch: FUTURE,
+        };
+        invites.mint(invite.clone());
+
+        let err = redeem_invite(
+            redeemer,
+            "bob".into(),
+            invite.encode(),
+            bob_store.clone(),
+            None,
+            &bob_dir.path().join("config.toml"),
+        )
+        .await
+        .expect_err("redeeming a nickname-squatting invite must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("alice"),
+            "the error must name the colliding nickname so the user can rename: {msg}"
+        );
+
+        // Bob's real alice-entry is untouched, and NO entry exists under Mallory's id.
+        let alice = bob_store
+            .resolve(&real_alice_id)
+            .unwrap()
+            .expect("the real alice entry survives a squatting attempt");
+        assert_eq!(alice.nickname, "alice");
+        assert_eq!(alice.services, vec!["notes".to_string()]);
+        assert!(
+            bob_store.resolve(&mallory_id).unwrap().is_none(),
+            "no entry may be written for the squatter"
+        );
+        drop(bob_dir);
+    })
+    .await
+    .expect("redeemer-side squatting test timed out");
 }
 
 /// **The load-bearing seam, end to end (M2b T6 Step 5).** A REAL redeemer (`redeem_invite`) pairs
@@ -821,6 +896,7 @@ async fn paired_and_granted_peer_is_admitted_to_the_service_end_to_end() {
             invite.encode(),
             bob_store.clone(),
             None,
+            &bob_dir.path().join("config.toml"),
         )
         .await
         .expect("redeem_invite dials, verifies the inviter id, sends the secret, succeeds");
@@ -992,6 +1068,7 @@ async fn pairing_exchanges_and_stores_each_sides_verified_user_id() {
                 user_pk: b_pk,
                 sig: b_sig,
             }),
+            &bob_dir.path().join("config.toml"),
         )
         .await
         .expect("redeem succeeds and exchanges self-sovereign bindings");
@@ -1064,9 +1141,16 @@ async fn redeem_refuses_an_address_swap_and_writes_no_entry_p3() {
         let bob = redeemer_endpoint().await;
         let bob_dir = tempfile::tempdir().unwrap();
         let bob_store = Arc::new(PeerStore::open(&bob_dir.path().join("state.redb")).unwrap());
-        let err = redeem_invite(bob, "bob".into(), invite.encode(), bob_store.clone(), None)
-            .await
-            .expect_err("a P3 id mismatch must fail the redeem");
+        let err = redeem_invite(
+            bob,
+            "bob".into(),
+            invite.encode(),
+            bob_store.clone(),
+            None,
+            &bob_dir.path().join("config.toml"),
+        )
+        .await
+        .expect_err("a P3 id mismatch must fail the redeem");
         assert!(
             err.to_string().contains("address-swap") || err.to_string().contains("id mismatch"),
             "expected an address-swap / id-mismatch error, got: {err}"

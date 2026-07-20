@@ -525,6 +525,7 @@ pub(crate) async fn redeem(state: &DaemonState, invite_line: String) -> Result<P
         invite_line,
         mesh.store.clone(),
         mesh.self_binding(),
+        &mesh.config_path,
     )
     .await
 }

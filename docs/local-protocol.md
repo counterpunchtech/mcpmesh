@@ -146,7 +146,7 @@ Methods split into two groups by audience:
 | `status` | *(none)* | [`StatusResult`](#statusresult) |
 | `audit_summary` | *(none)* | `{per_peer:[[name,count],…], per_service:[[name,count],…], total_sessions}` — this node's **local** session tallies; nothing is transmitted |
 | `invite` | `{services:[…]}` | `{invite_line:"mcpmesh-invite:…", expires_at_epoch}` |
-| `pair` | `{invite_line}` | `{peer_nickname, sas_code, services:[…]}` |
+| `pair` | `{invite_line}` | `{peer_nickname, sas_code, services:[…]}` — fails (no dial attempted) if the invite's suggested nickname is already yours for a *different* peer, or already sits in a `[services.*].allow`; see [Nickname collisions](#nickname-collisions) |
 | `peer_remove` | `{nickname}` | `{}` (ack) |
 | `peer_rename` | `{to, user_id?, nickname?}` — rename a person by `user_id`, else a provisional contact by `nickname` | `{}` (ack) |
 | `open_session` | `{peer, service}` | *no response frame — see [Sessions](#sessions)* |
@@ -162,6 +162,28 @@ Methods split into two groups by audience:
 Paths and files (`roster_install.path`, `org_join.user_key`, `blob_publish.path`,
 `blob_fetch.dest_path`) are passed **as local paths, not bytes** — the same-uid daemon reads/writes
 them directly, which is within the trust boundary.
+
+### Nickname collisions
+
+Nicknames are the daemon's authorization principal: the trust gate resolves an inbound endpoint to
+its nickname, and `[services.*].allow` admits by that nickname. So a nickname must never come to
+mean two different endpoints — whoever holds the name inherits every grant made to it.
+
+Both halves of the pairing ceremony therefore refuse a name that is already meaningful:
+
+- **`pair` (redeemer side)** — an invite carries the inviter's *suggested* nickname, chosen by
+  them. The redeem fails, **before any dial**, if a stored peer already holds that nickname under a
+  different endpoint, or if no peer holds it but it already appears in some `[services.*].allow`.
+  Without this, redeeming a stranger's invite could silently repoint a trusted name at them —
+  breaking the rule that redeeming an invite grants the other side nothing.
+- **Inviter side** — symmetrically, a redeemer that self-asserts a nickname already belonging to a
+  different endpoint (or sitting unbacked in an `allow`) is refused with the generic
+  `pairing refused`, which deliberately leaks no detail about which names exist.
+- **`peer_rename`** — refuses a target name that is already taken or already granted.
+
+Re-pairing with a peer you already know always passes: the only entry holding the name is that
+peer's own, so renaming a peer by redeeming a fresh invite from them keeps working. To reuse a name
+for someone new, `peer_remove` the old holder first.
 
 ### Reserved / internal methods
 

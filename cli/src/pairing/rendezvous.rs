@@ -468,6 +468,7 @@ pub async fn redeem_invite(
     invite_line: String,
     store: Arc<PeerStore>,
     self_binding: Option<SelfBinding>,
+    config_path: &Path,
 ) -> anyhow::Result<PairResult> {
     let invite = Invite::decode(&invite_line)?;
 
@@ -475,6 +476,22 @@ pub async fn redeem_invite(
     // enforces at redeem — this just avoids a pointless dial).
     if invite.expires_at_epoch < epoch_now() {
         bail!("invite expired");
+    }
+
+    // Client-side nickname-squatting check — the mirror of the inviter side's
+    // [`nickname_collision`], and enforced BEFORE the dial so a squatting invite never reaches
+    // the wire. `invite.nickname` is a stranger's SUGGESTION for what we should call them, and
+    // applying it verbatim is what makes the name our gate resolves to (and our
+    // `[services.*].allow` authorizes) point at THEIR endpoint. Refusing here keeps the
+    // invariant that redeeming an invite grants the other side nothing.
+    if let Some(conflict) =
+        nickname_squat(&store, config_path, &invite.nickname, &invite.inviter_id)?
+    {
+        bail!(
+            "this invite asks to be called '{}', but {conflict} \
+             Ask them for an invite suggesting a different name.",
+            invite.nickname,
+        );
     }
 
     // Dial the inviter at the exact address the invite embeds — pairing needs no discovery
@@ -618,6 +635,49 @@ fn nickname_collision(
         return Ok(true);
     }
     Ok(false)
+}
+
+/// Redeemer-side name-squatting guard — the mirror of [`nickname_collision`], run before we adopt
+/// an invite's *suggested* nickname. Returns `Some(reason)` = REFUSE when adopting the suggestion
+/// would repoint an already-meaningful name at the inviter's endpoint:
+///  - **impersonation** — a stored peer already holds this nickname under a DIFFERENT
+///    `endpoint_id`. Adopting it would make our gate resolve the inviter's dials to the name we
+///    granted the *other* peer, handing them that peer's access.
+///  - **orphan-allow** — no stored peer holds the name, but it already sits in some service's
+///    `[services.*].allow` (a pre-provisioned grant), which the inviter would silently inherit.
+///
+/// Re-pairing with the SAME endpoint passes both, so rename-by-a-fresh-invite keeps working: the
+/// only entry sharing the name is that peer's own, and the name is not an orphan.
+///
+/// The returned string is a reason phrase, spliced into the caller's guidance message.
+fn nickname_squat(
+    store: &PeerStore,
+    config_path: &Path,
+    nickname: &str,
+    inviter_id: &[u8; 32],
+) -> anyhow::Result<Option<String>> {
+    let same_name: Vec<PeerEntry> = store
+        .list()?
+        .into_iter()
+        .filter(|e| e.nickname == nickname)
+        .collect();
+    if same_name.iter().any(|e| &e.endpoint_id != inviter_id) {
+        return Ok(Some(
+            "you already use that name for a different peer — \
+             accepting it would hand this invite's sender that peer's access. \
+             Unpair the existing peer first if you no longer need it."
+                .to_string(),
+        ));
+    }
+    if same_name.is_empty() && nickname_in_any_service_allow(config_path, nickname)? {
+        return Ok(Some(
+            "that name is already granted access to one of your services, \
+             so accepting it would hand this invite's sender that grant. \
+             Remove the name from the service's `allow` first if it is stale."
+                .to_string(),
+        ));
+    }
+    Ok(None)
 }
 
 /// Does `nickname` appear in ANY config `[services.*].allow`? Reads the CURRENT config on disk (the
