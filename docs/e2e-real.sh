@@ -121,6 +121,47 @@ if [ "$PEER_MODE" = "local" ]; then
     peer status | sed -n '1,4p'
 fi
 
+echo "--- 1. pair ---"
+if [ "$PEER_MODE" = "local" ]; then
+    # || true: grep exits 1 when it finds no match (and `peer invite` itself
+    # can fail); under set -e either would silently abort the whole script
+    # instead of counting as a failed assertion.
+    INVITE=$(peer invite notes | grep -o 'mcpmesh-invite:[A-Za-z0-9]*') || true
+else
+    # An UNSET INVITE_FILE is a usage error: the :? runs in the MAIN shell so
+    # it really aborts (inside the $(...) below, || true would rescue it). A
+    # set-but-unreadable file falls through to the empty-INVITE check instead.
+    : "${INVITE_FILE:?INVITE_FILE required when PEER_MODE=remote}"
+    INVITE=$(cat "$INVITE_FILE") || true
+fi
+
+if [ -z "${INVITE:-}" ]; then
+    # Pairing with an empty string would only produce a confusing usage error;
+    # surface the real problem (minting failed) as the failed assertion.
+    bad "could not mint an invite"
+else
+    PAIROUT=$("$MM" pair "$INVITE" 2>&1) || true
+    echo "$PAIROUT" | sed -n '1,2p'
+    case "$PAIROUT" in
+        *"Paired with"*) ok "pairing completed" ;;
+        *) bad "pairing failed: $PAIROUT" ;;
+    esac
+
+    # The SAS is the security ceremony: both sides must print the SAME words, or a
+    # tampered invite would go unnoticed. Comparing them is the point of the code.
+    # Format on our side: "Paired with <peer> — code: <words>" (render::pair_lines);
+    # on theirs: "  <nick> · code: <words> · <age>" (render::recent_pairing_lines).
+    OUR_SAS=$(printf '%s' "$PAIROUT" | sed -n 's/.*code: \([a-z-]*\).*/\1/p')
+    if [ "$PEER_MODE" = "local" ]; then
+        THEIR_SAS=$(peer status | sed -n 's/.*code: \([a-z-]*\).*/\1/p' | head -1)
+        if [ -n "$OUR_SAS" ] && [ "$OUR_SAS" = "$THEIR_SAS" ]; then
+            ok "safety code matches on both sides ($OUR_SAS)"
+        else
+            bad "safety code mismatch: ours='$OUR_SAS' theirs='$THEIR_SAS'"
+        fi
+    fi
+fi
+
 # Sets the script's exit status; the EXIT trap prints the summary and cleans
 # up, and dash preserves this status through the trap.
 [ "$fail" -eq 0 ]
