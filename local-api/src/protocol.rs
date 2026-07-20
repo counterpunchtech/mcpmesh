@@ -17,7 +17,12 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hello {
     pub api: String,         // "mcpmesh-local/1"
-    pub api_version: String, // semver of the API major.minor
+    pub api_version: String, // "MAJOR.MINOR" of the protocol surface (see API_MINOR)
+    /// The protocol-compatibility MINOR as an integer, for a trivial machine comparison
+    /// (`api_minor >= N`) without string parsing. Distinct from `stack_version` (the crate
+    /// release train). Additive: an older daemon omits it and it defaults to 0.
+    #[serde(default)]
+    pub api_minor: u32,
     pub stack_version: String,
 }
 
@@ -140,15 +145,19 @@ pub struct StatusResult {
 
 /// Params of [`Request::RegisterService`]: the `[services.*]` entry to write/update.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RegisterServiceParams {
     pub name: String,
     pub backend: BackendSpec,
     pub allow: Vec<String>,
 }
 
-/// Params of [`Request::Invite`]: the services the minted invite grants. `services` is
-/// defaultable — an absent list grants nothing (the documented server-side tolerance).
+/// Params of [`Request::Invite`]: the services the minted invite grants. Rejects unknown
+/// fields (so `{service: "kb"}` — a singular typo — is a loud error, not a silently
+/// grants-nothing invite), and the daemon additionally rejects an empty/absent `services`
+/// list (an invite that grants nothing is useless — #34).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InviteParams {
     #[serde(default)]
     pub services: Vec<String>,
@@ -157,6 +166,7 @@ pub struct InviteParams {
 /// Params of [`Request::Pair`]: the copyable `mcpmesh-invite:` line. Defaultable — an
 /// absent field reads as an empty line, which simply fails to decode (a clean pair error).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PairParams {
     #[serde(default)]
     pub invite_line: String,
@@ -164,6 +174,7 @@ pub struct PairParams {
 
 /// Params of [`Request::PeerRemove`]: the nickname to unpair.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PeerRemoveParams {
     pub nickname: String,
 }
@@ -171,6 +182,7 @@ pub struct PeerRemoveParams {
 /// Params of [`Request::PeerRename`]: the contact to rename — every device sharing `user_id`
 /// when given, else the single provisional `nickname` entry — and the new nickname `to`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PeerRenameParams {
     #[serde(default)]
     pub user_id: Option<String>,
@@ -182,6 +194,7 @@ pub struct PeerRenameParams {
 /// Params of [`Request::PeerAdd`] (reserved/internal — see the variant): a raw `endpoint_id`
 /// (iroh base32) plus the nickname and service allow list to install it under.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PeerAddParams {
     pub nickname: String,
     pub endpoint_id: String,
@@ -192,6 +205,7 @@ pub struct PeerAddParams {
 /// Params of [`Request::OpenSession`]: the `peer/service` target to dial. Both fields are
 /// defaultable — an empty target simply fails the dial (a clean `-32055` error).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OpenSessionParams {
     #[serde(default)]
     pub peer: String,
@@ -202,6 +216,7 @@ pub struct OpenSessionParams {
 /// Params of [`Request::RosterInstall`]: the LOCAL roster file `path`, plus the org-root pin
 /// on FIRST install (`b64u:`; omit once pinned — config carries it).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RosterInstallParams {
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -211,6 +226,7 @@ pub struct RosterInstallParams {
 /// Params of [`Request::OrgJoin`]: the `[identity]` pin. `user_key` is a LOCAL path — the key
 /// never crosses the API.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OrgJoinParams {
     pub org_id: String,
     pub org_root_pk: String,
@@ -220,12 +236,14 @@ pub struct OrgJoinParams {
 
 /// Params of [`Request::SetRosterUrl`]: the HTTPS roster URL to pin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SetRosterUrlParams {
     pub url: String,
 }
 
 /// Params of [`Request::BlobPublish`]: the scope to publish into and the LOCAL file to add.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlobPublishParams {
     pub scope: String,
     pub path: String,
@@ -233,6 +251,7 @@ pub struct BlobPublishParams {
 
 /// Params of [`Request::BlobGrant`]: the scope and the flat-namespace principal to grant it to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlobGrantParams {
     pub scope: String,
     pub principal: String,
@@ -240,6 +259,7 @@ pub struct BlobGrantParams {
 
 /// Params of [`Request::BlobFetch`]: the `mcpmesh/blob/1` ticket and the LOCAL export path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlobFetchParams {
     pub ticket: String,
     pub dest_path: String,
@@ -685,7 +705,18 @@ pub enum BackendSpec {
 }
 
 pub const API_NAME: &str = "mcpmesh-local/1";
-pub const API_VERSION: &str = "1.0";
+/// The protocol-compatibility version as `"MAJOR.MINOR"`, distinct from the crate/stack version.
+///
+/// - **MAJOR** matches the `/N` in [`API_NAME`] and changes only on a breaking wire change (the
+///   transport already rejects a mismatched `api`, so an equality check on that is redundant).
+/// - **MINOR** ([`API_MINOR`]) increments on EVERY surface change within a major — additive fields,
+///   new methods, or a strictness change like params validation — bumped in the same change that
+///   makes it. A client can guard with `api_minor >= N` for a feature it needs, or refuse a daemon
+///   older than a minor it requires. It never resets except on a MAJOR bump.
+pub const API_VERSION: &str = "1.1";
+/// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
+/// became strict (#34), the first change that made this field worth checking.
+pub const API_MINOR: u32 = 1;
 
 #[cfg(test)]
 mod tests {
@@ -725,11 +756,58 @@ mod tests {
         assert_eq!(method_of(&req), Some("subscribe"));
     }
 
+    // --- #34: params structs reject unknown fields (the `{service: "kb"}` silent-accept bug) ---
+
+    #[test]
+    fn invite_params_reject_singular_service_typo() {
+        // The reported bug: `{"service":"kb"}` (singular) used to deserialize to
+        // InviteParams { services: [] } and mint a grants-nothing invite that looked
+        // successful. With deny_unknown_fields the typo is a loud parse error instead.
+        let err = serde_json::from_value::<InviteParams>(serde_json::json!({"service": "kb"}));
+        assert!(
+            err.is_err(),
+            "an unknown `service` key must be rejected, not silently ignored"
+        );
+        // The correct plural shape still parses.
+        let ok: InviteParams =
+            serde_json::from_value(serde_json::json!({"services": ["kb"]})).unwrap();
+        assert_eq!(ok.services, vec!["kb".to_string()]);
+    }
+
+    #[test]
+    fn open_session_params_reject_unknown_field() {
+        let err = serde_json::from_value::<OpenSessionParams>(
+            serde_json::json!({"peer": "a", "service": "b", "nonsense": 1}),
+        );
+        assert!(err.is_err(), "unknown params keys must be rejected");
+    }
+
+    #[test]
+    fn api_minor_is_present_and_monotonic_from_hello() {
+        // #34 part 2: a machine-comparable protocol-compat minor, distinct from the
+        // crate/stack version, additive on the Hello frame.
+        let h = Hello {
+            api: API_NAME.into(),
+            api_version: API_VERSION.into(),
+            api_minor: API_MINOR,
+            stack_version: "9.9.9".into(),
+        };
+        let v = serde_json::to_value(&h).unwrap();
+        assert_eq!(v["api_minor"], API_MINOR);
+        // An OLD Hello without api_minor still deserializes (additive contract).
+        let old = serde_json::json!({
+            "api": API_NAME, "api_version": "1.0", "stack_version": "0.4.0"
+        });
+        let back: Hello = serde_json::from_value(old).unwrap();
+        assert_eq!(back.api_minor, 0, "absent api_minor defaults to 0");
+    }
+
     #[test]
     fn hello_result_roundtrips() {
         let h = Hello {
             api: "mcpmesh-local/1".into(),
             api_version: "1.0".into(),
+            api_minor: 0,
             stack_version: "0.1.0".into(),
         };
         let v = serde_json::to_value(&h).unwrap();

@@ -130,6 +130,7 @@ async fn handle_conn(stream: LocalStream, state: Arc<DaemonState>) -> Result<()>
     let hello = Hello {
         api: API_NAME.into(),
         api_version: API_VERSION.into(),
+        api_minor: mcpmesh_local_api::API_MINOR,
         stack_version: state.stack_version.clone(),
     };
     write_frame(&mut write_half, &serde_json::to_value(&hello)?).await?;
@@ -171,7 +172,8 @@ async fn handle_conn(stream: LocalStream, state: Arc<DaemonState>) -> Result<()>
                         Ok(p) => p,
                         Err(e) => {
                             let id = req.get("id").cloned().unwrap_or(Value::Null);
-                            let resp = error(id, -32000, format!("open_session failed: {e}"));
+                            // Params shape error → -32602 (invalid params), matching `respond`.
+                            let resp = error(id, -32602, format!("open_session failed: {e}"));
                             write_frame(&mut write_half, &resp).await?;
                             continue;
                         }
@@ -408,17 +410,32 @@ async fn handle_request(req: &Value, state: &DaemonState) -> Value {
     }
 }
 
+/// A params-deserialization failure, distinguished from a handler failure so [`respond`] can map
+/// it to the JSON-RPC standard `-32602` "invalid params" (a param typo / unknown field / bad shape
+/// is the caller's error), while a handler failure stays `-32000`. Carried through the shared
+/// `anyhow::Result` surface and recovered by downcast.
+#[derive(Debug)]
+struct InvalidParams(String);
+impl std::fmt::Display for InvalidParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+impl std::error::Error for InvalidParams {}
+
 /// Fold one control call's `Result` into the JSON-RPC response frame — the boilerplate every
 /// dispatch arm shared: `Ok(v)` → `{"result": v}` (a `()`-returning verb maps itself to `json!({})`
-/// via [`unit`] first), `Err(e)` → `-32000` with the `"{method} failed: {e}"` message shape every
-/// arm used. Wire-identical to the per-arm match blocks it replaces (pinned by the daemon_dispatch
-/// / control tests).
+/// via [`unit`] first), a params error → `-32602`, any other `Err(e)` → `-32000`, both with the
+/// `"{method} failed: {e}"` message shape every arm used.
 fn respond<T: serde::Serialize>(id: Value, method: &str, r: anyhow::Result<T>) -> Value {
     match r {
         Ok(v) => ok(
             id,
             serde_json::to_value(v).expect("control result serializes"),
         ),
+        Err(e) if e.downcast_ref::<InvalidParams>().is_some() => {
+            error(id, -32602, format!("{method} failed: {e}"))
+        }
         Err(e) => error(id, -32000, format!("{method} failed: {e}")),
     }
 }
@@ -524,7 +541,8 @@ fn params_of<T: serde::de::DeserializeOwned>(params: &Value) -> anyhow::Result<T
         Value::Null => json!({}),
         p => p.clone(),
     };
-    serde_json::from_value(v).map_err(|e| anyhow::anyhow!("invalid params: {e}"))
+    serde_json::from_value(v)
+        .map_err(|e| anyhow::Error::new(InvalidParams(format!("invalid params: {e}"))))
 }
 
 /// The shared parse-then-handle shape of every param-carrying dispatch arm: deserialize
@@ -621,9 +639,18 @@ mod tests {
             "blob_fetch",
         ] {
             let r = handle_request(&req(method, json!({})), &st).await;
-            assert_eq!(
-                r["error"]["code"], -32000,
-                "method {method} should error in control-only mode, got {r}"
+            // Graceful error, never a panic or a success. With empty params, a method whose
+            // params carry required fields is rejected at parse (-32602, #34); a method whose
+            // params are all defaultable reaches the handler and reports the missing mesh
+            // (-32000). Both are clean errors — assert it's one of the two and never a result.
+            let code = r["error"]["code"].as_i64();
+            assert!(
+                matches!(code, Some(-32000) | Some(-32602)),
+                "method {method} should error gracefully in control-only mode, got {r}"
+            );
+            assert!(
+                r.get("result").is_none(),
+                "method {method} must not succeed: {r}"
             );
         }
     }
@@ -634,9 +661,11 @@ mod tests {
     #[tokio::test]
     async fn malformed_params_answer_an_invalid_params_error() {
         let st = control_only();
-        // Wrong field type (nickname must be a string).
+        // Wrong field type (nickname must be a string) → the JSON-RPC standard -32602
+        // "invalid params" (#34: params shape errors are the caller's error, distinct from a
+        // handler failure's -32000).
         let r = handle_request(&req("peer_remove", json!({ "nickname": 42 })), &st).await;
-        assert_eq!(r["error"]["code"], -32000);
+        assert_eq!(r["error"]["code"], -32602);
         assert!(
             r["error"]["message"]
                 .as_str()
@@ -644,9 +673,19 @@ mod tests {
                 .contains("invalid params"),
             "message names the params problem: {r}"
         );
-        // Missing required field.
+        // Missing required field → also -32602.
         let r = handle_request(&req("peer_rename", json!({ "user_id": "u" })), &st).await;
-        assert_eq!(r["error"]["code"], -32000);
+        assert_eq!(r["error"]["code"], -32602);
+        // An unknown field is now rejected too (deny_unknown_fields), not silently ignored.
+        let r = handle_request(
+            &req("peer_remove", json!({ "nickname": "a", "extra": true })),
+            &st,
+        )
+        .await;
+        assert_eq!(
+            r["error"]["code"], -32602,
+            "unknown params field is rejected: {r}"
+        );
     }
 
     /// `audit_summary` works WITHOUT a mesh (a local-only read; an empty/absent audit dir yields an

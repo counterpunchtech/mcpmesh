@@ -53,8 +53,8 @@ pub mod principals;
 pub mod protocol;
 pub use principals::principal_set;
 pub use protocol::{
-    API_NAME, API_VERSION, ActiveSession, AuditKind, AuditRecord, AuditSummaryResult, BackendKind,
-    BackendSpec, BlobFetchParams, BlobFetchResult, BlobGrantParams, BlobPublishParams,
+    API_MINOR, API_NAME, API_VERSION, ActiveSession, AuditKind, AuditRecord, AuditSummaryResult,
+    BackendKind, BackendSpec, BlobFetchParams, BlobFetchResult, BlobGrantParams, BlobPublishParams,
     BlobPublishResult, BlobScopeList, Hello, InviteParams, InviteResult, OpenSessionParams,
     OrgJoinParams, OrgJoinResult, PairParams, PairResult, PeerAddParams, PeerInfo,
     PeerReachability, PeerRemoveParams, PeerRenameParams, PresencePeer, RecentPairing,

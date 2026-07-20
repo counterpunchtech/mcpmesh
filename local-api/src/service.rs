@@ -234,11 +234,13 @@ pub async fn send_hello<W: AsyncWrite + Unpin>(
     writer: &mut W,
     api: &str,
     api_version: &str,
+    api_minor: u32,
     stack_version: &str,
 ) -> io::Result<()> {
     let hello = serde_json::to_value(Hello {
         api: api.into(),
         api_version: api_version.into(),
+        api_minor,
         stack_version: stack_version.into(),
     })
     .expect("Hello serializes");
@@ -405,7 +407,7 @@ mod tests {
     #[tokio::test]
     async fn send_hello_writes_the_family_hello_frame() {
         let (mut a, b) = tokio::io::duplex(1024);
-        send_hello(&mut a, "loc-local/1", "1", "0.1.0")
+        send_hello(&mut a, "loc-local/1", "1", 0, "0.1.0")
             .await
             .unwrap();
         drop(a);
@@ -436,6 +438,7 @@ mod tests {
                 &serde_json::to_value(Hello {
                     api: API_NAME.into(),
                     api_version: API_VERSION.into(),
+                    api_minor: 0,
                     stack_version: "0.1.0".into(),
                 })
                 .unwrap(),

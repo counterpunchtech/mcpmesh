@@ -463,6 +463,17 @@ fn unregistered_service_error(requested: &[String], served: &[String]) -> Option
 pub(crate) async fn mint_invite(services: Vec<String>, mesh: &MeshState) -> Result<InviteResult> {
     use rand::RngCore;
 
+    // An invite that grants nothing is useless, and a silently-empty list is exactly the
+    // symptom of a param typo like `{service: "kb"}` (singular) slipping past validation
+    // (#34). Reject it before minting, matching the CLI porcelain which already makes the
+    // service arg required. `deny_unknown_fields` on `InviteParams` catches the typo at parse
+    // time; this is the belt-and-braces guard on the value itself.
+    if services.is_empty() {
+        anyhow::bail!(
+            "invite must name at least one registered service (an invite granting nothing is useless)"
+        );
+    }
+
     // Registration check FIRST — before the CSPRNG mint and the online()-wait, so a typo'd
     // name fails fast and never touches the invite registry.
     let cfg = Config::load(&mesh.config_path)

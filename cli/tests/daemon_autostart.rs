@@ -126,7 +126,8 @@ async fn ensure_daemon_autostarts_reuses_and_serves_status() {
             .await
             .expect("first ensure_daemon");
         assert_eq!(first.hello().api, "mcpmesh-local/1");
-        assert_eq!(first.hello().api_version, "1.0");
+        assert_eq!(first.hello().api_version, "1.1"); // #34: bumped when params validation went strict
+        assert_eq!(first.hello().api_minor, 1);
         assert_eq!(first.hello().stack_version, STACK_VERSION);
         assert!(launch.socket.exists(), "daemon bound the control socket");
 

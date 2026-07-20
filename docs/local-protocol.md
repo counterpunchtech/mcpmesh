@@ -7,7 +7,7 @@ named pipe on Windows. Anything that can open the endpoint and parse JSON can sp
 language — [`local-api/examples/status.py`](../local-api/examples/status.py) is a complete client
 in ~60 lines of dependency-free Python.
 
-> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.0`) and evolves
+> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.1`, `api_minor` `1`) and evolves
 > **additively** (see [Versioning](#versioning)), but until a stable release this document — like the
 > wire format itself — may change without a migration path. Pin the mcpmesh version you build
 > against. Source of truth is the Rust in [`local-api/`](../local-api/src/protocol.rs); where this
@@ -79,7 +79,7 @@ porcelain verb starts the daemon) or runs `mcpmesh internal daemon` itself.
 **The server speaks first.** Immediately on accept, the daemon writes one `Hello` frame:
 
 ```json
-{"api":"mcpmesh-local/1","api_version":"1.0","stack_version":"…"}
+{"api":"mcpmesh-local/1","api_version":"1.1","api_minor":1,"stack_version":"…"}
 ```
 
 A client MUST read this frame first and check `api == "mcpmesh-local/1"` before sending anything. A
@@ -423,11 +423,32 @@ inside a [session](#sessions), not as control-method responses, and carry `data.
 
 ## Versioning
 
-The API is `mcpmesh-local/1` at `api_version` `1.0` and changes **additively within a major
-version**: new response fields are added as optional (absent-tolerant) fields, so a payload from a
-newer daemon still parses in an older client and vice versa. Build defensively — ignore fields you do
-not recognize, and do not assume an optional field is present. A breaking change would bump the major
-(`mcpmesh-local/2`), which a client detects at the `Hello`.
+The API is `mcpmesh-local/1`. Two version numbers travel on the `Hello`, and they mean different
+things:
+
+- **`api` / the `/N` major** — bumped only on a breaking wire change (`mcpmesh-local/2`). The
+  transport already rejects a mismatched `api`, so a client needs no explicit equality check.
+- **`api_version` = `"MAJOR.MINOR"`, and `api_minor` = the integer MINOR** — the
+  protocol-compatibility version, **distinct from `stack_version`** (the crate release train, which
+  moves for reasons unrelated to the wire). MINOR increments on **every** surface change within a
+  major: an added field, a new method, or a strictness change. It is bumped in the same change that
+  makes it, and never resets except on a MAJOR bump. A client guards a feature it needs with
+  `api_minor >= N` — e.g. strict params validation is `api_minor >= 1`. `api_minor` is itself
+  additive: a pre-1.1 daemon omits it and it reads as `0`.
+
+Changes remain **additive within a major**: new response fields are optional (absent-tolerant), so a
+newer daemon's payload still parses in an older client and vice versa. Build defensively — ignore
+fields you do not recognize, and do not assume an optional field is present.
+
+### Params are strict; the envelope is tolerant
+
+The two are deliberately different. The **envelope** (the keys beside `method`/`params`/`id`) is
+tolerant — unknown top-level fields are ignored, so a conforming client can send extra envelope
+metadata. **Params are strict**: every method's `params` object rejects unknown fields
+(`-32602 invalid params`), so a typo like `{service: "kb"}` for `invite` (singular — the field is
+`services`) fails loudly instead of silently minting a wrongly-scoped invite. One consequence for
+forward-compat: a *newer* client that sends a *new* optional param field to an *older* daemon is
+rejected rather than having the field ignored — gate such a send on `api_minor`.
 
 ## Security model
 

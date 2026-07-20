@@ -437,6 +437,7 @@ mod tests {
             &serde_json::to_value(Hello {
                 api: API_NAME.into(),
                 api_version: API_VERSION.into(),
+                api_minor: 0,
                 stack_version: "0.1.0".into(),
             })
             .unwrap(),
@@ -525,6 +526,7 @@ mod tests {
                 &serde_json::to_value(Hello {
                     api: API_NAME.into(),
                     api_version: API_VERSION.into(),
+                    api_minor: 0,
                     stack_version: "0.1.0".into(),
                 })
                 .unwrap(),
@@ -603,6 +605,7 @@ mod tests {
                 &serde_json::to_value(Hello {
                     api: API_NAME.into(),
                     api_version: API_VERSION.into(),
+                    api_minor: 0,
                     stack_version: "0.1.0".into(),
                 })
                 .unwrap(),
@@ -649,6 +652,7 @@ mod tests {
                 &serde_json::to_value(Hello {
                     api: API_NAME.into(),
                     api_version: API_VERSION.into(),
+                    api_minor: 0,
                     stack_version: "0.1.0".into(),
                 })
                 .unwrap(),
@@ -708,6 +712,7 @@ mod tests {
                 &serde_json::to_value(Hello {
                     api: API_NAME.into(),
                     api_version: API_VERSION.into(),
+                    api_minor: 0,
                     stack_version: "0.1.0".into(),
                 })
                 .unwrap(),
@@ -769,6 +774,7 @@ mod tests {
                 &serde_json::to_value(Hello {
                     api: API_NAME.into(),
                     api_version: API_VERSION.into(),
+                    api_minor: 0,
                     stack_version: "0.1.0".into(),
                 })
                 .unwrap(),
