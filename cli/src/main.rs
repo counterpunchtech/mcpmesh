@@ -21,6 +21,12 @@ fn serve_after_help() -> String {
 #[derive(Parser)]
 #[command(name = "mcpmesh", version)]
 struct Cli {
+    /// Run against an isolated PROFILE rooted at this directory — all keys, config, data, state,
+    /// and the control socket live under it, instead of the standard per-user locations. One flag
+    /// replaces overriding five XDG_* env vars to sandbox an instance. The spawned daemon inherits
+    /// it (via MCPMESH_HOME), so every verb in this profile rendezvous on the same socket.
+    #[arg(long, value_name = "dir", global = true, visible_alias = "home")]
+    profile: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -350,6 +356,19 @@ enum PeerCmd {
 
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
+    // Pin the profile root BEFORE any path resolves (keys, config, socket) — an in-process
+    // override, since `set_var` is barred under `forbid(unsafe_code)`. Absolute-ize a relative
+    // `--profile` against the cwd so the value handed to the spawned daemon is unambiguous.
+    if let Some(dir) = &cli.profile {
+        let abs = if dir.is_absolute() {
+            dir.clone()
+        } else {
+            std::env::current_dir()
+                .map(|c| c.join(dir))
+                .unwrap_or_else(|_| dir.clone())
+        };
+        let _ = paths::set_root(abs);
+    }
     match run(cli) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(err) => {

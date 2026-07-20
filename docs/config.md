@@ -6,6 +6,20 @@ Every table and key the daemon reads from `config.toml`, with its default. The f
   var is set, non-empty, and absolute)
 - **Windows:** `%APPDATA%\mcpmesh\config.toml` (an absolute `XDG_CONFIG_HOME` override still wins)
 
+### Profiles: isolating an instance
+
+To run an isolated second identity on one machine — a sandbox for local testing, or a per-tenant
+instance in an embedder — pass **`mcpmesh --profile <dir>`** (alias `--home <dir>`). It roots
+*everything* under that one directory: keys, config, data, state, and the control socket. This
+replaces the old dance of overriding five separate `XDG_*` variables (overriding only `HOME` leaks
+the real identity's state, because the XDG vars take precedence). A deep profile directory still
+gets a bindable control socket — when `<dir>/run/mcpmesh.sock` would exceed the OS socket-path
+limit, the socket is placed at a short `$TMPDIR/mcpmesh-<hash>/mcpmesh.sock` derived from the root.
+
+The equivalent env var is **`MCPMESH_HOME`** (absolute path); the `--profile` flag takes precedence.
+The spawned daemon inherits the profile, so every verb you run with the same `--profile` rendezvous
+on the same instance. Omit it for the standard per-user locations above.
+
 > **You rarely hand-edit this file.** The porcelain writes it: `serve` writes `[services.<name>]`,
 > each pairing appends the new peer to the granted `allow` lists, and `org create` / `join` pin the
 > `[identity]` and `[roster]` anchors. Hand-editing is for the tunables — `[network]` self-hosting,

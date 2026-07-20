@@ -27,10 +27,20 @@ pub struct DaemonLaunch {
 
 impl DaemonLaunch {
     pub fn ambient() -> Result<Self> {
+        // A `--profile`/`MCPMESH_HOME` root is in-process state (a OnceLock), so the DETACHED
+        // daemon we spawn would not see it — pass it explicitly via MCPMESH_HOME so the daemon
+        // resolves the SAME profile paths (and binds the same socket) as this CLI.
+        let mut env = Vec::new();
+        if let Some(root) = paths::profile_root() {
+            env.push((
+                std::ffi::OsString::from("MCPMESH_HOME"),
+                root.into_os_string(),
+            ));
+        }
         Ok(Self {
             exe: std::env::current_exe().context("resolve current executable")?,
             socket: paths::default_endpoint()?,
-            env: Vec::new(),
+            env,
         })
     }
 }

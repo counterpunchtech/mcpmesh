@@ -3,7 +3,66 @@
 //! it lives on the vocabulary crate precisely so EVERY consumer (the daemon, the CLI,
 //! and plugins, which are barred from `mcpmesh-trust`) resolves the same endpoint from
 //! the same rule instead of a per-crate replica. `mcpmesh_trust::paths` re-exports it.
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+/// The longest a Unix control-socket path may be (`sockaddr_un.sun_path`, minus the NUL): 103 on
+/// macOS/BSD, 107 on Linux. Used to keep a `--profile`/`MCPMESH_HOME` socket bindable no matter
+/// how deep the profile root sits (#32); the CLI keeps its own bind-time guard as a backstop.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd"
+))]
+pub const MAX_SOCKET_PATH: usize = 103;
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd"
+)))]
+pub const MAX_SOCKET_PATH: usize = 107;
+
+/// In-process profile-root override, set by `mcpmesh --profile <dir>` / `--home <dir>` before
+/// dispatch. Preferred over mutating env because `std::env::set_var` is `unsafe` under the
+/// workspace's `forbid(unsafe_code)` (and edition 2024). First set wins.
+static ROOT_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Pin the profile root for THIS process (the in-process form of `--profile`/`--home`). Returns
+/// `Err(dir)` if a root was already pinned (first set wins). The spawned daemon inherits the same
+/// root via the `MCPMESH_HOME` env var the launcher sets, so both ends resolve identically.
+pub fn set_root(dir: PathBuf) -> Result<(), PathBuf> {
+    ROOT_OVERRIDE.set(dir)
+}
+
+/// The active profile root: the in-process override if set, else an absolute non-empty
+/// `MCPMESH_HOME`. `None` = the standard XDG (unix) / APPDATA (windows) layout. When `Some`, ALL
+/// state — config, data, state, and the runtime socket — roots under this ONE directory (#32),
+/// so isolating an instance takes one knob instead of overriding five XDG vars.
+pub fn profile_root() -> Option<PathBuf> {
+    if let Some(p) = ROOT_OVERRIDE.get() {
+        return Some(p.clone());
+    }
+    std::env::var("MCPMESH_HOME")
+        .ok()
+        .filter(|s| !s.is_empty() && Path::new(s).is_absolute())
+        .map(PathBuf::from)
+}
+
+/// The runtime dir under a profile root — `<root>/run` when the resulting `mcpmesh.sock` path fits
+/// within [`MAX_SOCKET_PATH`], else a short deterministic `<tmp>/mcpmesh-<fnv8(root)>` so a DEEP
+/// profile root still yields a bindable socket. Deterministic in `root`, so the daemon and any
+/// client resolve the same path. Pure (no env) for unit-testing.
+fn runtime_under_root(root: &Path, tmp: &Path) -> PathBuf {
+    let natural = root.join("run");
+    let sock_len = natural.join("mcpmesh.sock").as_os_str().len();
+    if sock_len <= MAX_SOCKET_PATH {
+        natural
+    } else {
+        tmp.join(format!("mcpmesh-{}", fnv8(&root.to_string_lossy())))
+    }
+}
 
 /// The ONE XDG-basedir rule shared by [`config_dir`]/[`data_dir`]/[`state_dir`]:
 /// `$<var>/mcpmesh` when the var is set, non-empty, and absolute; otherwise
@@ -160,8 +219,13 @@ fn windows_pipe_name_from(
 fn windows_pipe_name() -> std::io::Result<PathBuf> {
     let domain = std::env::var("USERDOMAIN").ok();
     let user = std::env::var("USERNAME").ok();
-    let xdg = std::env::var("XDG_RUNTIME_DIR").ok();
-    windows_pipe_name_from(domain.as_deref(), user.as_deref(), xdg.as_deref())
+    // A profile root (#32) isolates the pipe just as XDG_RUNTIME_DIR does — its path hashes into
+    // the name suffix, so two profiles on one machine get distinct pipes and rendezvous by
+    // construction. Falls back to XDG_RUNTIME_DIR when no profile is active.
+    let iso = profile_root()
+        .map(|r| r.to_string_lossy().into_owned())
+        .or_else(|| std::env::var("XDG_RUNTIME_DIR").ok());
+    windows_pipe_name_from(domain.as_deref(), user.as_deref(), iso.as_deref())
 }
 
 /// Per-platform config dir: `$XDG_CONFIG_HOME/mcpmesh` when that var is set,
@@ -169,6 +233,9 @@ fn windows_pipe_name() -> std::io::Result<PathBuf> {
 /// `%APPDATA%\mcpmesh` (an absolute `XDG_CONFIG_HOME` override still wins, for test
 /// isolation).
 pub fn config_dir() -> std::io::Result<PathBuf> {
+    if let Some(root) = profile_root() {
+        return Ok(root.join("config"));
+    }
     #[cfg(unix)]
     return xdg_dir("XDG_CONFIG_HOME", &[".config"]);
     #[cfg(windows)]
@@ -189,12 +256,17 @@ pub fn default_config_path() -> std::io::Result<PathBuf> {
 /// itself private). Returns the path only; the daemon creates it 0700 + verifies
 /// ownership before binding (a bind-time concern — see cli `ipc::bind_control_socket`).
 pub fn runtime_dir() -> std::io::Result<PathBuf> {
-    let xdg = std::env::var("XDG_RUNTIME_DIR").ok();
     let tmp = std::env::var("TMPDIR")
         .ok()
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
+    if let Some(root) = profile_root() {
+        // A profile roots the socket under its own tree, or a short hashed tmp dir when the tree
+        // is too deep for SUN_LEN — either way deterministic in `root`, so all ends rendezvous.
+        return Ok(runtime_under_root(&root, &tmp));
+    }
+    let xdg = std::env::var("XDG_RUNTIME_DIR").ok();
     runtime_dir_from(xdg.as_deref(), tmp)
 }
 
@@ -245,6 +317,9 @@ pub fn default_endpoint() -> std::io::Result<PathBuf> {
 /// this is durable across reboots. On Windows, `%LOCALAPPDATA%\mcpmesh\data` (LOCALAPPDATA,
 /// not APPDATA — this data need not roam with the user profile).
 pub fn data_dir() -> std::io::Result<PathBuf> {
+    if let Some(root) = profile_root() {
+        return Ok(root.join("data"));
+    }
     #[cfg(unix)]
     return xdg_dir("XDG_DATA_HOME", &[".local", "share"]);
     #[cfg(windows)]
@@ -274,6 +349,9 @@ pub fn default_blob_scopes_path() -> std::io::Result<PathBuf> {
 /// Mirrors the `data_dir()` derivation exactly, swapping the var and the `.local/state` segment. On
 /// Windows, `%LOCALAPPDATA%\mcpmesh\state` (mirrors `data_dir()`'s Windows branch, `state` segment).
 pub fn state_dir() -> std::io::Result<PathBuf> {
+    if let Some(root) = profile_root() {
+        return Ok(root.join("state"));
+    }
     #[cfg(unix)]
     return xdg_dir("XDG_STATE_HOME", &[".local", "state"]);
     #[cfg(windows)]
@@ -322,6 +400,32 @@ mod path_tests {
     // plus test serialization), the §13 rule lives in the pure `runtime_dir_from`; we
     // unit-test it directly with explicit inputs. `default_endpoint()` is still
     // exercised against the real env, asserting the shape that holds for any env.
+
+    #[test]
+    fn profile_runtime_uses_the_short_socket_path_for_a_deep_root() {
+        // #32: a shallow profile root keeps the socket beside its state (<root>/run); a DEEP root
+        // whose <root>/run/mcpmesh.sock would blow SUN_LEN falls back to a short hashed tmp dir —
+        // deterministic in the root, so the daemon and its clients still rendezvous.
+        let shallow = Path::new("/tmp/p");
+        assert_eq!(
+            runtime_under_root(shallow, Path::new("/tmp")),
+            PathBuf::from("/tmp/p/run")
+        );
+        let deep = PathBuf::from(format!("/home/user/{}", "very-deep-segment/".repeat(12)));
+        let got = runtime_under_root(&deep, Path::new("/tmp"));
+        assert!(
+            got.join("mcpmesh.sock").as_os_str().len() <= MAX_SOCKET_PATH,
+            "deep-root socket must fit SUN_LEN, got {}",
+            got.display()
+        );
+        assert!(
+            got.to_string_lossy().starts_with("/tmp/mcpmesh-"),
+            "deep root falls back to a short hashed tmp dir, got {}",
+            got.display()
+        );
+        // Deterministic: same root → same short dir.
+        assert_eq!(got, runtime_under_root(&deep, Path::new("/tmp")));
+    }
 
     // The next three tests feed the pure cores POSIX literals like `/run/user/1000`,
     // which `Path::is_absolute` only treats as absolute on unix — and the xdg/runtime
