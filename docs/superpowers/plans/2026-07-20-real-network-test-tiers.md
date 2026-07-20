@@ -51,6 +51,33 @@ Additionally, Task 2's cleanup trap must print the summary, so that even an
 unexpected abort reports what had passed before it died rather than exiting
 silently.
 
+### Signal traps must exit themselves (found during Task 2 execution)
+
+Two more shell facts surfaced implementing the cleanup trap, both verified under
+dash, both load-bearing for every later task:
+
+1. **A trap that does not `exit` resumes the script body.** `trap cleanup EXIT
+   INT TERM` runs `cleanup` on SIGTERM and then *continues the script* from where
+   the signal landed — which, after cleanup has deleted the scratch world,
+   re-auto-starts a daemon into it (a leak) and can still exit 0 (a false pass).
+   Each signal trap must end in `exit`:
+   ```sh
+   trap cleanup EXIT
+   trap 'cleanup; exit 129' HUP     # HUP is NOT in the default set — SSH drop / CI cancel
+   trap 'cleanup; exit 130' INT
+   trap 'cleanup; exit 143' TERM
+   ```
+   The idempotence guard (`cleaned_up`) makes the double call (signal trap → EXIT
+   trap) a safe no-op.
+
+2. **A function's output redirection applies to the shell during the call.**
+   `peer() { ... "$MM" "$@"; }` invoked as `peer serve ... >/dev/null` sends the
+   trap's own summary to `/dev/null` if a signal lands during that call. Save the
+   real stdout once at startup (`exec 3>&1`) and write the summary to `>&3`.
+
+`cleanup` must also run under `set +e` (best-effort teardown), or a failed `echo`
+to a dead terminal aborts it before it kills the daemon.
+
 ### A note on TDD for a test harness
 
 The Iron Law still applies, but "write the failing test first" maps differently here: the artifact *is* a test. The equivalent discipline is **prove each assertion can fail before trusting it.** Every task that adds an assertion has a step that deliberately breaks the condition, runs the script, and confirms it reports FAIL. An assertion never observed failing is not an assertion — it is a comment.
