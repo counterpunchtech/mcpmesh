@@ -613,6 +613,7 @@ mod tests {
             sas_code: "tango-fig-42".into(),
             services: vec!["notes".into()],
             app_label: None,
+            peer_user_id: None,
         };
         let lines = pair_lines(&result);
         assert_eq!(lines[0], "Paired with alice — code: tango-fig-42");
@@ -643,6 +644,7 @@ mod tests {
             sas_code: "a-b-c".into(),
             services: vec!["notes".into(), "kb".into()],
             app_label: None,
+            peer_user_id: None,
         };
         let rendered = pair_lines(&result).join("\n");
         assert!(
@@ -668,6 +670,7 @@ mod tests {
             sas_code: "tango-fig-42".into(),
             services: vec!["notes".into()],
             app_label: None,
+            peer_user_id: None,
         };
         let rendered = pair_lines(&result).join("\n");
         assert!(
@@ -688,6 +691,7 @@ mod tests {
             sas_code: "a-b-c".into(),
             services: vec![],
             app_label: None,
+            peer_user_id: None,
         };
         let lines = pair_lines(&result);
         assert_eq!(lines[0], "Paired with alice — code: a-b-c");

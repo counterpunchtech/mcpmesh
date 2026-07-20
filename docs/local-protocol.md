@@ -146,10 +146,10 @@ Methods split into two groups by audience:
 | `status` | *(none)* | [`StatusResult`](#statusresult) |
 | `audit_summary` | *(none)* | `{per_peer:[[name,count],…], per_service:[[name,count],…], total_sessions}` — this node's **local** session tallies; nothing is transmitted |
 | `invite` | `{services:[…]}` | `{invite_line:"mcpmesh-invite:…", expires_at_epoch}` |
-| `pair` | `{invite_line}` | `{peer_nickname, sas_code, services:[…]}` — fails (no dial attempted) if the invite's suggested nickname is already yours for a *different* peer, or already sits in a `[services.*].allow`; see [Nickname collisions](#nickname-collisions) |
+| `pair` | `{invite_line}` | `{peer_nickname, sas_code, services:[…], app_label?, peer_user_id?}` — `app_label` echoes any opaque label the inviter attached (#31); `peer_user_id` is the inviter's stable `b64u:` identity when it presented a binding (#30). Fails (no dial attempted) if the invite's suggested nickname is already yours for a *different* peer, or already sits in a `[services.*].allow`; see [Nickname collisions](#nickname-collisions) |
 | `peer_remove` | `{nickname}` | `{}` (ack) |
 | `peer_rename` | `{to, user_id?, nickname?}` — rename a person by `user_id`, else a provisional contact by `nickname` | `{}` (ack) |
-| `open_session` | `{peer, service}` | *no response frame — see [Sessions](#sessions)* |
+| `open_session` | `{peer, service}` — `peer` is a **nickname OR a stable `b64u:` user_id** (#30); a user_id spanning several of a person's devices races them | *no response frame — see [Sessions](#sessions)* |
 | `subscribe` | *(none)* | *no response frame — a one-way live stream; see [Live event stream](#live-event-stream)* |
 | `roster_install` | `{path, org_root_pk?}` — `path` is a local file the daemon reads; `org_root_pk` pins the root on first install | `{org_id, serial, severed}` |
 | `org_join` | `{org_id, org_root_pk, user_id, user_key}` — `user_key` is a local path; the key never crosses the socket | `{org_id}` |
@@ -267,6 +267,15 @@ pipe**. The client sends:
 the mesh and, from that point, every byte in each direction is the remote MCP session verbatim —
 `initialize`, `tools/list`, `tools/call`, and so on, in the same newline-framed JSON. The client
 pumps its consumer's stdin/stdout against this connection until either side closes.
+
+`peer` may be a **local nickname** or the peer's **stable `b64u:` user_id** — the same
+self-sovereign identity attested *inbound* on `_meta["mcpmesh/peer"].user_id` (see [the identity
+contract](#the-identity-contract)). Addressing by `user_id` makes outbound symmetric with inbound:
+an embedder that keys its own contacts by a portable identity can dial `open_session(<user_id>,
+service)` directly, without maintaining a `URN → nickname` map. A `user_id` that spans several of a
+person's devices races them, exactly like a roster person→device dial; a nickname resolves the one
+peer it names. Either way the dial is still pinned to the peer's endpoint key and TLS-authenticated —
+the identity string is a lookup handle, never the trust decision.
 
 Two failure frames can arrive *in place of* a live session, as ordinary MCP error frames, so a
 consumer always gets a well-formed answer rather than a hang:

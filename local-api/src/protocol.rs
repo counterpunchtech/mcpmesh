@@ -498,6 +498,13 @@ pub struct PairResult {
     /// absent if none was set. mcpmesh never interprets it; the embedder does. Additive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_label: Option<String>,
+    /// The inviter's proven self-sovereign `user_id` (`b64u:<user_pk>`), when it presented a
+    /// device→user binding at pairing (#30). This is the STABLE, portable identity the redeemer
+    /// can align with its own — and the same value it may later pass to `open_session` to dial
+    /// this peer by identity rather than by local nickname. `None` if the inviter presented no
+    /// binding (a legacy/keyless peer). Additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_user_id: Option<String>,
 }
 
 /// The event class of an [`AuditRecord`] (the four audit event classes). An additive discriminant on
@@ -958,6 +965,7 @@ mod tests {
             sas_code: "tango-fig-cabbage".into(),
             services: vec!["notes".into(), "kb".into()],
             app_label: None,
+            peer_user_id: None,
         };
         let v = serde_json::to_value(&res).unwrap();
         assert_eq!(v["peer_nickname"], "alice");

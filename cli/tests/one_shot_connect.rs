@@ -160,3 +160,114 @@ async fn one_shot_piped_connect_yields_the_response() {
     .await
     .expect("one-shot connect e2e timed out");
 }
+
+/// #30: dial a peer's service by its STABLE `user_id` instead of the local nickname. After
+/// pairing, Bob learns Alice's `b64u:` user_id (here from his own `status`; a real embedder gets
+/// it from the `pair` result's `peer_user_id`) and connects `<alice_user_id>/echo`. The dial must
+/// resolve through the new user_id branch of `dial_service` and yield the backend's response,
+/// exactly as dialing by nickname does.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_shot_connect_by_user_id_yields_the_response() {
+    timeout(Duration::from_secs(120), async {
+        let alice_dir = tempfile::tempdir().unwrap();
+        let bob_dir = tempfile::tempdir().unwrap();
+
+        let (alice_socket, alice_env) = world(
+            alice_dir.path(),
+            &format!(
+                "[identity]\nnickname = \"alice\"\n\n[network]\nrelay_mode = \"disabled\"\n\n\
+                 [services.echo]\nrun = ['{STUB}']\nallow = []\n"
+            ),
+        );
+        let (bob_socket, bob_env) = world(
+            bob_dir.path(),
+            "[identity]\nnickname = \"bob\"\n\n[network]\nrelay_mode = \"disabled\"\n",
+        );
+
+        // invite (Alice) → pair (Bob).
+        let out = run_cmd(&alice_env, &["invite", "echo"]);
+        assert!(out.status.success(), "invite exit 0");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let invite_line = stdout
+            .split_whitespace()
+            .find(|t| t.starts_with("mcpmesh-invite:"))
+            .unwrap_or_else(|| panic!("no invite line in:\n{stdout}"))
+            .to_string();
+        let out = run_cmd(&bob_env, &["pair", &invite_line]);
+        assert!(
+            out.status.success(),
+            "pair exit 0; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // Bob reads Alice's proven user_id from his own status (the peers list carries it).
+        let mut client = mcpmesh::client::connect_control(&bob_socket)
+            .await
+            .expect("connect to bob's daemon");
+        let status: mcpmesh::StatusResult = serde_json::from_value(
+            client
+                .request(mcpmesh::Request::Status)
+                .await
+                .expect("status"),
+        )
+        .expect("StatusResult");
+        let alice_user_id = status
+            .peers
+            .iter()
+            .find(|p| p.name == "alice")
+            .and_then(|p| p.user_id.clone())
+            .expect("bob stored alice's proven user_id");
+        assert!(alice_user_id.starts_with("b64u:"), "a self-sovereign id");
+
+        // The decisive dial: connect by the STABLE user_id, not the nickname "alice".
+        let mut child = tokio::process::Command::new(MCPMESH)
+            .arg("connect")
+            .arg(format!("{alice_user_id}/echo"))
+            .envs(bob_env.iter().map(|(k, v)| (k.clone(), v.clone())))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn connect-by-user_id");
+        let mut child_in = child.stdin.take().expect("piped stdin");
+        write_frame(
+            &mut child_in,
+            &json!({
+                "jsonrpc": "2.0", "id": 7, "method": "initialize",
+                "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                           "clientInfo": {"name": "by-user-id", "version": "0"}}
+            }),
+        )
+        .await
+        .unwrap();
+        drop(child_in);
+
+        let out = timeout(Duration::from_secs(30), child.wait_with_output())
+            .await
+            .expect("connect-by-user_id did not finish within 30s")
+            .expect("collect output");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(
+            out.status.success(),
+            "connect-by-user_id exit 0; stdout: {stdout}; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let frames: Vec<Value> = stdout
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("non-JSON line {l:?}: {e}")))
+            .collect();
+        assert_eq!(frames.len(), 1, "one response frame:\n{stdout}");
+        assert_eq!(frames[0]["id"], 7, "answers our id: {}", frames[0]);
+        assert_eq!(
+            frames[0]["result"]["serverInfo"]["name"], "echo-stub",
+            "dialing by user_id reached the real backend: {}",
+            frames[0]
+        );
+
+        shutdown_daemon(&alice_socket).await;
+        shutdown_daemon(&bob_socket).await;
+    })
+    .await
+    .expect("connect-by-user_id e2e timed out");
+}

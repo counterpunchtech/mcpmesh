@@ -12,6 +12,7 @@ use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use super::MeshState;
+use crate::allowlist::PeerEntry;
 
 /// Resolve `peer` to a session over the mesh, preferring the roster PERSON→DEVICE path
 /// and falling back to the single-nickname path.
@@ -58,15 +59,39 @@ pub async fn dial_service(
                 .with_context(|| format!("dial {peer}/{service}"));
         }
     }
-    // Single-nickname fallback: resolve the allowlist nickname → its stored entry → dial by id
-    // WITH the pairing-persisted address hint attached (issue #27: a cold daemon must not
-    // depend on the in-process address cache or external discovery to reach a paired peer).
+    // Pairing-mode fallback. `peer` is resolved to stored entries by, in order:
+    //  1. a NICKNAME match (the redeemer's local name for the peer), then
+    //  2. a stable `user_id` match (#30: dial by the peer's self-sovereign `b64u:` identity, so a
+    //     caller can address it by an id it aligns with its own — symmetric with the `user_id`
+    //     already attested INBOUND on `_meta`). A user_id can match several devices of one person;
+    //     those are raced exactly like the roster person→device path.
+    // A single resolved entry is dialed WITH its pairing-persisted `last_addr` hint (issue #27: a
+    // cold daemon must not depend on external discovery to reach a paired peer).
     let peer_owned = peer.to_string();
     let store = mesh.store.clone();
-    let entry = tokio::task::spawn_blocking(move || store.entry_for(&peer_owned))
+    let (single, multi): (Option<PeerEntry>, Vec<[u8; 32]>) =
+        tokio::task::spawn_blocking(move || -> Result<_> {
+            if let Some(e) = store.entry_for(&peer_owned)? {
+                return Ok((Some(e), Vec::new()));
+            }
+            let mut by_user = store.entries_for_user(&peer_owned)?;
+            match by_user.len() {
+                0 => Ok((None, Vec::new())),
+                1 => Ok((by_user.pop(), Vec::new())),
+                _ => Ok((None, by_user.iter().map(|e| e.endpoint_id).collect())),
+            }
+        })
         .await
-        .context("join peer resolve")??
-        .with_context(|| format!("peer '{peer}' is not in the allowlist"))?;
+        .context("join peer resolve")??;
+
+    // Several devices share the resolved user_id → race them (bare-id, discovery-resolved),
+    // mirroring the roster person→device path.
+    if !multi.is_empty() {
+        return race_dial(&mesh.endpoint, multi, service)
+            .await
+            .with_context(|| format!("dial {peer}/{service}"));
+    }
+    let entry = single.with_context(|| format!("peer '{peer}' is not in the allowlist"))?;
     let endpoint_id = iroh::EndpointId::from_bytes(&entry.endpoint_id)
         .map_err(|e| anyhow::anyhow!("stored endpoint id for '{peer}' is invalid: {e}"))?;
     let addr = stored_dial_addr(entry.last_addr.as_deref(), endpoint_id);

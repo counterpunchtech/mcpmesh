@@ -547,6 +547,9 @@ pub async fn redeem_invite(
             ..
         } => verified_user_id(user_pk, binding_sig, &invite.inviter_id),
     };
+    // Returned to the redeemer in PairResult (#30) so it learns the peer's STABLE identity at
+    // pair time — cloned before `inviter_user_id` is moved into the stored PeerEntry below.
+    let peer_user_id = inviter_user_id.clone();
 
     // Our dial-back entry: the inviter, named by the invite's suggested nickname, granting the
     // services WE may dial on it (the asymmetric grant) — MERGED with any existing entry for this
@@ -605,6 +608,9 @@ pub async fn redeem_invite(
         // The opaque app label the inviter attached (#31), echoed to the embedder verbatim.
         // mcpmesh never interpreted it — it is display/metadata only.
         app_label: invite.app_label,
+        // The inviter's proven stable user_id (#30) — the redeemer's portable handle for it, and
+        // what it may pass to open_session to dial by identity rather than nickname.
+        peer_user_id,
     })
 }
 

@@ -1064,7 +1064,7 @@ async fn pairing_exchanges_and_stores_each_sides_verified_user_id() {
         let bob_user_id = mcpmesh_trust::binding::user_id(&bob_uk);
         let (b_pk, b_sig) = mcpmesh_trust::binding::present(&bob_uk, &bob_id);
 
-        redeem_invite(
+        let pair_result = redeem_invite(
             bob.clone(),
             "bob".into(),
             invite.encode(),
@@ -1077,6 +1077,14 @@ async fn pairing_exchanges_and_stores_each_sides_verified_user_id() {
         )
         .await
         .expect("redeem succeeds and exchanges self-sovereign bindings");
+
+        // #30: the redeemer LEARNS the inviter's stable user_id at pair time (PairResult), so it
+        // can align its own identity and later dial by it — no scraping `status`.
+        assert_eq!(
+            pair_result.peer_user_id.as_deref(),
+            Some(alice_user_id.as_str()),
+            "pair result must return alice's proven user_id to the redeemer"
+        );
 
         // ---- Each side stored the OTHER's VERIFIED user_id (invariant: bound to the TLS id) ----
         let bob_side = bob_store

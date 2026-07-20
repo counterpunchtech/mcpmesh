@@ -135,6 +135,20 @@ impl PeerStore {
         Ok(self.list()?.into_iter().find(|e| e.nickname == nickname))
     }
 
+    /// All stored entries whose proven `user_id` equals `user_id` (a `b64u:` self-sovereign
+    /// identifier) — the dial-by-stable-identity lookup (#30). A person's `user_id` spans their
+    /// devices, so this can return several entries (one per paired device); the dialer races
+    /// them, exactly like the roster person→device path. Entries with no proven `user_id`
+    /// (legacy / `internal peer add` rows) never match. Fails OPEN on corrupt rows (reuses
+    /// [`list`](Self::list)).
+    pub fn entries_for_user(&self, user_id: &str) -> Result<Vec<PeerEntry>> {
+        Ok(self
+            .list()?
+            .into_iter()
+            .filter(|e| e.user_id.as_deref() == Some(user_id))
+            .collect())
+    }
+
     /// All allowlisted peers, in endpoint_id order (redb's key order).
     ///
     /// Fails OPEN on a corrupt stored row: a row that will not deserialize is skipped and
@@ -471,6 +485,36 @@ mod tests {
         assert_eq!(got.endpoint_id, eid);
         assert_eq!(got.last_addr.as_deref(), Some("{}"));
         assert!(store.entry_for("nobody").unwrap().is_none());
+    }
+
+    #[test]
+    fn entries_for_user_groups_a_persons_devices() {
+        // #30: dial-by-user_id resolves every device sharing a proven user_id, so a caller can
+        // address a peer by its stable b64u identity instead of a local nickname.
+        let dir = tempfile::tempdir().unwrap();
+        let store = PeerStore::open(&dir.path().join("state.redb")).unwrap();
+        // Two devices of the same person (same user_id, different endpoint + nickname)...
+        let mut laptop = entry([1u8; 32], "alice", &["notes"]);
+        laptop.user_id = Some("b64u:ALICE".into());
+        let mut phone = entry([2u8; 32], "alice-phone", &["notes"]);
+        phone.user_id = Some("b64u:ALICE".into());
+        // ...plus another person, and a legacy row with no proven user_id.
+        let mut bob = entry([3u8; 32], "bob", &["kb"]);
+        bob.user_id = Some("b64u:BOB".into());
+        let legacy = entry([4u8; 32], "carol", &["x"]); // user_id None
+        for e in [laptop, phone, bob, legacy] {
+            store.add(e).unwrap();
+        }
+
+        let alice = store.entries_for_user("b64u:ALICE").unwrap();
+        assert_eq!(alice.len(), 2, "both of alice's devices match her user_id");
+        let mut eids: Vec<_> = alice.iter().map(|e| e.endpoint_id).collect();
+        eids.sort();
+        assert_eq!(eids, vec![[1u8; 32], [2u8; 32]]);
+
+        assert_eq!(store.entries_for_user("b64u:BOB").unwrap().len(), 1);
+        // A legacy row with no proven user_id never matches, and an unknown id is empty.
+        assert!(store.entries_for_user("b64u:NOBODY").unwrap().is_empty());
     }
 
     #[test]
