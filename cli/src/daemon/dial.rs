@@ -83,7 +83,10 @@ pub async fn dial_service(
 /// embedded id EQUALS the stored `endpoint_id` — a stored address claiming a DIFFERENT id is
 /// ignored (identity stays pinned to the allowlist row; TLS still authenticates whoever
 /// answers). An unparseable/absent hint degrades to the bare-id, discovery-only dial.
-fn stored_dial_addr(last_addr: Option<&str>, endpoint_id: iroh::EndpointId) -> iroh::EndpointAddr {
+pub(crate) fn stored_dial_addr(
+    last_addr: Option<&str>,
+    endpoint_id: iroh::EndpointId,
+) -> iroh::EndpointAddr {
     if let Some(json) = last_addr
         && let Ok(addr) = serde_json::from_str::<iroh::EndpointAddr>(json)
         && addr.id == endpoint_id

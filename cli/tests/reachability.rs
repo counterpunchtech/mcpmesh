@@ -86,6 +86,27 @@ fn seed_peer(store: &PeerStore, endpoint_id: [u8; 32], nickname: &str) {
         .unwrap();
 }
 
+/// Seed a peer carrying the pairing-persisted `last_addr` dial hint — the address the redeemer
+/// stores from `invite.inviter_addr_json`, already PROVEN dialable because the pairing handshake
+/// just completed over it.
+fn seed_peer_with_addr(
+    store: &PeerStore,
+    endpoint_id: [u8; 32],
+    nickname: &str,
+    addr: &iroh::EndpointAddr,
+) {
+    store
+        .add(PeerEntry {
+            endpoint_id,
+            nickname: nickname.into(),
+            services: vec![],
+            paired_at: None,
+            user_id: None,
+            last_addr: Some(serde_json::to_string(addr).expect("addr serializes")),
+        })
+        .unwrap();
+}
+
 fn assemble_mesh(
     endpoint: iroh::Endpoint,
     store: Arc<PeerStore>,
@@ -254,4 +275,71 @@ async fn status_includes_reachability() {
     })
     .await
     .expect("status reachability test timed out");
+}
+
+/// **The redeemer's cold probe must use the pairing-proven address hint (issue #27, probe arm).**
+///
+/// `dial_service` already attaches the stored `last_addr` so a cold daemon does not depend on
+/// external discovery to reach a paired peer. `probe_peer` was never given the same treatment: it
+/// dials the bare endpoint-id, so its reachability answer depends entirely on discovery having
+/// already resolved the peer.
+///
+/// That asymmetry is user-visible and was caught on real hardware. Pairing across two carrier NATs
+/// succeeded in ~1s, but `status` on the REDEEMER then reported the peer `offline` while sessions
+/// to that same peer worked — because the redeemer's first probe began a fresh id-only dial needing
+/// full discovery resolution, which blew the 3s `PROBE_TIMEOUT`. The INVITER, already holding a
+/// live path back, probed in 11ms. So the side that just redeemed an invite — precisely the person
+/// most likely to run `status` — is told their brand-new peer is offline.
+///
+/// The invite carries an address the handshake just proved dialable, so the probe never needed
+/// discovery at all. This models exactly that: `last_addr` is stored, discovery is NOT seeded
+/// (no `seed_lookup`), so an id-only dial cannot resolve the target and only a hint-carrying
+/// dial can reach it.
+#[tokio::test(flavor = "multi_thread")]
+async fn cold_probe_uses_the_pairing_proven_address_hint_without_discovery() {
+    timeout(Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(&config, "").unwrap();
+
+        // Target A serves the ping arm and trusts B.
+        let a_ep = target_endpoint().await;
+        let a_id = *a_ep.id().as_bytes();
+        let a_addr = a_ep.addr();
+        let a_store = Arc::new(PeerStore::open(&dir.path().join("a.redb")).unwrap());
+
+        // Prober B is the REDEEMER: it holds A's pairing-proven address, but NO discovery is
+        // seeded — `seed_lookup` is deliberately not called, standing in for a peer that
+        // discovery has not resolved yet (the cold, just-paired state).
+        let b_ep = dialer_endpoint().await;
+        let b_id = *b_ep.id().as_bytes();
+        let b_store = Arc::new(PeerStore::open(&dir.path().join("b.redb")).unwrap());
+        seed_peer_with_addr(&b_store, a_id, "alice", &a_addr);
+        seed_peer(&a_store, b_id, "beacon-b");
+
+        let a_mesh = assemble_mesh(a_ep, a_store, config.clone());
+        let b_mesh = assemble_mesh(b_ep, b_store, config.clone());
+        let accept = spawn_accept_loop(
+            a_mesh.clone(),
+            Arc::new(build_services(&Config::from_toml_str("").unwrap())),
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let entry = probe_peer(&b_mesh, a_id).await;
+
+        assert!(
+            entry.reachable,
+            "a cold probe must reach the peer using the pairing-proven `last_addr` hint rather \
+             than depending on discovery to resolve the bare endpoint-id"
+        );
+        assert!(
+            entry.rtt_ms.is_some(),
+            "a reachable probe reports a measured RTT"
+        );
+
+        accept.abort();
+        std::mem::forget(dir);
+    })
+    .await
+    .expect("cold-probe address-hint test timed out");
 }

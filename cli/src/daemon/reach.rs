@@ -30,9 +30,10 @@ pub const REACH_TTL_SECS: i64 = 20;
 /// reported unreachable. No retries/backoff/persistence (YAGNI); reachable ⇔ a pong in time.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Probe one peer over [`ALPN_PING`] and cache the result. Dials the peer BY ID (an id-only
-/// [`iroh::EndpointAddr`], exactly like `dial::dial_service`'s single-nickname fallback — discovery resolves
-/// the address from the id; hermetic localhost tests seed a `MemoryLookup`), sends one ping frame,
+/// Probe one peer over [`ALPN_PING`] and cache the result. Dials the peer by id WITH its stored
+/// `last_addr` hint attached when usable, exactly like `dial::dial_service`'s single-nickname
+/// fallback (discovery still resolves/merges addresses; hermetic localhost tests seed a
+/// `MemoryLookup` or store a hint), sends one ping frame,
 /// reads the pong, and measures RTT (dial + round-trip). Writes the outcome into the in-memory
 /// `MeshState::reachability` cache and returns it. Reachable ⇔ a pong arrived within
 /// `PROBE_TIMEOUT`; a gate refusal (no pong) or any dial/IO failure is a clean `reachable:false`.
@@ -58,7 +59,20 @@ pub async fn probe_peer(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> ReachEn
 async fn probe_once(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> Result<()> {
     let id = iroh::EndpointId::from_bytes(&endpoint_id)
         .map_err(|e| anyhow::anyhow!("invalid endpoint id: {e}"))?;
-    let addr = iroh::EndpointAddr::from(id);
+    // Attach the pairing-persisted `last_addr` hint, exactly as `dial::dial_service` does
+    // (issue #27): a just-paired peer is reachable at the address the handshake PROVED, so the
+    // probe must not sit waiting on discovery to resolve the bare id. Without this the redeemer's
+    // first probe blows `PROBE_TIMEOUT` and `status` calls a freshly-paired peer offline. A
+    // missing/unparseable/id-mismatched hint degrades to the bare-id dial (see `stored_dial_addr`).
+    // The redb read blocks, so it runs on the blocking pool (the fs house rule).
+    let store = mesh.store.clone();
+    let last_addr = tokio::task::spawn_blocking(move || store.resolve(&endpoint_id))
+        .await
+        .map_err(|e| anyhow::anyhow!("join peer resolve for probe: {e}"))?
+        .ok()
+        .flatten()
+        .and_then(|e| e.last_addr);
+    let addr = super::dial::stored_dial_addr(last_addr.as_deref(), id);
     let conn = mesh.endpoint.connect(addr, ALPN_PING).await?;
     // We open the bi-stream and send one ping frame — the write is what makes the responder's
     // `accept_bi` resolve (a silent QUIC stream is invisible to the peer). We say nothing
