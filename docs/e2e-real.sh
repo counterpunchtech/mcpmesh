@@ -17,7 +17,6 @@ set -eu
 
 MM="${MM:-mcpmesh}"
 PEER_MODE="${PEER_MODE:-local}"
-PEER="${PEER:-e2e-peer}"
 WORK="${E2E_WORK:-${HOME:-/tmp}/.mcpmesh-e2e}"
 SENTINEL='e2e sentinel: this note crossed the mesh'
 # Bound for assertion 2. Derived, not invented: REACH_TTL_SECS is 20s and
@@ -28,8 +27,10 @@ REACH_BOUND_SECS="${REACH_BOUND_SECS:-30}"
 
 # Where the peer's sentinel note lives. Local mode knows; remote mode must be told.
 if [ "$PEER_MODE" = "local" ]; then
+    PEER="${PEER:-e2e-peer}"
     NOTE_PATH="${NOTE_PATH:-$WORK/peer/notes/hello.md}"
 else
+    : "${PEER:?PEER (the remote peer nickname) required when PEER_MODE=remote}"
     : "${NOTE_PATH:?NOTE_PATH required when PEER_MODE=remote}"
     : "${INVITE_FILE:?INVITE_FILE required when PEER_MODE=remote}"
 fi
@@ -80,8 +81,9 @@ cleanup() {
         kill "$SQUAT_PID" 2>/dev/null || true
         wait "$SQUAT_PID" 2>/dev/null || true
     fi
-    # Targets ONLY the scratch peer's nickname ($PEER, default e2e-peer);
-    # real peers paired under other names are untouched.
+    # Removes the pairing THIS RUN created: local mode's scratch peer, or
+    # remote mode's invite-redeemed pairing — the pre-run guard refused to
+    # start if $PEER was already paired.
     "$MM" pair --remove "$PEER" >/dev/null 2>&1 || true
     rm -rf "$WORK"
 }
@@ -121,10 +123,19 @@ echo "=== mcpmesh real-network e2e ($PEER_MODE) ==="
 "$MM" --version
 
 rm -rf "$WORK"
-# A prior run that died without its traps (kill -9) can leave the $PEER
-# pairing in the REAL store, tripping the nickname-collision guard on this
-# run. Removes ONLY $PEER (e2e-peer) — never the user's real peers.
-"$MM" pair --remove "$PEER" >/dev/null 2>&1 || true
+if [ "$PEER_MODE" = "local" ]; then
+    # A prior run that died without its traps (kill -9) can leave the $PEER
+    # pairing in the REAL store, tripping the nickname-collision guard on this
+    # run. Local mode only: $PEER is always the scratch e2e identity there.
+    "$MM" pair --remove "$PEER" >/dev/null 2>&1 || true
+else
+    # Remote mode UNPAIRS $PEER at the end (assertion 6). A pre-existing
+    # pairing under that name is real user state — refuse rather than destroy.
+    if "$MM" status 2>/dev/null | grep -q "$PEER"; then
+        echo "error: a peer named '$PEER' is already paired — this harness would sever it. Unpair it yourself first, or use a dedicated test nickname." >&2
+        exit 2
+    fi
+fi
 if [ "$PEER_MODE" = "local" ]; then
     echo "--- standing up the local peer identity ---"
     setup_local_peer
