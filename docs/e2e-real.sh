@@ -251,12 +251,17 @@ if [ "$PEER_MODE" = "local" ]; then
     fi
     kill "$SQUAT_PID" 2>/dev/null || true
     wait "$SQUAT_PID" 2>/dev/null || true
+    SQUAT_PID=""
 fi
 
 echo "--- 6. pair --remove severs access ---"
 "$MM" pair --remove "$PEER" >/dev/null 2>&1 || true
-SEVERED=$(printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
-    | "$MM" connect "$PEER/notes" 2>&1 || true)
+SEVERED=$(
+  {
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e3","version":"0"}}}'
+    sleep 20
+  } | "$MM" connect "$PEER/notes" 2>&1
+) || true
 # An unknown/removed peer surfaces as -32055 "peer unreachable" (verified
 # against the shipped binary). A SUCCESSFUL dial here would mean unpairing did
 # not actually revoke access.
