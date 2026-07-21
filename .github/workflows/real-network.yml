@@ -23,6 +23,17 @@ jobs:
         # default and has neither ~/.cargo/bin nor any node manager's shims.
         run: |
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Point at the runner's own login XDG_RUNTIME_DIR
+        # The runner service unit has no PAM session, so it never gets an
+        # XDG_RUNTIME_DIR — $MM would resolve a DIFFERENT runtime dir than the
+        # Jetson's real, already-running daemon (started under a login session,
+        # bound at /run/user/<uid>/mcpmesh/mcpmesh.sock), find no socket there,
+        # and auto-spawn a second daemon that shares HOME with the real one and
+        # so collides trying to open its already-locked state.redb. Point the
+        # job at the same runtime dir so it rendezvous with the daemon that's
+        # actually running instead of racing it.
+        run: |
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
       - name: Build
         run: cargo build --release --locked
       - name: Real-network porcelain e2e (tier 2, LAN)
