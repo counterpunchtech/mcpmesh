@@ -154,6 +154,14 @@ enum Cmd {
         #[command(subcommand)]
         command: DevicesCmd,
     },
+    /// Print a shell completion script to stdout.
+    ///
+    /// Install e.g. `mcpmesh completions zsh > "${fpath[1]}/_mcpmesh"` or
+    /// `mcpmesh completions bash > /etc/bash_completion.d/mcpmesh`.
+    Completions {
+        /// The shell to emit a script for.
+        shell: clap_complete::Shell,
+    },
     /// Internal, non-porcelain subcommands (auto-started by the CLI; not for direct use).
     Internal {
         #[command(subcommand)]
@@ -277,6 +285,11 @@ enum Internal {
     /// event (and a lagged notice if a consumer falls behind). Runs until
     /// interrupted (Ctrl-C).
     Watch,
+    /// Generate roff man pages for every command into DIR (one file per command).
+    Man {
+        /// Directory to write the `*.1` files into (created if missing).
+        dir: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -465,6 +478,14 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Some(Cmd::Internal {
             command: Internal::Watch,
         }) => run_watch(cli.json),
+        Some(Cmd::Completions { shell }) => {
+            use clap::CommandFactory;
+            clap_complete::generate(shell, &mut Cli::command(), "mcpmesh", &mut std::io::stdout());
+            Ok(())
+        }
+        Some(Cmd::Internal {
+            command: Internal::Man { dir },
+        }) => run_internal_man(dir),
         Some(Cmd::Doctor) => doctor::run_doctor(cli.json),
         Some(Cmd::Up { timeout }) => run_up(timeout, cli.json),
         Some(Cmd::Status) | None => run_status(cli.json),
@@ -847,6 +868,37 @@ fn run_watch(json: bool) -> anyhow::Result<()> {
         }
         Ok(())
     })
+}
+
+/// `mcpmesh internal man <dir>`: render the whole clap command tree as roff man pages,
+/// one file per command (`mcpmesh.1`, `mcpmesh-pair.1`, `mcpmesh-org-create.1`, …). The
+/// same source of truth as `--help` — pages can never drift from the CLI itself.
+fn run_internal_man(dir: PathBuf) -> anyhow::Result<()> {
+    use clap::CommandFactory;
+    std::fs::create_dir_all(&dir)?;
+    let mut count = 0usize;
+    write_man_tree(&dir, &Cli::command(), "mcpmesh", &mut count)?;
+    println!("wrote {count} man pages to {}", dir.display());
+    Ok(())
+}
+
+fn write_man_tree(
+    dir: &std::path::Path,
+    cmd: &clap::Command,
+    stem: &str,
+    count: &mut usize,
+) -> anyhow::Result<()> {
+    let mut buf = Vec::new();
+    clap_mangen::Man::new(cmd.clone().name(stem.to_string())).render(&mut buf)?;
+    std::fs::write(dir.join(format!("{stem}.1")), buf)?;
+    *count += 1;
+    for sub in cmd
+        .get_subcommands()
+        .filter(|s| !s.is_hide_set() && s.get_name() != "help")
+    {
+        write_man_tree(dir, sub, &format!("{stem}-{}", sub.get_name()), count)?;
+    }
+    Ok(())
 }
 
 /// `mcpmesh internal id`: print this machine's full endpoint id — the same encoding

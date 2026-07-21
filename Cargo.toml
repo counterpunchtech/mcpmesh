@@ -19,7 +19,9 @@ serde_json = "1"
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "string"] }  # "string": owned command names for man-page stems
+clap_complete = "4"   # `mcpmesh completions <shell>` (agent/human shell integration)
+clap_mangen = "0.2"   # `mcpmesh internal man <dir>` (roff pages off the same clap tree)
 figment = { version = "0.10", features = ["toml", "env"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
