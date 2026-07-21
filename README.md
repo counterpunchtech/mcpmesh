@@ -45,6 +45,9 @@ Both of you also see the same short code, like `tango-fig-cabbage`. 🗣️ Read
 **matching words mean the pairing is authentic.** Now your friend's AI can search your notes over an
 encrypted peer-to-peer link, and it works both ways whenever they want to share back.
 
+> 🤖 Driving mcpmesh from a script or an AI agent? See [AGENTS.md](AGENTS.md) — every verb
+> takes `--json`, errors carry a machine-branchable code, and nothing ever prompts.
+
 ## 🧪 Try it alone
 
 Only one machine? Fake the friend. A daemon's whole world lives under `HOME` +
