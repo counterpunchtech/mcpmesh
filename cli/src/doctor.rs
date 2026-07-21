@@ -30,6 +30,18 @@ pub struct Verdict {
     pub message: String,
 }
 
+impl Level {
+    /// The machine word for this level (`doctor --json`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Level::Info => "info",
+            Level::Ok => "ok",
+            Level::Warn => "warn",
+            Level::Error => "error",
+        }
+    }
+}
+
 impl Verdict {
     pub fn info(message: impl Into<String>) -> Self {
         Self {

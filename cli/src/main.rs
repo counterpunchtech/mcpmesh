@@ -27,6 +27,13 @@ struct Cli {
     /// it (via MCPMESH_HOME), so every verb in this profile rendezvous on the same socket.
     #[arg(long, value_name = "dir", global = true, visible_alias = "home")]
     profile: Option<PathBuf>,
+    /// Print machine-readable JSON instead of prose: one JSON value on stdout, and a
+    /// failure becomes a single `{"error":{"code":…,"message":…}}` line on stderr
+    /// (`code` is the control API's error code when the daemon refused, else null).
+    /// Shapes mirror the mcpmesh-local/1 result types — see AGENTS.md. No effect on
+    /// `connect` (a byte pipe) or `internal daemon`.
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -369,11 +376,16 @@ fn main() -> std::process::ExitCode {
         };
         let _ = paths::set_root(abs);
     }
+    let json = cli.json;
     match run(cli) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(err) => {
-            for line in render::error_lines(&err) {
-                eprintln!("{line}");
+            if json {
+                eprintln!("{}", mcpmesh::json::error_json(&err));
+            } else {
+                for line in render::error_lines(&err) {
+                    eprintln!("{line}");
+                }
             }
             std::process::ExitCode::FAILURE
         }

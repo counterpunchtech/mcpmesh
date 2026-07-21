@@ -27,6 +27,8 @@ pub mod doctor;
 pub mod enrollcmd;
 #[doc(hidden)]
 pub mod ipc;
+
+pub mod json;
 #[doc(hidden)]
 pub mod limits;
 #[doc(hidden)]
