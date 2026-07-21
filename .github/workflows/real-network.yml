@@ -1,0 +1,33 @@
+name: real-network
+on:
+  pull_request:
+  workflow_dispatch:
+permissions: { contents: read }
+concurrency:
+  # The Jetson is ONE machine with one mcpmesh identity — two concurrent runs
+  # would fight over the same daemon, peer store, and nickname namespace.
+  group: real-network-jetson
+  cancel-in-progress: false
+jobs:
+  lan-porcelain:
+    # Self-hosted runner on a public repo: never run fork-submitted code.
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, jetson]
+    timeout-minutes: 20
+    # Non-blocking until its real flake rate is known (spec: promote later).
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+      - name: Put cargo on the runner service's PATH
+        # The runner is a systemd system service: its PATH is the bare system
+        # default and has neither ~/.cargo/bin nor any node manager's shims.
+        run: |
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Build
+        run: cargo build --release --locked
+      - name: Real-network porcelain e2e (tier 2, LAN)
+        run: |
+          echo "::notice::Tier 2 runs two identities on ONE host: it proves the"
+          echo "::notice::porcelain works over real interfaces and discovery."
+          echo "::notice::It does NOT prove NAT traversal — that is tier 3."
+          MM=./target/release/mcpmesh sh docs/e2e-real.sh
