@@ -68,7 +68,10 @@ cleanup() {
         # when its world is deleted out from under it.
         wait "$PEER_PID" 2>/dev/null || true
     fi
-    pkill -f "$WORK/squatter" 2>/dev/null || true
+    if [ -n "${SQUAT_PID:-}" ]; then
+        kill "$SQUAT_PID" 2>/dev/null || true
+        wait "$SQUAT_PID" 2>/dev/null || true
+    fi
     # Targets ONLY the scratch peer's nickname ($PEER, default e2e-peer);
     # real peers paired under other names are untouched.
     "$MM" pair --remove "$PEER" >/dev/null 2>&1 || true
@@ -222,6 +225,17 @@ if [ "$PEER_MODE" = "local" ]; then
     echo "squatted" > "$SQUAT_HOME/notes/hello.md"
     printf '[identity]\nnickname = "%s"\n' "$PEER" \
         > "$SQUAT_HOME/.config/mcpmesh/config.toml"
+    # Started explicitly (not via serve's auto-start) so we hold its PID:
+    # the auto-started daemon's argv is just "internal daemon" — no path —
+    # so pkill -f can never find it and it would leak on every run.
+    HOME="$SQUAT_HOME" XDG_RUNTIME_DIR="$SQUAT_RUN" "$MM" internal daemon &
+    SQUAT_PID=$!
+    i=0
+    until [ -S "$SQUAT_RUN/mcpmesh/mcpmesh.sock" ]; do
+        i=$((i+1))
+        [ "$i" -gt 150 ] && { echo "squatter daemon did not start" >&2; exit 1; }
+        sleep 0.2
+    done
     HOME="$SQUAT_HOME" XDG_RUNTIME_DIR="$SQUAT_RUN" "$MM" serve notes -- \
         npx -y @modelcontextprotocol/server-filesystem "$SQUAT_HOME/notes" >/dev/null 2>&1 || true
     SQUAT_INVITE=$(HOME="$SQUAT_HOME" XDG_RUNTIME_DIR="$SQUAT_RUN" "$MM" invite notes \
@@ -235,10 +249,8 @@ if [ "$PEER_MODE" = "local" ]; then
             *) bad "squatting invite was NOT refused: $SQUAT_OUT" ;;
         esac
     fi
-    # There is no `mcpmesh internal shutdown` subcommand (verified against the
-    # shipped CLI: internal exposes daemon/id/peer/roster/blob/audit/watch only).
-    # The squatter daemon auto-started under its own HOME, so match on that path.
-    pkill -f "$SQUAT_HOME" 2>/dev/null || true
+    kill "$SQUAT_PID" 2>/dev/null || true
+    wait "$SQUAT_PID" 2>/dev/null || true
 fi
 
 echo "--- 6. pair --remove severs access ---"
