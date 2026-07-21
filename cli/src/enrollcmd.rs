@@ -60,6 +60,7 @@ pub fn run_join(
     name: Option<String>,
     user_id: Option<String>,
     label: String,
+    json: bool,
 ) -> anyhow::Result<()> {
     use mcpmesh_trust::keys::UserKey;
     use mcpmesh_trust::roster::encode_b64u;
@@ -122,6 +123,19 @@ pub fn run_join(
     })?;
 
     let fingerprint = pairing::sas::fingerprint_words(&root_pk);
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "org_id": invite.org_id,
+                "user_id": requested_user_id,
+                "join_code": join,
+                "join_code_fingerprint": code_fp,
+                "org_root_fingerprint": fingerprint,
+            })
+        );
+        return Ok(());
+    }
     println!("Joined org '{}' as '{requested_user_id}'.", invite.org_id);
     println!("Org root fingerprint: {fingerprint}");
     println!(
@@ -145,6 +159,7 @@ pub fn run_org_create(
     name: String,
     expires: Option<String>,
     roster_url: Option<String>,
+    json: bool,
 ) -> anyhow::Result<()> {
     use mcpmesh_trust::keys::OrgRootKey;
     use mcpmesh_trust::roster::sign::mint_signed;
@@ -187,6 +202,18 @@ pub fn run_org_create(
     }
     .encode();
     let fingerprint = pairing::sas::fingerprint_words(&root.public_bytes());
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "org_id": result.org_id,
+                "serial": result.serial,
+                "org_invite": invite,
+                "org_root_fingerprint": fingerprint,
+            })
+        );
+        return Ok(());
+    }
     println!(
         "Created org '{}' (roster serial {}).",
         result.org_id, result.serial
@@ -229,6 +256,7 @@ pub fn run_org_approve(
     join_code: String,
     groups: String,
     user_id: Option<String>,
+    json: bool,
 ) -> anyhow::Result<()> {
     use mcpmesh_trust::roster::sign::{sign, verify_device_binding};
     use mcpmesh_trust::roster::{decode_endpoint_id, mutate};
@@ -253,15 +281,17 @@ pub fn run_org_approve(
     // can confirm — out-of-band — they are approving the SAME code the joiner read back (catching a
     // substituted code). Same derivation as `join`'s output (over user_pk ∥ device endpoint).
     let code_fp = pairing::sas::join_code_fingerprint(&user_pk, &device_id);
-    println!(
-        "Approving join code {code_fp} for '{}' as user '{uid}', groups [{}].",
-        jc.display_name,
-        groups.join(", ")
-    );
-    println!(
-        "  → Verify {code_fp} matches what the joiner read back to you out-of-band; if it doesn't, \
-         run `org revoke` on this device."
-    );
+    if !json {
+        println!(
+            "Approving join code {code_fp} for '{}' as user '{uid}', groups [{}].",
+            jc.display_name,
+            groups.join(", ")
+        );
+        println!(
+            "  → Verify {code_fp} matches what the joiner read back to you out-of-band; if it doesn't, \
+             run `org revoke` on this device."
+        );
+    }
     roster.serial += 1;
     mutate::upsert_member(
         &mut roster,
@@ -276,6 +306,19 @@ pub fn run_org_approve(
     sign(root.signing_key(), &mut roster).map_err(|e| anyhow::anyhow!("sign roster: {e}"))?;
 
     let result = install_signed_roster(&roster, None)?; // org root already pinned
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "user_id": uid,
+                "groups": groups,
+                "org_id": result.org_id,
+                "serial": result.serial,
+                "join_code_fingerprint": code_fp,
+            })
+        );
+        return Ok(());
+    }
     println!(
         "Approved '{}' into [{}] (org '{}', serial {}).",
         uid,
@@ -288,15 +331,17 @@ pub fn run_org_approve(
 
 /// `mcpmesh org revoke <person|device> [--user-key]`: mutate the installed roster per the
 /// target grammar, bump serial, re-sign, install (which severs the cut devices' live sessions).
-pub fn run_org_revoke(target: String, user_key: bool) -> anyhow::Result<()> {
+pub fn run_org_revoke(target: String, user_key: bool, json: bool) -> anyhow::Result<()> {
     use mcpmesh_trust::roster::mutate;
     use mcpmesh_trust::roster::sign::sign;
 
     let (root, mut roster) = load_operator_roster()?;
     roster.serial += 1;
+    let mode: &str;
     let action: String = if user_key {
         // Rotation: remove the person, keep their devices un-revoked (same device re-enrolls).
         mutate::remove_user(&mut roster, &target, false).map_err(|e| anyhow::anyhow!("{e}"))?;
+        mode = "user-key-rotation";
         format!(
             "Rotated '{target}': removed from the roster. They re-enroll with a fresh user key \
              (same device), then re-approve with the same user_id"
@@ -304,14 +349,29 @@ pub fn run_org_revoke(target: String, user_key: bool) -> anyhow::Result<()> {
     } else if let Some((person, device)) = target.split_once('/') {
         // One device.
         mutate::revoke_device(&mut roster, person, device).map_err(|e| anyhow::anyhow!("{e}"))?;
+        mode = "device";
         format!("Revoked device '{person}/{device}'")
     } else {
         // Person departing — remove + revoke every device (hard cut).
         mutate::remove_user(&mut roster, &target, true).map_err(|e| anyhow::anyhow!("{e}"))?;
+        mode = "person";
         format!("Revoked person '{target}' (all devices)")
     };
     sign(root.signing_key(), &mut roster).map_err(|e| anyhow::anyhow!("sign roster: {e}"))?;
     let result = install_signed_roster(&roster, None)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "target": target,
+                "mode": mode,
+                "org_id": result.org_id,
+                "serial": result.serial,
+                "severed": result.severed,
+            })
+        );
+        return Ok(());
+    }
     println!(
         "{action} (org '{}', serial {}). Severed {} live session{}.",
         result.org_id,
@@ -326,7 +386,7 @@ pub fn run_org_revoke(target: String, user_key: bool) -> anyhow::Result<()> {
 /// endpoint id + a label. NO key material rides in it (the endpoint id is derived locally from the
 /// device key, exactly like `internal id`); the already-enrolled device signs the binding with the
 /// SHARED user key it holds. Surface-clean: only the opaque `mcpmesh-device:` code prints.
-pub fn run_devices_code(label: String) -> anyhow::Result<()> {
+pub fn run_devices_code(label: String, json: bool) -> anyhow::Result<()> {
     use mcpmesh_trust::roster::encode_b64u;
     let device_id = load_device_key()?.public_bytes();
     let code = roster::enroll::DeviceCode {
@@ -334,6 +394,10 @@ pub fn run_devices_code(label: String) -> anyhow::Result<()> {
         device_label: label,
     }
     .encode();
+    if json {
+        println!("{}", serde_json::json!({"device_code": code}));
+        return Ok(());
+    }
     println!("Give this to an already-enrolled device (`mcpmesh devices add`): {code}");
     Ok(())
 }
@@ -346,7 +410,7 @@ pub fn run_devices_code(label: String) -> anyhow::Result<()> {
 /// device must know its `user_id` (config) AND hold the user key; else a clean error ("run join first").
 /// Prints the join code + the join-code fingerprint for the operator to read back (ceremony
 /// consistency with `join`/`org approve` — over the SAME user_pk ∥ NEW device endpoint).
-pub fn run_devices_add(device_code: String) -> anyhow::Result<()> {
+pub fn run_devices_add(device_code: String, json: bool) -> anyhow::Result<()> {
     use mcpmesh_trust::keys::UserKey;
     use mcpmesh_trust::roster::encode_b64u;
     use mcpmesh_trust::roster::sign::sign_device_binding;
@@ -393,6 +457,13 @@ pub fn run_devices_add(device_code: String) -> anyhow::Result<()> {
     // The join-code fingerprint (over user_pk ∥ NEW device endpoint) — the operator reads it back at
     // `org approve`, the same ceremony `join` uses (the substitution-MITM closer).
     let code_fp = pairing::sas::join_code_fingerprint(&user_pk, &new_device_id);
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"join_code": join, "join_code_fingerprint": code_fp})
+        );
+        return Ok(());
+    }
     println!("Send the operator this join code to add the device: {join}");
     println!("Join code fingerprint: {code_fp}");
     println!(
@@ -499,7 +570,7 @@ mod tests {
             binding_sig: encode_b64u(&sig),
         }
         .encode();
-        let err = run_org_approve(code, "team-eng".into(), None).unwrap_err();
+        let err = run_org_approve(code, "team-eng".into(), None, false).unwrap_err();
         assert!(
             err.to_string().contains("device binding failed"),
             "the forged binding must be the failure, not roster/operator state: {err}"
@@ -510,7 +581,7 @@ mod tests {
     fn a_garbage_device_code_fails_on_decode_not_enrollment_state() {
         // `devices add` decodes the code BEFORE reading config/keys, so garbage fails with the
         // codec's own sentence — never a misleading "this device is not enrolled".
-        let err = run_devices_add("garbage".into()).unwrap_err();
+        let err = run_devices_add("garbage".into(), false).unwrap_err();
         assert!(
             err.to_string().contains("mcpmesh-device:"),
             "the decode error names the expected scheme: {err}"

@@ -413,7 +413,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             name,
             user_id,
             label,
-        }) => enrollcmd::run_join(org_invite, name, user_id, label),
+        }) => enrollcmd::run_join(org_invite, name, user_id, label, cli.json),
         Some(Cmd::Org {
             command:
                 OrgCmd::Create {
@@ -421,7 +421,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     expires,
                     roster_url,
                 },
-        }) => enrollcmd::run_org_create(name, expires, roster_url),
+        }) => enrollcmd::run_org_create(name, expires, roster_url, cli.json),
         Some(Cmd::Org {
             command:
                 OrgCmd::Approve {
@@ -429,16 +429,16 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     groups,
                     user_id,
                 },
-        }) => enrollcmd::run_org_approve(join_code, groups, user_id),
+        }) => enrollcmd::run_org_approve(join_code, groups, user_id, cli.json),
         Some(Cmd::Org {
             command: OrgCmd::Revoke { target, user_key },
-        }) => enrollcmd::run_org_revoke(target, user_key),
+        }) => enrollcmd::run_org_revoke(target, user_key, cli.json),
         Some(Cmd::Devices {
             command: DevicesCmd::Code { label },
-        }) => enrollcmd::run_devices_code(label),
+        }) => enrollcmd::run_devices_code(label, cli.json),
         Some(Cmd::Devices {
             command: DevicesCmd::Add { device_code },
-        }) => enrollcmd::run_devices_add(device_code),
+        }) => enrollcmd::run_devices_add(device_code, cli.json),
         Some(Cmd::Internal {
             command:
                 Internal::Peer {
