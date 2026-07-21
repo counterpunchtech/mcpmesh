@@ -184,6 +184,35 @@ else
     bad "peer never reported online within ${REACH_BOUND_SECS}s (cold-probe regression?)"
 fi
 
+echo "--- 3. end-to-end tools/call ---"
+# initialize alone only proves the session opened. The tool call proves a real
+# request reached the peer's MCP server and its data came back — the omission
+# that let the /tmp symlink bug hide in docs/loopback.sh.
+REPLIES=$(
+  {
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0"}}}'
+    sleep 25
+    printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+    printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"'"$PEER_HOME"'/notes/hello.md"}}}'
+    sleep 15
+  } | "$MM" connect "$PEER/notes" 2>&1
+)
+printf '%s' "$REPLIES" | grep -q '"id":1.*result' \
+    && ok "initialize round-tripped" || bad "initialize did not round-trip"
+printf '%s' "$REPLIES" | grep -q "$SENTINEL" \
+    && ok "tool call returned the peer's file" \
+    || bad "tool call did not return the peer's file: $(printf '%s' "$REPLIES" | tail -2)"
+
+echo "--- 4. session reuse ---"
+R2=$(
+  {
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e2","version":"0"}}}'
+    sleep 20
+  } | "$MM" connect "$PEER/notes" 2>&1
+)
+printf '%s' "$R2" | grep -q '"id":1.*result' \
+    && ok "second session established" || bad "second session failed"
+
 # Sets the script's exit status; the EXIT trap prints the summary and cleans
 # up, and dash preserves this status through the trap.
 [ "$fail" -eq 0 ]
