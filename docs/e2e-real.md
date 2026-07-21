@@ -22,13 +22,47 @@ non-blocking until its flake rate is known.
 
 ## Run it
 
-Tier 2 — a scratch `HOME` on this machine is the second identity:
+Tier 2 — a scratch `HOME` on this machine is the second identity. You need a
+release build (`cargo build --release`) and `npx` (Node) on `PATH` for the demo
+filesystem server first — the script fails fast on either being missing, but
+building up front saves the round trip:
 
 ```sh
 MM=./target/release/mcpmesh sh docs/e2e-real.sh
 ```
 
-Tier 3 — pair with an invite minted on a machine on a different network:
+Tier 3 — pair with an invite minted on a machine on a different network.
+
+### On the peer's machine, first
+
+This side never sees the peer's machine, so it can't set this up for you — do
+it there before touching the redeemer commands below:
+
+```sh
+mkdir -p ~/notes
+echo 'e2e sentinel: this note crossed the mesh' > ~/notes/hello.md
+mcpmesh serve notes -- npx -y @modelcontextprotocol/server-filesystem ~/notes
+mcpmesh invite notes | grep -o 'mcpmesh-invite:[A-Za-z0-9]*' > invite.txt
+```
+
+- **The service must be named exactly `notes`** — the script hardcodes
+  `connect "$PEER/notes"`.
+- **The sentinel line must be exact, byte for byte**: `e2e sentinel: this note
+  crossed the mesh`. That's what assertion 3's `tools/call` greps for.
+- **`invite.txt` must hold only the bare token**, nothing else. The redeemer
+  side reads it with `INVITE=$(cat "$INVITE_FILE")`, which strips trailing
+  blank lines but not a leading one or any surrounding prose — a file holding
+  `invite`'s full human-readable output (the "share this:" framing, etc.)
+  breaks decoding. Piping through `grep -o` as above, rather than pasting the
+  command's output, is what keeps the file to just the token.
+- **Keep this `serve` process (and its daemon) running** for the whole run —
+  the redeemer dials it live in assertions 2 through 4.
+- Note this identity's nickname (`~/.config/mcpmesh/config.toml`'s
+  `[identity] nickname`, or whatever it already resolves to without one) —
+  that exact name is what the redeemer must pass as `PEER` below. Copy
+  `invite.txt` over to the redeemer's machine.
+
+Then, on the redeemer's machine:
 
 ```sh
 PEER_MODE=remote PEER=their-nickname \
@@ -36,16 +70,21 @@ INVITE_FILE=./invite.txt NOTE_PATH=/home/them/notes/hello.md \
 MM=./target/release/mcpmesh sh docs/e2e-real.sh
 ```
 
-Remote mode hard-requires `PEER`, `NOTE_PATH`, and `INVITE_FILE` — a missing one
-fails fast, before any state is touched, naming which one you forgot. Two
-details the peer side must get right or the run false-FAILs:
+Remote mode hard-requires `PEER`, `NOTE_PATH`, and `INVITE_FILE` — a missing
+one fails fast, before any state is touched, naming which one you forgot.
 
-- The file at `NOTE_PATH`, on the **peer's** machine, must contain exactly
-  `e2e sentinel: this note crossed the mesh` — that literal line is what
-  assertion 4 greps for. Easiest: `echo 'e2e sentinel: this note crossed the
-  mesh' > ~/notes/hello.md` on the peer side.
-- `NOTE_PATH` is spliced raw into a JSON `tools/call` payload, so no
-  double-quotes or backslashes in the path.
+- `PEER` must equal the peer's real nickname exactly: `pair` redeems the
+  invite under the name the invite itself carries, not whatever you happen to
+  pass. Get this wrong and pairing still succeeds under their real name, but
+  every later step that references `$PEER` — the reachability check, both
+  `connect` calls, and cleanup — is looking for a name that was never paired.
+  Assertion 2 fails after the full 30s wait, and cleanup's
+  `pair --remove "$PEER"` removes nothing, leaving a real (mis-tracked)
+  pairing behind.
+- `NOTE_PATH` is the sentinel file's path as the **peer's own** filesystem
+  server sees it — here, `/home/them/notes/hello.md` on their disk, not yours
+  — and it's spliced raw into a JSON `tools/call` payload, so no
+  double-quotes or backslashes in it.
 
 Use a dedicated test nickname for `PEER`, not one you actually pair with day to
 day: the run's last assertion unpairs `$PEER`, and — since that would destroy
@@ -56,13 +95,20 @@ once the script finishes. Re-pair before using that peer again for real.
 
 ## What it asserts
 
-1. Pairing completes.
-2. The safety code matches on both sides (local mode only — remote has no way to read the peer's screen).
-3. `status` reports the peer online within 30s of pairing. **This is the `049877b` regression guard**: before that fix the redeemer's cold probe blew the 3s `PROBE_TIMEOUT` and reported a freshly-paired peer offline.
-4. A real `tools/call` returns the peer's file — not merely `initialize` (this is two checks: the `initialize` round-trip and the `tools/call` result, so a full run prints 8 `PASS` lines against this 7-item list).
-5. A second session establishes.
-6. A nickname-squatting invite is refused (local mode only).
-7. `pair --remove` severs access.
+The script prints six numbered banners but eight `PASS` lines — banners 1 and
+3 each cover two checks:
+
+1. `pair` completes, **and** the safety code matches on both sides (local
+   mode only — remote has no way to read the peer's screen).
+2. `status` reports the peer online within 30s of pairing. **This is the
+   `049877b` regression guard**: before that fix the redeemer's cold probe
+   blew the 3s `PROBE_TIMEOUT` (`cli/src/daemon/reach.rs`) and reported a
+   freshly-paired peer offline.
+3. A real `tools/call` returns the peer's file, **and** the `initialize`
+   round-trip that precedes it succeeds — not merely `initialize` alone.
+4. A second session establishes (session reuse).
+5. A nickname-squatting invite is refused (local mode only).
+6. `pair --remove` severs access.
 
 ## What it does NOT prove
 
@@ -70,7 +116,7 @@ once the script finishes. Re-pair before using that peer again for real.
   NIC. Relay bootstrap and hole-punching are tier 3's job.
 - **Tier 2 cannot catch a cold-probe regression, even though it runs the
   assertion.** During implementation we reverted `049877b`, rebuilt, restarted
-  the daemon from the reverted binary, and re-ran this script — assertion 3
+  the daemon from the reverted binary, and re-ran this script — assertion 2
   still passed, peer online in ~2s. Same-host discovery resolves the bare-id
   dial far inside the 3s `PROBE_TIMEOUT`, so the bug that motivated this whole
   suite is structurally invisible in local mode. The guard is only meaningful
