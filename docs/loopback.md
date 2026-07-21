@@ -88,6 +88,12 @@ friend mcpmesh status      # "recent pairings: … code: tango-fig-cabbage"
 
 Matching words are what a real pairing ceremony checks.
 
+The script version does this assertion for you, programmatically: it reads your
+`sas_code` from `mcpmesh --json pair …` and the friend's from
+`friend mcpmesh --json status` (under `recent_pairings`), and fails on a mismatch.
+Any automated harness should assert the same two strings are equal — it is the same
+authenticity check the humans perform aloud.
+
 ### 4. Prove a live exchange end to end
 
 Mount it in your AI client (`mcpmesh use demo-friend/notes` prints the steps), or prove the pipe

@@ -23,7 +23,10 @@ pub fn error_json(err: &anyhow::Error) -> serde_json::Value {
             _ => None,
         });
     let joined = render::error_lines(err).join("\n");
-    let message = joined.strip_prefix("Error: ").unwrap_or(&joined).to_string();
+    let message = joined
+        .strip_prefix("Error: ")
+        .unwrap_or(&joined)
+        .to_string();
     serde_json::json!({"error": {"code": code, "message": message}})
 }
 
@@ -142,12 +145,14 @@ mod tests {
 
     #[test]
     fn error_json_on_a_plain_error_has_null_code_and_the_chain() {
-        let err =
-            anyhow::Error::from(std::io::Error::other("disk full")).context("write roster");
+        let err = anyhow::Error::from(std::io::Error::other("disk full")).context("write roster");
         let v = error_json(&err);
         assert_eq!(v["error"]["code"], serde_json::Value::Null);
         let msg = v["error"]["message"].as_str().unwrap();
-        assert!(msg.contains("write roster") && msg.contains("disk full"), "{msg}");
+        assert!(
+            msg.contains("write roster") && msg.contains("disk full"),
+            "{msg}"
+        );
     }
 
     #[test]
@@ -222,7 +227,10 @@ mod tests {
     #[test]
     fn small_ack_objects_have_their_documented_shapes() {
         assert_eq!(unpair_json("bob"), json!({"removed": "bob"}));
-        assert_eq!(serve_json("notes"), json!({"service": "notes", "serving": true}));
+        assert_eq!(
+            serve_json("notes"),
+            json!({"service": "notes", "serving": true})
+        );
         assert_eq!(
             up_json(std::path::Path::new("/run/mcpmesh/mcpmesh.sock")),
             json!({"socket": "/run/mcpmesh/mcpmesh.sock"})
@@ -233,7 +241,10 @@ mod tests {
     fn doctor_json_tallies_and_flags_errors() {
         let findings = vec![
             ("config", Verdict::ok("config parses")),
-            ("device.key", Verdict::error("group/world-writable (mode 0666)")),
+            (
+                "device.key",
+                Verdict::error("group/world-writable (mode 0666)"),
+            ),
             ("daemon", Verdict::warn("daemon not running")),
         ];
         let v = doctor_json(&findings);

@@ -112,6 +112,18 @@ local-only checks are skipped.)
 5. A nickname-squatting invite is refused (local mode only).
 6. `pair --remove` severs access.
 
+### Asserting the safety code
+
+Since 0.6.1 every verb takes `--json`, so the SAS assertion needs no prose scraping:
+the redeemer reads `.sas_code` from `mcpmesh --json pair …`, the inviter reads the
+newest `.recent_pairings[].sas_code` from `mcpmesh --json status`, and the harness
+string-compares the two. A match is a real man-in-the-middle assertion — strictly
+stronger than skipping the ceremony (pairing completes either way; the check is
+advisory authenticity). Outside automated runs the human read-aloud ceremony remains
+the norm. In remote mode the runner cannot read the peer's screen; if the peer end is
+scriptable (ssh), fetch its `--json status` and make the same comparison — otherwise
+the check stays local-mode-only, as today.
+
 ## What it does NOT prove
 
 - **Tier 2 does not prove NAT traversal.** Two identities on one host share a

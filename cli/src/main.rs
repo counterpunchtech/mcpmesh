@@ -480,7 +480,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         }) => run_watch(cli.json),
         Some(Cmd::Completions { shell }) => {
             use clap::CommandFactory;
-            clap_complete::generate(shell, &mut Cli::command(), "mcpmesh", &mut std::io::stdout());
+            clap_complete::generate(
+                shell,
+                &mut Cli::command(),
+                "mcpmesh",
+                &mut std::io::stdout(),
+            );
             Ok(())
         }
         Some(Cmd::Internal {
@@ -836,7 +841,10 @@ fn run_status(json: bool) -> anyhow::Result<()> {
         let hello = client.hello().clone();
         let status = client.status().await?;
         if json {
-            println!("{}", mcpmesh::json::status_json(&fingerprint, &hello, &status));
+            println!(
+                "{}",
+                mcpmesh::json::status_json(&fingerprint, &hello, &status)
+            );
         } else {
             render::render_status(&fingerprint, &hello, &status, has_roster_url);
         }

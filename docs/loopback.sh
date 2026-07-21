@@ -50,7 +50,21 @@ INVITE=$(friend mcpmesh invite notes | grep -o 'mcpmesh-invite:[^ ]*')
 # 3. YOUR identity (your normal environment) redeems it — the same command a
 #    real friend would run with an invite you sent them.
 echo "==> you redeem it"
-mcpmesh pair "$INVITE"
+PAIR_JSON=$(mcpmesh --json pair "$INVITE")
+echo "$PAIR_JSON"
+
+# 3b. Assert the safety code programmatically: the redeemer's SAS (from `pair --json`)
+#     must equal the inviter's (from their `status --json` recent_pairings). Humans
+#     compare these words aloud; automation compares the strings — a real
+#     man-in-the-middle assertion, not a skipped ceremony.
+MY_SAS=$(printf '%s' "$PAIR_JSON" | sed -n 's/.*"sas_code":"\([^"]*\)".*/\1/p')
+FRIEND_SAS=$(friend mcpmesh --json status | sed -n 's/.*"sas_code":"\([^"]*\)".*/\1/p' | head -n 1)
+if [ -n "$MY_SAS" ] && [ "$MY_SAS" = "$FRIEND_SAS" ]; then
+    echo "==> safety code verified on both sides: $MY_SAS"
+else
+    echo "safety code mismatch: you saw '$MY_SAS', the friend saw '$FRIEND_SAS'" >&2
+    exit 1
+fi
 
 # 4. Prove a live MCP exchange end to end: initialize the friend's server through
 #    the mesh, then actually CALL a tool and read the note back. Initialize alone
