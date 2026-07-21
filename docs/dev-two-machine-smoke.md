@@ -1,5 +1,10 @@
 # Dev smoke: MCP echo across two real machines / NATs
 
+> **Layer note:** this runbook drives `mcpmesh-net` directly (a `StaticGate`,
+> hand-passed addresses, an echo backend) — it does not exercise pairing,
+> `status`, or reachability. For the CLI porcelain across a real network, see
+> [`e2e-real.md`](e2e-real.md).
+
 Validates the one M1 acceptance clause CI cannot exercise —
 **"two machines on different NATs complete an MCP session over `mcpmesh/mcp/1`"**
 (spec §16 AC; §10.2/§10.3 relay+discovery). Run it whenever iroh is re-pinned,
