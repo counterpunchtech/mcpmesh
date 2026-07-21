@@ -449,22 +449,22 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                             allow,
                         },
                 },
-        }) => run_peer_add(nickname, endpoint_id, allow),
+        }) => run_peer_add(nickname, endpoint_id, allow, cli.json),
         Some(Cmd::Internal {
             command:
                 Internal::Roster {
                     command: RosterCmd::Install { file, org_root_pk },
                 },
-        }) => run_roster_install(file, org_root_pk),
+        }) => run_roster_install(file, org_root_pk, cli.json),
         Some(Cmd::Internal {
             command: Internal::Blob { command },
-        }) => run_internal_blob(command),
+        }) => run_internal_blob(command, cli.json),
         Some(Cmd::Internal {
             command: Internal::Audit { command },
-        }) => run_internal_audit(command),
+        }) => run_internal_audit(command, cli.json),
         Some(Cmd::Internal {
             command: Internal::Watch,
-        }) => run_watch(),
+        }) => run_watch(cli.json),
         Some(Cmd::Doctor) => doctor::run_doctor(cli.json),
         Some(Cmd::Up { timeout }) => run_up(timeout, cli.json),
         Some(Cmd::Status) | None => run_status(cli.json),
@@ -629,6 +629,7 @@ fn run_peer_add(
     nickname: String,
     endpoint_id: String,
     allow: Option<String>,
+    json: bool,
 ) -> anyhow::Result<()> {
     let allow = split_csv(allow);
     with_daemon(async move |mut client| {
@@ -639,7 +640,11 @@ fn run_peer_add(
                 allow,
             }))
             .await?;
-        println!("added peer '{nickname}'");
+        if json {
+            println!("{}", serde_json::json!({"peer": nickname, "added": true}));
+        } else {
+            println!("added peer '{nickname}'");
+        }
         Ok(())
     })
 }
@@ -651,11 +656,19 @@ fn run_peer_add(
 /// confirmation: org_id + serial + severed count (roster-status vocabulary) — NEVER a key /
 /// endpoint id / path. A control error (bad signature, rollback serial, no pinned root)
 /// propagates out of `main` → the message prints to stderr and the process exits non-zero.
-fn run_roster_install(file: PathBuf, org_root_pk: Option<String>) -> anyhow::Result<()> {
+fn run_roster_install(
+    file: PathBuf,
+    org_root_pk: Option<String>,
+    json: bool,
+) -> anyhow::Result<()> {
     let path = file.to_string_lossy().into_owned();
     with_daemon(async move |mut client| {
         let installed = client.roster_install(&path, org_root_pk).await?;
-        println!("{}", render::roster_install_line(&installed));
+        if json {
+            println!("{}", serde_json::to_value(&installed)?);
+        } else {
+            println!("{}", render::roster_install_line(&installed));
+        }
         Ok(())
     })
 }
@@ -663,39 +676,68 @@ fn run_roster_install(file: PathBuf, org_root_pk: Option<String>) -> anyhow::Res
 /// `mcpmesh internal blob <publish|grant|list|fetch>`: auto-start the daemon and drive the gated
 /// app-blob provider over the control API. Surface-clean output: tickets/hashes are the
 /// blob-reference vocabulary; scope names / principals are flat. Errors propagate → non-zero exit.
-fn run_internal_blob(command: BlobCmd) -> anyhow::Result<()> {
+fn run_internal_blob(command: BlobCmd, json: bool) -> anyhow::Result<()> {
     with_daemon(async move |mut client| {
         match command {
             BlobCmd::Publish { scope, file } => {
                 let path = file.to_string_lossy().into_owned();
                 let r = client.blob_publish(&scope, &path).await?;
-                println!("Published (hash {}).", r.hash);
-                println!("{}", r.ticket);
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"hash": r.hash, "ticket": r.ticket})
+                    );
+                } else {
+                    println!("Published (hash {}).", r.hash);
+                    println!("{}", r.ticket);
+                }
             }
             BlobCmd::Grant { scope, principal } => {
                 client.blob_grant(&scope, &principal).await?;
-                println!("Granted scope '{scope}' to '{principal}'.");
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"scope": scope, "principal": principal, "granted": true})
+                    );
+                } else {
+                    println!("Granted scope '{scope}' to '{principal}'.");
+                }
             }
             BlobCmd::List => {
                 let r = client.blob_list().await?;
-                for s in r.scopes {
-                    println!(
-                        "{}: {} blob(s), granted to [{}]",
-                        s.name,
-                        s.hashes.len(),
-                        s.grants.join(", ")
-                    );
+                if json {
+                    println!("{}", serde_json::to_value(&r)?);
+                } else {
+                    for s in r.scopes {
+                        println!(
+                            "{}: {} blob(s), granted to [{}]",
+                            s.name,
+                            s.hashes.len(),
+                            s.grants.join(", ")
+                        );
+                    }
                 }
             }
             BlobCmd::Fetch { ticket, dest } => {
                 let dest_path = dest.to_string_lossy().into_owned();
                 let r = client.blob_fetch(&ticket, &dest_path).await?;
-                println!(
-                    "Fetched {} bytes (hash {}) → {}",
-                    r.bytes_len,
-                    r.hash,
-                    dest.display()
-                );
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "bytes_len": r.bytes_len,
+                            "hash": r.hash,
+                            "dest": dest.display().to_string(),
+                        })
+                    );
+                } else {
+                    println!(
+                        "Fetched {} bytes (hash {}) → {}",
+                        r.bytes_len,
+                        r.hash,
+                        dest.display()
+                    );
+                }
             }
         }
         Ok(())
@@ -704,10 +746,11 @@ fn run_internal_blob(command: BlobCmd) -> anyhow::Result<()> {
 
 /// `mcpmesh internal audit <tail|list|prune>`: read/rotate the LOCAL audit log directly —
 /// nothing is transmitted anywhere; no daemon round-trip. Errors propagate → non-zero exit.
-fn run_internal_audit(command: AuditCmd) -> anyhow::Result<()> {
+fn run_internal_audit(command: AuditCmd, json: bool) -> anyhow::Result<()> {
     use mcpmesh::audit;
     let dir = paths::default_audit_dir()?;
     match command {
+        // `tail` is already JSONL in both modes (the records ARE the machine face).
         AuditCmd::Tail { lines, kind, peer } => {
             let kind_filter = match kind.as_deref() {
                 Some(s) => {
@@ -723,13 +766,23 @@ fn run_internal_audit(command: AuditCmd) -> anyhow::Result<()> {
             }
         }
         AuditCmd::List => {
-            for (month, _, size) in audit::list_month_files(&dir)? {
-                println!("{month}  {size} bytes");
+            if json {
+                let months: Vec<serde_json::Value> = audit::list_month_files(&dir)?
+                    .into_iter()
+                    .map(|(month, _, size)| serde_json::json!({"month": month, "bytes": size}))
+                    .collect();
+                println!("{}", serde_json::Value::Array(months));
+            } else {
+                for (month, _, size) in audit::list_month_files(&dir)? {
+                    println!("{month}  {size} bytes");
+                }
             }
         }
         AuditCmd::Prune { before } => {
             let deleted = audit::prune_before(&dir, &before)?;
-            if deleted.is_empty() {
+            if json {
+                println!("{}", serde_json::json!({"pruned": deleted}));
+            } else if deleted.is_empty() {
                 println!("Nothing to prune before {before}.");
             } else {
                 println!("Pruned {} month(s): {}.", deleted.len(), deleted.join(", "));
@@ -777,12 +830,20 @@ fn run_status(json: bool) -> anyhow::Result<()> {
 /// until the stream ends or the process is interrupted. Surface-clean: the output carries only
 /// the nicknames/user_ids/service names/numbers the frames themselves carry — never a raw
 /// endpoint id (the frames don't carry one).
-fn run_watch() -> anyhow::Result<()> {
+fn run_watch(json: bool) -> anyhow::Result<()> {
     with_daemon(async move |client| {
         let mut stream = client.subscribe().await?;
-        println!("watching the mesh — Ctrl-C to stop");
+        // JSON mode is pure JSONL of the typed StreamFrame wire shape — no banner,
+        // so stdout stays parseable line-by-line.
+        if !json {
+            println!("watching the mesh — Ctrl-C to stop");
+        }
         while let Some(frame) = stream.next().await? {
-            println!("{}", render::render_frame(&frame));
+            if json {
+                println!("{}", serde_json::to_string(&frame)?);
+            } else {
+                println!("{}", render::render_frame(&frame));
+            }
         }
         Ok(())
     })
