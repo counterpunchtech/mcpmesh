@@ -162,6 +162,28 @@ else
     fi
 fi
 
+echo "--- 2. reachability within ${REACH_BOUND_SECS}s of pairing ---"
+# Regression guard for 049877b. Before that fix the REDEEMER's first probe began
+# a cold id-only dial needing full discovery resolution, blew the 3s
+# PROBE_TIMEOUT, and status reported a freshly-paired peer as offline — while
+# sessions to that same peer worked. Poll rather than sleep-then-check so the
+# reported latency is the real one.
+REACH_START=$(date +%s)
+REACH_SEEN=""
+while [ $(( $(date +%s) - REACH_START )) -lt "$REACH_BOUND_SECS" ]; do
+    LINE=$("$MM" status 2>/dev/null | grep "$PEER" | grep -E 'online|offline' || true)
+    case "$LINE" in
+        *online*) REACH_SEEN="$LINE"; break ;;
+    esac
+    sleep 2
+done
+REACH_TOOK=$(( $(date +%s) - REACH_START ))
+if [ -n "$REACH_SEEN" ]; then
+    ok "peer online after ${REACH_TOOK}s:$(printf '%s' "$REACH_SEEN" | sed 's/^ *//')"
+else
+    bad "peer never reported online within ${REACH_BOUND_SECS}s (cold-probe regression?)"
+fi
+
 # Sets the script's exit status; the EXIT trap prints the summary and cleans
 # up, and dash preserves this status through the trap.
 [ "$fail" -eq 0 ]
