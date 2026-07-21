@@ -403,11 +403,11 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Some(Cmd::Internal {
             command: Internal::Id,
         }) => run_internal_id(),
-        Some(Cmd::Serve { name, allow, cmd }) => run_serve(name, allow, cmd),
+        Some(Cmd::Serve { name, allow, cmd }) => run_serve(name, allow, cmd, cli.json),
         Some(Cmd::Connect { target }) => run_connect(target),
-        Some(Cmd::Invite { services, label }) => run_invite(services, label),
-        Some(Cmd::Pair { invite, remove }) => run_pair(invite, remove),
-        Some(Cmd::Use { target }) => run_use(target),
+        Some(Cmd::Invite { services, label }) => run_invite(services, label, cli.json),
+        Some(Cmd::Pair { invite, remove }) => run_pair(invite, remove, cli.json),
+        Some(Cmd::Use { target }) => run_use(target, cli.json),
         Some(Cmd::Join {
             org_invite,
             name,
@@ -465,9 +465,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Some(Cmd::Internal {
             command: Internal::Watch,
         }) => run_watch(),
-        Some(Cmd::Doctor) => doctor::run_doctor(),
-        Some(Cmd::Up { timeout }) => run_up(timeout),
-        Some(Cmd::Status) | None => run_status(),
+        Some(Cmd::Doctor) => doctor::run_doctor(cli.json),
+        Some(Cmd::Up { timeout }) => run_up(timeout, cli.json),
+        Some(Cmd::Status) | None => run_status(cli.json),
     }
 }
 
@@ -476,7 +476,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
 /// answers its `Hello`, so a script needs no post-hoc socket probe. A start failure surfaces the
 /// daemon's own captured reason and exits non-zero (via the normal error path). The socket path
 /// goes to stdout alone, so `SOCK=$(mcpmesh up)` is a clean one-liner.
-fn run_up(timeout: Option<u64>) -> anyhow::Result<()> {
+fn run_up(timeout: Option<u64>, json: bool) -> anyhow::Result<()> {
     let launch = mcpmesh::client::DaemonLaunch::ambient()?;
     let ready = timeout
         .map(std::time::Duration::from_secs)
@@ -490,18 +490,31 @@ fn run_up(timeout: Option<u64>) -> anyhow::Result<()> {
         let _client = mcpmesh::client::ensure_daemon_with_timeout(&launch, ready).await?;
         Ok::<(), anyhow::Error>(())
     })?;
-    println!("{}", socket.display());
+    if json {
+        println!("{}", mcpmesh::json::up_json(&socket));
+    } else {
+        println!("{}", socket.display());
+    }
     Ok(())
 }
 
 /// `mcpmesh serve <name> [--allow a,b] -- <cmd...>`: auto-start the daemon and register the
 /// service over the control API (which persists it + hot-reloads serving).
-fn run_serve(name: String, allow: Option<String>, cmd: Vec<String>) -> anyhow::Result<()> {
+fn run_serve(
+    name: String,
+    allow: Option<String>,
+    cmd: Vec<String>,
+    json: bool,
+) -> anyhow::Result<()> {
     let allow = split_csv(allow);
     with_daemon(async move |mut client| {
         client
             .register_service(&name, BackendSpec::Run { cmd }, allow)
             .await?;
+        if json {
+            println!("{}", mcpmesh::json::serve_json(&name));
+            return Ok(());
+        }
         println!("serving '{name}'");
         // The next exact instruction. Nothing is shared until someone is granted access, so the
         // invite is ALWAYS the next step — `--allow` names nicknames, but only a redeemed invite
@@ -531,12 +544,16 @@ fn run_connect(target: String) -> anyhow::Result<()> {
 ///
 /// Empty `services` is an ERROR: an invite that grants nothing is useless, and erroring here is
 /// friendlier than minting a dead invite the redeemer can do nothing with.
-fn run_invite(services: Vec<String>, label: Option<String>) -> anyhow::Result<()> {
+fn run_invite(services: Vec<String>, label: Option<String>, json: bool) -> anyhow::Result<()> {
     if services.is_empty() {
         anyhow::bail!("specify at least one service to grant (e.g. `mcpmesh invite notes`)");
     }
     with_daemon(async move |mut client| {
         let invite = client.invite_with(services.clone(), label).await?;
+        if json {
+            println!("{}", mcpmesh::json::invite_json(&invite, &services));
+            return Ok(());
+        }
         for line in render::invite_lines(&invite, &services, util::epoch_now_u64()) {
             println!("{line}");
         }
@@ -550,7 +567,7 @@ fn run_invite(services: Vec<String>, label: Option<String>) -> anyhow::Result<()
 ///
 /// A control-API error (a pair refused/expired/id-mismatch, or a peer_remove failure) propagates
 /// out of `main` → the process prints the message to stderr and exits non-zero.
-fn run_pair(invite: Option<String>, remove: Option<String>) -> anyhow::Result<()> {
+fn run_pair(invite: Option<String>, remove: Option<String>, json: bool) -> anyhow::Result<()> {
     match (invite, remove) {
         (Some(_), Some(_)) => {
             anyhow::bail!("provide an invite to redeem OR --remove <nickname>, not both")
@@ -560,6 +577,10 @@ fn run_pair(invite: Option<String>, remove: Option<String>) -> anyhow::Result<()
         }
         (Some(invite_line), None) => with_daemon(async move |mut client| {
             let paired = client.pair(&invite_line).await?;
+            if json {
+                println!("{}", mcpmesh::json::pair_json(&paired));
+                return Ok(());
+            }
             for line in render::pair_lines(&paired) {
                 println!("{line}");
             }
@@ -570,7 +591,11 @@ fn run_pair(invite: Option<String>, remove: Option<String>) -> anyhow::Result<()
             // Sessions already in flight are NOT severed (they run to completion) — only new
             // authorized sessions are blocked from here on. The nickname just stops resolving
             // + being admitted.
-            println!("Unpaired {nickname}.");
+            if json {
+                println!("{}", mcpmesh::json::unpair_json(&nickname));
+            } else {
+                println!("Unpaired {nickname}.");
+            }
             Ok(())
         }),
     }
@@ -580,12 +605,16 @@ fn run_pair(invite: Option<String>, remove: Option<String>) -> anyhow::Result<()
 /// the same block `pair` prints, on demand. Validates the target against the daemon's known
 /// peers/services first (issue #12): a typo'd target gets the known list NOW, not a refusal
 /// later when the AI client first runs `connect`.
-fn run_use(target: String) -> anyhow::Result<()> {
+fn run_use(target: String, json: bool) -> anyhow::Result<()> {
     let (peer, service) = proxy::split_target(&target)?;
     with_daemon(async move |mut client| {
         let status = client.status().await?;
         if let Some(message) = render::use_target_error(&peer, &service, &status.peers) {
             anyhow::bail!("{message}");
+        }
+        if json {
+            println!("{}", mcpmesh::json::use_json(&peer, &[service]));
+            return Ok(());
         }
         for line in proxy::client_instruction_lines(&peer, &[service]) {
             println!("{line}");
@@ -716,7 +745,7 @@ fn run_internal_audit(command: AuditCmd) -> anyhow::Result<()> {
 /// carries NO transport vocabulary — services show only the backend KIND (never the
 /// command/path), peers only their nickname (never the endpoint id), and the device's own
 /// identity appears only as a short fingerprint, never the raw id.
-fn run_status() -> anyhow::Result<()> {
+fn run_status(json: bool) -> anyhow::Result<()> {
     // The device's own short fingerprint (the deliberate identity carve-out from the raw-id
     // ban) is deterministic from the local device key — derive it directly rather than
     // round-tripping the daemon.
@@ -732,7 +761,11 @@ fn run_status() -> anyhow::Result<()> {
     with_daemon(async move |mut client| {
         let hello = client.hello().clone();
         let status = client.status().await?;
-        render::render_status(&fingerprint, &hello, &status, has_roster_url);
+        if json {
+            println!("{}", mcpmesh::json::status_json(&fingerprint, &hello, &status));
+        } else {
+            render::render_status(&fingerprint, &hello, &status, has_roster_url);
+        }
         Ok(())
     })
 }

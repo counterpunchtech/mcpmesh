@@ -558,11 +558,15 @@ fn findings(inp: &DoctorInputs) -> Vec<(&'static str, Verdict)> {
 /// findings (greens included) so the report reads as a full health summary. On ERROR it prints the
 /// report THEN `std::process::exit(1)` — the report lines are already flushed (Rust stdout is
 /// line-buffered), and this avoids anyhow's trailing "Error:" line polluting the clean report.
-pub fn run_doctor() -> anyhow::Result<()> {
+pub fn run_doctor(json: bool) -> anyhow::Result<()> {
     let inputs = gather();
     let findings = findings(&inputs);
-    for line in render_report(&findings) {
-        println!("{line}");
+    if json {
+        println!("{}", crate::json::doctor_json(&findings));
+    } else {
+        for line in render_report(&findings) {
+            println!("{line}");
+        }
     }
     if worst_level(&findings) == Level::Error {
         std::process::exit(1);
