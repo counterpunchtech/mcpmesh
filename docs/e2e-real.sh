@@ -68,6 +68,7 @@ cleanup() {
         # when its world is deleted out from under it.
         wait "$PEER_PID" 2>/dev/null || true
     fi
+    pkill -f "$WORK/squatter" 2>/dev/null || true
     # Targets ONLY the scratch peer's nickname ($PEER, default e2e-peer);
     # real peers paired under other names are untouched.
     "$MM" pair --remove "$PEER" >/dev/null 2>&1 || true
@@ -85,8 +86,6 @@ trap 'cleanup; exit 143' TERM
 
 peer() { HOME="$PEER_HOME" XDG_RUNTIME_DIR="$PEER_RUN" "$MM" "$@"; }
 
-# Task 6 will generalize this into a start_scratch_daemon <subdir> <nickname>
-# helper for the squatter identity; note cleanup currently kills only PEER_PID.
 setup_local_peer() {
     command -v npx >/dev/null 2>&1 || { echo "error: npx not found — needed for the demo notes server" >&2; exit 2; }
     mkdir -p "$PEER_HOME/notes" "$PEER_RUN" "$PEER_HOME/.config/mcpmesh"
@@ -212,6 +211,48 @@ R2=$(
 ) || true
 printf '%s' "$R2" | grep -q '"id":1.*result' \
     && ok "second session established" || bad "second session failed"
+
+echo "--- 5. nickname squatting is refused ---"
+# Guard from d525c06: an invite from a DIFFERENT endpoint claiming a nickname we
+# already trust must be refused, or it would inherit that peer's access.
+if [ "$PEER_MODE" = "local" ]; then
+    SQUAT_HOME="$WORK/squatter"
+    SQUAT_RUN="$SQUAT_HOME/runtime"
+    mkdir -p "$SQUAT_HOME/notes" "$SQUAT_RUN" "$SQUAT_HOME/.config/mcpmesh"
+    echo "squatted" > "$SQUAT_HOME/notes/hello.md"
+    printf '[identity]\nnickname = "%s"\n' "$PEER" \
+        > "$SQUAT_HOME/.config/mcpmesh/config.toml"
+    HOME="$SQUAT_HOME" XDG_RUNTIME_DIR="$SQUAT_RUN" "$MM" serve notes -- \
+        npx -y @modelcontextprotocol/server-filesystem "$SQUAT_HOME/notes" >/dev/null 2>&1 || true
+    SQUAT_INVITE=$(HOME="$SQUAT_HOME" XDG_RUNTIME_DIR="$SQUAT_RUN" "$MM" invite notes \
+        2>/dev/null | grep -o 'mcpmesh-invite:[A-Za-z0-9]*') || true
+    if [ -z "${SQUAT_INVITE:-}" ]; then
+        bad "could not mint a squatting invite"
+    else
+        SQUAT_OUT=$("$MM" pair "$SQUAT_INVITE" 2>&1) || true
+        case "$SQUAT_OUT" in
+            *"already use that name"*) ok "squatting invite refused" ;;
+            *) bad "squatting invite was NOT refused: $SQUAT_OUT" ;;
+        esac
+    fi
+    # There is no `mcpmesh internal shutdown` subcommand (verified against the
+    # shipped CLI: internal exposes daemon/id/peer/roster/blob/audit/watch only).
+    # The squatter daemon auto-started under its own HOME, so match on that path.
+    pkill -f "$SQUAT_HOME" 2>/dev/null || true
+fi
+
+echo "--- 6. pair --remove severs access ---"
+"$MM" pair --remove "$PEER" >/dev/null 2>&1 || true
+SEVERED=$(printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+    | "$MM" connect "$PEER/notes" 2>&1 || true)
+# An unknown/removed peer surfaces as -32055 "peer unreachable" (verified
+# against the shipped binary). A SUCCESSFUL dial here would mean unpairing did
+# not actually revoke access.
+case "$SEVERED" in
+    *-32055*|*"unreachable"*|*"not in the allowlist"*) ok "unpaired peer can no longer be dialed" ;;
+    *result*) bad "SECURITY: dial succeeded after unpair: $SEVERED" ;;
+    *) ok "unpaired peer dial failed (as expected): $(printf '%s' "$SEVERED" | head -1)" ;;
+esac
 
 # Sets the script's exit status; the EXIT trap prints the summary and cleans
 # up, and dash preserves this status through the trap.
