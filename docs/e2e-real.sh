@@ -196,7 +196,7 @@ REPLIES=$(
     printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"'"$PEER_HOME"'/notes/hello.md"}}}'
     sleep 15
   } | "$MM" connect "$PEER/notes" 2>&1
-)
+) || true
 printf '%s' "$REPLIES" | grep -q '"id":1.*result' \
     && ok "initialize round-tripped" || bad "initialize did not round-trip"
 printf '%s' "$REPLIES" | grep -q "$SENTINEL" \
@@ -209,7 +209,7 @@ R2=$(
     printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e2","version":"0"}}}'
     sleep 20
   } | "$MM" connect "$PEER/notes" 2>&1
-)
+) || true
 printf '%s' "$R2" | grep -q '"id":1.*result' \
     && ok "second session established" || bad "second session failed"
 
