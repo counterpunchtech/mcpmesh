@@ -124,6 +124,13 @@ local-only checks are skipped.)
   suite is structurally invisible in local mode. The guard is only meaningful
   on tier 3 (or better, cross-NAT) runs — which is where the original bug was
   actually found, carrier NAT to carrier NAT.
+- **In CI, the redeemer-side daemon is not the build under test.** The tier-2
+  job rendezvouses with the Jetson's already-running daemon (one machine, one
+  lockable `state.redb` — a second daemon under the same `HOME` cannot start).
+  Only the CLI front-end and the scratch peer/squatter daemons run the PR's
+  binary; redeemer-side daemon behavior (probing, gate decisions, dialing) is
+  whatever the Jetson's installed daemon was built from. A PR that regresses
+  only that side can still go green here.
 - Nothing here covers Windows: the porcelain is driven through a POSIX shell
   script.
 - A green run says nothing about throughput or memory — see `docs/load-soak.md`.

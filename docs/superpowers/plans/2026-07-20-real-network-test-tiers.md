@@ -89,7 +89,7 @@ The Iron Law still applies, but "write the failing test first" maps differently 
 **Files:**
 - Create: `docs/e2e-real.sh`
 
-- [ ] **Step 1: Write the skeleton with its counters and no real assertions yet**
+- [x] **Step 1: Write the skeleton with its counters and no real assertions yet**
 
 ```sh
 #!/bin/sh
@@ -132,12 +132,12 @@ echo "=== $pass passed, $fail failed ==="
 [ "$fail" -eq 0 ]
 ```
 
-- [ ] **Step 2: Verify the harness reports success and exits 0**
+- [x] **Step 2: Verify the harness reports success and exits 0**
 
 Run: `sh docs/e2e-real.sh; echo "exit=$?"`
 Expected: prints the version, `=== 0 passed, 0 failed ===`, `exit=0`.
 
-- [ ] **Step 3: Verify the harness can actually fail**
+- [x] **Step 3: Verify the harness can actually fail**
 
 Temporarily add the line `bad "deliberate"` immediately before the final `echo`, then run:
 
@@ -146,13 +146,13 @@ Expected: prints `  FAIL  deliberate`, `=== 0 passed, 1 failed ===`, `exit=1`.
 
 **Remove the temporary `bad "deliberate"` line before continuing.** If exit was 0, the harness is broken — fix it before adding any assertion, because every later assertion depends on this.
 
-- [ ] **Step 4: Verify it runs under dash, not just bash**
+- [x] **Step 4: Verify it runs under dash, not just bash**
 
 Run: `dash docs/e2e-real.sh; echo "exit=$?"`
 (On macOS, skip — dash is absent. The Jetson runner uses `sh` = dash, so this must be checked at least once on Linux before Task 8.)
 Expected: same output as Step 2. A syntax error here means a bashism slipped in.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add docs/e2e-real.sh
@@ -166,7 +166,7 @@ git commit -m "test: skeleton for the real-network e2e harness"
 **Files:**
 - Modify: `docs/e2e-real.sh`
 
-- [ ] **Step 1: Add identity setup and a trap-based cleanup**
+- [x] **Step 1: Add identity setup and a trap-based cleanup**
 
 Insert after the `ok`/`bad` definitions, before the `echo "=== mcpmesh real-network e2e"` line:
 
@@ -206,7 +206,7 @@ setup_local_peer() {
 }
 ```
 
-- [ ] **Step 2: Call it and print the peer's identity**
+- [x] **Step 2: Call it and print the peer's identity**
 
 Insert after the `"$MM" --version` line:
 
@@ -219,12 +219,12 @@ if [ "$PEER_MODE" = "local" ]; then
 fi
 ```
 
-- [ ] **Step 3: Run it**
+- [x] **Step 3: Run it**
 
 Run: `sh docs/e2e-real.sh; echo "exit=$?"`
 Expected: prints the peer's `mcpmesh-local/1` banner with a `device` and `identity` line distinct from your own, then `0 passed, 0 failed`, `exit=0`.
 
-- [ ] **Step 4: Verify cleanup actually removed everything**
+- [x] **Step 4: Verify cleanup actually removed everything**
 
 Run: `ls -d "$HOME/.mcpmesh-e2e" 2>/dev/null || echo "work dir gone"`
 Expected: `work dir gone`.
@@ -232,7 +232,7 @@ Expected: `work dir gone`.
 Run: `pgrep -f "mcpmesh internal daemon" | wc -l`
 Expected: at most 1 (your own daemon). If 2+, the trap is not killing the peer — fix before continuing, or every later run inherits a stale identity.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add docs/e2e-real.sh
@@ -246,7 +246,7 @@ git commit -m "test: stand up and tear down the e2e peer identity"
 **Files:**
 - Modify: `docs/e2e-real.sh`
 
-- [ ] **Step 1: Add the pairing assertion**
+- [x] **Step 1: Add the pairing assertion**
 
 Insert before the final `echo "=== $pass passed"` line:
 
@@ -278,12 +278,12 @@ if [ "$PEER_MODE" = "local" ]; then
 fi
 ```
 
-- [ ] **Step 2: Run it and watch it pass**
+- [x] **Step 2: Run it and watch it pass**
 
 Run: `sh docs/e2e-real.sh; echo "exit=$?"`
 Expected: `PASS  pairing completed`, `PASS  safety code matches on both sides (…)`, `2 passed, 0 failed`, `exit=0`.
 
-- [ ] **Step 3: Prove the SAS assertion can fail**
+- [x] **Step 3: Prove the SAS assertion can fail**
 
 Temporarily change `THEIR_SAS=$(peer status ...)` to `THEIR_SAS="wrong-words-here"`, then run:
 
@@ -292,7 +292,7 @@ Expected: `FAIL  safety code mismatch: ours='…' theirs='wrong-words-here'`, `e
 
 **Revert the temporary change.** An assertion never seen failing proves nothing.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add docs/e2e-real.sh
@@ -308,7 +308,7 @@ This is the regression guard for `049877b`. It is the reason this whole plan exi
 **Files:**
 - Modify: `docs/e2e-real.sh`
 
-- [ ] **Step 1: Add the bounded reachability assertion**
+- [x] **Step 1: Add the bounded reachability assertion**
 
 Insert after the Task 3 block:
 
@@ -336,12 +336,12 @@ else
 fi
 ```
 
-- [ ] **Step 2: Run it and watch it pass**
+- [x] **Step 2: Run it and watch it pass**
 
 Run: `sh docs/e2e-real.sh; echo "exit=$?"`
 Expected: `PASS  peer online after Ns: …` where N is small (single digits on a LAN), `3 passed, 0 failed`.
 
-- [ ] **Step 3: Prove this assertion catches the actual bug it guards**
+- [x] **Step 3: Prove this assertion catches the actual bug it guards**
 
 This is the highest-value verification in the plan: confirm the assertion goes red against the pre-fix code.
 
@@ -364,7 +364,7 @@ git revert --abort 2>/dev/null || git checkout -- .
 cargo build --release
 ```
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add docs/e2e-real.sh
@@ -378,7 +378,7 @@ git commit -m "test: assert status reports a freshly-paired peer online within 3
 **Files:**
 - Modify: `docs/e2e-real.sh`
 
-- [ ] **Step 1: Add the tool-call and reuse assertions**
+- [x] **Step 1: Add the tool-call and reuse assertions**
 
 Insert after the Task 4 block:
 
@@ -415,12 +415,12 @@ printf '%s' "$R2" | grep -q '"id":1.*result' \
 
 Note: `PEER_HOME` is only meaningful when `PEER_MODE=local`. For `remote`, the caller must export `NOTE_PATH` and this block needs `"$NOTE_PATH"` instead — handled in Task 7.
 
-- [ ] **Step 2: Run it and watch both pass**
+- [x] **Step 2: Run it and watch both pass**
 
 Run: `sh docs/e2e-real.sh; echo "exit=$?"`
 Expected: `PASS  tool call returned the peer's file`, `PASS  second session established`, `6 passed, 0 failed`. Takes ~90s.
 
-- [ ] **Step 3: Prove the sentinel assertion can fail**
+- [x] **Step 3: Prove the sentinel assertion can fail**
 
 Temporarily change the `read_file` path to `/nonexistent/nope.md`, then run:
 
@@ -429,7 +429,7 @@ Expected: `FAIL  tool call did not return the peer's file: …`, `exit=1`.
 
 **Revert the temporary change.**
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add docs/e2e-real.sh
@@ -443,7 +443,7 @@ git commit -m "test: assert a real tool call round-trips and sessions are reusab
 **Files:**
 - Modify: `docs/e2e-real.sh`
 
-- [ ] **Step 1: Add the squatting assertion**
+- [x] **Step 1: Add the squatting assertion**
 
 Insert after the Task 5 block. This runs BEFORE severance, because it needs the peer still paired:
 
@@ -490,7 +490,7 @@ Add the squatter daemon to `cleanup()` so a failure mid-assertion cannot leak it
 > but if you ever widen it, verify with `pgrep -af <pattern>` first and confirm
 > the only matches are the processes you intend to kill.
 
-- [ ] **Step 2: Add the severance assertion**
+- [x] **Step 2: Add the severance assertion**
 
 Insert after the squatting block. This must be LAST, since it unpairs:
 
@@ -509,12 +509,12 @@ case "$SEVERED" in
 esac
 ```
 
-- [ ] **Step 3: Run the full script**
+- [x] **Step 3: Run the full script**
 
 Run: `sh docs/e2e-real.sh; echo "exit=$?"`
 Expected: `8 passed, 0 failed`, `exit=0`. Takes ~2 minutes.
 
-- [ ] **Step 4: Prove the squatting assertion can fail**
+- [x] **Step 4: Prove the squatting assertion can fail**
 
 Temporarily change its `case` pattern from `*"already use that name"*` to `*"this text never appears"*`, then run:
 
@@ -523,7 +523,7 @@ Expected: `FAIL  squatting invite was NOT refused: …`, `exit=1`.
 
 **Revert the temporary change.**
 
-- [ ] **Step 5: Verify cleanup after a full run**
+- [x] **Step 5: Verify cleanup after a full run**
 
 Run: `ls -d "$HOME/.mcpmesh-e2e" 2>/dev/null || echo "gone"; pgrep -f "mcpmesh internal daemon" | wc -l`
 Expected: `gone`, and at most 1 daemon.
@@ -531,7 +531,7 @@ Expected: `gone`, and at most 1 daemon.
 Run: `mcpmesh status | grep -c "$PEER" || echo "no leftover peer"`
 Expected: `no leftover peer`.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add docs/e2e-real.sh
@@ -545,7 +545,7 @@ git commit -m "test: assert squatting is refused and unpair severs access"
 **Files:**
 - Modify: `docs/e2e-real.sh`
 
-- [ ] **Step 1: Parameterize the note path and skip local-only assertions**
+- [x] **Step 1: Parameterize the note path and skip local-only assertions**
 
 Replace the hardcoded `"$PEER_HOME"/notes/hello.md` in the Task 5 tool-call block with `"$NOTE_PATH"`, and add this near the other defaults at the top:
 
@@ -561,17 +561,17 @@ fi
 
 The SAS-comparison, squatting, and peer-setup blocks are already guarded by `[ "$PEER_MODE" = "local" ]`, so they skip correctly in remote mode. Assertions 1, 2, 3, 4 and 6 all run in both modes.
 
-- [ ] **Step 2: Verify local mode still passes unchanged**
+- [x] **Step 2: Verify local mode still passes unchanged**
 
 Run: `sh docs/e2e-real.sh; echo "exit=$?"`
 Expected: `8 passed, 0 failed`, `exit=0` — identical to Task 6.
 
-- [ ] **Step 3: Verify remote mode fails fast without its required inputs**
+- [x] **Step 3: Verify remote mode fails fast without its required inputs**
 
 Run: `PEER_MODE=remote sh docs/e2e-real.sh; echo "exit=$?"`
 Expected: exits non-zero with `NOTE_PATH required when PEER_MODE=remote`. A missing input must be a loud error, never a silently skipped assertion.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add docs/e2e-real.sh
@@ -584,11 +584,11 @@ git commit -m "test: support PEER_MODE=remote for the cross-NAT tier"
 
 No code — infrastructure. The Jetson is `aarch64`, has `npx`, 57G free, and user lingering already enabled (verified 2026-07-20), so a user-scoped runner service will survive logout.
 
-- [ ] **Step 1: Create the runner registration token**
+- [x] **Step 1: Create the runner registration token**
 
 In the GitHub UI: repository → Settings → Actions → Runners → New self-hosted runner → Linux / ARM64. Copy the token from the `config.sh` line it displays.
 
-- [ ] **Step 2: Install the runner on the Jetson**
+- [x] **Step 2: Install the runner on the Jetson**
 
 ```bash
 ssh jetson-001
@@ -602,7 +602,7 @@ tar xzf actions-runner-linux-arm64.tar.gz
 
 Check the release page for the current version if that filename 404s.
 
-- [ ] **Step 3: Install it as a service so it survives reboot**
+- [x] **Step 3: Install it as a service so it survives reboot**
 
 ```bash
 sudo ./svc.sh install bolo
@@ -612,12 +612,12 @@ sudo ./svc.sh status
 
 Expected: `active (running)`.
 
-- [ ] **Step 4: Confirm GitHub sees it**
+- [x] **Step 4: Confirm GitHub sees it**
 
 Run: `gh api repos/counterpunchtech/mcpmesh/actions/runners --jq '.runners[] | "\(.name) \(.status) \(.labels[].name)"'`
 Expected: a line containing `online` and `jetson`.
 
-- [ ] **Step 5: Verify the runner can build the project**
+- [x] **Step 5: Verify the runner can build the project**
 
 ```bash
 ssh jetson-001 'cd ~/mcpmesh-src && ~/.cargo/bin/cargo build --release 2>&1 | tail -2'
@@ -632,7 +632,7 @@ Expected: `Finished \`release\` profile`. If Rust is missing in the runner's env
 **Files:**
 - Create: `.github/workflows/real-network.yml`
 
-- [ ] **Step 1: Write the workflow**
+- [x] **Step 1: Write the workflow**
 
 ```yaml
 name: real-network
@@ -663,7 +663,7 @@ jobs:
           MM=./target/release/mcpmesh sh docs/e2e-real.sh
 ```
 
-- [ ] **Step 2: Push and trigger it**
+- [x] **Step 2: Push and trigger it**
 
 ```bash
 git add .github/workflows/real-network.yml
@@ -672,12 +672,12 @@ git push
 gh workflow run real-network --ref "$(git rev-parse --abbrev-ref HEAD)"
 ```
 
-- [ ] **Step 3: Watch the run and confirm it passes**
+- [x] **Step 3: Watch the run and confirm it passes**
 
 Run: `gh run watch "$(gh run list --workflow=real-network --limit 1 --json databaseId --jq '.[0].databaseId')"`
 Expected: the job succeeds and its log shows `8 passed, 0 failed` plus the three `::notice::` limitation lines.
 
-- [ ] **Step 4: Confirm the runner left nothing behind**
+- [x] **Step 4: Confirm the runner left nothing behind**
 
 ```bash
 ssh jetson-001 'ls -d ~/.mcpmesh-e2e 2>/dev/null || echo "gone"; pgrep -fc "mcpmesh internal daemon"'
@@ -685,7 +685,7 @@ ssh jetson-001 'ls -d ~/.mcpmesh-e2e 2>/dev/null || echo "gone"; pgrep -fc "mcpm
 
 Expected: `gone`, and `1` (the Jetson's own daemon). A leaked identity here breaks the next run.
 
-- [ ] **Step 5: Commit any fixes**
+- [x] **Step 5: Commit any fixes**
 
 If the job needed environment adjustments (a `PATH` for cargo, a `HOME` override), commit them:
 
@@ -702,7 +702,7 @@ git commit -m "ci: fix the jetson runner environment for the tier-2 job"
 - Create: `docs/e2e-real.md`
 - Modify: `docs/dev-two-machine-smoke.md`
 
-- [ ] **Step 1: Write `docs/e2e-real.md`**
+- [x] **Step 1: Write `docs/e2e-real.md`**
 
 ```markdown
 # Real-network porcelain e2e
@@ -758,7 +758,7 @@ MM=./target/release/mcpmesh sh docs/e2e-real.sh
 - A green run says nothing about throughput or memory — see `docs/load-soak.md`.
 ```
 
-- [ ] **Step 2: Cross-reference from the existing runbook**
+- [x] **Step 2: Cross-reference from the existing runbook**
 
 Add to the top of `docs/dev-two-machine-smoke.md`, right after its title line:
 
@@ -769,12 +769,12 @@ Add to the top of `docs/dev-two-machine-smoke.md`, right after its title line:
 > [`e2e-real.md`](e2e-real.md).
 ```
 
-- [ ] **Step 3: Verify every command in the doc actually runs**
+- [x] **Step 3: Verify every command in the doc actually runs**
 
 Run each `sh` invocation from "Run it" verbatim. The tier-3 one should fail fast with a clear missing-input error, not a confusing one.
 Expected: tier 2 passes; tier 3 without its env vars exits non-zero naming the missing variable.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add docs/e2e-real.md docs/dev-two-machine-smoke.md

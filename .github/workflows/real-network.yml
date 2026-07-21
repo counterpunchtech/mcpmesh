@@ -41,4 +41,6 @@ jobs:
           echo "::notice::Tier 2 runs two identities on ONE host: it proves the"
           echo "::notice::porcelain works over real interfaces and discovery."
           echo "::notice::It does NOT prove NAT traversal — that is tier 3."
+          echo "::notice::The redeemer-side daemon is the Jetson's installed one,"
+          echo "::notice::NOT this PR's build — see e2e-real.md, what it does not prove."
           MM=./target/release/mcpmesh sh docs/e2e-real.sh
