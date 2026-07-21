@@ -26,6 +26,14 @@ SENTINEL='e2e sentinel: this note crossed the mesh'
 # so this fails loudly on a regression without being flaky.
 REACH_BOUND_SECS="${REACH_BOUND_SECS:-30}"
 
+# Where the peer's sentinel note lives. Local mode knows; remote mode must be told.
+if [ "$PEER_MODE" = "local" ]; then
+    NOTE_PATH="${NOTE_PATH:-$WORK/peer/notes/hello.md}"
+else
+    : "${NOTE_PATH:?NOTE_PATH required when PEER_MODE=remote}"
+    : "${INVITE_FILE:?INVITE_FILE required when PEER_MODE=remote}"
+fi
+
 command -v "$MM" >/dev/null 2>&1 || { echo "error: '$MM' not found — build with 'cargo build --release' or set MM" >&2; exit 2; }
 
 # ok/bad mutate these counters: call them ONLY from the main shell, never
@@ -195,7 +203,7 @@ REPLIES=$(
     printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e","version":"0"}}}'
     sleep 25
     printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
-    printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"'"$PEER_HOME"'/notes/hello.md"}}}'
+    printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"'"$NOTE_PATH"'"}}}'
     sleep 15
   } | "$MM" connect "$PEER/notes" 2>&1
 ) || true
