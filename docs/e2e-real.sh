@@ -37,6 +37,17 @@ fi
 
 command -v "$MM" >/dev/null 2>&1 || { echo "error: '$MM' not found — build with 'cargo build --release' or set MM" >&2; exit 2; }
 
+# Remote mode UNPAIRS $PEER at the end (assertion 6). A pre-existing pairing
+# under that name is real user state — refuse rather than destroy. Runs BEFORE
+# the cleanup trap exists: an exit here must not trigger cleanup's own
+# pair --remove, which would sever the very pairing this refuses to sever.
+# status failing (daemon unreachable) yields empty grep input and lets the run
+# proceed — the subsequent pair would fail loudly anyway.
+if [ "$PEER_MODE" = "remote" ] && "$MM" status 2>/dev/null | grep -q "$PEER"; then
+    echo "error: a peer named '$PEER' is already paired — this harness would sever it. Unpair it yourself first, or use a dedicated test nickname." >&2
+    exit 2
+fi
+
 # ok/bad mutate these counters: call them ONLY from the main shell, never
 # inside a pipeline or $(...). dash runs those in a subshell, so the
 # increment would be lost and the run would report a FALSE PASS.
@@ -128,13 +139,6 @@ if [ "$PEER_MODE" = "local" ]; then
     # pairing in the REAL store, tripping the nickname-collision guard on this
     # run. Local mode only: $PEER is always the scratch e2e identity there.
     "$MM" pair --remove "$PEER" >/dev/null 2>&1 || true
-else
-    # Remote mode UNPAIRS $PEER at the end (assertion 6). A pre-existing
-    # pairing under that name is real user state — refuse rather than destroy.
-    if "$MM" status 2>/dev/null | grep -q "$PEER"; then
-        echo "error: a peer named '$PEER' is already paired — this harness would sever it. Unpair it yourself first, or use a dedicated test nickname." >&2
-        exit 2
-    fi
 fi
 if [ "$PEER_MODE" = "local" ]; then
     echo "--- standing up the local peer identity ---"
