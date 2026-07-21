@@ -52,11 +52,12 @@ mcpmesh invite notes | grep -o 'mcpmesh-invite:[A-Za-z0-9]*' > invite.txt
 - **`invite.txt` must hold only the bare token**, nothing else. The redeemer
   side reads it with `INVITE=$(cat "$INVITE_FILE")`, which strips trailing
   blank lines but not a leading one or any surrounding prose — a file holding
-  `invite`'s full human-readable output (the "share this:" framing, etc.)
-  breaks decoding. Piping through `grep -o` as above, rather than pasting the
+  `invite`'s full human-readable output (the `Share it out-of-band:` framing,
+  etc.) breaks decoding. Piping through `grep -o` as above, rather than pasting the
   command's output, is what keeps the file to just the token.
 - **Keep this `serve` process (and its daemon) running** for the whole run —
-  the redeemer dials it live in assertions 2 through 4.
+  the redeemer dials it live from `pair` itself (assertion 1) through
+  assertion 4.
 - Note this identity's nickname (`~/.config/mcpmesh/config.toml`'s
   `[identity] nickname`, or whatever it already resolves to without one) —
   that exact name is what the redeemer must pass as `PEER` below. Copy
@@ -95,8 +96,9 @@ once the script finishes. Re-pair before using that peer again for real.
 
 ## What it asserts
 
-The script prints six numbered banners but eight `PASS` lines — banners 1 and
-3 each cover two checks:
+The script prints six numbered banners but eight `PASS` lines in local mode —
+banners 1 and 3 each cover two checks. (Remote mode prints six: the two
+local-only checks are skipped.)
 
 1. `pair` completes, **and** the safety code matches on both sides (local
    mode only — remote has no way to read the peer's screen).
