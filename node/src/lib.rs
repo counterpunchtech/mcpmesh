@@ -13,8 +13,16 @@
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[doc(hidden)]
+pub mod allowlist;
+#[doc(hidden)]
+pub mod audit;
+#[doc(hidden)]
 pub mod config;
 #[doc(hidden)]
 pub mod ipc;
+#[doc(hidden)]
+pub mod limits;
+#[doc(hidden)]
+pub mod stream;
 #[doc(hidden)]
 pub mod util;
