@@ -40,7 +40,13 @@ async fn two_embedded_nodes_pair_and_run_an_mcp_session() {
     // a serves the hermetic stdio MCP stub — the same binary the process-level tests spawn.
     let mut a_ctl = a.control().await.expect("a control");
     a_ctl
-        .register_service("notes", BackendSpec::Run { cmd: vec![STUB.into()] }, vec![])
+        .register_service(
+            "notes",
+            BackendSpec::Run {
+                cmd: vec![STUB.into()],
+            },
+            vec![],
+        )
         .await
         .expect("register notes");
 

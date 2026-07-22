@@ -815,7 +815,9 @@ mod tests {
     #[test]
     fn report_leaks_no_transport_vocabulary() {
         // A real base32 EndpointId — doctor must NEVER render one (surface-clean).
-        let sample_id = mcpmesh_net::iroh::SecretKey::from_bytes(&[9u8; 32]).public().to_string();
+        let sample_id = mcpmesh_net::iroh::SecretKey::from_bytes(&[9u8; 32])
+            .public()
+            .to_string();
         // Build the full finding set the way `findings()` does, with adversarial inputs that exercise
         // every branch (warns + an error), then assert the rendered report is clean.
         let findings = vec![

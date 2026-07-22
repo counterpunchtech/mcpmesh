@@ -58,9 +58,9 @@ pub mod ipc;
 #[doc(hidden)]
 pub mod limits;
 pub mod node;
-pub mod paths;
 #[doc(hidden)]
 pub mod pairing;
+pub mod paths;
 #[doc(hidden)]
 pub mod roster;
 #[doc(hidden)]

@@ -692,10 +692,7 @@ fn nickname_squat(
 /// Does `nickname` appear in ANY config `[services.*].allow`? Reads the CURRENT config on disk (the
 /// same file the grant appends to). A missing/empty config → `false` (nothing granted yet). Shared
 /// with the daemon's rename collision guard (`rename_plan`).
-pub fn nickname_in_any_service_allow(
-    config_path: &Path,
-    nickname: &str,
-) -> anyhow::Result<bool> {
+pub fn nickname_in_any_service_allow(config_path: &Path, nickname: &str) -> anyhow::Result<bool> {
     let cfg = crate::config::Config::load(config_path)
         .map_err(|e| anyhow::anyhow!("load config for nickname collision check: {e}"))?;
     Ok(cfg

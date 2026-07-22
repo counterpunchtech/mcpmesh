@@ -41,7 +41,9 @@ impl StartError {
                 path: db_path.to_path_buf(),
             };
         }
-        if e.chain().any(|c| c.downcast_ref::<figment::Error>().is_some()) {
+        if e.chain()
+            .any(|c| c.downcast_ref::<figment::Error>().is_some())
+        {
             return StartError::Config(e);
         }
         StartError::Other(e)
