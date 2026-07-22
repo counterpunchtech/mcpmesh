@@ -10,6 +10,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use mcpmesh_trust::paths;
 
+// Consumed only by the unix flock block below; windows' singleton is the pipe bind.
+#[cfg(unix)]
 use crate::ipc;
 
 /// Run the daemon. On unix, acquires the per-uid flock singleton (another holder → exit 0);
