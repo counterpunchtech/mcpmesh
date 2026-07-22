@@ -124,8 +124,19 @@ async fn handle_conn(stream: LocalStream, state: Arc<DaemonState>) -> Result<()>
         tracing::warn!(%e, "refused unauthorized control connection");
         return Ok(());
     }
-    let (read_half, mut write_half) = mcpmesh_local_api::transport::split_local(stream);
+    let (read_half, write_half) = mcpmesh_local_api::transport::split_local(stream);
+    serve_control_io(read_half, write_half, state).await
+}
 
+/// Serve one mcpmesh-local/1 connection over ALREADY-AUTHORIZED byte halves — the
+/// transport-agnostic body of [`handle_conn`], and what an embedded node's in-memory
+/// control connection runs (`Node::control` — a tokio duplex needs no peer gate: it
+/// never leaves the process).
+pub async fn serve_control_io(
+    read_half: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    mut write_half: impl tokio::io::AsyncWrite + Unpin + Send + 'static,
+    state: Arc<DaemonState>,
+) -> Result<()> {
     // The server speaks first: a `Hello` frame identifies the api.
     let hello = Hello {
         api: API_NAME.into(),
@@ -635,6 +646,26 @@ mod tests {
     }
     fn req(method: &str, params: Value) -> Value {
         json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params })
+    }
+
+    /// The transport-agnostic serve body speaks full mcpmesh-local/1 over a plain duplex —
+    /// what an embedded node's `Node::control` runs (no socket, no peer gate: the pipe
+    /// never leaves the process). Proves hello + a typed request round-trip end to end
+    /// against the REAL `connect_control_io` client.
+    #[tokio::test]
+    async fn serve_control_io_speaks_the_protocol_over_a_duplex() {
+        let state = control_only();
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (sr, sw) = tokio::io::split(server_io);
+        tokio::spawn(serve_control_io(sr, sw, state));
+        let (cr, cw) = tokio::io::split(client_io);
+        let mut client = mcpmesh_local_api::connect_control_io(cr, cw)
+            .await
+            .expect("hello handshake");
+        assert_eq!(client.hello().stack_version, "0.1.0-test");
+        let status = client.status().await.expect("status");
+        assert_eq!(status.stack_version, "0.1.0-test");
+        assert!(status.services.is_empty());
     }
 
     /// `status` on a control-only daemon answers version + empty service/peer lists and no
