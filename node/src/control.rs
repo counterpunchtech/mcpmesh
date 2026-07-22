@@ -67,6 +67,18 @@ impl DaemonState {
         }
     }
 
+    /// Wait until a shutdown has been requested — the control `shutdown` verb, or an
+    /// embedder's `Node::shutdown`. (`notify_one` stores a permit, so a request that
+    /// landed before this call still resolves it.)
+    pub(crate) async fn shutdown_requested(&self) {
+        self.shutdown.notified().await;
+    }
+
+    /// Raise the shutdown signal — the programmatic form of the control `shutdown` verb.
+    pub(crate) fn request_shutdown(&self) {
+        self.shutdown.notify_one();
+    }
+
     /// The mesh half, if this daemon owns an endpoint (always, except control-only tests).
     /// Returns `&Arc<MeshState>` so callers that must reload the accept loop (the pairing
     /// grant, `register_service`) can cheaply clone the shared handle.
@@ -129,7 +141,7 @@ async fn handle_conn(stream: LocalStream, state: Arc<DaemonState>) -> Result<()>
 }
 
 /// Serve one mcpmesh-local/1 connection over ALREADY-AUTHORIZED byte halves — the
-/// transport-agnostic body of [`handle_conn`], and what an embedded node's in-memory
+/// transport-agnostic body of `handle_conn`, and what an embedded node's in-memory
 /// control connection runs (`Node::control` — a tokio duplex needs no peer gate: it
 /// never leaves the process).
 pub async fn serve_control_io(

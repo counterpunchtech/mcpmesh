@@ -16,6 +16,7 @@ use crate::config::Config;
 use crate::control::{DaemonState, serve_control};
 use crate::ipc;
 use crate::pairing::LiveInvites;
+use crate::node::StartError;
 use crate::paths::NodePaths;
 use crate::roster::RosterStore;
 use crate::roster::freshness::FreshnessStore;
@@ -28,27 +29,17 @@ use super::roster_install::{
 };
 use super::{MeshState, STACK_VERSION, build_services_audited, default_self_nickname};
 
-/// The async body: compose the mesh serve loop and the control server, then run until
-/// shutdown. Split out from the shell's `run` so the runtime setup stays synchronous.
+/// The daemon shell's async body: bind the control endpoint, boot the node core
+/// (`start_node`), and serve the control API until a `shutdown` request stops it.
 /// `paths` is the node's resolved on-disk world — the shell passes [`NodePaths::from_env`];
 /// nothing below consults the environment for a location.
 pub async fn serve_forever(socket: &Path, paths: NodePaths) -> Result<()> {
-    // 0. CRITICAL: install a process-default rustls `CryptoProvider` (ring) BEFORE any
-    //    reqwest client is built. reqwest 0.13.4 (`rustls-no-provider`) resolves the provider via
-    //    `CryptoProvider::get_default()` at CLIENT-BUILD time and PANICS ("No rustls crypto provider
-    //    is configured") if none is installed. iroh 1.0.1 passes ring per-endpoint and installs NO
-    //    process-default, so nothing else does this for us. Idempotent: `install_default` returns Err
-    //    if a provider is already installed, which `let _ =` swallows (safe against a re-entry / a test
-    //    that also installed one). This MUST precede the URL poll loop spawned below.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
     // 0a. Bind the control listener FIRST — before state.redb, the endpoint, or the audit log. On
-    //     Windows the pipe bind IS the singleton lock (there is no flock; `run` skips it there): a
-    //     FILE_FLAG_FIRST_PIPE_INSTANCE create returns AddrInUse once a peer daemon owns the pipe,
-    //     so binding early is what serializes daemons. On unix this AddrInUse arm is dead — `run`'s
-    //     flock already serialized us before we ever reached here — but the shape is uniform. The
-    //     socket/pipe creation has no side effects the later construction depends on, so hoisting it
-    //     only moves WHEN the endpoint appears (earlier), never WHAT gets built.
+    //     Windows the pipe bind IS the singleton lock (there is no flock; the shell skips it there):
+    //     a FILE_FLAG_FIRST_PIPE_INSTANCE create returns AddrInUse once a peer daemon owns the pipe,
+    //     so binding early is what serializes daemons. On unix this AddrInUse arm is dead — the
+    //     shell's flock already serialized us before we ever reached here — but the shape is uniform.
+    //     The socket/pipe creation has no side effects the later construction depends on.
     let listener = match ipc::bind_control_socket(socket).await {
         Ok(l) => l,
         Err(e)
@@ -60,6 +51,57 @@ pub async fn serve_forever(socket: &Path, paths: NodePaths) -> Result<()> {
         }
         Err(e) => return Err(e),
     };
+    let booted = start_node(paths, None).await?;
+    let state = booted.state;
+    // The daemon serves for the process lifetime — the background handles need no owner
+    // (the embedding `Node` keeps them to abort on `shutdown`; the process just exits).
+    drop(booted.background);
+    // Our own endpoint id is operator-shareable (it is how a peer pairs us) — not a
+    // surface leak (that discipline forbids leaking OTHER peers' ids/paths in porcelain).
+    tracing::info!(
+        endpoint_id = %state.mesh_required()?.endpoint.id(),
+        socket = %socket.display(),
+        "mcpmesh daemon serving mesh + control"
+    );
+    serve_control(listener, state).await
+}
+
+/// A booted node core: the control-dispatch state plus the detached background loops the
+/// boot spawned (presence, roster converge, staleness sweep). The daemon shell drops the
+/// handles (process lifetime); the embedding `Node` aborts them on `shutdown`.
+pub(crate) struct BootedNode {
+    pub(crate) state: Arc<DaemonState>,
+    pub(crate) background: Vec<tokio::task::JoinHandle<()>>,
+}
+
+/// Boot the node core — everything `serve_forever` does EXCEPT the control endpoint:
+/// crypto-provider install, audit sink, config + device key, the iroh endpoint, stores,
+/// gates, limiters, service registry, the mesh accept loop, and roster mode's loops.
+/// `config` overrides the on-disk `paths.config_path` when `Some` (the embedder's
+/// programmatic config); config-persisting verbs still write that path.
+pub(crate) async fn start_node(
+    paths: NodePaths,
+    config: Option<Config>,
+) -> Result<BootedNode, StartError> {
+    let config_path = paths.config_path.clone();
+    let db_path = paths.state_db_path.clone();
+    boot_node(paths, config)
+        .await
+        .map_err(|e| StartError::classify(e, &config_path, &db_path))
+}
+
+/// The anyhow-typed boot body — [`start_node`] classifies its error at the boundary
+/// (classification inspects the error CHAIN, so inner `?` sites stay untouched).
+async fn boot_node(paths: NodePaths, config: Option<Config>) -> Result<BootedNode> {
+    // 0. CRITICAL: install a process-default rustls `CryptoProvider` (ring) BEFORE any
+    //    reqwest client is built. reqwest 0.13.4 (`rustls-no-provider`) resolves the provider via
+    //    `CryptoProvider::get_default()` at CLIENT-BUILD time and PANICS ("No rustls crypto provider
+    //    is configured") if none is installed. iroh 1.0.1 passes ring per-endpoint and installs NO
+    //    process-default, so nothing else does this for us. Idempotent: `install_default` returns Err
+    //    if a provider is already installed, which `let _ =` swallows — a HOST APPLICATION that
+    //    installed its own provider first wins. This MUST precede the URL poll loop spawned below.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut background: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
     // 0b. The audit log: one bounded-channel writer over <state_dir>/audit. Best-effort
     //     — record() never blocks or fails a session. Threaded into the backends (build_services_
@@ -68,8 +110,13 @@ pub async fn serve_forever(socket: &Path, paths: NodePaths) -> Result<()> {
 
     // 1. Config + device key.
     let config_path = paths.config_path.clone();
-    let cfg = Config::load(&config_path)
-        .map_err(|e| anyhow::anyhow!("config error in {}: {e}", config_path.display()))?;
+    let cfg = match config {
+        Some(c) => c,
+        // `.with_context` (not a formatted `anyhow!`) keeps the `figment::Error` in the
+        // chain — `StartError::classify` keys on it.
+        None => Config::load(&config_path)
+            .with_context(|| format!("config error in {}", config_path.display()))?,
+    };
     let key_path = match cfg.identity.device_key.clone() {
         Some(p) => p,
         None => paths.device_key_path.clone(),
@@ -290,7 +337,7 @@ pub async fn serve_forever(socket: &Path, paths: NodePaths) -> Result<()> {
             256,
         ));
         let _ = mesh.roster_addr_book.set(book);
-        let _converge = crate::roster::distribute::spawn_receive_loop(mesh.clone());
+        background.push(crate::roster::distribute::spawn_receive_loop(mesh.clone()));
     }
 
     // 5b'. Roster mode: spawn presence. ADVISORY-ONLY — presence feeds `status` + the
@@ -305,7 +352,7 @@ pub async fn serve_forever(socket: &Path, paths: NodePaths) -> Result<()> {
     //      `[identity].user_id`, else its roster resolution) — a beat under an unknown user_id would be
     //      self-rejected by every peer's user_id binding, so it is skipped rather than sent as noise.
     if roster_mode {
-        let _track = crate::roster::presence::track_loop(mesh.presence_ctx());
+        background.push(crate::roster::presence::track_loop(mesh.presence_ctx()));
         let self_user_id = cfg.identity.user_id.clone().or_else(|| {
             mesh.roster
                 .view()
@@ -314,8 +361,11 @@ pub async fn serve_forever(socket: &Path, paths: NodePaths) -> Result<()> {
         match self_user_id {
             Some(user_id) => {
                 let device_key = ed25519_dalek::SigningKey::from_bytes(&key.secret_bytes());
-                let _publish =
-                    crate::roster::presence::publish_loop(mesh.presence_ctx(), device_key, user_id);
+                background.push(crate::roster::presence::publish_loop(
+                    mesh.presence_ctx(),
+                    device_key,
+                    user_id,
+                ));
             }
             None => tracing::debug!(
                 "presence publish skipped: no user_id for this node (track loop still runs)"
@@ -327,7 +377,7 @@ pub async fn serve_forever(socket: &Path, paths: NodePaths) -> Result<()> {
     // `resolve`; this cuts EXISTING roster-authorized sessions once the node crosses
     // `last_confirmed + max_staleness + grace`. Roster mode only; never severs pairing-only sessions.
     if roster_mode {
-        let _sweep = spawn_staleness_sweep(mesh.clone());
+        background.push(spawn_staleness_sweep(mesh.clone()));
     }
 
     // 5c. Roster mode with a pinned `[roster].url`: spawn the HTTPS fallback poll loop.
@@ -343,17 +393,10 @@ pub async fn serve_forever(socket: &Path, paths: NodePaths) -> Result<()> {
         respawn_poll_loop(&mesh, url).await;
     }
 
-    // 6. The control server on the local endpoint (bound in step 0a), running on the same runtime
-    //    as the mesh serve loop.
+    // 6. The control-dispatch state over the mesh half; the caller decides how it is
+    //    served — the daemon shell binds a socket, an embedded `Node` opens in-memory pipes.
     let state = Arc::new(DaemonState::with_mesh(STACK_VERSION, mesh));
-    // Our own endpoint id is operator-shareable (it is how a peer pairs us) — not a
-    // surface leak (that discipline forbids leaking OTHER peers' ids/paths in porcelain).
-    tracing::info!(
-        endpoint_id = %our_id,
-        socket = %socket.display(),
-        "mcpmesh daemon serving mesh + control"
-    );
-    serve_control(listener, state).await
+    Ok(BootedNode { state, background })
 }
 
 /// How this daemon's endpoint resolves peer addresses: the n0 defaults

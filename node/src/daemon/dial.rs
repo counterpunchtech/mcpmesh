@@ -36,7 +36,7 @@ use crate::allowlist::PeerEntry;
 ///
 /// **Single-nickname fallback.** Otherwise resolve the nickname to its stored [`PeerEntry`] via the
 /// allowlist store and dial an [`iroh::EndpointAddr`] carrying the entry's pairing-persisted
-/// `last_addr` hint when usable ([`stored_dial_addr`]) — else id-only. iroh merges provided direct
+/// `last_addr` hint when usable (`stored_dial_addr`) — else id-only. iroh merges provided direct
 /// addrs with what discovery (DNS/pkarr under the N0 preset) resolves FROM the id, so the hint makes
 /// a COLD daemon able to reach a paired peer even with discovery disabled (issue #27) without ever
 /// narrowing the discovery path. On LOCALHOST tests the connecting endpoint is

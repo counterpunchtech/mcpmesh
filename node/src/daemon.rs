@@ -22,7 +22,7 @@
 //! an exclusive file lock) guarantees exactly one process opens `state.redb`. A redundant
 //! daemon loses the lock and exits 0 before touching the device key, store, or endpoint.
 mod accept;
-mod boot;
+pub(crate) mod boot;
 pub(crate) mod config_write;
 mod dial;
 mod handlers;
