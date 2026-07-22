@@ -13,7 +13,6 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use mcpmesh_local_api::{OrgJoinResult, RosterInstallResult};
-use mcpmesh_trust::paths;
 use mcpmesh_trust::roster::validate::RosterState;
 use tokio::task::JoinHandle;
 
@@ -250,7 +249,9 @@ pub(crate) async fn install_roster(
             .context("no org root pinned; pass --org-root-pk on first install")?,
     };
     let pk = crate::roster::parse_org_root_pk(&pk_str)?;
-    let rstore = RosterStore::new(paths::default_roster_path()?);
+    // Per-node like every other roster location: derived from `mesh.config_path` (see
+    // `installed_roster_path`), production-identical to the old global default_roster_path.
+    let rstore = RosterStore::new(installed_roster_path(mesh));
     let now = epoch_now_i64();
     let file = PathBuf::from(path);
     // Read + validate + persist on a blocking thread (fs + verify); returns the resolvable view.

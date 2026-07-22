@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 /// cancelled task) into an anyhow error under `ctx` — the house fs/redb discipline in one place:
 /// blocking work never runs on a runtime worker, and every site reads
 /// `blocking("join …", move || …).await?` (with a second `?` when `f` itself returns a `Result`).
-pub(crate) async fn blocking<T, F>(ctx: &'static str, f: F) -> Result<T>
+pub async fn blocking<T, F>(ctx: &'static str, f: F) -> Result<T>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
@@ -28,7 +28,7 @@ where
 /// in-process writers interleave `create(O_TRUNC)` + `write_all` on the same temp → byte-mixed
 /// content → a torn file published by whichever rename runs last. This mirrors the device-key
 /// mint path ("no fixed temp name").
-pub(crate) fn unique_temp_path(dir: &Path, prefix: &str) -> PathBuf {
+pub fn unique_temp_path(dir: &Path, prefix: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
@@ -38,14 +38,14 @@ pub(crate) fn unique_temp_path(dir: &Path, prefix: &str) -> PathBuf {
 /// RAII removal of a temp file: best-effort `remove_file` on drop — success, error, and
 /// panic-unwind alike — so a temp file never orphans next to its target. A path already renamed
 /// into place (the atomic-replace pattern) or never created makes the drop a harmless no-op.
-pub(crate) struct TempPathGuard(PathBuf);
+pub struct TempPathGuard(PathBuf);
 
 impl TempPathGuard {
-    pub(crate) fn new(path: PathBuf) -> Self {
+    pub fn new(path: PathBuf) -> Self {
         Self(path)
     }
 
-    pub(crate) fn path(&self) -> &Path {
+    pub fn path(&self) -> &Path {
         &self.0
     }
 }
@@ -83,7 +83,7 @@ pub fn epoch_now_i64() -> i64 {
 /// `proxy::client_instruction_lines` PRINTS what to paste instead.) `kb-core/src/fsutil.rs`
 /// mirrors this discipline on the plugin side (layering forbids sharing the code) — keep the two
 /// in step.
-pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
 
     let parent = path.parent().context("path has no parent")?;

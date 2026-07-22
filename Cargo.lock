@@ -2389,25 +2389,17 @@ version = "0.6.1"
 dependencies = [
  "anyhow",
  "assert_cmd",
- "async-trait",
  "blake3",
- "bytes",
  "clap",
  "clap_complete",
  "clap_mangen",
- "data-encoding",
  "ed25519-dalek 2.2.0",
- "figment",
  "iroh",
  "iroh-blobs",
- "iroh-gossip",
  "mcpmesh-local-api",
  "mcpmesh-net",
+ "mcpmesh-node",
  "mcpmesh-trust",
- "n0-future",
- "rand 0.8.6",
- "redb 2.6.3",
- "reqwest",
  "rustix",
  "rustls",
  "serde",
@@ -2415,10 +2407,8 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
- "toml",
  "tracing",
  "tracing-subscriber",
- "url",
 ]
 
 [[package]]
@@ -2457,6 +2447,40 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "mcpmesh-node"
+version = "0.6.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "blake3",
+ "bytes",
+ "data-encoding",
+ "ed25519-dalek 2.2.0",
+ "figment",
+ "iroh",
+ "iroh-blobs",
+ "iroh-gossip",
+ "mcpmesh-local-api",
+ "mcpmesh-net",
+ "mcpmesh-trust",
+ "n0-future",
+ "rand 0.8.6",
+ "redb 2.6.3",
+ "reqwest",
+ "rustix",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

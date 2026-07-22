@@ -332,14 +332,15 @@ async fn id_mismatch_is_refused_writes_no_entry_and_logs_no_peer_id() {
         );
 
         // Surface discipline: the peer's (TLS-resolved) EndpointId never appears in OUR logs. We
-        // isolate this crate's lines by target (`mcpmesh::…`) so iroh's internal INFO logging —
-        // which may print endpoint ids and is not our surface — can't pollute the assertion. The
-        // id-mismatch refusal line is unique to THIS test (others log a different reason), so its
-        // presence confirms our handler's refusal log was captured.
+        // isolate this crate's lines by target (`mcpmesh_node::…` — the daemon core lives in
+        // the mcpmesh-node crate) so iroh's internal INFO logging — which may print endpoint
+        // ids and is not our surface — can't pollute the assertion. The id-mismatch refusal
+        // line is unique to THIS test (others log a different reason), so its presence
+        // confirms our handler's refusal log was captured.
         let logs = String::from_utf8(log_buf.lock().unwrap().clone()).unwrap();
         let ours: String = logs
             .lines()
-            .filter(|l| l.contains("mcpmesh::"))
+            .filter(|l| l.contains("mcpmesh_node::"))
             .collect::<Vec<_>>()
             .join("\n");
         assert!(

@@ -6,43 +6,24 @@
 //! Building on mcpmesh? Depend on [`mcpmesh-local-api`](https://docs.rs/mcpmesh-local-api)
 //! instead — that crate is the supported integration surface.
 #[doc(hidden)]
-pub mod allowlist;
-#[doc(hidden)]
-pub mod audit;
-#[doc(hidden)]
-pub mod backends;
-#[doc(hidden)]
-pub mod blobs;
-#[doc(hidden)]
 pub mod client;
 #[doc(hidden)]
-pub mod config;
-#[doc(hidden)]
-pub mod control;
-#[doc(hidden)]
-pub mod daemon;
+pub mod daemonshell;
 #[doc(hidden)]
 pub mod doctor;
 #[doc(hidden)]
 pub mod enrollcmd;
-#[doc(hidden)]
-pub mod ipc;
-
 pub mod json;
-#[doc(hidden)]
-pub mod limits;
-#[doc(hidden)]
-pub mod pairing;
 #[doc(hidden)]
 pub mod proxy;
 #[doc(hidden)]
 pub mod render;
 #[doc(hidden)]
-pub mod roster;
-#[doc(hidden)]
-pub mod stream;
-#[doc(hidden)]
-pub mod util;
-
-#[doc(hidden)]
 pub use mcpmesh_local_api::{Hello, Request, StatusResult};
+// Daemon-core modules now live in mcpmesh-node; re-exported so the shell's remaining
+// `crate::x` paths and the integration tests' `mcpmesh::x` paths resolve unchanged.
+#[doc(hidden)]
+pub use mcpmesh_node::{
+    allowlist, audit, backends, blobs, config, control, daemon, ipc, limits, pairing, roster,
+    stream, util,
+};

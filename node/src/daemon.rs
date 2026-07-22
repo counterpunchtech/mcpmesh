@@ -22,7 +22,7 @@
 //! an exclusive file lock) guarantees exactly one process opens `state.redb`. A redundant
 //! daemon loses the lock and exits 0 before touching the device key, store, or endpoint.
 mod accept;
-mod boot;
+pub(crate) mod boot;
 pub(crate) mod config_write;
 mod dial;
 mod handlers;
@@ -54,7 +54,7 @@ use crate::util::blocking;
 use roster_install::roster_confirmed_path;
 
 pub use accept::spawn_accept_loop;
-pub use boot::run;
+pub use boot::serve_forever;
 pub use dial::{dial_service, pipe_session, race_dial};
 pub use handlers::{grant_service_access, remove_peer, rename_peer};
 pub use reach::{REACH_TTL_SECS, ReachEntry, probe_peer, reachability_of};
@@ -62,7 +62,7 @@ pub use roster_install::{
     install_roster_view_and_sever, should_staleness_sever, staleness_sweep_once,
 };
 
-pub(crate) use boot::{NetPlan, net_plan};
+pub use boot::{NetPlan, net_plan};
 pub(crate) use handlers::{
     add_peer, blob_fetch, blob_grant, blob_list, blob_publish, mint_invite, open_session, redeem,
     register_service, unregister_ephemeral,

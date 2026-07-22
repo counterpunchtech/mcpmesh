@@ -553,8 +553,8 @@ mod tests {
         // `org approve` verifies the device→user-key binding BEFORE touching any
         // operator state, so a substituted code dies on the signature check itself — this test runs
         // on a machine with NO org root key and still gets the binding error, not "not an operator".
-        let mallory = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-        let alice_pk = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32])
+        let mallory = mcpmesh_trust::ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let alice_pk = mcpmesh_trust::ed25519_dalek::SigningKey::from_bytes(&[9u8; 32])
             .verifying_key()
             .to_bytes();
         let device_id = [42u8; 32];

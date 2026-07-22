@@ -57,6 +57,10 @@ pub use mcpmesh_local_api::ActiveSession;
 /// live-session table so "which sessions are open right now" is queryable.
 pub struct AuditLog {
     tx: mpsc::Sender<AuditRecord>,
+    /// The directory the writer task appends under — retained so readers (`audit_summary`)
+    /// summarize exactly what THIS node wrote (per-node under an embedded node's root, the
+    /// standard state dir under the daemon), never a re-derived location.
+    dir: PathBuf,
     /// Live fan-out of every record to `subscribe()`rs. Independent of the file path — a full ring
     /// buffer or zero subscribers never affects the writer channel or blocks `record`.
     bcast: broadcast::Sender<AuditRecord>,
@@ -73,11 +77,12 @@ impl AuditLog {
     /// runtime workers, the repo's fs house rule). An append error is logged and the record dropped —
     /// the task never exits on an IO error, so a transient full disk does not disable auditing.
     pub fn spawn(dir: PathBuf) -> Arc<Self> {
+        let writer_dir = dir.clone();
         let (tx, mut rx) = mpsc::channel::<AuditRecord>(AUDIT_CHANNEL_DEPTH);
         let (bcast, _) = broadcast::channel(STREAM_BROADCAST_DEPTH);
         tokio::spawn(async move {
             while let Some(rec) = rx.recv().await {
-                let dir = dir.clone();
+                let dir = writer_dir.clone();
                 let res = tokio::task::spawn_blocking(move || append_record(&dir, &rec)).await;
                 match res {
                     Ok(Ok(())) => {}
@@ -88,6 +93,7 @@ impl AuditLog {
         });
         Arc::new(Self {
             tx,
+            dir,
             bcast,
             live: Mutex::new(HashMap::new()),
             seq: AtomicU64::new(0),
@@ -175,6 +181,10 @@ impl AuditSink {
     /// The no-op sink (auditing disabled).
     pub fn disabled() -> Self {
         Self(None)
+    }
+    /// The directory the log writes under, or `None` when auditing is disabled.
+    pub fn dir(&self) -> Option<&Path> {
+        self.0.as_ref().map(|log| log.dir.as_path())
     }
     /// Record an event if enabled; a no-op otherwise. Never blocks, never errors.
     pub fn record(&self, rec: AuditRecord) {

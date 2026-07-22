@@ -67,6 +67,18 @@ impl DaemonState {
         }
     }
 
+    /// Wait until a shutdown has been requested — the control `shutdown` verb, or an
+    /// embedder's `Node::shutdown`. (`notify_one` stores a permit, so a request that
+    /// landed before this call still resolves it.)
+    pub(crate) async fn shutdown_requested(&self) {
+        self.shutdown.notified().await;
+    }
+
+    /// Raise the shutdown signal — the programmatic form of the control `shutdown` verb.
+    pub(crate) fn request_shutdown(&self) {
+        self.shutdown.notify_one();
+    }
+
     /// The mesh half, if this daemon owns an endpoint (always, except control-only tests).
     /// Returns `&Arc<MeshState>` so callers that must reload the accept loop (the pairing
     /// grant, `register_service`) can cheaply clone the shared handle.
@@ -124,8 +136,19 @@ async fn handle_conn(stream: LocalStream, state: Arc<DaemonState>) -> Result<()>
         tracing::warn!(%e, "refused unauthorized control connection");
         return Ok(());
     }
-    let (read_half, mut write_half) = mcpmesh_local_api::transport::split_local(stream);
+    let (read_half, write_half) = mcpmesh_local_api::transport::split_local(stream);
+    serve_control_io(read_half, write_half, state).await
+}
 
+/// Serve one mcpmesh-local/1 connection over ALREADY-AUTHORIZED byte halves — the
+/// transport-agnostic body of `handle_conn`, and what an embedded node's in-memory
+/// control connection runs (`Node::control` — a tokio duplex needs no peer gate: it
+/// never leaves the process).
+pub async fn serve_control_io(
+    read_half: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    mut write_half: impl tokio::io::AsyncWrite + Unpin + Send + 'static,
+    state: Arc<DaemonState>,
+) -> Result<()> {
     // The server speaks first: a `Hello` frame identifies the api.
     let hello = Hello {
         api: API_NAME.into(),
@@ -441,9 +464,18 @@ async fn handle_request(req: &Value, state: &DaemonState) -> Value {
             // audit dir off the runtime (spawn_blocking — the fs house rule) and aggregate to
             // per-peer / per-service session counts. Never touches the network; params are ignored
             // (parameterless, like `status`). Works in control-only mode (an empty/absent dir → an
-            // empty summary).
-            match tokio::task::spawn_blocking(|| {
-                let dir = mcpmesh_trust::paths::default_audit_dir()?;
+            // empty summary). The dir is THE one this node's audit writer was spawned over
+            // (per-node — an embedded node roots it under its own root dir); the env default
+            // remains only for the mesh-less control-only mode, which has no writer to ask.
+            let sink_dir = state
+                .mesh
+                .as_ref()
+                .and_then(|m| m.audit().dir().map(std::path::Path::to_path_buf));
+            match tokio::task::spawn_blocking(move || {
+                let dir = match sink_dir {
+                    Some(d) => d,
+                    None => mcpmesh_trust::paths::default_audit_dir()?,
+                };
                 crate::audit::read_all_records(&dir)
                     .map(|recs| crate::audit::summarize_sessions(&recs))
             })
@@ -626,6 +658,26 @@ mod tests {
     }
     fn req(method: &str, params: Value) -> Value {
         json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params })
+    }
+
+    /// The transport-agnostic serve body speaks full mcpmesh-local/1 over a plain duplex —
+    /// what an embedded node's `Node::control` runs (no socket, no peer gate: the pipe
+    /// never leaves the process). Proves hello + a typed request round-trip end to end
+    /// against the REAL `connect_control_io` client.
+    #[tokio::test]
+    async fn serve_control_io_speaks_the_protocol_over_a_duplex() {
+        let state = control_only();
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (sr, sw) = tokio::io::split(server_io);
+        tokio::spawn(serve_control_io(sr, sw, state));
+        let (cr, cw) = tokio::io::split(client_io);
+        let mut client = mcpmesh_local_api::connect_control_io(cr, cw)
+            .await
+            .expect("hello handshake");
+        assert_eq!(client.hello().stack_version, "0.1.0-test");
+        let status = client.status().await.expect("status");
+        assert_eq!(status.stack_version, "0.1.0-test");
+        assert!(status.services.is_empty());
     }
 
     /// `status` on a control-only daemon answers version + empty service/peer lists and no

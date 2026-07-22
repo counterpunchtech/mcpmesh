@@ -15,16 +15,30 @@ use crate::protocol::{
     PeerRenameParams, RegisterServiceParams, Request, RosterInstallParams, RosterInstallResult,
     SetRosterUrlParams, StatusResult, StreamFrame,
 };
-use crate::transport::{LocalReadHalf, LocalWriteHalf, connect_local, split_local};
+use crate::transport::{connect_local, split_local};
 
-/// A connected mcpmesh-local/1 client: the framed UDS stream + the server's `Hello`.
-// DEVIATION (declared): `#[derive(Debug)]` added — the plan's `wrong_api_hello_is_rejected`
-// test formats `Result<ControlClient, _>` with `{:?}`. [source: plan T2 client.rs test]
-#[derive(Debug)]
+/// The client's read half — boxed so ONE `ControlClient` serves every transport (the
+/// platform socket/pipe via [`connect_control`], or an embedder's in-memory duplex via
+/// [`connect_control_io`]).
+pub type ControlRead = Box<dyn tokio::io::AsyncRead + Send + Unpin>;
+/// The client's write half — see [`ControlRead`].
+pub type ControlWrite = Box<dyn tokio::io::AsyncWrite + Send + Unpin>;
+
+/// A connected mcpmesh-local/1 client: the framed stream + the server's `Hello`.
 pub struct ControlClient {
     hello: Hello,
-    reader: FrameReader<LocalReadHalf>,
-    writer: LocalWriteHalf,
+    reader: FrameReader<ControlRead>,
+    writer: ControlWrite,
+}
+
+/// Hand-rolled (the boxed transport halves are not `Debug`): the `Hello` is the one
+/// diagnostic a `{:?}` needs — tests format `Result<ControlClient, _>` this way.
+impl std::fmt::Debug for ControlClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlClient")
+            .field("hello", &self.hello)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The error surface of the client — thin, so callers can `anyhow`-wrap it.
@@ -104,7 +118,7 @@ impl ControlClient {
         mut self,
         peer: String,
         service: String,
-    ) -> Result<(FrameReader<LocalReadHalf>, LocalWriteHalf), ClientError> {
+    ) -> Result<(FrameReader<ControlRead>, ControlWrite), ClientError> {
         let frame = serde_json::to_value(Request::OpenSession(OpenSessionParams { peer, service }))
             .expect("Request serializes");
         write_frame(&mut self.writer, &frame).await?;
@@ -121,7 +135,7 @@ impl ControlClient {
     pub async fn open_stream(
         mut self,
         method: &str,
-    ) -> Result<(FrameReader<LocalReadHalf>, LocalWriteHalf), ClientError> {
+    ) -> Result<(FrameReader<ControlRead>, ControlWrite), ClientError> {
         let frame = serde_json::json!({ "method": method });
         write_frame(&mut self.writer, &frame).await?;
         Ok((self.reader, self.writer))
@@ -369,10 +383,16 @@ impl ControlClient {
 /// events/lagged notices) until the daemon side closes. Holds the connection's write half for its
 /// lifetime — a subscriber only reads, but dropping the writer would half-close the socket. Drop
 /// the subscription to disconnect (there is no request channel back).
-#[derive(Debug)]
 pub struct StreamSubscription {
-    reader: FrameReader<LocalReadHalf>,
-    _writer: LocalWriteHalf,
+    reader: FrameReader<ControlRead>,
+    _writer: ControlWrite,
+}
+
+/// Hand-rolled like [`ControlClient`]'s: the boxed transport halves are not `Debug`.
+impl std::fmt::Debug for StreamSubscription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamSubscription").finish_non_exhaustive()
+    }
 }
 
 impl StreamSubscription {
@@ -391,11 +411,14 @@ impl StreamSubscription {
     }
 }
 
-/// Connect + complete the hello handshake, asserting the api name is `mcpmesh-local/1`.
-pub async fn connect_control(path: &Path) -> Result<ControlClient, ClientError> {
-    let stream = connect_local(path).await?;
-    let (read_half, writer) = split_local(stream);
-    let mut reader = FrameReader::new(read_half, MAX_FRAME_BYTES);
+/// Complete the mcpmesh-local/1 hello handshake over ALREADY-CONNECTED byte halves —
+/// the transport-agnostic core of [`connect_control`], and the front door for in-process
+/// embedding (`mcpmesh-node`'s `Node::control` dials a tokio duplex through here).
+pub async fn connect_control_io(
+    reader: impl tokio::io::AsyncRead + Send + Unpin + 'static,
+    writer: impl tokio::io::AsyncWrite + Send + Unpin + 'static,
+) -> Result<ControlClient, ClientError> {
+    let mut reader = FrameReader::new(Box::new(reader) as ControlRead, MAX_FRAME_BYTES);
     let hello: Hello = match reader.next().await? {
         Some(Inbound::Frame(v)) => {
             serde_json::from_value(v).map_err(|_| ClientError::Malformed("hello"))?
@@ -412,8 +435,15 @@ pub async fn connect_control(path: &Path) -> Result<ControlClient, ClientError> 
     Ok(ControlClient {
         hello,
         reader,
-        writer,
+        writer: Box::new(writer) as ControlWrite,
     })
+}
+
+/// Connect + complete the hello handshake, asserting the api name is `mcpmesh-local/1`.
+pub async fn connect_control(path: &Path) -> Result<ControlClient, ClientError> {
+    let stream = connect_local(path).await?;
+    let (read_half, write_half) = split_local(stream);
+    connect_control_io(read_half, write_half).await
 }
 
 /// [`connect_control`] at the platform default endpoint ([`crate::paths::default_endpoint`]):
@@ -504,6 +534,30 @@ mod tests {
         .await
         .unwrap();
         writer.flush().await.unwrap();
+    }
+
+    /// The transport-agnostic front door: the same hello handshake over a plain in-memory
+    /// duplex — what an embedded node's `Node::control` dials through.
+    #[tokio::test]
+    async fn connect_control_io_handshakes_over_a_duplex() {
+        let (client_io, mut server_io) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            write_frame(
+                &mut server_io,
+                &serde_json::to_value(Hello {
+                    api: API_NAME.into(),
+                    api_version: API_VERSION.into(),
+                    api_minor: 0,
+                    stack_version: "in-proc".into(),
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        });
+        let (r, w) = tokio::io::split(client_io);
+        let client = connect_control_io(r, w).await.expect("handshake");
+        assert_eq!(client.hello().stack_version, "in-proc");
     }
 
     #[tokio::test]

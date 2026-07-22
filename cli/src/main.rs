@@ -4,7 +4,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use mcpmesh::enrollcmd::{load_device_key, split_csv, with_daemon};
 use mcpmesh::render::{self, SERVE_EXAMPLE};
-use mcpmesh::{config, daemon, doctor, enrollcmd, proxy, util};
+use mcpmesh::{config, doctor, enrollcmd, proxy, util};
 use mcpmesh_local_api::{BackendSpec, PeerAddParams};
 use mcpmesh_trust::paths;
 
@@ -412,7 +412,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         // The daemon owns its own runtime; dispatch it before the porcelain preamble.
         Some(Cmd::Internal {
             command: Internal::Daemon,
-        }) => daemon::run(),
+        }) => mcpmesh::daemonshell::run(),
         Some(Cmd::Internal {
             command: Internal::Id,
         }) => run_internal_id(),
@@ -917,7 +917,7 @@ fn write_man_tree(
 /// `PublicKey` alias), so no daemon round-trip is needed.
 fn run_internal_id() -> anyhow::Result<()> {
     let key = load_device_key()?;
-    let endpoint_id = iroh::SecretKey::from_bytes(&key.secret_bytes()).public();
+    let endpoint_id = mcpmesh_net::iroh::SecretKey::from_bytes(&key.secret_bytes()).public();
     println!("{endpoint_id}");
     Ok(())
 }

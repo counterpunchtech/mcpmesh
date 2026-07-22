@@ -5,9 +5,9 @@ everything else bumps the PATCH.
 
 ## 1. Bump the version
 
-Edit `[workspace.package] version` and the four `mcpmesh-*` pins in `[workspace.dependencies]`
+Edit `[workspace.package] version` and the five `mcpmesh-*` pins in `[workspace.dependencies]`
 of `Cargo.toml` to `X.Y.Z`. One version drives everything: the pins (`mcpmesh-codec`/`-net`/
-`-trust`/`-local-api`) move with it because crates.io refuses version-less path deps. Then:
+`-trust`/`-local-api`/`-node`) move with it because crates.io refuses version-less path deps. Then:
 
     cargo update -w
     cargo test --workspace --locked

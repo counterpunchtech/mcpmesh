@@ -219,10 +219,10 @@ impl RosterCfg {
 /// negative/overflowing/garbage value as `Err` (the caller supplies the
 /// default). `u64` parse then a checked `i64` conversion: a negative grace is meaningless, so `-1`
 /// fails the `u64` parse and falls back to the default rather than becoming a negative window.
-// `pub(crate)`: reached only by the accessors above and the `org create --expires` porcelain
-// (`enrollcmd`, the operator-managed validity window) — nothing outside the lib needs it.
-// Pure parser — no state.
-pub(crate) fn parse_duration(s: &str) -> Result<i64, String> {
+// Reached only by the accessors above and the `org create --expires` porcelain
+// (`enrollcmd`, the operator-managed validity window — now across the crate seam, hence
+// `pub`; still `#[doc(hidden)]` at the module level). Pure parser — no state.
+pub fn parse_duration(s: &str) -> Result<i64, String> {
     let s = s.trim();
     let (num, mult) = if let Some(n) = s.strip_suffix('d') {
         (n, 24 * 3600)

@@ -664,7 +664,9 @@ mod tests {
         // The pair porcelain shows the nickname, the SAS, and the local `<peer>/<service>`
         // mount names — all permitted pairing artifacts. It must NEVER contain a raw base32
         // endpoint id. A PairResult carries none, so the rendered lines can't either; assert it.
-        let alice_id = iroh::SecretKey::from_bytes(&[7u8; 32]).public().to_string();
+        let alice_id = mcpmesh_net::iroh::SecretKey::from_bytes(&[7u8; 32])
+            .public()
+            .to_string();
         let result = PairResult {
             peer_nickname: "alice".into(),
             sas_code: "tango-fig-42".into(),
@@ -1098,7 +1100,9 @@ mod tests {
         // The recent-pairings block carries the nickname, the SAS words, and a friendly age
         // ONLY. A RecentPairing carries no endpoint id, so the lines can't either — assert it,
         // and assert no transport vocabulary.
-        let bob_id = iroh::SecretKey::from_bytes(&[7u8; 32]).public().to_string();
+        let bob_id = mcpmesh_net::iroh::SecretKey::from_bytes(&[7u8; 32])
+            .public()
+            .to_string();
         let pairings = vec![RecentPairing {
             peer_nickname: "bob".into(),
             sas_code: "tango-fig-cabbage".into(),
