@@ -11,3 +11,10 @@
 
 /// This crate's version — the mcpmesh release-train version the daemon binary ships on.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[doc(hidden)]
+pub mod config;
+#[doc(hidden)]
+pub mod ipc;
+#[doc(hidden)]
+pub mod util;

@@ -16,8 +16,6 @@ pub mod blobs;
 #[doc(hidden)]
 pub mod client;
 #[doc(hidden)]
-pub mod config;
-#[doc(hidden)]
 pub mod control;
 #[doc(hidden)]
 pub mod daemon;
@@ -25,9 +23,6 @@ pub mod daemon;
 pub mod doctor;
 #[doc(hidden)]
 pub mod enrollcmd;
-#[doc(hidden)]
-pub mod ipc;
-
 pub mod json;
 #[doc(hidden)]
 pub mod limits;
@@ -42,7 +37,8 @@ pub mod roster;
 #[doc(hidden)]
 pub mod stream;
 #[doc(hidden)]
-pub mod util;
-
-#[doc(hidden)]
 pub use mcpmesh_local_api::{Hello, Request, StatusResult};
+// Daemon-core modules now live in mcpmesh-node; re-exported so the shell's remaining
+// `crate::x` paths and the integration tests' `mcpmesh::x` paths resolve unchanged.
+#[doc(hidden)]
+pub use mcpmesh_node::{config, ipc, util};
