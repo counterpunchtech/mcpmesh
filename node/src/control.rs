@@ -441,9 +441,18 @@ async fn handle_request(req: &Value, state: &DaemonState) -> Value {
             // audit dir off the runtime (spawn_blocking — the fs house rule) and aggregate to
             // per-peer / per-service session counts. Never touches the network; params are ignored
             // (parameterless, like `status`). Works in control-only mode (an empty/absent dir → an
-            // empty summary).
-            match tokio::task::spawn_blocking(|| {
-                let dir = mcpmesh_trust::paths::default_audit_dir()?;
+            // empty summary). The dir is THE one this node's audit writer was spawned over
+            // (per-node — an embedded node roots it under its own root dir); the env default
+            // remains only for the mesh-less control-only mode, which has no writer to ask.
+            let sink_dir = state
+                .mesh
+                .as_ref()
+                .and_then(|m| m.audit().dir().map(std::path::Path::to_path_buf));
+            match tokio::task::spawn_blocking(move || {
+                let dir = match sink_dir {
+                    Some(d) => d,
+                    None => mcpmesh_trust::paths::default_audit_dir()?,
+                };
                 crate::audit::read_all_records(&dir)
                     .map(|recs| crate::audit::summarize_sessions(&recs))
             })

@@ -43,7 +43,9 @@ pub fn run() -> Result<()> {
         .enable_all()
         .build()
         .context("build daemon tokio runtime")?;
-    rt.block_on(async move { mcpmesh_node::daemon::serve_forever(&socket).await })
+    rt.block_on(async move {
+        mcpmesh_node::daemon::serve_forever(&socket, mcpmesh_node::NodePaths::from_env()?).await
+    })
 }
 
 /// Acquire the per-uid singleton lock. Returns `Some(file)` when we

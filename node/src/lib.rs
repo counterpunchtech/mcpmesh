@@ -12,6 +12,8 @@
 /// This crate's version — the mcpmesh release-train version the daemon binary ships on.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+pub use paths::NodePaths;
+
 #[doc(hidden)]
 pub mod allowlist;
 #[doc(hidden)]
@@ -28,6 +30,7 @@ pub mod control;
 pub mod daemon;
 #[doc(hidden)]
 pub mod ipc;
+pub mod paths;
 #[doc(hidden)]
 pub mod limits;
 #[doc(hidden)]

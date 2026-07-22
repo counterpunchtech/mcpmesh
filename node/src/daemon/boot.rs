@@ -8,7 +8,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use mcpmesh_net::registry::ConnRegistry;
 use mcpmesh_net::{ALPN_MCP, ALPN_PAIR, ALPN_PING, TrustGate};
-use mcpmesh_trust::{DeviceKey, paths};
+use mcpmesh_trust::DeviceKey;
 
 use crate::allowlist::{AllowlistGate, PeerStore};
 use crate::audit::{AuditLog, AuditSink};
@@ -16,6 +16,7 @@ use crate::config::Config;
 use crate::control::{DaemonState, serve_control};
 use crate::ipc;
 use crate::pairing::LiveInvites;
+use crate::paths::NodePaths;
 use crate::roster::RosterStore;
 use crate::roster::freshness::FreshnessStore;
 use crate::roster::gate::{ComposedGate, RosterGate};
@@ -28,8 +29,10 @@ use super::roster_install::{
 use super::{MeshState, STACK_VERSION, build_services_audited, default_self_nickname};
 
 /// The async body: compose the mesh serve loop and the control server, then run until
-/// shutdown. Split out from [`run`] so the runtime setup stays synchronous.
-pub async fn serve_forever(socket: &Path) -> Result<()> {
+/// shutdown. Split out from the shell's `run` so the runtime setup stays synchronous.
+/// `paths` is the node's resolved on-disk world — the shell passes [`NodePaths::from_env`];
+/// nothing below consults the environment for a location.
+pub async fn serve_forever(socket: &Path, paths: NodePaths) -> Result<()> {
     // 0. CRITICAL: install a process-default rustls `CryptoProvider` (ring) BEFORE any
     //    reqwest client is built. reqwest 0.13.4 (`rustls-no-provider`) resolves the provider via
     //    `CryptoProvider::get_default()` at CLIENT-BUILD time and PANICS ("No rustls crypto provider
@@ -61,15 +64,15 @@ pub async fn serve_forever(socket: &Path) -> Result<()> {
     // 0b. The audit log: one bounded-channel writer over <state_dir>/audit. Best-effort
     //     — record() never blocks or fails a session. Threaded into the backends (build_services_
     //     audited) and stored on the mesh for the reload sites + trust-event hooks.
-    let audit = AuditSink::new(AuditLog::spawn(paths::default_audit_dir()?));
+    let audit = AuditSink::new(AuditLog::spawn(paths.audit_dir.clone()));
 
     // 1. Config + device key.
-    let config_path = paths::default_config_path()?;
+    let config_path = paths.config_path.clone();
     let cfg = Config::load(&config_path)
         .map_err(|e| anyhow::anyhow!("config error in {}: {e}", config_path.display()))?;
     let key_path = match cfg.identity.device_key.clone() {
         Some(p) => p,
-        None => paths::default_device_key_path()?,
+        None => paths.device_key_path.clone(),
     };
     let (key, _created) = DeviceKey::load_or_generate(&key_path)
         .map_err(|e| anyhow::anyhow!("device key error at {}: {e}", key_path.display()))?;
@@ -84,7 +87,7 @@ pub async fn serve_forever(socket: &Path) -> Result<()> {
 
     // 3. The peer allowlist store + gate. redb open + reads are blocking; open on a blocking
     //    thread so a slow trust-file fsync never stalls a runtime worker.
-    let db_path = paths::default_state_db_path()?;
+    let db_path = paths.state_db_path.clone();
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create data dir {}", parent.display()))?;
@@ -113,7 +116,7 @@ pub async fn serve_forever(socket: &Path) -> Result<()> {
     if let Some(pk_str) = cfg.identity.org_root_pk.clone() {
         match crate::roster::parse_org_root_pk(&pk_str) {
             Ok(pk) => {
-                let rstore = RosterStore::new(paths::default_roster_path()?);
+                let rstore = RosterStore::new(paths.roster_path.clone());
                 match blocking("join roster load", move || rstore.load(&pk)).await {
                     Ok(Ok(Some(view))) => {
                         roster.install(view);
@@ -225,7 +228,7 @@ pub async fn serve_forever(socket: &Path) -> Result<()> {
     // still works, peers store `user_id: None`) rather than failing the daemon.
     let user_key_path = match cfg.identity.user_key.clone() {
         Some(p) => p,
-        None => paths::default_user_key_path()?,
+        None => paths.user_key_path.clone(),
     };
     let self_binding = match mcpmesh_trust::UserKey::load_or_generate(&user_key_path) {
         Ok((user_key, _created)) => {
@@ -248,7 +251,7 @@ pub async fn serve_forever(socket: &Path) -> Result<()> {
     // failure disables app blobs with a warning (pairing + mesh keep working); a pure-pairing daemon
     // never builds it.
     if roster_mode {
-        let scopes_path = paths::default_blob_scopes_path()?;
+        let scopes_path = paths.blob_scopes_path.clone();
         match blocking("join app-blob scopes load", move || {
             crate::blobs::scope::ScopeStore::load(scopes_path)
         })
@@ -256,7 +259,7 @@ pub async fn serve_forever(socket: &Path) -> Result<()> {
         {
             Ok(Ok(scopes)) => {
                 match crate::blobs::provider::AppBlobs::load(
-                    paths::default_blobs_dir()?,
+                    paths.blobs_dir.clone(),
                     Arc::new(scopes),
                     mesh.gate.clone(),
                     mesh.endpoint.clone(),
