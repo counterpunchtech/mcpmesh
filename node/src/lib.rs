@@ -17,11 +17,19 @@ pub mod allowlist;
 #[doc(hidden)]
 pub mod audit;
 #[doc(hidden)]
+pub mod backends;
+#[doc(hidden)]
+pub mod blobs;
+#[doc(hidden)]
 pub mod config;
 #[doc(hidden)]
 pub mod ipc;
 #[doc(hidden)]
 pub mod limits;
+#[doc(hidden)]
+pub mod pairing;
+#[doc(hidden)]
+pub mod roster;
 #[doc(hidden)]
 pub mod stream;
 #[doc(hidden)]
