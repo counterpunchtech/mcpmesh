@@ -917,7 +917,7 @@ fn write_man_tree(
 /// `PublicKey` alias), so no daemon round-trip is needed.
 fn run_internal_id() -> anyhow::Result<()> {
     let key = load_device_key()?;
-    let endpoint_id = iroh::SecretKey::from_bytes(&key.secret_bytes()).public();
+    let endpoint_id = mcpmesh_net::iroh::SecretKey::from_bytes(&key.secret_bytes()).public();
     println!("{endpoint_id}");
     Ok(())
 }

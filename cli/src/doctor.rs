@@ -412,11 +412,12 @@ fn gather() -> DoctorInputs {
     #[cfg(windows)]
     let our_uid = 0u32;
 
-    let cfg_result = match paths::default_config_path() {
-        Ok(p) => crate::config::Config::load(&p),
-        Err(e) => Err(figment::Error::from(e.to_string())),
-    };
-    let parse_ok = cfg_result.is_ok();
+    // Parse VALIDITY is all doctor reports (`check_config`); the parse error's text is the
+    // daemon/porcelain paths' to render — so no config-error type crosses this seam.
+    let cfg_result = paths::default_config_path()
+        .ok()
+        .and_then(|p| crate::config::Config::load(&p).ok());
+    let parse_ok = cfg_result.is_some();
     let cfg = cfg_result.unwrap_or_default();
 
     // Diagnostics never fail on an unresolvable default path (no HOME): an empty
@@ -814,7 +815,7 @@ mod tests {
     #[test]
     fn report_leaks_no_transport_vocabulary() {
         // A real base32 EndpointId — doctor must NEVER render one (surface-clean).
-        let sample_id = iroh::SecretKey::from_bytes(&[9u8; 32]).public().to_string();
+        let sample_id = mcpmesh_net::iroh::SecretKey::from_bytes(&[9u8; 32]).public().to_string();
         // Build the full finding set the way `findings()` does, with adversarial inputs that exercise
         // every branch (warns + an error), then assert the rendered report is clean.
         let findings = vec![
