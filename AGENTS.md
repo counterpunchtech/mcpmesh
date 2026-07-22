@@ -5,6 +5,9 @@ agents (Claude Code, Codex, …) and shell scripts alike. Everything here is sta
 tested behavior; the human-facing prose output is NOT part of the contract, the
 `--json` output is.
 
+(Building a Rust program instead of driving the CLI? `mcpmesh-node` embeds a full node
+in-process — same control vocabulary, no daemon: see [docs/embedding.md](docs/embedding.md).)
+
 ## TL;DR recipe
 
 ```sh

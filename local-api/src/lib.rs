@@ -8,6 +8,9 @@
 //!
 //! The full protocol (framing, method-by-method semantics, the identity contract) is documented in
 //! [`docs/local-protocol.md`](https://github.com/counterpunchtech/mcpmesh/blob/main/docs/local-protocol.md).
+//! To RUN a node in-process instead of driving a daemon, see
+//! [`mcpmesh-node`](https://docs.rs/mcpmesh-node) — its `Node::control()` returns this same
+//! [`ControlClient`] over an in-memory pipe.
 //!
 //! # Quickstart (feature `client`)
 //!

@@ -48,6 +48,10 @@ encrypted peer-to-peer link, and it works both ways whenever they want to share 
 > 🤖 Driving mcpmesh from a script or an AI agent? See [AGENTS.md](AGENTS.md) — every verb
 > takes `--json`, errors carry a machine-branchable code, and nothing ever prompts.
 
+> 🦀 Building in Rust? Embed a full node **in-process** — no daemon, no sidecar:
+> [`mcpmesh-node`](docs/embedding.md) boots your app's own mesh identity in a few lines,
+> speaking the same control API the daemon serves.
+
 ## 🧪 Try it alone
 
 Only one machine? Fake the friend. A daemon's whole world lives under `HOME` +
