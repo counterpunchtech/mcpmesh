@@ -41,6 +41,10 @@ mcpmesh-net.workspace = true
 # control socket, and the porcelain client wraps the seam's no-iroh ControlClient (D5) —
 # adding daemon auto-start on top rather than re-implementing the wire.
 mcpmesh-local-api = { workspace = true, features = ["service"] }
+# The daemon core: the cli's daemon subcommand is the process shell (flock, env paths,
+# runtime, control socket) around this crate's Node; porcelain + tests reach the moved
+# modules through cli/src/lib.rs re-exports.
+mcpmesh-node.workspace = true
 # Org-root VerifyingKey for roster install/load + the `org_root_pk` b64u decode (M3a Task 4).
 # Same crate mcpmesh-trust already pins (workspace `ed25519-dalek` 2, already in the lock via
 # trust/iroh) → a dependency edge only, NO new crate version, no deny.toml change.

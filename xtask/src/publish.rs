@@ -8,8 +8,8 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 
 /// crates.io publish order — a topological order of the internal dep graph
-/// (codec ← local-api ← {net, trust} ← cli). Guarded by `publish_order_is_topological`.
-pub const PUBLISH_ORDER: [&str; 5] = ["codec", "local-api", "trust", "net", "cli"];
+/// (codec ← local-api ← {net, trust} ← node ← cli). Guarded by `publish_order_is_topological`.
+pub const PUBLISH_ORDER: [&str; 6] = ["codec", "local-api", "trust", "net", "node", "cli"];
 
 /// crates.io sparse-index sharding (index.crates.io): `1/{name}`, `2/{name}`, `3/{c}/{name}`,
 /// else `{name[0..2]}/{name[2..4]}/{name}`. Crate names are ASCII, so byte slicing is safe.
@@ -62,7 +62,7 @@ fn run(cmd: &str, args: &[&str], cwd: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// Publish the five crates in PUBLISH_ORDER from a clean `main` checkout. Resumable: crates
+/// Publish the six crates in PUBLISH_ORDER from a clean `main` checkout. Resumable: crates
 /// whose current version already sits in the sparse index are skipped, so a run that died
 /// mid-sequence just re-runs. cargo (>=1.66) waits for each crate to land in the index
 /// before the next dependent publish proceeds.
@@ -195,6 +195,6 @@ serde = { version = "1" }
                 assert!(pos < i, "{dir} depends on {dep}, which publishes later");
             }
         }
-        assert_eq!(PUBLISH_ORDER.len(), 5);
+        assert_eq!(PUBLISH_ORDER.len(), 6);
     }
 }
