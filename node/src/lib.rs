@@ -23,6 +23,10 @@ pub mod blobs;
 #[doc(hidden)]
 pub mod config;
 #[doc(hidden)]
+pub mod control;
+#[doc(hidden)]
+pub mod daemon;
+#[doc(hidden)]
 pub mod ipc;
 #[doc(hidden)]
 pub mod limits;

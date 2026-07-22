@@ -8,9 +8,7 @@
 #[doc(hidden)]
 pub mod client;
 #[doc(hidden)]
-pub mod control;
-#[doc(hidden)]
-pub mod daemon;
+pub mod daemonshell;
 #[doc(hidden)]
 pub mod doctor;
 #[doc(hidden)]
@@ -26,5 +24,6 @@ pub use mcpmesh_local_api::{Hello, Request, StatusResult};
 // `crate::x` paths and the integration tests' `mcpmesh::x` paths resolve unchanged.
 #[doc(hidden)]
 pub use mcpmesh_node::{
-    allowlist, audit, backends, blobs, config, ipc, limits, pairing, roster, stream, util,
+    allowlist, audit, backends, blobs, config, control, daemon, ipc, limits, pairing, roster,
+    stream, util,
 };

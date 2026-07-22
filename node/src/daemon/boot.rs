@@ -2,8 +2,6 @@
 //! ([`net_plan`]), Iroh endpoint construction, roster-mode transport composition, and the
 //! `serve_forever` assembly that wires the whole daemon together and serves until shutdown.
 
-#[cfg(unix)]
-use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -29,43 +27,9 @@ use super::roster_install::{
 };
 use super::{MeshState, STACK_VERSION, build_services_audited, default_self_nickname};
 
-/// Run the daemon. On unix, acquires the per-uid flock singleton (another holder → exit 0);
-/// on Windows the control-endpoint bind in `serve_forever` is the singleton. Then binds the
-/// control endpoint FIRST, builds the endpoint + store + gate + service registry, starts the
-/// mesh serve loop, and serves the control API until a `shutdown` request stops it.
-pub fn run() -> Result<()> {
-    // Unix singleton: the per-uid flock, taken BEFORE anything else so the stale-socket unlink
-    // and the state.redb open are single-daemon-safe. We hold the exclusive lock, so no other
-    // daemon is live: the stale-socket unlink cannot orphan anyone AND we are the sole opener of
-    // state.redb. `_lock` lives until this function returns (process lifetime for a serving
-    // daemon). Windows singleton: there is no advisory-lock/filesystem equivalent here — the
-    // control-pipe bind ITSELF is the singleton (a FILE_FLAG_FIRST_PIPE_INSTANCE create fails with
-    // AddrInUse once a peer daemon owns the pipe), which is why `serve_forever` binds the listener
-    // FIRST, before opening state.redb.
-    #[cfg(unix)]
-    let _lock = {
-        let runtime = paths::runtime_dir()?;
-        ipc::ensure_runtime_dir(&runtime)?;
-        let lock_path = runtime.join("mcpmesh.lock");
-        match acquire_singleton_lock(&lock_path)? {
-            Some(lock) => lock,
-            None => {
-                tracing::info!("another mcpmesh daemon already holds the singleton lock; exiting");
-                return Ok(());
-            }
-        }
-    };
-    let socket = paths::default_endpoint()?;
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("build daemon tokio runtime")?;
-    rt.block_on(async move { serve_forever(&socket).await })
-}
-
 /// The async body: compose the mesh serve loop and the control server, then run until
 /// shutdown. Split out from [`run`] so the runtime setup stays synchronous.
-async fn serve_forever(socket: &Path) -> Result<()> {
+pub async fn serve_forever(socket: &Path) -> Result<()> {
     // 0. CRITICAL: install a process-default rustls `CryptoProvider` (ring) BEFORE any
     //    reqwest client is built. reqwest 0.13.4 (`rustls-no-provider`) resolves the provider via
     //    `CryptoProvider::get_default()` at CLIENT-BUILD time and PANICS ("No rustls crypto provider
@@ -394,7 +358,7 @@ async fn serve_forever(socket: &Path) -> Result<()> {
 /// self-hosted pkarr relay URLs used for BOTH publish and resolve (`discovery_mode =
 /// "custom"` + `discovery_urls`).
 #[derive(Debug)]
-pub(crate) enum DiscoveryPlan {
+pub enum DiscoveryPlan {
     N0,
     Custom(Vec<url::Url>),
 }
@@ -403,7 +367,7 @@ pub(crate) enum DiscoveryPlan {
 /// binds and `doctor` reports on. `Hermetic` (`relay_mode = "disabled"`) is no relay AND no
 /// discovery — the localhost/tests mode.
 #[derive(Debug)]
-pub(crate) enum NetPlan {
+pub enum NetPlan {
     Hermetic,
     Mesh {
         relay: iroh::RelayMode,
@@ -415,7 +379,7 @@ pub(crate) enum NetPlan {
 /// `doctor` share it. Unknown modes and a `"custom"` without URLs are ERRORS, never a silent
 /// fallback to public infrastructure — a metadata-privacy knob that quietly reverts to n0
 /// defaults would be worse than none.
-pub(crate) fn net_plan(net: &crate::config::NetworkCfg) -> Result<NetPlan> {
+pub fn net_plan(net: &crate::config::NetworkCfg) -> Result<NetPlan> {
     let relay = match net.relay_mode.as_str() {
         // Hermetic: no relay, no discovery (discovery_mode is ignored — doctor warns if set).
         "disabled" => return Ok(NetPlan::Hermetic),
@@ -601,27 +565,6 @@ async fn compose_roster_transport(
             }
         };
     (Some(gossip), Some(blobs), roster_topic, presence_topic)
-}
-
-/// Acquire the per-uid singleton lock. Returns `Some(file)` when we
-/// win the exclusive advisory lock (hold it for the process lifetime; dropping it releases
-/// the lock), or `None` when another daemon already holds it (`EWOULDBLOCK`). Unix-only: on
-/// Windows the control-pipe bind is the singleton (see `run`), so there is no flock path.
-#[cfg(unix)]
-fn acquire_singleton_lock(lock_path: &Path) -> Result<Option<File>> {
-    use rustix::fs::{FlockOperation, flock};
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(lock_path)
-        .with_context(|| format!("open singleton lock {}", lock_path.display()))?;
-    match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => Ok(Some(file)),
-        Err(rustix::io::Errno::WOULDBLOCK) => Ok(None),
-        Err(e) => Err(anyhow::Error::new(e).context("flock singleton lock")),
-    }
 }
 
 #[cfg(test)]
