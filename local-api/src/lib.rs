@@ -62,7 +62,8 @@ pub use protocol::{
     OrgJoinParams, OrgJoinResult, PairParams, PairResult, PeerAddParams, PeerInfo,
     PeerReachability, PeerRemoveParams, PeerRenameParams, PresencePeer, RecentPairing,
     RegisterServiceParams, Request, RosterInstallParams, RosterInstallResult, RosterStatus,
-    ScopeInfo, ServiceInfo, SetRosterUrlParams, StatusResult, StreamFrame, method_of,
+    ScopeInfo, ServiceInfo, SetNicknameParams, SetRosterUrlParams, StatusResult, StreamFrame,
+    method_of,
 };
 
 #[cfg(feature = "client")]
