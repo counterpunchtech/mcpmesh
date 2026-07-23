@@ -13,7 +13,7 @@ use crate::protocol::{
     BlobPublishParams, BlobPublishResult, BlobScopeList, Hello, InviteParams, InviteResult,
     OpenSessionParams, OrgJoinParams, OrgJoinResult, PairParams, PairResult, PeerRemoveParams,
     PeerRenameParams, RegisterServiceParams, Request, RosterInstallParams, RosterInstallResult,
-    SetRosterUrlParams, StatusResult, StreamFrame,
+    SetNicknameParams, SetRosterUrlParams, StatusResult, StreamFrame,
 };
 use crate::transport::{connect_local, split_local};
 
@@ -307,6 +307,16 @@ impl ControlClient {
         .await
     }
 
+    /// Rename this node LIVE (#37): the daemon validates + persists `[identity].nickname`
+    /// under its own config lock and updates the name future invites present — no restart.
+    /// Peers keep their stored pairing-time nickname until a re-invite (display-only).
+    pub async fn set_nickname(&mut self, nickname: &str) -> Result<(), ClientError> {
+        self.request_ack(Request::SetNickname(SetNicknameParams {
+            nickname: nickname.to_string(),
+        }))
+        .await
+    }
+
     /// Summarize the daemon's LOCAL audit log into per-peer / per-service session counts
     /// (local-only — nothing is transmitted).
     pub async fn audit_summary(&mut self) -> Result<AuditSummaryResult, ClientError> {
@@ -526,6 +536,7 @@ mod tests {
             self_user_id: None,
             recent_pairings: vec![],
             reachability: vec![],
+            self_nickname: String::new(),
         };
         write_frame(
             &mut writer,

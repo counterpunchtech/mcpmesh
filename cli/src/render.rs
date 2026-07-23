@@ -717,6 +717,7 @@ mod tests {
             self_user_id: None,
             recent_pairings: Vec::new(),
             reachability: Vec::new(),
+            self_nickname: String::new(),
         }
     }
 

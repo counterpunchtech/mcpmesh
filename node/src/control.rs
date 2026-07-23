@@ -21,7 +21,7 @@ use mcpmesh_local_api::transport::{LocalListener, LocalStream};
 use mcpmesh_local_api::{
     API_NAME, API_VERSION, BlobFetchParams, BlobGrantParams, BlobPublishParams, Hello,
     InviteParams, OpenSessionParams, OrgJoinParams, PairParams, RosterInstallParams,
-    SetRosterUrlParams, StatusResult, method_of,
+    SetNicknameParams, SetRosterUrlParams, StatusResult, method_of,
 };
 use mcpmesh_net::framing::{FrameReader, Inbound, write_frame};
 use serde_json::{Value, json};
@@ -433,6 +433,17 @@ async fn handle_request(req: &Value, state: &DaemonState) -> Value {
             .await
             .map(unit),
         ),
+        // Rename this node LIVE (#37): validated + persisted under `reload_lock`, then the
+        // in-memory name updates — future invites present it immediately, no restart.
+        Some("set_nickname") => respond(
+            id,
+            "set_nickname",
+            with_params(&params, |p: SetNicknameParams| {
+                crate::daemon::set_nickname(state, p.nickname)
+            })
+            .await
+            .map(unit),
+        ),
         Some("blob_publish") => respond(
             id,
             "blob_publish",
@@ -613,6 +624,12 @@ pub(crate) fn status_result(state: &DaemonState) -> Result<StatusResult> {
         self_user_id,
         recent_pairings,
         reachability,
+        // The EFFECTIVE self-nickname (live — reflects a `set_nickname` immediately);
+        // empty in mesh-less control-only mode, which the additive field skips.
+        self_nickname: state
+            .mesh()
+            .map(|mesh| mesh.self_nickname())
+            .unwrap_or_default(),
     })
 }
 

@@ -593,7 +593,7 @@ pub(crate) async fn mint_invite(
         secret,
         inviter_id,
         inviter_addr_json,
-        nickname: mesh.self_nickname.clone(),
+        nickname: mesh.self_nickname(),
         services: services.clone(),
         expires_at_epoch,
         app_label,
@@ -624,7 +624,7 @@ pub(crate) async fn redeem(state: &DaemonState, invite_line: String) -> Result<P
     let mesh = state.mesh_required()?;
     crate::pairing::rendezvous::redeem_invite(
         mesh.endpoint.clone(),
-        mesh.self_nickname.clone(),
+        mesh.self_nickname(),
         invite_line,
         mesh.store.clone(),
         mesh.self_binding(),

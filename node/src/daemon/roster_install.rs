@@ -25,7 +25,8 @@ use crate::util::{TempPathGuard, blocking, epoch_now_i64, unique_temp_path};
 
 use super::MeshState;
 use super::config_write::{
-    write_identity_pin, write_identity_user_id, write_join_pin, write_roster_url,
+    write_identity_nickname, write_identity_pin, write_identity_user_id, write_join_pin,
+    write_roster_url,
 };
 
 /// Warn — once, at install/load time — when the just-installed roster is serving in DEGRADED-GRACE
@@ -442,6 +443,33 @@ pub(crate) async fn org_join(
     .await??;
     tracing::info!(org_id = %org_id, "pinned org root (join)");
     Ok(OrgJoinResult { org_id })
+}
+
+/// Handle a `set_nickname` control request (#37): validate, persist
+/// `[identity].nickname` under `reload_lock` (the SAME serialization as
+/// `register_service` — no lost-update window against a concurrent grant), and only on
+/// write success install the new in-memory name future invites present. No restart, no
+/// accept-loop reload (the nickname gates nothing). Display-only: peers keep their stored
+/// pairing-time nickname until a re-invite.
+pub(crate) async fn set_nickname(state: &DaemonState, nickname: String) -> Result<()> {
+    let mesh = state.mesh_required()?;
+    let nickname = nickname.trim().to_string();
+    anyhow::ensure!(!nickname.is_empty(), "set_nickname: the nickname is empty");
+    // The nickname becomes the peer-side `<peer>/<service>` mount prefix — a `/` would
+    // make every mount of this node unparseable there.
+    anyhow::ensure!(
+        !nickname.contains('/'),
+        "set_nickname: the nickname must not contain '/'"
+    );
+    let _reload = mesh.reload_lock.lock().await;
+    let config_path = mesh.config_path.clone();
+    let persisted = nickname.clone();
+    blocking("join set_nickname config write", move || {
+        write_identity_nickname(&config_path, &persisted)
+    })
+    .await??;
+    mesh.set_self_nickname(nickname);
+    Ok(())
 }
 
 /// Handle a `set_roster_url` control request: pin `[roster].url` in config AND, when

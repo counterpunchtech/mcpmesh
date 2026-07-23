@@ -67,7 +67,7 @@ pub(crate) use handlers::{
     add_peer, blob_fetch, blob_grant, blob_list, blob_publish, mint_invite, open_session, redeem,
     register_service, unregister_ephemeral,
 };
-pub(crate) use roster_install::{install_roster, org_join, set_roster_url};
+pub(crate) use roster_install::{install_roster, org_join, set_nickname, set_roster_url};
 pub(crate) use status::{peer_infos, presence_peers, roster_status, service_infos};
 
 /// The lockstep stack version (workspace version) reported in `Hello`/`status`.
@@ -113,9 +113,11 @@ pub struct MeshState {
     /// `mcpmesh/pair/1` branch redeems against it; shared with every spawned pair handler.
     pub(crate) invites: Arc<LiveInvites>,
     /// This device's suggested name for itself, carried in a minted invite.
-    /// Resolved once at startup: config `identity.nickname`, else a short base32 fingerprint
-    /// of the endpoint id. The redeemer stores it as its local name for us.
-    pub(crate) self_nickname: String,
+    /// Resolved at startup (config `identity.nickname`, else a short base32 fingerprint of
+    /// the endpoint id) and LIVE-updatable by the `set_nickname` verb (#37) — hence the
+    /// `RwLock` (std, never held across await; read-clone via [`self_nickname`](Self::self_nickname)).
+    /// The redeemer stores it as its local name for us.
+    pub(crate) self_nickname: std::sync::RwLock<String>,
     /// The daemon's own ALPN-dispatch accept loop (see [`spawn_accept_loop`]). Hot-reload
     /// takes it, `.abort()`s it, and installs a fresh loop with the rebuilt registry — a brief
     /// serving blip is acceptable.
@@ -266,7 +268,7 @@ impl MeshState {
             gate,
             store,
             invites,
-            self_nickname,
+            self_nickname: std::sync::RwLock::new(self_nickname),
             accept_task: tokio::sync::Mutex::new(None),
             poll_loop: tokio::sync::Mutex::new(None),
             reload_lock: tokio::sync::Mutex::new(()),
@@ -338,6 +340,24 @@ impl MeshState {
 
     /// Install the process audit sink, once, before serving. A second call is ignored
     /// (`OnceLock::set` returns `Err`), keeping the invariant self-healing.
+    /// The name a freshly minted invite would present — read-clone (the lock is
+    /// never held across an await).
+    pub(crate) fn self_nickname(&self) -> String {
+        self.self_nickname
+            .read()
+            .expect("self_nickname lock not poisoned")
+            .clone()
+    }
+
+    /// Install a new self-nickname (the `set_nickname` verb, #37) — called only AFTER the
+    /// config write succeeded, so the in-memory name never runs ahead of the persisted one.
+    pub(crate) fn set_self_nickname(&self, nickname: String) {
+        *self
+            .self_nickname
+            .write()
+            .expect("self_nickname lock not poisoned") = nickname;
+    }
+
     pub fn set_audit(&self, sink: AuditSink) {
         let _ = self.audit.set(sink);
     }

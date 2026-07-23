@@ -146,6 +146,12 @@ pub struct StatusResult {
     /// first probe completes. Additive: default + skip-if-empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reachability: Vec<PeerReachability>,
+    /// This node's EFFECTIVE self-nickname — what a freshly minted invite would present
+    /// (config `[identity].nickname`, else the hostname, else a fingerprint; live-updated by
+    /// `set_nickname`, #37). Empty only in mesh-less control-only mode. Additive: default +
+    /// skip-if-empty so an older payload round-trips.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub self_nickname: String,
 }
 
 /// Params of [`Request::RegisterService`]: the `[services.*]` entry to write/update.
@@ -250,6 +256,15 @@ pub struct OrgJoinParams {
     pub org_root_pk: String,
     pub user_id: String,
     pub user_key: String,
+}
+
+/// Params of [`Request::SetNickname`]: this node's new self-nickname (#37). Display-only
+/// semantics: it names this node in FUTURE invites/presentations; peers keep the nickname
+/// they stored at pairing time until a re-invite.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetNicknameParams {
+    pub nickname: String,
 }
 
 /// Params of [`Request::SetRosterUrl`]: the HTTPS roster URL to pin.
@@ -361,6 +376,11 @@ pub enum Request {
     /// `reload_lock` (single-writer), then the poll loop picks it up on the next daemon start. Tag
     /// `"set_roster_url"`.
     SetRosterUrl(SetRosterUrlParams),
+    /// Rename this node LIVE (#37): validate + upsert `[identity].nickname` through the
+    /// daemon's own serialized config-write path (no lost-update window against a
+    /// concurrent grant/registration) and update the in-memory name future invites
+    /// present — no restart. Ack result. Tag `"set_nickname"` (snake_case).
+    SetNickname(SetNicknameParams),
     /// Publish a LOCAL file INTO a scope: the daemon adds the bytes to its gated
     /// app-blob store and records the hash in `scope`. `path` is a local file the same-uid daemon
     /// reads. Answers a [`BlobPublishResult`] carrying the `mcpmesh/blob/1` ticket + hash.
@@ -747,10 +767,10 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   new methods, or a strictness change like params validation — bumped in the same change that
 ///   makes it. A client can guard with `api_minor >= N` for a feature it needs, or refuse a daemon
 ///   older than a minor it requires. It never resets except on a MAJOR bump.
-pub const API_VERSION: &str = "1.1";
+pub const API_VERSION: &str = "1.2";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
-/// became strict (#34), the first change that made this field worth checking.
-pub const API_MINOR: u32 = 1;
+/// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37).
+pub const API_MINOR: u32 = 2;
 
 #[cfg(test)]
 mod tests {
@@ -814,6 +834,38 @@ mod tests {
             serde_json::json!({"peer": "a", "service": "b", "nonsense": 1}),
         );
         assert!(err.is_err(), "unknown params keys must be rejected");
+    }
+
+    #[test]
+    fn set_nickname_request_carries_the_method_tag() {
+        let r = Request::SetNickname(SetNicknameParams {
+            nickname: "workbench".into(),
+        });
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["method"], "set_nickname");
+        assert_eq!(v["params"]["nickname"], "workbench");
+        assert_eq!(method_of(&v), Some("set_nickname"));
+    }
+
+    #[test]
+    fn set_nickname_params_reject_unknown_field() {
+        let err = serde_json::from_value::<SetNicknameParams>(
+            serde_json::json!({"nickname": "x", "nonsense": 1}),
+        );
+        assert!(err.is_err(), "unknown params keys must be rejected");
+    }
+
+    /// An OLDER daemon's status payload (no `self_nickname`) must still deserialize —
+    /// the additive-only contract — and an empty name must not serialize at all.
+    #[test]
+    fn status_self_nickname_is_additive() {
+        let old = serde_json::json!({
+            "stack_version": "0.7.0", "services": [], "peers": []
+        });
+        let s: StatusResult = serde_json::from_value(old).unwrap();
+        assert_eq!(s.self_nickname, "");
+        let v = serde_json::to_value(&s).unwrap();
+        assert!(v.get("self_nickname").is_none(), "empty name is skipped");
     }
 
     #[test]
@@ -1190,6 +1242,7 @@ mod tests {
             self_user_id: Some("b64u:selfpk".into()),
             recent_pairings: vec![],
             reachability: vec![],
+            self_nickname: String::new(),
         };
         let v = serde_json::to_value(&s).unwrap();
         assert_eq!(v["services"][0]["backend"], "run");
@@ -1253,6 +1306,7 @@ mod tests {
             self_user_id: None,
             recent_pairings: vec![],
             reachability: vec![],
+            self_nickname: String::new(),
         };
         let v = serde_json::to_value(&s).unwrap();
         assert_eq!(v["roster"]["org_id"], "acme");
@@ -1289,6 +1343,7 @@ mod tests {
                 paired_at_epoch: 1_800_000_000,
             }],
             reachability: vec![],
+            self_nickname: String::new(),
         };
         let v = serde_json::to_value(&s).unwrap();
         assert_eq!(v["recent_pairings"][0]["peer_nickname"], "bob");
