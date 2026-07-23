@@ -115,6 +115,12 @@ pub(crate) fn write_roster_url(path: &Path, url: &str) -> Result<()> {
     upsert_config_strings(path, "roster", &[("url", url)])
 }
 
+/// Upsert `[identity].nickname` (the `set_nickname` control arm, #37). Every other
+/// `[identity]` key (org pins, key paths, user_id) is preserved.
+pub(crate) fn write_identity_nickname(path: &Path, nickname: &str) -> Result<()> {
+    upsert_config_strings(path, "identity", &[("nickname", nickname)])
+}
+
 /// Upsert `[services.<name>]` (atomic, surgical RMW), updating the backend while UNIONING the
 /// incoming `allow` into any grants already on disk. Registration OWNS the backend; the allowlist
 /// is co-owned by the pairing grant (`grant_service_access` appends nicknames). A re-registration

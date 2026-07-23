@@ -225,8 +225,10 @@ async fn ensure_daemon_autostarts_reuses_and_serves_status() {
             .await
             .expect("first ensure_daemon");
         assert_eq!(first.hello().api, "mcpmesh-local/1");
-        assert_eq!(first.hello().api_version, "1.1"); // #34: bumped when params validation went strict
-        assert_eq!(first.hello().api_minor, 1);
+        // Constants, not literals (the RELEASING.md stack_version rule, applied to the
+        // protocol minor): the daemon must report the CURRENT protocol surface.
+        assert_eq!(first.hello().api_version, mcpmesh_local_api::API_VERSION);
+        assert_eq!(first.hello().api_minor, mcpmesh_local_api::API_MINOR);
         assert_eq!(first.hello().stack_version, STACK_VERSION);
         assert!(launch.socket.exists(), "daemon bound the control socket");
 
