@@ -340,7 +340,12 @@ async fn two_machine_serve() -> anyhow::Result<()> {
         addr.id
     );
 
-    let _handle = serve(server, gate, echo_services(), Arc::new(ConnRegistry::new()));
+    // NOT `echo_services()` (allow=["bob"], the in-process tests' gate nickname): this
+    // gate resolves the connector to "smoke-peer" (above), so the service's own allow
+    // list must admit THAT nickname or every real dial is refused
+    // `-32054 unknown or unauthorized service` before ever reaching `EchoBackend`.
+    let services = service_with_allow("echo", vec!["smoke-peer".into()]);
+    let _handle = serve(server, gate, services, Arc::new(ConnRegistry::new()));
     tokio::time::sleep(Duration::from_secs(600)).await;
     Ok(())
 }
