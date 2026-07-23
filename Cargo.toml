@@ -3,7 +3,7 @@ resolver = "3"
 members = ["codec", "net", "trust", "local-api", "node", "cli", "xtask"]
 
 [workspace.package]
-version = "0.7.0"          # the release-train version: all six crates publish in lockstep (see RELEASING.md)
+version = "0.7.1"          # the release-train version: all six crates publish in lockstep (see RELEASING.md)
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.95.0"
@@ -45,8 +45,8 @@ rmcp = { version = "=2.1.0", features = ["client", "server", "macros"] }  # offi
 url = "2"  # pkarr relay URLs (spec §10.3): iroh's Pkarr builders take `url::Url` directly
 # Internal crates: `path` drives the workspace build; `version` is REQUIRED for crates.io
 # (`cargo publish` rewrites path deps to registry deps and refuses version-less ones).
-mcpmesh-codec = { path = "codec", version = "0.7.0" }
-mcpmesh-net = { path = "net", version = "0.7.0" }
-mcpmesh-trust = { path = "trust", version = "0.7.0" }
-mcpmesh-local-api = { path = "local-api", version = "0.7.0", default-features = false }
-mcpmesh-node = { path = "node", version = "0.7.0" }
+mcpmesh-codec = { path = "codec", version = "0.7.1" }
+mcpmesh-net = { path = "net", version = "0.7.1" }
+mcpmesh-trust = { path = "trust", version = "0.7.1" }
+mcpmesh-local-api = { path = "local-api", version = "0.7.1", default-features = false }
+mcpmesh-node = { path = "node", version = "0.7.1" }
