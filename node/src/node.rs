@@ -114,11 +114,17 @@ impl Node {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let (server_read, server_write) = tokio::io::split(server_io);
         let state = self.booted.state.clone();
-        tokio::spawn(async move {
+        let track_state = state.clone();
+        let handle = tokio::spawn(async move {
             if let Err(e) = serve_control_io(server_read, server_write, state).await {
                 tracing::debug!(%e, "in-process control connection ended");
             }
         });
+        // Tracked like a socket connection's serving task (`serve_control`'s per-connection
+        // spawn): without this, an attached `subscribe()` stream never notices `shutdown` (see
+        // `Node::shutdown`) and outlives the node, holding its `Arc<DaemonState>`/mesh/redb lock
+        // open.
+        track_state.track_control_task(handle);
         let (client_read, client_write) = tokio::io::split(client_io);
         connect_control_io(client_read, client_write).await
     }
@@ -135,11 +141,14 @@ impl Node {
         self.booted.state.shutdown_requested().await;
     }
 
-    /// Stop serving: raise the shutdown signal, stop the accept/poll/background loops,
-    /// and close the endpoint (a graceful QUIC close — live sessions end cleanly).
+    /// Stop serving: raise the shutdown signal, stop the accept/poll/background loops and
+    /// every live control connection (subscription streams end immediately; in-flight control
+    /// requests get a dropped connection — acceptable, shutdown means shutdown), and close the
+    /// endpoint (a graceful QUIC close — live sessions end cleanly).
     pub async fn shutdown(self) {
         let state = &self.booted.state;
         state.request_shutdown();
+        state.abort_control_tasks();
         let mesh = self
             .booted
             .state

@@ -14,6 +14,42 @@ async fn a_node_starts_in_an_empty_root_and_answers_status() {
     node.shutdown().await;
 }
 
+/// A live `subscribe()` stream must not outlive `Node::shutdown()` — the embedder scenario:
+/// restarting an embedded node (e.g. to apply a config change) while its own events
+/// subscription is attached must free the root dir immediately, not whenever that
+/// subscription's server task happens to notice its client is gone. Regression for the
+/// control-connection-serving-task leak: `subscribe`'s server task only notices a dead client
+/// via a subsequent failed WRITE, and with no audit traffic it never writes — so, unlike every
+/// OTHER tracked serving loop `shutdown` stops, it (and the `Arc<DaemonState>`/mesh/redb lock
+/// it holds) lingers forever. Proven here by the symptom an embedder actually hits: a second
+/// `NodeBuilder::start` on the SAME root, right after `shutdown`, must succeed promptly rather
+/// than hang/refuse with `DataDirInUse` because the first node's redb lock is still held by
+/// the leaked task.
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_frees_the_root_even_with_a_live_subscription_attached() {
+    let root = tempfile::tempdir().unwrap();
+    let node = NodeBuilder::new(root.path()).start().await.expect("start");
+    let control = node.control().await.expect("control");
+    // Keep the subscription (and its underlying connection) alive across `shutdown` — never
+    // read from it, never drop it — so the only thing that can end its server task is
+    // `shutdown` itself closing the connection.
+    let _sub = control.subscribe().await.expect("subscribe");
+    tokio::time::timeout(std::time::Duration::from_secs(5), node.shutdown())
+        .await
+        .expect("shutdown must complete promptly even with a live subscription attached");
+    // The real proof: a fresh node on the same root must be able to start right away. Today it
+    // hangs/refuses (`DataDirInUse`) because the orphaned subscription server task still holds
+    // the old node's `Arc<DaemonState>` (and thus its redb lock) open.
+    let restarted = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        NodeBuilder::new(root.path()).start(),
+    )
+    .await
+    .expect("restart must not hang")
+    .expect("restart must succeed once the old node's resources are released");
+    restarted.shutdown().await;
+}
+
 /// Two nodes on ONE root must refuse: redb's exclusive lock is the guard, surfaced typed.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_second_node_on_the_same_root_is_refused() {
