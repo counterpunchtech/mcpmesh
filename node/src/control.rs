@@ -26,6 +26,7 @@ use mcpmesh_local_api::{
 use mcpmesh_net::framing::{FrameReader, Inbound, write_frame};
 use serde_json::{Value, json};
 use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 
 use crate::daemon::MeshState;
 use crate::ipc::{self, MAX_FRAME_BYTES};
@@ -40,6 +41,15 @@ pub struct DaemonState {
     pub stack_version: String,
     pub(crate) mesh: Option<Arc<MeshState>>,
     shutdown: Notify,
+    /// Every live control-connection serving task — one per accepted socket connection
+    /// ([`serve_control`]'s per-connection spawn) AND one per in-process pipe
+    /// ([`Node::control`](crate::node::Node::control)'s duplex spawn). Tracked so a shutdown
+    /// can ABORT them, exactly like `MeshState::accept_task`/`poll_loop`/the boot background
+    /// loops: without this, a `subscribe` stream's task only notices its client is gone via a
+    /// subsequent failed WRITE — which, with no audit traffic, may never come — so it (and the
+    /// `Arc<DaemonState>`/mesh/redb lock it holds) would outlive the node itself. A std `Mutex`
+    /// (never held across an await; push/drain are sync + tiny, like `ephemeral_services`).
+    control_tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl DaemonState {
@@ -50,6 +60,7 @@ impl DaemonState {
             stack_version: stack_version.into(),
             mesh: None,
             shutdown: Notify::new(),
+            control_tasks: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -64,6 +75,7 @@ impl DaemonState {
             stack_version: stack_version.into(),
             mesh: Some(mesh),
             shutdown: Notify::new(),
+            control_tasks: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -92,6 +104,38 @@ impl DaemonState {
         self.mesh()
             .context("daemon has no mesh (control-only mode)")
     }
+
+    /// Track a just-spawned control-connection serving task so a later
+    /// [`abort_control_tasks`](Self::abort_control_tasks) can end it. Opportunistically drops
+    /// already-finished handles first (most connections close long before shutdown) so a
+    /// long-lived daemon's list stays bounded to roughly the CURRENTLY live connections rather
+    /// than growing with every connection ever served.
+    pub(crate) fn track_control_task(&self, handle: JoinHandle<()>) {
+        let mut tasks = self
+            .control_tasks
+            .lock()
+            .expect("control_tasks lock not poisoned");
+        tasks.retain(|h| !h.is_finished());
+        tasks.push(handle);
+    }
+
+    /// Abort every tracked live control-connection serving task — subscription streams end
+    /// immediately, in-flight requests get a dropped connection. Called from
+    /// [`Node::shutdown`](crate::node::Node::shutdown) AND from the wire-level `shutdown` verb
+    /// handler (after that verb's own ack is written), so BOTH the programmatic and the
+    /// control-protocol shutdown path get the same guarantee: shutdown means shutdown, even for
+    /// a connection with no other reason to ever notice.
+    pub(crate) fn abort_control_tasks(&self) {
+        let tasks = std::mem::take(
+            &mut *self
+                .control_tasks
+                .lock()
+                .expect("control_tasks lock not poisoned"),
+        );
+        for task in tasks {
+            task.abort();
+        }
+    }
 }
 
 /// Accept control connections until a `shutdown` request stops the loop. Each connection is
@@ -116,12 +160,13 @@ pub async fn serve_control(mut listener: LocalListener, state: Arc<DaemonState>)
                         continue;
                     }
                 };
-                let state = state.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = handle_conn(stream, state).await {
+                let conn_state = state.clone();
+                let handle = tokio::spawn(async move {
+                    if let Err(e) = handle_conn(stream, conn_state).await {
                         tracing::debug!(%e, "control connection ended");
                     }
                 });
+                state.track_control_task(handle);
             }
         }
     }
@@ -191,6 +236,13 @@ pub async fn serve_control_io(
                         loop_state.shutdown.notify_one();
                         let resp = dispatch(&req, &loop_state);
                         let _ = write_frame(&mut write_half, &resp).await;
+                        // Abort every OTHER live control connection (this one's own task is
+                        // included and about to return anyway — no correctness issue, the ack
+                        // above already landed). Mirrors `Node::shutdown`'s programmatic path:
+                        // the wire-level `shutdown` verb gets the same guarantee that an
+                        // attached `subscribe` stream (or any other live connection) ends
+                        // immediately rather than lingering until it next fails a write.
+                        loop_state.abort_control_tasks();
                         return Ok(());
                     }
                     if method_of(&req) == Some("open_session") {
