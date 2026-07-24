@@ -40,7 +40,13 @@ pub enum BackendKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceInfo {
     pub name: String,
-    pub allow: Vec<String>,   // nicknames/groups (flat namespace)
+    pub allow: Vec<String>,   // STABLE principals (b64u:/eid:) or roster names (#38) — never nicknames
+    /// The HUMAN rendering of `allow`, index-aligned: each principal resolved to its peer's
+    /// display nickname by the daemon (which owns the store); an unresolvable stable
+    /// principal renders as a neutral placeholder — porcelain must show THESE, never raw
+    /// ids (surface discipline). Additive: default + skip-if-empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_display: Vec<String>,
     pub backend: BackendKind, // "run" | "socket" (kind only, never the command/path)
     /// True if this registration is ephemeral (#36): in-memory only, tied to the registering
     /// control connection's lifetime, absent from config, gone on restart. Additive — an older
@@ -331,7 +337,7 @@ pub enum Request {
     /// `PeerEntry` — the durable allowlist row — lives in the daemon crate.
     Pair(PairParams),
     /// Remove a paired peer by nickname (`mcpmesh pair --remove`). The daemon drops the
-    /// peer's `PeerEntry` (identity) AND revokes its access by removing the nickname from every
+    /// peer's `PeerEntry` (identity) AND revokes its access by stripping its stable principals from every
     /// `[services.*].allow` (authorization) — the inverse of the pairing grant. Idempotent: a
     /// nickname with no entry / no allow membership is a clean no-op. Live in-flight sessions are
     /// NOT severed here: existing sessions run to completion; the peer only loses the
@@ -767,10 +773,12 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   new methods, or a strictness change like params validation — bumped in the same change that
 ///   makes it. A client can guard with `api_minor >= N` for a feature it needs, or refuse a daemon
 ///   older than a minor it requires. It never resets except on a MAJOR bump.
-pub const API_VERSION: &str = "1.2";
+pub const API_VERSION: &str = "1.3";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
-/// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37).
-pub const API_MINOR: u32 = 2;
+/// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
+/// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
+/// never nicknames (#38, a semantic change to strings crossing this API).
+pub const API_MINOR: u32 = 3;
 
 #[cfg(test)]
 mod tests {
@@ -1228,6 +1236,7 @@ mod tests {
             services: vec![ServiceInfo {
                 name: "notes".into(),
                 allow: vec!["alice".into()],
+                allow_display: vec![],
                 backend: BackendKind::Run,
                 ephemeral: false,
             }],

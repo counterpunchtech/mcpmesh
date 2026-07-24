@@ -233,8 +233,25 @@ pub fn render_status(
             let kind = backend_kind_label(svc.backend);
             let allowed = if svc.allow.is_empty() {
                 "no one yet".to_owned()
+            } else if !svc.allow_display.is_empty() {
+                // Allow entries are STABLE principals (#38); the daemon resolves each to its
+                // display form (`allow_display`, index-aligned) because only it owns the
+                // store. A raw `eid:`/`b64u:` never reaches human output (surface discipline).
+                svc.allow_display.join(", ")
             } else {
-                svc.allow.join(", ")
+                // No display annotation (mesh-less stub daemons): show only entries that are
+                // already human words (roster names); redact stable principals.
+                svc.allow
+                    .iter()
+                    .map(|p| {
+                        if p.starts_with("eid:") || p.starts_with("b64u:") {
+                            "paired-peer".to_owned()
+                        } else {
+                            p.clone()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
             };
             println!("  {} · {kind} · allowed: {allowed}", svc.name);
         }
@@ -725,6 +742,7 @@ mod tests {
         ServiceInfo {
             name: name.into(),
             allow: allow.iter().map(|s| s.to_string()).collect(),
+            allow_display: vec![],
             backend: BackendKind::Run,
             ephemeral: false,
         }

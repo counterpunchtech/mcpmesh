@@ -594,7 +594,7 @@ pub(crate) async fn mint_invite(
         .lock()
         .expect("ephemeral_services lock not poisoned")
         .clone();
-    let served: Vec<String> = service_infos(&cfg, &ephemeral)
+    let served: Vec<String> = service_infos(&cfg, &ephemeral, &[])
         .into_iter()
         .map(|s| s.name)
         .collect();

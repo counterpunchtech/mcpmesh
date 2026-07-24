@@ -124,9 +124,34 @@ pub(crate) fn presence_peers(mesh: &Arc<MeshState>) -> Vec<PresencePeer> {
 
 /// The `status`-facing view of the configured services (name, allow, backend KIND only — no
 /// command/path). Malformed entries are omitted (they are not served either).
+/// Map one authz principal to its human display form (#38): a `b64u:`/`eid:` principal
+/// resolves through the peer entries to a display nickname; a bare string (roster
+/// group/user_id) shows verbatim; an unresolvable stable principal renders a neutral
+/// placeholder — porcelain shows THESE, never raw ids (surface discipline).
+fn display_principal(principal: &str, peers: &[crate::allowlist::PeerEntry]) -> String {
+    if principal.starts_with("eid:") {
+        return peers
+            .iter()
+            .find(|p| {
+                mcpmesh_net::EndpointId::from_bytes(p.endpoint_id).principal() == principal
+            })
+            .map(|p| p.nickname.clone())
+            .unwrap_or_else(|| "unpaired-device".to_owned());
+    }
+    if principal.starts_with("b64u:") {
+        return peers
+            .iter()
+            .find(|p| p.user_id.as_deref() == Some(principal))
+            .map(|p| p.nickname.clone())
+            .unwrap_or_else(|| "unpaired-peer".to_owned());
+    }
+    principal.to_owned()
+}
+
 pub(crate) fn service_infos(
     cfg: &Config,
     ephemeral: &std::collections::HashMap<String, crate::daemon::EphemeralService>,
+    peers: &[crate::allowlist::PeerEntry],
 ) -> Vec<ServiceInfo> {
     let mut out: Vec<ServiceInfo> = cfg
         .services
@@ -140,6 +165,11 @@ pub(crate) fn service_infos(
             Some(ServiceInfo {
                 name: name.clone(),
                 allow: svc.allow.clone(),
+                allow_display: svc
+                    .allow
+                    .iter()
+                    .map(|p| display_principal(p, peers))
+                    .collect(),
                 backend,
                 ephemeral: false,
             })
@@ -155,6 +185,11 @@ pub(crate) fn service_infos(
         out.push(ServiceInfo {
             name: name.clone(),
             allow: eph.allow.clone(),
+            allow_display: eph
+                .allow
+                .iter()
+                .map(|p| display_principal(p, peers))
+                .collect(),
             backend,
             ephemeral: true,
         });
