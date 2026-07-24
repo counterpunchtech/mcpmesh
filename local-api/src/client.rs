@@ -13,7 +13,7 @@ use crate::protocol::{
     BlobPublishParams, BlobPublishResult, BlobScopeList, Hello, InviteParams, InviteResult,
     OpenSessionParams, OrgJoinParams, OrgJoinResult, PairParams, PairResult, PeerRemoveParams,
     PeerRenameParams, RegisterServiceParams, Request, RosterInstallParams, RosterInstallResult,
-    SetNicknameParams, SetRosterUrlParams, StatusResult, StreamFrame,
+    SetAppMetadataParams, SetNicknameParams, SetRosterUrlParams, StatusResult, StreamFrame,
 };
 use crate::transport::{connect_local, split_local};
 
@@ -303,6 +303,16 @@ impl ControlClient {
     pub async fn set_roster_url(&mut self, url: &str) -> Result<(), ClientError> {
         self.request_ack(Request::SetRosterUrl(SetRosterUrlParams {
             url: url.to_string(),
+        }))
+        .await
+    }
+
+    /// Set this node's opaque app-metadata blob (#39, roster mode): ≤256 bytes, folded
+    /// signed into each presence heartbeat so paired peers read it in `status` presence —
+    /// no per-peer session. `""` clears it; in-memory (re-set on startup).
+    pub async fn set_app_metadata(&mut self, metadata: &str) -> Result<(), ClientError> {
+        self.request_ack(Request::SetAppMetadata(SetAppMetadataParams {
+            metadata: metadata.to_string(),
         }))
         .await
     }

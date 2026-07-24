@@ -102,6 +102,11 @@ pub struct PresencePeer {
     pub role: String, // "primary" | "mirror" (roster vocabulary)
     /// Whether the device has a live presence heartbeat (advisory — absence never blocks a dial).
     pub online: bool,
+    /// The device's OPTIONAL embedder-set app metadata (#39) — an opaque ≤256B blob carried
+    /// (signed) on its presence heartbeat, empty when the device set none. Advisory display
+    /// data; never an authz input. Additive: default + skip-if-empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub meta: String,
 }
 
 /// One recently completed INVITER-side pairing, surfaced by `status` so the inviter's human can
@@ -264,6 +269,16 @@ pub struct OrgJoinParams {
     pub user_key: String,
 }
 
+/// Params of [`Request::SetAppMetadata`]: this node's opaque app-metadata blob (#39). The
+/// daemon NEVER interprets it — the embedder structures its own bytes (a version string,
+/// small JSON, …). Capped at 256 bytes; `""` clears it. Roster-mode only (it rides the
+/// signed presence heartbeat); a pure-pairing daemon accepts + stores it but never gossips it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetAppMetadataParams {
+    pub metadata: String,
+}
+
 /// Params of [`Request::SetNickname`]: this node's new self-nickname (#37). Display-only
 /// semantics: it names this node in FUTURE invites/presentations; peers keep the nickname
 /// they stored at pairing time until a re-invite.
@@ -387,6 +402,11 @@ pub enum Request {
     /// concurrent grant/registration) and update the in-memory name future invites
     /// present — no restart. Ack result. Tag `"set_nickname"` (snake_case).
     SetNickname(SetNicknameParams),
+    /// Set this node's opaque app-metadata blob (#39): validated (≤256B) and folded, signed,
+    /// into each outgoing presence heartbeat, so paired roster peers see it in their `status`
+    /// presence — no per-peer session. Ack result. Tag `"set_app_metadata"`. In-memory (lost
+    /// on restart; the embedder re-sets on startup).
+    SetAppMetadata(SetAppMetadataParams),
     /// Publish a LOCAL file INTO a scope: the daemon adds the bytes to its gated
     /// app-blob store and records the hash in `scope`. `path` is a local file the same-uid daemon
     /// reads. Answers a [`BlobPublishResult`] carrying the `mcpmesh/blob/1` ticket + hash.
@@ -773,12 +793,12 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   new methods, or a strictness change like params validation — bumped in the same change that
 ///   makes it. A client can guard with `api_minor >= N` for a feature it needs, or refuse a daemon
 ///   older than a minor it requires. It never resets except on a MAJOR bump.
-pub const API_VERSION: &str = "1.3";
+pub const API_VERSION: &str = "1.4";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
-/// never nicknames (#38, a semantic change to strings crossing this API).
-pub const API_MINOR: u32 = 3;
+/// never nicknames (#38); to 4 with the `set_app_metadata` verb + `PresencePeer.meta` (#39).
+pub const API_MINOR: u32 = 4;
 
 #[cfg(test)]
 mod tests {
@@ -842,6 +862,37 @@ mod tests {
             serde_json::json!({"peer": "a", "service": "b", "nonsense": 1}),
         );
         assert!(err.is_err(), "unknown params keys must be rejected");
+    }
+
+    #[test]
+    fn set_app_metadata_request_carries_the_method_tag() {
+        let r = Request::SetAppMetadata(SetAppMetadataParams {
+            metadata: "v=1.2.3".into(),
+        });
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["method"], "set_app_metadata");
+        assert_eq!(v["params"]["metadata"], "v=1.2.3");
+        assert_eq!(method_of(&v), Some("set_app_metadata"));
+    }
+
+    #[test]
+    fn set_app_metadata_params_reject_unknown_field() {
+        let err = serde_json::from_value::<SetAppMetadataParams>(
+            serde_json::json!({"metadata": "x", "nonsense": 1}),
+        );
+        assert!(err.is_err(), "unknown params keys must be rejected");
+    }
+
+    /// `PresencePeer.meta` is additive — an older payload (no meta) still deserializes, and an
+    /// empty meta does not serialize.
+    #[test]
+    fn presence_peer_meta_is_additive() {
+        let old = serde_json::json!({
+            "user_id": "b64u:A", "device_label": "laptop", "role": "primary", "online": true
+        });
+        let p: PresencePeer = serde_json::from_value(old).unwrap();
+        assert_eq!(p.meta, "");
+        assert!(serde_json::to_value(&p).unwrap().get("meta").is_none());
     }
 
     #[test]
@@ -1304,12 +1355,14 @@ mod tests {
                     device_label: "laptop".into(),
                     role: "primary".into(),
                     online: true,
+                    meta: String::new(),
                 },
                 PresencePeer {
                     user_id: "alice".into(),
                     device_label: "desktop".into(),
                     role: "mirror".into(),
                     online: false,
+                    meta: String::new(),
                 },
             ],
             self_user_id: None,

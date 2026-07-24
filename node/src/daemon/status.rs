@@ -98,19 +98,26 @@ pub(crate) fn presence_peers(mesh: &Arc<MeshState>) -> Vec<PresencePeer> {
         return Vec::new();
     };
     let now = epoch_now_i64();
-    let online: std::collections::HashSet<[u8; 32]> = mesh
-        .presence_table
-        .active(now)
-        .into_iter()
-        .map(|(eid, _)| eid)
-        .collect();
+    // Map each active device to its freshest beat, so both `online` and the beat's app
+    // metadata (#39) come from ONE table read.
+    let active: std::collections::HashMap<[u8; 32], crate::roster::presence::PresenceEntry> =
+        mesh.presence_table.active(now).into_iter().collect();
+    // This node's OWN metadata is best-effort self-reported (a node does not receive its own
+    // gossip, so it has no self entry in the table).
+    let self_eid = *mesh.endpoint.id().as_bytes();
+    let self_meta = mesh.app_metadata();
     let mut peers: Vec<PresencePeer> = view
         .devices()
         .map(|(eid, d)| PresencePeer {
             user_id: d.user_id.clone(),
             device_label: d.label.clone(),
             role: d.role.clone(),
-            online: online.contains(eid),
+            online: active.contains_key(eid),
+            meta: if *eid == self_eid {
+                self_meta.clone()
+            } else {
+                active.get(eid).map(|e| e.meta.clone()).unwrap_or_default()
+            },
         })
         .collect();
     peers.sort_by(|a, b| {

@@ -207,3 +207,92 @@ async fn dial_service_races_a_person_to_the_live_mirror_when_the_primary_is_dead
     .await
     .expect("person→device race test timed out");
 }
+
+/// #39 — app-metadata end to end through the REAL control path: a roster-mode node sets its
+/// app metadata via `set_app_metadata`, and `status` presence surfaces it on the node's own
+/// device (the self-meta path); the ≤256B cap is enforced. The signed beat/accept/table chain
+/// that carries a PEER's metadata is covered by the presence unit tests; this proves the
+/// control verb, storage, cap, and status surfacing against the live control server.
+#[tokio::test]
+async fn set_app_metadata_surfaces_in_status_presence() {
+    use mcpmesh::control::{DaemonState, serve_control_io};
+    use mcpmesh_local_api::connect_control_io;
+
+    timeout(Duration::from_secs(30), async {
+        let dir = tempfile::tempdir().unwrap();
+        let root = SigningKey::from_bytes(&[9u8; 32]);
+
+        // A roster where THIS node's own endpoint is alice's primary device, so its own
+        // device appears in `status` presence (where the self-meta is surfaced).
+        let self_ep = local_endpoint().await;
+        let self_id = *self_ep.id().as_bytes();
+        let other = [7u8; 32]; // a second (unused) device so the view is well-formed
+        let roster = Arc::new(RosterGate::empty());
+        roster.install(alice_two_device_view(&root, self_id, other));
+
+        let store = Arc::new(PeerStore::open(&dir.path().join("state.redb")).unwrap());
+        let gate: Arc<dyn TrustGate> = Arc::new(AllowlistGate::new(store.clone()));
+        let mesh = MeshState::new(
+            self_ep,
+            gate,
+            store,
+            Arc::new(LiveInvites::new()),
+            "self".into(),
+            dir.path().join("config.toml"),
+            roster.clone(),
+            Arc::new(ConnRegistry::new()),
+            None,
+            None,
+            None,
+            None,
+        );
+        let state = Arc::new(DaemonState::with_mesh("test", mesh));
+
+        // Drive the REAL control verb + status over an in-memory control connection.
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (sr, sw) = tokio::io::split(server_io);
+        tokio::spawn(serve_control_io(sr, sw, state));
+        let (cr, cw) = tokio::io::split(client_io);
+        let mut ctl = connect_control_io(cr, cw).await.expect("hello");
+
+        // Before: no metadata → the self device carries none.
+        let before = ctl.status().await.expect("status");
+        let self_dev = |s: &mcpmesh_local_api::StatusResult| {
+            s.presence
+                .iter()
+                .find(|p| p.device_label == "laptop") // self is alice's primary "laptop"
+                .cloned()
+                .expect("self device present in status")
+        };
+        assert_eq!(self_dev(&before).meta, "", "no metadata before set");
+
+        // Set it, then status surfaces it live — no restart.
+        ctl.set_app_metadata("v=1.2.3")
+            .await
+            .expect("set_app_metadata");
+        let after = ctl.status().await.expect("status");
+        assert_eq!(
+            self_dev(&after).meta,
+            "v=1.2.3",
+            "metadata visible in status presence"
+        );
+
+        // Clearing works.
+        ctl.set_app_metadata("").await.expect("clear");
+        assert_eq!(self_dev(&ctl.status().await.unwrap()).meta, "", "cleared");
+
+        // The ≤256B cap is enforced (257 bytes → a control error, nothing stored).
+        let toobig = "x".repeat(257);
+        assert!(
+            ctl.set_app_metadata(&toobig).await.is_err(),
+            "over-cap metadata must be refused"
+        );
+        assert_eq!(
+            self_dev(&ctl.status().await.unwrap()).meta,
+            "",
+            "a refused set stores nothing"
+        );
+    })
+    .await
+    .expect("app-metadata status test timed out");
+}

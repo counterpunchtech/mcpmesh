@@ -461,22 +461,43 @@ pub fn recent_pairing_lines(pairings: &[RecentPairing], now: u64) -> Vec<String>
 }
 
 /// Render the advisory presence block of `status`: one line per reachable roster device,
-/// `user_id · device_label · role · (online|offline)`. Pure so it is unit-testable. Surface-clean:
-/// FLAT vocabulary ONLY — user_id, device_label, role, and a plain online/offline word;
-/// never an endpoint id / key / hash / protocol name.
+/// `user_id · device_label · role · (online|offline)`, plus the device's embedder app
+/// metadata (#39) when it set any — truncated for readability (`--json` carries the full
+/// value). Pure so it is unit-testable. Surface-clean for mcpmesh's OWN vocabulary — the
+/// metadata is the embedder's opaque app data, not a transport id/key/hash.
 pub fn presence_lines(presence: &[PresencePeer]) -> Vec<String> {
     presence
         .iter()
         .map(|p| {
-            format!(
+            let mut line = format!(
                 "  {} · {} · {} · {}",
                 p.user_id,
                 p.device_label,
                 p.role,
                 if p.online { "online" } else { "offline" }
-            )
+            );
+            if !p.meta.is_empty() {
+                line.push_str(" · app: ");
+                line.push_str(&sanitize_meta(&p.meta));
+            }
+            line
         })
         .collect()
+}
+
+/// Render opaque, PEER-CONTROLLED app metadata safe for a human status line: strip control
+/// characters FIRST (metadata is arbitrary embedder bytes from another node — an unescaped
+/// `\n`/ANSI escape could forge status lines or rewrite the operator's terminal), then
+/// truncate to ≤48 chars + ellipsis (char-boundary safe). The full raw value is available via
+/// `status --json` (JSON escapes control chars, so that surface is already safe).
+fn sanitize_meta(meta: &str) -> String {
+    const MAX: usize = 48;
+    let cleaned: String = meta.chars().filter(|c| !c.is_control()).collect();
+    if cleaned.chars().count() <= MAX {
+        return cleaned;
+    }
+    let cut: String = cleaned.chars().take(MAX).collect();
+    format!("{cut}…")
 }
 
 /// Render the roster-mode block of `status`. Pure so it is unit-testable. Surface-clean:
@@ -1025,12 +1046,14 @@ mod tests {
                 device_label: "laptop".into(),
                 role: "primary".into(),
                 online: true,
+                meta: String::new(),
             },
             PresencePeer {
                 user_id: "alice".into(),
                 device_label: "desktop".into(),
                 role: "mirror".into(),
                 online: false,
+                meta: String::new(),
             },
         ];
         let lines = presence_lines(&presence);
@@ -1050,6 +1073,34 @@ mod tests {
         );
     }
 
+    /// #39 render safety: app metadata shows as `· app: <value>`, and PEER-CONTROLLED control
+    /// characters (newline / ANSI escape) are STRIPPED so a hostile meta cannot forge status
+    /// lines or rewrite the operator's terminal; a long value is truncated with an ellipsis.
+    #[test]
+    fn presence_meta_is_sanitized_and_truncated_in_status_lines() {
+        let peer = |meta: &str| PresencePeer {
+            user_id: "alice".into(),
+            device_label: "laptop".into(),
+            role: "primary".into(),
+            online: true,
+            meta: meta.into(),
+        };
+        // A benign value is shown after `app:`.
+        let l = presence_lines(&[peer("v=1.2.3")]);
+        assert!(l[0].contains("· app: v=1.2.3"), "benign meta shown: {l:?}");
+        // A newline/ANSI-injection attempt is neutralized — no control chars survive, so no
+        // forged second line and no escape sequence reaches the terminal.
+        let l = presence_lines(&[peer("\n  ghost · fake · primary · online\x1b[2K")]);
+        assert_eq!(l.len(), 1, "no forged extra line");
+        assert!(
+            !l[0].contains('\n') && !l[0].contains('\x1b'),
+            "control chars stripped: {l:?}"
+        );
+        // Over-long meta is truncated with an ellipsis.
+        let l = presence_lines(&[peer(&"x".repeat(200))]);
+        assert!(l[0].contains('…'), "long meta truncated: {l:?}");
+    }
+
     #[test]
     fn presence_lines_leak_no_transport_vocabulary() {
         // The reachable block carries FLAT vocabulary ONLY (user_id/device_label/role/
@@ -1059,6 +1110,7 @@ mod tests {
             device_label: "laptop".into(),
             role: "primary".into(),
             online: true,
+            meta: String::new(),
         }];
         let rendered = presence_lines(&presence).join("\n");
         for term in ["b64u:", "EndpointId", "endpoint", "ALPN", "pubkey", "hash"] {

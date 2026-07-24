@@ -67,7 +67,9 @@ pub(crate) use handlers::{
     add_peer, blob_fetch, blob_grant, blob_list, blob_publish, mint_invite, open_session, redeem,
     register_service, unregister_ephemeral,
 };
-pub(crate) use roster_install::{install_roster, org_join, set_nickname, set_roster_url};
+pub(crate) use roster_install::{
+    install_roster, org_join, set_app_metadata, set_nickname, set_roster_url,
+};
 pub(crate) use status::{peer_infos, presence_peers, roster_status, service_infos};
 
 /// The lockstep stack version (workspace version) reported in `Hello`/`status`.
@@ -170,6 +172,11 @@ pub struct MeshState {
     /// authz check, or sever decision ever consults it (absence never blocks a dial). Always present
     /// (constructed in [`new`](Self::new)); a pure-pairing daemon simply never records into it.
     pub(crate) presence_table: Arc<crate::roster::presence::PresenceTable>,
+    /// OPTIONAL embedder-set app metadata (#39): an opaque ≤256B blob folded (signed) into
+    /// this node's outgoing presence heartbeats. `Arc<RwLock<..>>` so the detached publish
+    /// loop reads it FRESH each beat via [`presence_ctx`](Self::presence_ctx). Empty = unset.
+    /// In-memory only (lost on restart; the embedder re-sets on startup).
+    pub(crate) app_metadata: Arc<std::sync::RwLock<String>>,
     /// The gated per-scope app-blob provider. `None` in a pure-pairing daemon and
     /// until [`set_app_blobs`](Self::set_app_blobs) installs it (roster mode only — grants use roster
     /// vocabulary). Behind a `tokio::sync::Mutex<Option<..>>` set post-construction (like
@@ -280,6 +287,7 @@ impl MeshState {
             roster_topic: tokio::sync::Mutex::new(roster_topic),
             presence_topic: Arc::new(tokio::sync::Mutex::new(presence_topic)),
             presence_table: Arc::new(crate::roster::presence::PresenceTable::new()),
+            app_metadata: Arc::new(std::sync::RwLock::new(String::new())),
             app_blobs: tokio::sync::Mutex::new(None),
             audit: std::sync::OnceLock::new(),
             limits: std::sync::OnceLock::new(),
@@ -351,6 +359,23 @@ impl MeshState {
 
     /// Install a new self-nickname (the `set_nickname` verb, #37) — called only AFTER the
     /// config write succeeded, so the in-memory name never runs ahead of the persisted one.
+    /// This node's current app metadata (#39) — read-clone (the lock is never held across an
+    /// await). Empty when unset.
+    pub(crate) fn app_metadata(&self) -> String {
+        self.app_metadata
+            .read()
+            .expect("app_metadata lock not poisoned")
+            .clone()
+    }
+
+    /// Set this node's app metadata (#39); future heartbeats carry it. `""` clears it.
+    pub(crate) fn set_app_metadata(&self, metadata: String) {
+        *self
+            .app_metadata
+            .write()
+            .expect("app_metadata lock not poisoned") = metadata;
+    }
+
     pub(crate) fn set_self_nickname(&self, nickname: String) {
         *self
             .self_nickname
@@ -427,6 +452,7 @@ impl MeshState {
             roster: self.roster.clone(),
             table: self.presence_table.clone(),
             topic: self.presence_topic.clone(),
+            app_metadata: self.app_metadata.clone(),
         }
     }
 

@@ -18,6 +18,11 @@ use crate::roster::gate::RosterGate;
 use crate::roster::transport::{self, RosterGossip};
 
 const PRESENCE_DOMAIN: &[u8] = b"mcpmesh/presence/1";
+
+/// The cap on the embedder-set app-metadata blob (#39), enforced on BOTH the local set path
+/// (`set_app_metadata`) AND the gossip RECEIVE path ([`Presence::verify`]) — a hostile roster
+/// member cannot inject a larger blob by signing an oversized beat directly onto the topic.
+pub const APP_METADATA_MAX_BYTES: usize = 256;
 pub const PRESENCE_SKEW_SECS: i64 = 120;
 pub const PRESENCE_TTL_SECS: i64 = 180;
 
@@ -28,16 +33,29 @@ pub struct Presence {
     pub user_id: String,
     pub ts: i64,            // epoch seconds
     pub roster_serial: u64, // doubles as roster-update discovery
-    pub sig: String,        // b64u:
+    /// OPTIONAL embedder-set app metadata (#39): an opaque ≤256B blob the daemon never
+    /// interprets. Signed (folded into the preimage WHEN NON-EMPTY — an absent/empty value
+    /// keeps the signed bytes byte-identical to a pre-feature beat, so old nodes still
+    /// verify). Additive: an old beat omits it and it defaults to `""`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub meta: String,
+    pub sig: String, // b64u:
 }
 
-fn preimage(endpoint_id: &[u8; 32], user_id: &str, ts: i64, serial: u64) -> Vec<u8> {
-    let mut m = Vec::with_capacity(PRESENCE_DOMAIN.len() + 32 + user_id.len() + 16);
+fn preimage(endpoint_id: &[u8; 32], user_id: &str, ts: i64, serial: u64, meta: &str) -> Vec<u8> {
+    let mut m = Vec::with_capacity(PRESENCE_DOMAIN.len() + 32 + user_id.len() + 16 + meta.len());
     m.extend_from_slice(PRESENCE_DOMAIN);
     m.extend_from_slice(endpoint_id);
     m.extend_from_slice(user_id.as_bytes());
     m.extend_from_slice(&ts.to_le_bytes());
     m.extend_from_slice(&serial.to_le_bytes());
+    // #39: the metadata is signed by appending it to the preimage ONLY when non-empty. An
+    // empty blob appends nothing, so a beat carrying no metadata has the EXACT signed bytes a
+    // pre-#39 node produced — old and new nodes keep verifying each other's plain beats. A
+    // non-empty blob changes the signed bytes: only nodes on this build verify such a beat.
+    if !meta.is_empty() {
+        m.extend_from_slice(meta.as_bytes());
+    }
     m
 }
 
@@ -49,15 +67,17 @@ impl Presence {
         user_id: &str,
         ts: i64,
         serial: u64,
+        meta: &str,
     ) -> Self {
         use ed25519_dalek::Signer;
-        let sig = device_key.sign(&preimage(endpoint_id, user_id, ts, serial));
+        let sig = device_key.sign(&preimage(endpoint_id, user_id, ts, serial, meta));
         Self {
             t: "presence".into(),
             endpoint_id: mcpmesh_trust::roster::encode_b64u(endpoint_id),
             user_id: user_id.to_string(),
             ts,
             roster_serial: serial,
+            meta: meta.to_string(),
             sig: mcpmesh_trust::roster::encode_b64u(&sig.to_bytes()),
         }
     }
@@ -68,6 +88,10 @@ impl Presence {
         // (a crafted `ts == i64::MIN` would panic the plain subtraction/`abs` in debug) — saturate.
         if self.t != "presence"
             || now.saturating_sub(self.ts).saturating_abs() >= PRESENCE_SKEW_SECS
+            // #39: an oversized `meta` is a protocol violation — a conforming node caps at
+            // set time, so a larger blob is a hostile injection. Drop the whole beat (cheap
+            // pre-signature reject) rather than surface an unbounded value downstream.
+            || self.meta.len() > APP_METADATA_MAX_BYTES
         {
             return None;
         }
@@ -76,7 +100,7 @@ impl Presence {
         let sig =
             Signature::from_slice(&mcpmesh_trust::roster::decode_b64u(&self.sig).ok()?).ok()?;
         vk.verify_strict(
-            &preimage(&eid, &self.user_id, self.ts, self.roster_serial),
+            &preimage(&eid, &self.user_id, self.ts, self.roster_serial, &self.meta),
             &sig,
         )
         .ok()?;
@@ -115,6 +139,8 @@ impl Presence {
 pub struct PresenceEntry {
     pub user_id: String,
     pub ts: i64,
+    /// The signed app metadata from the freshest beat (#39; empty when the device set none).
+    pub meta: String,
 }
 
 /// The advisory presence table: the freshest verified heartbeat per endpoint. Records are
@@ -135,12 +161,12 @@ impl PresenceTable {
 
     /// Record a VERIFIED heartbeat (called ONLY after [`Presence::accept`] bound the user_id to the
     /// roster). Keeps the freshest `ts` per endpoint so a reordered/older beat never regresses recency.
-    pub fn record(&self, eid: [u8; 32], user_id: String, ts: i64) {
+    pub fn record(&self, eid: [u8; 32], user_id: String, ts: i64, meta: String) {
         let mut g = self.inner.lock().expect("presence table mutex poisoned");
         match g.get(&eid) {
-            Some(e) if e.ts >= ts => {} // an older/duplicate beat does not regress recency
+            Some(e) if e.ts >= ts => {} // an older/duplicate beat does not regress recency (or meta)
             _ => {
-                g.insert(eid, PresenceEntry { user_id, ts });
+                g.insert(eid, PresenceEntry { user_id, ts, meta });
             }
         }
     }
@@ -180,6 +206,8 @@ pub struct PresenceCtx {
     /// loop moves the receiver out ONCE. `None`/empty in a pure-pairing daemon or when the
     /// subscribe failed — both loops then return immediately.
     pub topic: Arc<tokio::sync::Mutex<Option<RosterGossip>>>,
+    /// This node's app metadata (#39) — read fresh into each outgoing beat (empty = none).
+    pub app_metadata: Arc<std::sync::RwLock<String>>,
 }
 
 impl PresenceCtx {
@@ -221,7 +249,12 @@ pub fn publish_loop(
         loop {
             let now = crate::util::epoch_now_i64();
             let serial = ctx.roster.view().map(|v| v.serial()).unwrap_or(0);
-            let beat = Presence::signed(&device_key, &endpoint_id, &user_id, now, serial);
+            let meta = ctx
+                .app_metadata
+                .read()
+                .expect("app_metadata lock not poisoned")
+                .clone();
+            let beat = Presence::signed(&device_key, &endpoint_id, &user_id, now, serial, &meta);
             if let Err(e) = transport::broadcast(&sender, beat.to_bytes()).await {
                 tracing::debug!(%e, "presence heartbeat broadcast failed; will retry next beat");
             }
@@ -257,7 +290,7 @@ pub fn track_loop(ctx: PresenceCtx) -> tokio::task::JoinHandle<()> {
                 continue; // no roster installed yet: nothing to bind against — drop (advisory)
             };
             if let Some(eid) = p.accept(now, &view) {
-                ctx.table.record(eid, p.user_id, p.ts);
+                ctx.table.record(eid, p.user_id, p.ts, p.meta);
             }
         }
     })
@@ -285,6 +318,20 @@ const PRESENCE_JITTER_SECS: i64 = 15;
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
+
+    /// The pre-#39 preimage (no meta arm) — the exact bytes an old node signs/verifies.
+    fn legacy_preimage(endpoint_id: &[u8; 32], user_id: &str, ts: i64, serial: u64) -> Vec<u8> {
+        let mut m = Vec::new();
+        m.extend_from_slice(PRESENCE_DOMAIN);
+        m.extend_from_slice(endpoint_id);
+        m.extend_from_slice(user_id.as_bytes());
+        m.extend_from_slice(&ts.to_le_bytes());
+        m.extend_from_slice(&serial.to_le_bytes());
+        m
+    }
+    fn decode_b64u_sig(s: &str) -> Signature {
+        Signature::from_slice(&mcpmesh_trust::roster::decode_b64u(s).unwrap()).unwrap()
+    }
     use mcpmesh_trust::roster::sign::mint_signed;
     use mcpmesh_trust::roster::validate::load_installed;
     use mcpmesh_trust::roster::{Roster, RosterDevice, RosterUser, encode_b64u};
@@ -294,8 +341,31 @@ mod tests {
         let dk = SigningKey::from_bytes(&[4u8; 32]);
         let eid = dk.verifying_key().to_bytes();
         let now = 1_760_000_000;
-        let p = Presence::signed(&dk, &eid, "alice", now, 7);
+        let p = Presence::signed(&dk, &eid, "alice", now, 7, "");
         assert_eq!(p.verify(now + 5), Some(eid)); // within skew
+
+        // #39 compat guarantee: an empty-meta beat's SIGNED bytes are byte-identical to the
+        // pre-feature preimage, so an old node still verifies it (its sig matches ours).
+        let sig_no_meta = decode_b64u_sig(&p.sig);
+        let dk_v = dk.verifying_key();
+        use ed25519_dalek::Verifier;
+        assert!(
+            dk_v.verify(&legacy_preimage(&eid, "alice", now, 7), &sig_no_meta)
+                .is_ok(),
+            "empty-meta signed bytes must equal the pre-#39 preimage"
+        );
+
+        // A signed non-empty blob round-trips (verify reconstructs the same preimage)...
+        let pm = Presence::signed(&dk, &eid, "alice", now, 7, "v=1.2.3");
+        assert_eq!(pm.verify(now + 5), Some(eid));
+        assert_eq!(pm.meta, "v=1.2.3");
+        // ...and tampering the meta breaks the signature (it is SIGNED, not decorative).
+        let mut tampered = pm.clone();
+        tampered.meta = "v=9.9.9".into();
+        assert!(
+            tampered.verify(now).is_none(),
+            "meta is signed — a swap fails"
+        );
         assert!(
             p.verify(now + PRESENCE_SKEW_SECS).is_none(),
             "outside ±120s rejected"
@@ -306,7 +376,11 @@ mod tests {
         let mut swapped = p.clone();
         swapped.endpoint_id = encode_b64u(&[9u8; 32]);
         assert!(swapped.verify(now).is_none()); // can't swap the endpoint (it's the pubkey)
-        assert!(serde_json::to_vec(&p).unwrap().len() < 512); // P9 512B cap
+        // Size sanity: a plain beat stays small; the ≤256B meta cap keeps a full beat well
+        // under 768B (headroom for the b64u endpoint id + sig + a 256B blob).
+        assert!(serde_json::to_vec(&p).unwrap().len() < 768);
+        let full = Presence::signed(&dk, &eid, "alice", now, 7, &"x".repeat(256));
+        assert!(serde_json::to_vec(&full).unwrap().len() < 768);
     }
 
     #[test]
@@ -316,11 +390,112 @@ mod tests {
         // would kill the presence track loop). The skew gate runs before any sig check.
         let dk = SigningKey::from_bytes(&[4u8; 32]);
         let eid = dk.verifying_key().to_bytes();
-        let mut p = Presence::signed(&dk, &eid, "alice", 1_760_000_000, 7);
+        let mut p = Presence::signed(&dk, &eid, "alice", 1_760_000_000, 7, "");
         p.ts = i64::MIN;
         assert!(p.verify(1_760_000_000).is_none());
         p.ts = i64::MAX;
         assert!(p.verify(i64::MIN).is_none());
+    }
+
+    /// The table keeps the freshest beat's metadata, and a reordered OLDER beat never
+    /// regresses it (mirrors the ts-recency rule) — the #39 surface reads the current value.
+    #[test]
+    fn table_surfaces_freshest_meta_and_does_not_regress() {
+        let table = PresenceTable::new();
+        let eid = [3u8; 32];
+        table.record(eid, "b64u:A".into(), 1000, "v=1.0.0".into());
+        let got = table
+            .active(1000)
+            .into_iter()
+            .find(|(e, _)| *e == eid)
+            .unwrap()
+            .1;
+        assert_eq!(got.meta, "v=1.0.0");
+        // A newer beat updates both ts and meta.
+        table.record(eid, "b64u:A".into(), 1050, "v=1.1.0".into());
+        let got = table
+            .active(1050)
+            .into_iter()
+            .find(|(e, _)| *e == eid)
+            .unwrap()
+            .1;
+        assert_eq!(got.meta, "v=1.1.0");
+        // A reordered OLDER beat is dropped — meta does not regress.
+        table.record(eid, "b64u:A".into(), 1010, "v=0.9.0".into());
+        let got = table
+            .active(1050)
+            .into_iter()
+            .find(|(e, _)| *e == eid)
+            .unwrap()
+            .1;
+        assert_eq!(got.meta, "v=1.1.0", "older beat must not regress meta");
+    }
+
+    /// The RECEIVE path (#39): a signed beat carrying metadata is accepted against the roster,
+    /// recorded, and its meta surfaces — AND an oversized-meta beat is DROPPED at verify (the
+    /// 256B cap holds on gossip input, not just the local set path — a hostile roster member
+    /// cannot inject a larger blob by signing an oversized beat directly onto the topic).
+    #[test]
+    fn receive_path_records_capped_meta_and_drops_oversized() {
+        // A one-device roster for "alice" whose device IS the beat's signer.
+        let dk = SigningKey::from_bytes(&[5u8; 32]);
+        let eid = dk.verifying_key().to_bytes();
+        let root = SigningKey::from_bytes(&[9u8; 32]);
+        let signed = mint_signed(
+            &root,
+            Roster {
+                format: "mcpmesh-roster/1".into(),
+                org_id: "acme".into(),
+                serial: 1,
+                issued_at: "2000-01-01T00:00:00Z".into(),
+                expires_at: "2999-01-01T00:00:00Z".into(),
+                groups: vec![],
+                users: vec![RosterUser {
+                    user_id: "alice".into(),
+                    display_name: "Alice".into(),
+                    user_pk: encode_b64u(&[1u8; 32]),
+                    groups: vec![],
+                    devices: vec![RosterDevice {
+                        endpoint_id: encode_b64u(&eid),
+                        label: "laptop".into(),
+                        role: "primary".into(),
+                    }],
+                }],
+                revoked_endpoints: vec![],
+                sig: String::new(),
+            },
+        );
+        let view = load_installed(&signed, &root.verifying_key()).unwrap();
+        let now = 1_760_000_000;
+        let table = PresenceTable::new();
+
+        // A conforming beat (meta within cap) is accepted and its meta is recorded — this is a
+        // received PEER beat driven through the exact track-loop path (accept → record).
+        let good = Presence::signed(&dk, &eid, "alice", now, 1, "v=1.2.3");
+        let got = good
+            .accept(now, &view)
+            .expect("valid rostered beat accepts");
+        assert_eq!(got, eid);
+        table.record(got, "alice".into(), good.ts, good.meta.clone());
+        assert_eq!(
+            table
+                .active(now)
+                .into_iter()
+                .find(|(e, _)| *e == eid)
+                .unwrap()
+                .1
+                .meta,
+            "v=1.2.3"
+        );
+
+        // An OVERSIZED-meta beat — validly signed by the same device over the large preimage —
+        // is DROPPED at verify (returns None), so nothing oversized ever reaches the table.
+        let big = Presence::signed(&dk, &eid, "alice", now, 1, &"x".repeat(257));
+        assert!(
+            big.verify(now).is_none(),
+            "oversized meta must drop the beat"
+        );
+        assert!(big.accept(now, &view).is_none());
     }
 
     #[test]
@@ -357,13 +532,13 @@ mod tests {
         let now = 1_760_000_000;
         // Genuine: alice's device advertises as "alice" → accepted.
         assert_eq!(
-            Presence::signed(&dk, &eid, "alice", now, 5).accept(now, &view),
+            Presence::signed(&dk, &eid, "alice", now, 5, "").accept(now, &view),
             Some(eid)
         );
         // FORGERY: alice's device (validly signed) advertises under "bob" → REJECTED,
         // even though the sig verifies and the endpoint is in the roster.
         assert!(
-            Presence::signed(&dk, &eid, "bob", now, 5)
+            Presence::signed(&dk, &eid, "bob", now, 5, "")
                 .accept(now, &view)
                 .is_none()
         );
@@ -371,7 +546,7 @@ mod tests {
         let stranger = SigningKey::from_bytes(&[7u8; 32]);
         let seid = stranger.verifying_key().to_bytes();
         assert!(
-            Presence::signed(&stranger, &seid, "alice", now, 5)
+            Presence::signed(&stranger, &seid, "alice", now, 5, "")
                 .accept(now, &view)
                 .is_none()
         );
