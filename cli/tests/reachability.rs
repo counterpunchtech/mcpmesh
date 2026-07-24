@@ -343,3 +343,69 @@ async fn cold_probe_uses_the_pairing_proven_address_hint_without_discovery() {
     .await
     .expect("cold-probe address-hint test timed out");
 }
+
+/// #40 — pairing-mode app metadata on the probe pong, end to end: target A sets its app
+/// metadata via the REAL `set_app_metadata` control verb; prober B probes A over
+/// `mcpmesh/ping/1`, reads the metadata off the pong, and surfaces it per-peer in
+/// `reachability_of`. Proves the pairing-mode path #40 adds (no presence gossip involved).
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_carries_peer_app_metadata_into_reachability() {
+    timeout(Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(&config, "").unwrap();
+
+        // Target A serves the ping arm; its gate trusts B.
+        let a_ep = target_endpoint().await;
+        let a_id = *a_ep.id().as_bytes();
+        let a_addr = a_ep.addr();
+        let a_store = Arc::new(PeerStore::open(&dir.path().join("a.redb")).unwrap());
+
+        // Prober B, paired with A (B names A "alice").
+        let b_ep = dialer_endpoint().await;
+        let b_id = *b_ep.id().as_bytes();
+        seed_lookup(&b_ep, a_addr.clone());
+        let b_store = Arc::new(PeerStore::open(&dir.path().join("b.redb")).unwrap());
+        seed_peer(&b_store, a_id, "alice");
+        seed_peer(&a_store, b_id, "beacon-b");
+
+        let a_mesh = assemble_mesh(a_ep, a_store, config.clone());
+        let b_mesh = assemble_mesh(b_ep, b_store, config.clone());
+        let accept = spawn_accept_loop(
+            a_mesh.clone(),
+            Arc::new(build_services(&Config::from_toml_str("").unwrap())),
+        );
+
+        // A sets its app metadata through the REAL control verb (A's own control server).
+        let a_socket = dir.path().join("a-control.sock");
+        let a_listener = mcpmesh::ipc::bind_control_socket(&a_socket).await.unwrap();
+        let a_state = Arc::new(DaemonState::with_mesh(STACK_VERSION, a_mesh.clone()));
+        let a_control = tokio::spawn(serve_control(a_listener, a_state));
+        connect_control(&a_socket)
+            .await
+            .expect("connect A control")
+            .set_app_metadata("v=4.2.0")
+            .await
+            .expect("A sets its app metadata");
+
+        // B probes A → the pong carries A's metadata, surfaced per-peer in reachability.
+        let entry = probe_peer(&b_mesh, a_id).await;
+        assert!(entry.reachable, "the paired peer is reachable");
+        assert_eq!(
+            entry.meta, "v=4.2.0",
+            "the probe carried the peer's app metadata off the pong"
+        );
+        let list = reachability_of(&b_mesh);
+        let alice = list.iter().find(|r| r.name == "alice").expect("A surfaced");
+        assert_eq!(
+            alice.meta, "v=4.2.0",
+            "reachability surfaces the peer's app metadata"
+        );
+
+        a_control.abort();
+        accept.abort();
+        std::mem::forget(dir);
+    })
+    .await
+    .expect("probe-metadata test timed out");
+}

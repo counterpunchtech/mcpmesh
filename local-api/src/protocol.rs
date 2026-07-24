@@ -78,6 +78,13 @@ pub struct PeerReachability {
     pub rtt_ms: Option<u64>, // last measured round-trip, if reachable
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub age_secs: Option<u64>, // None = never probed (consumer shows "checking…")
+    /// The peer's OPTIONAL app metadata (#40) — the same opaque ≤256B blob #39 exposes via
+    /// presence, here carried on the pairing-mode `mcpmesh/ping/1` probe pong so PAIRED peers
+    /// (which have no presence gossip) see it too. Empty when the peer set none. Advisory
+    /// display data; never an authz input. Near-real-time when `status` is read (the probe
+    /// cache has a ~20s TTL), not a steady push. Additive: default + skip-if-empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub meta: String,
 }
 
 /// Roster-mode status. Surface-clean roster VOCABULARY only: org_id, serial, a plain
@@ -793,12 +800,13 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   new methods, or a strictness change like params validation — bumped in the same change that
 ///   makes it. A client can guard with `api_minor >= N` for a feature it needs, or refuse a daemon
 ///   older than a minor it requires. It never resets except on a MAJOR bump.
-pub const API_VERSION: &str = "1.4";
+pub const API_VERSION: &str = "1.5";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
-/// never nicknames (#38); to 4 with the `set_app_metadata` verb + `PresencePeer.meta` (#39).
-pub const API_MINOR: u32 = 4;
+/// never nicknames (#38); to 4 with the `set_app_metadata` verb + `PresencePeer.meta` (#39);
+/// to 5 with `PeerReachability.meta` — pairing-mode app metadata on the probe pong (#40).
+pub const API_MINOR: u32 = 5;
 
 #[cfg(test)]
 mod tests {
@@ -811,6 +819,7 @@ mod tests {
             reachable: true,
             rtt_ms: Some(42),
             age_secs: Some(3),
+            meta: String::new(),
         };
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["name"], "bob");
@@ -823,6 +832,7 @@ mod tests {
             reachable: false,
             rtt_ms: None,
             age_secs: None,
+            meta: String::new(),
         };
         let uv = serde_json::to_value(&unknown).unwrap();
         assert!(uv.get("rtt_ms").is_none() && uv.get("age_secs").is_none());
@@ -885,6 +895,26 @@ mod tests {
 
     /// `PresencePeer.meta` is additive — an older payload (no meta) still deserializes, and an
     /// empty meta does not serialize.
+    #[test]
+    fn peer_reachability_meta_is_additive() {
+        // An older payload (no meta) still deserializes; an empty meta does not serialize.
+        let old = serde_json::json!({"name": "bob", "reachable": true});
+        let r: PeerReachability = serde_json::from_value(old).unwrap();
+        assert_eq!(r.meta, "");
+        assert!(serde_json::to_value(&r).unwrap().get("meta").is_none());
+        // A set value round-trips.
+        let with = PeerReachability {
+            name: "bob".into(),
+            reachable: true,
+            rtt_ms: Some(12),
+            age_secs: Some(3),
+            meta: "v=1.2.3".into(),
+        };
+        let back: PeerReachability =
+            serde_json::from_value(serde_json::to_value(&with).unwrap()).unwrap();
+        assert_eq!(back.meta, "v=1.2.3");
+    }
+
     #[test]
     fn presence_peer_meta_is_additive() {
         let old = serde_json::json!({
@@ -1513,6 +1543,7 @@ mod tests {
                 reachable: true,
                 rtt_ms: Some(42),
                 age_secs: Some(3),
+                meta: String::new(),
             }],
         };
         let v = serde_json::to_value(&snap).unwrap();
