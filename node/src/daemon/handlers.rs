@@ -70,6 +70,12 @@ pub(crate) async fn blob_grant(
     principal: String,
 ) -> Result<()> {
     let mesh = state.mesh_required()?;
+    // Same write-time resolution as service allow entries (#38): a bare stored-peer
+    // nickname becomes that peer's stable principal; prefixed/roster entries pass verbatim.
+    let principal = resolve_allow_entries(mesh, vec![principal])
+        .await?
+        .pop()
+        .expect("one entry in, one out");
     let provider = mesh
         .app_blobs()
         .await
@@ -154,6 +160,45 @@ async fn reload_services_from_disk(mesh: &Arc<MeshState>, why: &str) -> Result<(
     Ok(())
 }
 
+/// Resolve operator-typed allow/grant entries into the STABLE principal namespace (#38), in
+/// one store pass on a blocking thread. The rules (spec `2026-07-24-stable-principal-authz`):
+/// a `b64u:`/`eid:`-prefixed entry passes verbatim; a bare name matching a stored peer's
+/// nickname resolves to that peer's stable principal (its verified `b64u:` user_id when
+/// bound, else its `eid:` device principal); an unresolvable bare name is kept verbatim —
+/// roster vocabulary (a group name or bare roster user_id), which remains a legitimate
+/// principal. Resolution happens at WRITE time so what lands in config can never desync from
+/// a later rename.
+async fn resolve_allow_entries(
+    mesh: &Arc<MeshState>,
+    entries: Vec<String>,
+) -> Result<Vec<String>> {
+    if entries
+        .iter()
+        .all(|e| e.starts_with("b64u:") || e.starts_with("eid:"))
+    {
+        return Ok(entries); // nothing bare — skip the store pass
+    }
+    let store = mesh.store.clone();
+    blocking("join allow-entry resolution", move || {
+        let peers = store.list()?;
+        Ok(entries
+            .into_iter()
+            .map(|entry| {
+                if entry.starts_with("b64u:") || entry.starts_with("eid:") {
+                    return entry;
+                }
+                match peers.iter().find(|p| p.nickname == entry) {
+                    Some(p) => p.user_id.clone().unwrap_or_else(|| {
+                        mcpmesh_net::EndpointId::from_bytes(p.endpoint_id).principal()
+                    }),
+                    None => entry,
+                }
+            })
+            .collect())
+    })
+    .await?
+}
+
 /// Handle a `register_service` control request: write/update the `[services.*]` config entry
 /// (atomic), reload the registry, and hot-reload the mesh serve loop. Config writes block, so
 /// they run on `spawn_blocking` (the fs house rule).
@@ -174,6 +219,9 @@ pub(crate) async fn register_service(
         allow,
         ephemeral,
     } = params;
+    // Operator-typed allow input resolves to stable principals HERE, before either branch
+    // persists anything (#38) — the ephemeral registry shares the admit path with config.
+    let allow = resolve_allow_entries(mesh, allow).await?;
 
     if ephemeral {
         // #36: in-memory only. Refuse a name that already exists on disk — an ephemeral entry
@@ -656,18 +704,21 @@ pub(crate) async fn redeem(state: &DaemonState, invite_line: String) -> Result<P
 /// + the live rebuilt `Services` are the functional truth.)
 pub async fn grant_service_access(
     mesh: &Arc<MeshState>,
-    redeemer_nickname: &str,
+    principal: &str,
+    display_nickname: &str,
     services: &[String],
 ) -> Result<()> {
     // SAME serialization as register_service: hold the whole append→reload→swap section.
     let _reload = mesh.reload_lock.lock().await;
 
-    // 1. Idempotent allow-append on a blocking thread (config IO blocks).
+    // 1. Idempotent allow-append on a blocking thread (config IO blocks). `principal` is the
+    //    redeemer's STABLE identity (#38: `b64u:` when bound, else `eid:`) — the display
+    //    nickname below is audit/log color only and never lands in `allow`.
     let config_path = mesh.config_path.clone();
-    let nickname = redeemer_nickname.to_string();
+    let principal_w = principal.to_string();
     let services_w = services.to_vec();
     let changed = blocking("join grant config write", move || {
-        append_allow_to_config(&config_path, &nickname, &services_w)
+        append_allow_to_config(&config_path, &principal_w, &services_w)
     })
     .await??;
 
@@ -678,13 +729,13 @@ pub async fn grant_service_access(
         reload_services_from_disk(mesh, "grant").await?;
     }
 
-    // Trust event: NO secret, NO endpoint id (nickname only).
-    tracing::info!(peer = %redeemer_nickname, ?services, changed, "granted service access");
-    // Trust event: a pairing grant. Nickname only — NO secret, NO endpoint id.
+    // Trust event: NO secret (the display nickname is the surface-clean handle).
+    tracing::info!(peer = %display_nickname, ?services, changed, "granted service access");
+    // Trust event: a pairing grant. Display nickname only — NO secret.
     mesh.audit().record(AuditRecord::trust(
         now_ts(),
         "pair".into(),
-        Some(redeemer_nickname.to_string()),
+        Some(display_nickname.to_string()),
     ));
     Ok(())
 }

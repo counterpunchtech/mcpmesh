@@ -118,12 +118,15 @@ pub struct SelfBinding {
     pub sig: String,
 }
 
-/// The inviter-side AUTHORIZATION hook: `(nickname, services)` → append the nickname to each granted
-/// service's config `allow` and hot-reload the serving registry so the peer is actually admitted.
-/// Boxed so this module never depends on the daemon's config/reload machinery — the daemon hands
-/// the hook in via [`InviterCtx`].
+/// The inviter-side AUTHORIZATION hook: `(principal, display_nickname, services)` → append the
+/// redeemer's STABLE principal (#38: its verified `b64u:` user_id when it presented a binding,
+/// else its `eid:` device principal — never the rewritable display nickname) to each granted
+/// service's config `allow` and hot-reload the serving registry so the peer is actually
+/// admitted. The display nickname rides along for the audit/log lines only. Boxed so this
+/// module never depends on the daemon's config/reload machinery — the daemon hands the hook in
+/// via [`InviterCtx`].
 pub type GrantFn = Box<
-    dyn Fn(String, Vec<String>) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>
+    dyn Fn(String, String, Vec<String>) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>
         + Send
         + Sync,
 >;
@@ -341,6 +344,12 @@ pub async fn handle_inviter_side(
                     .or_else(|| existing.and_then(|e| e.user_id)),
                 last_addr,
             };
+            // The redeemer's STABLE principal, captured BEFORE the entry moves into the store:
+            // the verified `b64u:` user_id when a binding was presented (or already proven),
+            // else the `eid:` device principal of the TLS-AUTHENTICATED endpoint (#38).
+            let principal = entry.user_id.clone().unwrap_or_else(|| {
+                mcpmesh_net::EndpointId::from_bytes(tls_id).principal()
+            });
             // redb writes block + fsync — run on a blocking thread (mirrors `daemon::add_peer`'s
             // spawn_blocking + `.context(...)` + double-`?` join). A store write failure returns
             // here → the connection drops with a bare close (no explicit Refused frame), which
@@ -351,15 +360,16 @@ pub async fn handle_inviter_side(
                 .await
                 .context("join pair store write")??;
 
-            // (2) AUTHORIZATION grant (the load-bearing step): append the redeemer's EFFECTIVE
-            // nickname — the one the entry stores and the gate will resolve its dials to (for an
-            // existing peer that is the PRESERVED name, not the self-suggestion) — to each
-            // granted service's config `[services.<svc>].allow` and RELOAD, so `select_service`
-            // actually admits it. Fail-closed: propagate a grant failure so the pair FAILS
-            // rather than silently leaving the peer known-but-forbidden. The invite is already
-            // burned (try_redeem removed it), so on failure the redeemer must re-mint —
-            // acceptable, and correct: no half-authorized peer.
-            (ctx.grant)(nickname.clone(), invite.services.clone()).await?;
+            // (2) AUTHORIZATION grant (the load-bearing step): append the redeemer's STABLE
+            // principal — computed above from the verified binding / authenticated TLS id,
+            // NEVER the display nickname (#38: names are rewritable, so a rename or re-pair
+            // must not be able to desync a grant) — to each granted service's config
+            // `[services.<svc>].allow` and RELOAD, so `select_service` actually admits it.
+            // Fail-closed: propagate a grant failure so the pair FAILS rather than silently
+            // leaving the peer known-but-forbidden. The invite is already burned (try_redeem
+            // removed it), so on failure the redeemer must re-mint — acceptable, and correct:
+            // no half-authorized peer.
+            (ctx.grant)(principal, nickname.clone(), invite.services.clone()).await?;
 
             // Audit + completion notice — AFTER the durable trust write AND the durable grant,
             // BEFORE the network reply: the SAS (order-independent over both ids + the secret;

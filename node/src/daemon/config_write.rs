@@ -187,16 +187,17 @@ pub(crate) fn write_service_to_config(
     write_config_doc(path, &doc)
 }
 
-/// Append `nickname` to each `[services.<svc>].allow` in the config at `path`, idempotently,
+/// Append `principal` (a STABLE authz principal — `b64u:`/`eid:`/roster name, #38; never a
+/// display nickname) to each `[services.<svc>].allow` in the config at `path`, idempotently,
 /// and atomically rewrite the file. Returns whether the config actually CHANGED (so the caller
 /// can skip a pointless reload).
 ///
 /// A service NOT present in config is logged + skipped: a pairing grant authorizes into an
-/// existing service, it never creates one. An already-present nickname is a no-op for that
+/// existing service, it never creates one. An already-present principal is a no-op for that
 /// service (idempotent re-pair). Returns `Ok(false)` with no write when nothing changed.
 pub(crate) fn append_allow_to_config(
     path: &Path,
-    nickname: &str,
+    principal: &str,
     services: &[String],
 ) -> Result<bool> {
     let existing = read_config_for_rmw(path)?;
@@ -230,10 +231,10 @@ pub(crate) fn append_allow_to_config(
             );
         };
         // Idempotent: append only if not already granted.
-        if allow_arr.iter().any(|v| v.as_str() == Some(nickname)) {
+        if allow_arr.iter().any(|v| v.as_str() == Some(principal)) {
             continue;
         }
-        allow_arr.push(toml::Value::String(nickname.to_string()));
+        allow_arr.push(toml::Value::String(principal.to_string()));
         changed = true;
     }
 
@@ -243,7 +244,7 @@ pub(crate) fn append_allow_to_config(
     Ok(changed)
 }
 
-/// Remove `nickname` from EVERY `[services.<svc>].allow` in the config at `path`, and atomically
+/// Remove `principal` from EVERY `[services.<svc>].allow` in the config at `path`, and atomically
 /// rewrite the file. Returns whether the config actually CHANGED (so the caller can skip a
 /// pointless reload). The exact inverse of [`append_allow_to_config`].
 ///

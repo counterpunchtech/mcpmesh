@@ -340,7 +340,7 @@ async fn trust_mutations_emit_audit_events() {
         mesh.set_audit(AuditSink::new(AuditLog::spawn(audit_dir.clone())));
 
         // A pairing grant → one trust(event="pair") record targeted at "bob".
-        grant_service_access(&mesh, "bob", &["notes".to_string()])
+        grant_service_access(&mesh, "bob", "bob", &["notes".to_string()])
             .await
             .unwrap();
 
