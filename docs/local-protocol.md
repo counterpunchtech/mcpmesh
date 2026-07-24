@@ -7,7 +7,7 @@ named pipe on Windows. Anything that can open the endpoint and parse JSON can sp
 language — [`local-api/examples/status.py`](../local-api/examples/status.py) is a complete client
 in ~60 lines of dependency-free Python.
 
-> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.4`, `api_minor` `4`) and evolves
+> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.5`, `api_minor` `5`) and evolves
 > **additively** (see [Versioning](#versioning)), but until a stable release this document — like the
 > wire format itself — may change without a migration path. Pin the mcpmesh version you build
 > against. Source of truth is the Rust in [`local-api/`](../local-api/src/protocol.rs); where this
@@ -150,7 +150,7 @@ Methods split into two groups by audience:
 | `peer_remove` | `{nickname}` | `{}` (ack) |
 | `peer_rename` | `{to, user_id?, nickname?}` — rename a person by `user_id`, else a provisional contact by `nickname` | `{}` (ack) |
 | `set_nickname` | `{nickname}` — rename **this node** live (#37, `api_minor >= 2`): validated (trimmed non-empty, no `/`), persisted to `[identity].nickname` under the daemon's own config lock (no lost-update window against a concurrent grant/registration), and effective for FUTURE invites/presentations immediately — no restart. Display-only: peers keep the nickname they stored at pairing time until a re-invite | `{}` (ack) |
-| `set_app_metadata` | `{metadata}` — attach this node's opaque app metadata (#39, `api_minor >= 4`, roster mode): a ≤256-byte blob the daemon never interprets, folded **signed** into each presence heartbeat so paired roster peers see it in their `status` presence (`PresencePeer.meta`) — no per-peer session. `""` clears it. In-memory (lost on restart; re-set on startup). Over-cap → error. On a pure-pairing daemon (no roster) it is accepted and stored but never gossiped — nothing surfaces it, so it is effectively a no-op until the node enters roster mode. | `{}` (ack) |
+| `set_app_metadata` | `{metadata}` — attach this node's opaque app metadata (#39, `api_minor >= 4`, roster mode): a ≤256-byte blob the daemon never interprets, folded **signed** into each presence heartbeat so paired roster peers see it in their `status` presence (`PresencePeer.meta`) — no per-peer session. `""` clears it. In-memory (lost on restart; re-set on startup). Over-cap → error. In pairing mode it is carried on the `mcpmesh/ping/1` reachability probe pong instead (#40), surfacing as `PeerReachability.meta` (near-real-time when a peer reads `status` — the probe cache has a ~20s TTL). | `{}` (ack) |
 | `open_session` | `{peer, service}` — `peer` is a **nickname OR a stable `b64u:` user_id** (#30); a user_id spanning several of a person's devices races them | *no response frame — see [Sessions](#sessions)* |
 | `subscribe` | *(none)* | *no response frame — a one-way live stream; see [Live event stream](#live-event-stream)* |
 | `roster_install` | `{path, org_root_pk?}` — `path` is a local file the daemon reads; `org_root_pk` pins the root on first install | `{org_id, serial, severed}` |
@@ -234,7 +234,7 @@ Do not build on either — they may change or disappear without an `api_version`
   "roster":   {"org_id":"…","serial":42,"state":"approved","org_root_fingerprint":"tango-fig-cabbage"},
   "presence": [{"user_id":"b64u:…","device_label":"laptop","role":"primary","online":true,"meta":"v=1.2.3"}],
   "recent_pairings": [{"peer_nickname":"bob","sas_code":"tango-fig-cabbage","paired_at_epoch":1751760000}],
-  "reachability": [{"name":"bob","reachable":true,"rtt_ms":42,"age_secs":3}],
+  "reachability": [{"name":"bob","reachable":true,"rtt_ms":42,"age_secs":3,"meta":"v=1.2.3"}],
   "self_nickname": "workbench"
 }
 ```
@@ -488,7 +488,8 @@ things:
   major: an added field, a new method, or a strictness change. It is bumped in the same change that
   makes it, and never resets except on a MAJOR bump. A client guards a feature it needs with
   `api_minor >= N` — e.g. strict params validation is `api_minor >= 1`; the `set_app_metadata`
-  verb + `PresencePeer.meta` are `api_minor >= 4` (#39); the `set_nickname` verb
+  verb + `PresencePeer.meta` are `api_minor >= 4` (#39); `PeerReachability.meta` — the same
+  app metadata on the pairing-mode probe pong — is `api_minor >= 5` (#40); the `set_nickname` verb
   and `StatusResult.self_nickname` are `api_minor >= 2` (#37); STABLE-principal `allow`
   strings + `ServiceInfo.allow_display` are `api_minor >= 3` (#38). `api_minor` is itself
   additive: a pre-1.1 daemon omits it and it reads as `0`.

@@ -165,7 +165,18 @@ pub fn spawn_accept_loop(mesh: Arc<MeshState>, services: Arc<Services>) -> JoinH
                         // ensure the pong is ACKed before `conn` drops (the pairing `send_reply`
                         // discipline — a bare drop could preempt the un-acked reply).
                         if let Ok((mut send, _recv)) = conn.accept_bi().await {
-                            let pong = serde_json::json!({ "stack_version": STACK_VERSION });
+                            // The pong carries our stack version AND (#40) our optional app
+                            // metadata — the SAME ≤256B value #39 gossips on presence, here
+                            // handed to a paired peer over this AUTHENTICATED channel (no
+                            // signature needed: the QUIC/TLS session already proves it is us).
+                            // Omitted when empty so a metadata-less pong is byte-shape-identical
+                            // to the pre-#40 pong.
+                            let meta = mesh.app_metadata();
+                            let pong = if meta.is_empty() {
+                                serde_json::json!({ "stack_version": STACK_VERSION })
+                            } else {
+                                serde_json::json!({ "stack_version": STACK_VERSION, "meta": meta })
+                            };
                             if write_frame(&mut send, &pong).await.is_ok() {
                                 let _ = send.finish();
                                 let _ = send.stopped().await;

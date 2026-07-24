@@ -348,10 +348,18 @@ pub fn reachability_lines(reachability: &[PeerReachability]) -> Vec<String> {
                 (true, _) => "online",
                 (false, _) => "offline",
             };
-            match r.rtt_ms {
+            let mut line = match r.rtt_ms {
                 Some(ms) if r.reachable => format!("  {} · {label} · {ms}ms", r.name),
                 _ => format!("  {} · {label}", r.name),
+            };
+            // #40: the peer's app metadata (from the probe pong), control-char-stripped +
+            // truncated for the terminal (peer-controlled bytes — same hygiene as #39's
+            // presence line; `--json` carries the raw value).
+            if !r.meta.is_empty() {
+                line.push_str(" · app: ");
+                line.push_str(&sanitize_meta(&r.meta));
             }
+            line
         })
         .collect()
 }
@@ -868,18 +876,21 @@ mod tests {
                 reachable: true,
                 rtt_ms: Some(23),
                 age_secs: Some(4),
+                meta: String::new(),
             },
             PeerReachability {
                 name: "bob".into(),
                 reachable: false,
                 rtt_ms: None,
                 age_secs: Some(90),
+                meta: String::new(),
             },
             PeerReachability {
                 name: "carol".into(),
                 reachable: false,
                 rtt_ms: None,
                 age_secs: None, // never probed
+                meta: String::new(),
             },
         ]);
         assert_eq!(lines[0], "  alice · online · 23ms");
@@ -1099,6 +1110,36 @@ mod tests {
         // Over-long meta is truncated with an ellipsis.
         let l = presence_lines(&[peer(&"x".repeat(200))]);
         assert!(l[0].contains('…'), "long meta truncated: {l:?}");
+    }
+
+    /// #40 render safety: the SAME hygiene on the pairing-mode reachability line — peer app
+    /// metadata from the probe pong is shown after `app:`, with control chars stripped.
+    #[test]
+    fn reachability_meta_is_sanitized_in_status_lines() {
+        let peer = |meta: &str| PeerReachability {
+            name: "bob".into(),
+            reachable: true,
+            rtt_ms: Some(12),
+            age_secs: Some(2),
+            meta: meta.into(),
+        };
+        let l = reachability_lines(&[peer("v=2.0.0")]);
+        assert!(l[0].contains("· app: v=2.0.0"), "benign meta shown: {l:?}");
+        let l = reachability_lines(&[peer("\n  ghost · online\x1b[2K")]);
+        assert_eq!(l.len(), 1, "no forged extra line");
+        assert!(
+            !l[0].contains('\n') && !l[0].contains('\x1b'),
+            "control chars stripped: {l:?}"
+        );
+        // An offline peer with no meta renders unchanged.
+        let l = reachability_lines(&[PeerReachability {
+            name: "carol".into(),
+            reachable: false,
+            rtt_ms: None,
+            age_secs: Some(30),
+            meta: String::new(),
+        }]);
+        assert!(!l[0].contains("app:"), "no app segment without meta: {l:?}");
     }
 
     #[test]

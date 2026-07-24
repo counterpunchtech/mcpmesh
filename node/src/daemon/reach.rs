@@ -20,6 +20,9 @@ pub struct ReachEntry {
     pub reachable: bool,
     pub rtt_ms: Option<u64>,
     pub probed_at: i64,
+    /// The peer's app metadata (#40), read from its pong — empty when it set none, or when a
+    /// hostile/oversized value was dropped on receive. Advisory display data, never authz.
+    pub meta: String,
 }
 
 /// Advisory reachability TTL: a cache entry older than this is refreshed by a NON-BLOCKING
@@ -40,11 +43,16 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub async fn probe_peer(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> ReachEntry {
     let started = std::time::Instant::now();
     let outcome = tokio::time::timeout(PROBE_TIMEOUT, probe_once(mesh, endpoint_id)).await;
-    let reachable = matches!(outcome, Ok(Ok(())));
+    // `probe_once` returns the peer's (already length-capped) metadata on a reachable pong.
+    let (reachable, meta) = match outcome {
+        Ok(Ok(meta)) => (true, meta),
+        _ => (false, String::new()),
+    };
     let entry = ReachEntry {
         reachable,
         rtt_ms: reachable.then(|| started.elapsed().as_millis() as u64),
         probed_at: epoch_now_i64(),
+        meta,
     };
     mesh.reachability
         .lock()
@@ -56,7 +64,7 @@ pub async fn probe_peer(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> ReachEn
 /// The dial → ping → pong half of [`probe_peer`], separated so the whole exchange is one timeout
 /// unit. Reuses the real iroh 1.0.1 call shapes from `dial.rs`/`pairing::rendezvous`
 /// (`endpoint.connect`, `open_bi`, `write_frame`, `finish`, a framed read).
-async fn probe_once(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> Result<()> {
+async fn probe_once(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> Result<String> {
     let id = iroh::EndpointId::from_bytes(&endpoint_id)
         .map_err(|e| anyhow::anyhow!("invalid endpoint id: {e}"))?;
     // Attach the pairing-persisted `last_addr` hint, exactly as `dial::dial_service` does
@@ -85,9 +93,25 @@ async fn probe_once(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> Result<()> 
         mcpmesh_net::framing::MAX_FRAME_BYTES,
     );
     match reader.next().await? {
-        Some(Inbound::Frame(_)) => Ok(()), // any well-formed pong frame ⇒ reachable
+        // Any well-formed pong frame ⇒ reachable. It MAY carry the peer's app metadata (#40);
+        // extract it, but — defense in depth against a compromised paired peer — enforce the
+        // SAME ≤256B cap the sender applies (an oversized/absent/non-string value ⇒ empty).
+        // The channel is authenticated (this is a trust-gated paired peer), so no signature is
+        // needed; the cap is the only receive-side hardening required.
+        Some(Inbound::Frame(v)) => Ok(pong_meta(&v)),
         _ => anyhow::bail!("no pong from peer"),
     }
+}
+
+/// Extract the optional app metadata from a pong frame, applying the receive cap (#40): a
+/// missing / non-string / over-`APP_METADATA_MAX_BYTES` value yields empty. Control-character
+/// hygiene is applied at RENDER time (`--json` carries it raw, JSON-escaped).
+fn pong_meta(pong: &serde_json::Value) -> String {
+    pong.get("meta")
+        .and_then(|m| m.as_str())
+        .filter(|s| s.len() <= crate::roster::presence::APP_METADATA_MAX_BYTES)
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// Build the `status` reachability list from the probe cache, and fire a NON-BLOCKING background
@@ -128,6 +152,7 @@ pub fn reachability_of(mesh: &Arc<MeshState>) -> Vec<mcpmesh_local_api::PeerReac
                     reachable: e.reachable,
                     rtt_ms: e.rtt_ms,
                     age_secs: Some(age as u64),
+                    meta: e.meta.clone(),
                 });
             }
             None => {
@@ -137,6 +162,7 @@ pub fn reachability_of(mesh: &Arc<MeshState>) -> Vec<mcpmesh_local_api::PeerReac
                     reachable: false,
                     rtt_ms: None,
                     age_secs: None, // never probed → consumer shows "checking…"
+                    meta: String::new(),
                 });
             }
         }
@@ -155,4 +181,36 @@ pub fn reachability_of(mesh: &Arc<MeshState>) -> Vec<mcpmesh_local_api::PeerReac
         });
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pong_meta;
+    use crate::roster::presence::APP_METADATA_MAX_BYTES;
+
+    /// The probe RECEIVE cap (#40): a pong's `meta` is surfaced only when it is a string within
+    /// the ≤256B cap — a missing, non-string, or OVERSIZED value (a compromised paired peer
+    /// signing nothing, just sending bytes over the authenticated channel) yields empty, so the
+    /// prober never caches or surfaces an unbounded/garbage blob.
+    #[test]
+    fn pong_meta_extracts_within_cap_and_drops_the_rest() {
+        assert_eq!(
+            pong_meta(&serde_json::json!({"stack_version": "1", "meta": "v=1.2.3"})),
+            "v=1.2.3"
+        );
+        // No meta field → empty.
+        assert_eq!(pong_meta(&serde_json::json!({"stack_version": "1"})), "");
+        // Non-string meta → empty (never panics on hostile shapes).
+        assert_eq!(pong_meta(&serde_json::json!({"meta": 42})), "");
+        assert_eq!(pong_meta(&serde_json::json!({"meta": {"x": 1}})), "");
+        // Exactly at the cap is kept; one over is dropped.
+        let at = "x".repeat(APP_METADATA_MAX_BYTES);
+        assert_eq!(pong_meta(&serde_json::json!({"meta": at.clone()})), at);
+        let over = "x".repeat(APP_METADATA_MAX_BYTES + 1);
+        assert_eq!(
+            pong_meta(&serde_json::json!({"meta": over})),
+            "",
+            "oversized meta dropped"
+        );
+    }
 }

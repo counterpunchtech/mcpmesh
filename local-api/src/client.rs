@@ -908,6 +908,7 @@ mod tests {
                         reachable: true,
                         rtt_ms: Some(42),
                         age_secs: Some(3),
+                        meta: String::new(),
                     }],
                 },
                 StreamFrame::Event {
