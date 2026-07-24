@@ -21,7 +21,7 @@ use mcpmesh_local_api::transport::{LocalListener, LocalStream};
 use mcpmesh_local_api::{
     API_NAME, API_VERSION, BlobFetchParams, BlobGrantParams, BlobPublishParams, Hello,
     InviteParams, OpenSessionParams, OrgJoinParams, PairParams, RosterInstallParams,
-    SetNicknameParams, SetRosterUrlParams, StatusResult, method_of,
+    SetAppMetadataParams, SetNicknameParams, SetRosterUrlParams, StatusResult, method_of,
 };
 use mcpmesh_net::framing::{FrameReader, Inbound, write_frame};
 use serde_json::{Value, json};
@@ -492,6 +492,17 @@ async fn handle_request(req: &Value, state: &DaemonState) -> Value {
             "set_nickname",
             with_params(&params, |p: SetNicknameParams| {
                 crate::daemon::set_nickname(state, p.nickname)
+            })
+            .await
+            .map(unit),
+        ),
+        // Set this node's app-metadata blob (#39): stored in memory, folded signed into
+        // future presence heartbeats — no config write, no reload.
+        Some("set_app_metadata") => respond(
+            id,
+            "set_app_metadata",
+            with_params(&params, |p: SetAppMetadataParams| {
+                crate::daemon::set_app_metadata(state, p.metadata)
             })
             .await
             .map(unit),

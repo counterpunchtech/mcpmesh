@@ -461,22 +461,39 @@ pub fn recent_pairing_lines(pairings: &[RecentPairing], now: u64) -> Vec<String>
 }
 
 /// Render the advisory presence block of `status`: one line per reachable roster device,
-/// `user_id · device_label · role · (online|offline)`. Pure so it is unit-testable. Surface-clean:
-/// FLAT vocabulary ONLY — user_id, device_label, role, and a plain online/offline word;
-/// never an endpoint id / key / hash / protocol name.
+/// `user_id · device_label · role · (online|offline)`, plus the device's embedder app
+/// metadata (#39) when it set any — truncated for readability (`--json` carries the full
+/// value). Pure so it is unit-testable. Surface-clean for mcpmesh's OWN vocabulary — the
+/// metadata is the embedder's opaque app data, not a transport id/key/hash.
 pub fn presence_lines(presence: &[PresencePeer]) -> Vec<String> {
     presence
         .iter()
         .map(|p| {
-            format!(
+            let mut line = format!(
                 "  {} · {} · {} · {}",
                 p.user_id,
                 p.device_label,
                 p.role,
                 if p.online { "online" } else { "offline" }
-            )
+            );
+            if !p.meta.is_empty() {
+                line.push_str(" · app: ");
+                line.push_str(&truncate_meta(&p.meta));
+            }
+            line
         })
         .collect()
+}
+
+/// Truncate opaque app metadata for a human status line (≤48 chars + ellipsis). Char-boundary
+/// safe. The full value is always available via `status --json`.
+fn truncate_meta(meta: &str) -> String {
+    const MAX: usize = 48;
+    if meta.chars().count() <= MAX {
+        return meta.to_string();
+    }
+    let cut: String = meta.chars().take(MAX).collect();
+    format!("{cut}…")
 }
 
 /// Render the roster-mode block of `status`. Pure so it is unit-testable. Surface-clean:
@@ -1025,12 +1042,14 @@ mod tests {
                 device_label: "laptop".into(),
                 role: "primary".into(),
                 online: true,
+                meta: String::new(),
             },
             PresencePeer {
                 user_id: "alice".into(),
                 device_label: "desktop".into(),
                 role: "mirror".into(),
                 online: false,
+                meta: String::new(),
             },
         ];
         let lines = presence_lines(&presence);
@@ -1059,6 +1078,7 @@ mod tests {
             device_label: "laptop".into(),
             role: "primary".into(),
             online: true,
+            meta: String::new(),
         }];
         let rendered = presence_lines(&presence).join("\n");
         for term in ["b64u:", "EndpointId", "endpoint", "ALPN", "pubkey", "hash"] {
