@@ -127,11 +127,13 @@ async fn subscribe_pushes_snapshot_then_live_session_events() {
         let server_addr = server_ep.addr();
 
         // Dialing node D's endpoint id — S's gate must trust it (the mesh peer S sees).
+        // allow holds the STABLE eid: principal of the dialing endpoint (nicknames never admit).
         let daemon_ep = local_endpoint().await;
         let daemon_id = *daemon_ep.id().as_bytes();
+        let daemon_eid = format!("eid:{}", daemon_ep.id());
 
         let server_cfg = Config::from_toml_str(&format!(
-            "[services.echo]\nrun = ['{STUB}']\nallow = [\"daemon\"]\n"
+            "[services.echo]\nrun = ['{STUB}']\nallow = [\"{daemon_eid}\"]\n"
         ))
         .expect("parse server config");
         let server_store = Arc::new(PeerStore::open(&dir.path().join("server.redb")).unwrap());

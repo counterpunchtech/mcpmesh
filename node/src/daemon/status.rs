@@ -132,9 +132,7 @@ fn display_principal(principal: &str, peers: &[crate::allowlist::PeerEntry]) -> 
     if principal.starts_with("eid:") {
         return peers
             .iter()
-            .find(|p| {
-                mcpmesh_net::EndpointId::from_bytes(p.endpoint_id).principal() == principal
-            })
+            .find(|p| mcpmesh_net::EndpointId::from_bytes(p.endpoint_id).principal() == principal)
             .map(|p| p.nickname.clone())
             .unwrap_or_else(|| "unpaired-device".to_owned());
     }

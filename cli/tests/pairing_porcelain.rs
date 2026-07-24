@@ -9,9 +9,10 @@
 //!
 //!  - **`pair --remove` functional truth (in-process).** We assemble a HERMETIC `MeshState`
 //!    (temp config + temp store + a localhost endpoint) inside a `DaemonState`, seed a peer AND a
-//!    service `allow` listing it, then call the REAL `daemon::remove_peer` handler and assert on
-//!    the STORE + CONFIG (not `status` output — the T7 out-of-scope note): the PeerEntry is gone
-//!    AND the nickname is stripped from every `[services.*].allow`. Re-removal + removal of an
+//!    service `allow` listing its STABLE principals (#38: `eid:` / `b64u:` — never the display
+//!    nickname), then call the REAL `daemon::remove_peer` handler and assert on the STORE +
+//!    CONFIG (not `status` output — the T7 out-of-scope note): the PeerEntry is gone AND the
+//!    peer's principals are stripped from every `[services.*].allow`. Re-removal + removal of an
 //!    absent peer tear nothing down and are refused (no false success on a revocation surface).
 //!
 //! A full `pair <invite>` against a live inviter folds into Task 8's E2E; the `pair` OUTPUT shape
@@ -39,7 +40,7 @@ use mcpmesh::pairing::LiveInvites;
 use mcpmesh::roster::gate::RosterGate;
 use mcpmesh_local_api::PeerRemoveParams;
 use mcpmesh_net::registry::ConnRegistry;
-use mcpmesh_net::{ALPN_MCP, ALPN_PAIR, TrustGate};
+use mcpmesh_net::{ALPN_MCP, ALPN_PAIR, EndpointId, TrustGate};
 use serde_json::json;
 
 const STUB: &str = env!("CARGO_BIN_EXE_echo_mcp_stub");
@@ -262,45 +263,59 @@ async fn local_endpoint() -> iroh::Endpoint {
         .expect("bind localhost endpoint")
 }
 
-fn seed_peer(store: &PeerStore, endpoint_id: [u8; 32], nickname: &str, services: &[&str]) {
+fn seed_peer(
+    store: &PeerStore,
+    endpoint_id: [u8; 32],
+    nickname: &str,
+    user_id: Option<&str>,
+    services: &[&str],
+) {
     store
         .add(PeerEntry {
             endpoint_id,
             nickname: nickname.into(),
             services: services.iter().map(|s| s.to_string()).collect(),
             paired_at: Some("1751760000".into()),
-            user_id: None,
+            user_id: user_id.map(|u| u.to_string()),
             last_addr: None,
         })
         .unwrap();
 }
 
-/// `peer_remove` drops the peer's PeerEntry (identity) AND strips the nickname from EVERY
-/// `[services.*].allow` (authorization) — asserted on the store + config directly (functional
-/// truth, not `status`). A different peer (carol) sharing a service is left untouched.
-/// Re-removal + removing an absent peer tear nothing down, so both are ERRORS (revocation must
-/// never report false success) — and both leave the durable state untouched.
+/// `peer_remove` drops the peer's PeerEntry (identity) AND strips the peer's STABLE principals
+/// (#38: the device `eid:` and — when no other entry shares it — the person `b64u:` user_id)
+/// from EVERY `[services.*].allow` (authorization) — asserted on the store + config directly
+/// (functional truth, not `status`). A different peer (carol, allowed by her own `eid:`) sharing
+/// a service is left untouched. Re-removal + removing an absent peer tear nothing down, so both
+/// are ERRORS (revocation must never report false success) — and both leave the durable state
+/// untouched.
 #[tokio::test(flavor = "multi_thread")]
 async fn pair_remove_drops_the_peer_and_revokes_every_service_allow() {
     tokio::time::timeout(Duration::from_secs(30), async {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("state.redb");
         let config_path = dir.path().join("config.toml");
-        // bob is allowed on BOTH notes and kb; carol shares kb (must survive bob's removal).
+        // Stable principals for the seeded fixture identities (#38): the allow entries are the
+        // machine authz namespace — `eid:`/`b64u:` — never the display nicknames.
+        let bob_id = [1u8; 32];
+        let carol_id = [2u8; 32];
+        let bob_eid = EndpointId::from_bytes(bob_id).principal();
+        let bob_uid = "b64u:BOB";
+        let carol_eid = EndpointId::from_bytes(carol_id).principal();
+        // bob is allowed on BOTH notes (by device eid AND person user_id) and kb; carol shares kb
+        // via her own eid (must survive bob's removal).
         std::fs::write(
             &config_path,
             format!(
-                "[services.notes]\nrun = ['{STUB}']\nallow = [\"bob\"]\n\
-                 [services.kb]\nrun = ['{STUB}']\nallow = [\"bob\", \"carol\"]\n"
+                "[services.notes]\nrun = ['{STUB}']\nallow = [\"{bob_eid}\", \"{bob_uid}\"]\n\
+                 [services.kb]\nrun = ['{STUB}']\nallow = [\"{bob_eid}\", \"{carol_eid}\"]\n"
             ),
         )
         .unwrap();
 
         let store = Arc::new(PeerStore::open(&db_path).unwrap());
-        let bob_id = [1u8; 32];
-        let carol_id = [2u8; 32];
-        seed_peer(&store, bob_id, "bob", &["notes", "kb"]);
-        seed_peer(&store, carol_id, "carol", &["kb"]);
+        seed_peer(&store, bob_id, "bob", Some(bob_uid), &["notes", "kb"]);
+        seed_peer(&store, carol_id, "carol", None, &["kb"]);
 
         let gate: Arc<dyn TrustGate> = Arc::new(AllowlistGate::new(store.clone()));
         let endpoint = local_endpoint().await;
@@ -335,17 +350,19 @@ async fn pair_remove_drops_the_peer_and_revokes_every_service_allow() {
             "carol's PeerEntry must be untouched"
         );
 
-        // Authorization: bob is stripped from EVERY service's allow on disk; carol survives in kb.
+        // Authorization: BOTH of bob's stable principals (device eid + person b64u:, which no
+        // other entry shares) are stripped from EVERY service's allow on disk; carol's own eid
+        // survives in kb.
         let cfg = Config::load(&config_path).unwrap();
         assert!(
             cfg.services.get("notes").unwrap().allow.is_empty(),
-            "bob must be revoked from notes.allow: {:?}",
+            "bob's eid + b64u principals must be revoked from notes.allow: {:?}",
             cfg.services.get("notes").unwrap().allow
         );
         assert_eq!(
             cfg.services.get("kb").unwrap().allow,
-            vec!["carol".to_string()],
-            "bob must be revoked from kb.allow, carol untouched"
+            vec![carol_eid.clone()],
+            "bob's eid must be revoked from kb.allow, carol's eid untouched"
         );
 
         // ── Re-removing bob tears nothing down (revoke changed=false, store no-op) → ERROR
@@ -372,10 +389,7 @@ async fn pair_remove_drops_the_peer_and_revokes_every_service_allow() {
         assert!(store.resolve(&carol_id).unwrap().is_some());
         let cfg = Config::load(&config_path).unwrap();
         assert!(cfg.services.get("notes").unwrap().allow.is_empty());
-        assert_eq!(
-            cfg.services.get("kb").unwrap().allow,
-            vec!["carol".to_string()]
-        );
+        assert_eq!(cfg.services.get("kb").unwrap().allow, vec![carol_eid]);
 
         std::mem::forget(dir); // keep the redb file alive for the store's lifetime
     })
@@ -401,7 +415,7 @@ async fn pair_remove_drops_a_peer_with_no_service_allow() {
 
         let store = Arc::new(PeerStore::open(&db_path).unwrap());
         let dave_id = [3u8; 32];
-        seed_peer(&store, dave_id, "dave", &[]);
+        seed_peer(&store, dave_id, "dave", None, &[]);
 
         let gate: Arc<dyn TrustGate> = Arc::new(AllowlistGate::new(store.clone()));
         let endpoint = local_endpoint().await;
@@ -452,15 +466,17 @@ async fn pair_remove_audits_a_real_unpair_but_not_a_no_op() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("state.redb");
         let config_path = dir.path().join("config.toml");
+        // The allow holds bob's STABLE device principal (#38), not his display nickname.
+        let bob_id = [1u8; 32];
+        let bob_eid = EndpointId::from_bytes(bob_id).principal();
         std::fs::write(
             &config_path,
-            format!("[services.notes]\nrun = ['{STUB}']\nallow = [\"bob\"]\n"),
+            format!("[services.notes]\nrun = ['{STUB}']\nallow = [\"{bob_eid}\"]\n"),
         )
         .unwrap();
 
         let store = Arc::new(PeerStore::open(&db_path).unwrap());
-        let bob_id = [1u8; 32];
-        seed_peer(&store, bob_id, "bob", &["notes"]);
+        seed_peer(&store, bob_id, "bob", None, &["notes"]);
 
         let gate: Arc<dyn TrustGate> = Arc::new(AllowlistGate::new(store.clone()));
         let endpoint = local_endpoint().await;

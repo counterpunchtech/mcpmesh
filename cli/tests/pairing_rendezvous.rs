@@ -567,7 +567,6 @@ async fn collision_guard_refuses_impersonating_an_existing_peer() {
     .expect("impersonation test timed out");
 }
 
-
 // ---------------------------------------------------------------------------------------------
 // Second-pairing MERGE semantics (the "reverse pairing clobbers the dial directory" fix).
 // `PeerStore::add` is a replace-on-endpoint_id upsert, so the rendezvous write sites must
@@ -1052,7 +1051,11 @@ async fn rename_after_pairing_keeps_the_peer_admitted() {
         .await
         .expect("rename succeeds");
         assert_eq!(
-            store.resolve(bob.id().as_bytes()).unwrap().unwrap().nickname,
+            store
+                .resolve(bob.id().as_bytes())
+                .unwrap()
+                .unwrap()
+                .nickname,
             "robert",
             "the display rename landed"
         );
@@ -1259,15 +1262,9 @@ async fn redeem_refuses_an_address_swap_and_writes_no_entry_p3() {
         let bob = redeemer_endpoint().await;
         let bob_dir = tempfile::tempdir().unwrap();
         let bob_store = Arc::new(PeerStore::open(&bob_dir.path().join("state.redb")).unwrap());
-        let err = redeem_invite(
-            bob,
-            "bob".into(),
-            invite.encode(),
-            bob_store.clone(),
-            None,
-        )
-        .await
-        .expect_err("a P3 id mismatch must fail the redeem");
+        let err = redeem_invite(bob, "bob".into(), invite.encode(), bob_store.clone(), None)
+            .await
+            .expect_err("a P3 id mismatch must fail the redeem");
         assert!(
             err.to_string().contains("address-swap") || err.to_string().contains("id mismatch"),
             "expected an address-swap / id-mismatch error, got: {err}"

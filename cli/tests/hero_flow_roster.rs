@@ -262,17 +262,19 @@ async fn revoking_a_rostered_device_severs_its_live_session_and_a_stale_pair_ent
  {
     timeout(Duration::from_secs(60), async {
         let dir = tempfile::tempdir().unwrap();
-        // echo admits the roster GROUP `team-eng` (alice) AND the pairing nickname `bob`.
-        let cfg = Config::from_toml_str(&format!(
-            "[services.echo]\nrun = ['{STUB}']\nallow = [\"team-eng\", \"bob\"]\n"
-        ))
-        .expect("parse config");
-
         let root = SigningKey::from_bytes(&[9u8; 32]);
         let alice_client = client_endpoint().await;
         let bob_client = client_endpoint().await;
         let alice_id = *alice_client.id().as_bytes();
         let bob_id = *bob_client.id().as_bytes();
+
+        // echo admits the roster GROUP `team-eng` (alice) AND bob's STABLE `eid:` principal
+        // (0.8.0: allow holds stable principals — bob's nickname is display-only and never admits).
+        let bob_principal = format!("eid:{}", bob_client.id());
+        let cfg = Config::from_toml_str(&format!(
+            "[services.echo]\nrun = ['{STUB}']\nallow = [\"team-eng\", \"{bob_principal}\"]\n"
+        ))
+        .expect("parse config");
 
         // The store holds a STALE pair entry for alice's endpoint (the AC's "one holding a stale pair
         // entry" — masked by her roster identity) plus bob's real pairing entry.

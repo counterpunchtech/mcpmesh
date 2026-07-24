@@ -287,7 +287,6 @@ pub(crate) fn remove_allow_from_config(path: &Path, principals: &[String]) -> Re
     Ok(changed)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,5 +528,4 @@ mod tests {
             "union: existing grant kept, incoming appended"
         );
     }
-
 }

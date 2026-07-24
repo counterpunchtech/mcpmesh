@@ -63,8 +63,11 @@ async fn real_session_audits_with_hashed_args_and_all_event_classes() {
         // Serve an echo `run` service named "notes", threaded with a REAL audit sink.
         // TOML LITERAL string for the stub path (like every sibling suite): a windows
         // `D:\…\stub.exe` path in a basic "…" string is an invalid escape sequence.
+        // 0.8.0 (#38): `allow` holds STABLE principals — the caller's `eid:<hex>` — never the
+        // display nickname ("bob" is display-only and would not admit).
+        let caller_eid = format!("eid:{}", caller_ep.id());
         let cfg = Config::from_toml_str(&format!(
-            "[services.notes]\nrun = ['{STUB}']\nallow = [\"bob\"]\n"
+            "[services.notes]\nrun = ['{STUB}']\nallow = [\"{caller_eid}\"]\n"
         ))
         .unwrap();
         let sink = AuditSink::new(AuditLog::spawn(audit_dir.clone()));

@@ -524,36 +524,48 @@ mod tests {
         .expect("strike-out test timed out");
     }
 
-    /// `caller_admits` implements the flat namespace: nickname (name) OR user_id OR group. This
-    /// calls the PRODUCTION function so activating the user_id arm is a real red→green change.
+    /// `caller_admits` implements the flat STABLE-principal namespace (#38): the authenticated
+    /// device `eid:` OR user_id OR group — the display nickname NEVER admits. This calls the
+    /// PRODUCTION function so each arm (and the nickname refusal) is a real red→green change.
     #[test]
-    fn caller_admits_by_nickname_user_id_or_group() {
+    fn caller_admits_by_eid_user_id_or_group() {
         let allow = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
-        // A roster identity: name == user_id == "alice", groups team-eng+all.
+        // A roster identity: user_id "alice", groups team-eng+all, on device [1u8; 32].
         let roster = PeerIdentity {
-            endpoint: EndpointId::from_bytes([0u8; 32]),
+            endpoint: EndpointId::from_bytes([1u8; 32]),
             name: "alice".into(),
             user_id: Some("alice".into()),
             groups: vec!["team-eng".into(), "all".into()],
         };
         assert!(
             caller_admits(&roster, &allow(&["alice"])),
-            "user_id/name arm"
+            "user_id arm (bare roster handle is a principal)"
         );
         assert!(
             caller_admits(&roster, &allow(&["team-eng"])),
             "group arm (the group allow)"
         );
         assert!(
+            caller_admits(&roster, &allow(&[&roster.endpoint.principal()])),
+            "eid arm (the authenticated device principal admits)"
+        );
+        assert!(
             !caller_admits(&roster, &allow(&["bob"])),
             "unrelated name refused"
         );
+        assert!(
+            !caller_admits(
+                &roster,
+                &allow(&[&EndpointId::from_bytes([9u8; 32]).principal()])
+            ),
+            "an UNRELATED eid principal is refused"
+        );
 
-        // The load-bearing case: name != user_id proves the user_id arm is REQUIRED (name alone
-        // would not admit "alice"). Against a name-OR-groups-only predicate this FAILS.
+        // The load-bearing case: name != user_id proves the user_id arm is REQUIRED, and the
+        // nickname arm is GONE — an allow entry naming the display nickname must NOT admit.
         let by_uid_only = PeerIdentity {
-            endpoint: EndpointId::from_bytes([0u8; 32]),
+            endpoint: EndpointId::from_bytes([2u8; 32]),
             name: "device-label".into(),
             user_id: Some("alice".into()),
             groups: vec![],
@@ -562,15 +574,27 @@ mod tests {
             caller_admits(&by_uid_only, &allow(&["alice"])),
             "user_id arm admits independent of name"
         );
+        assert!(
+            !caller_admits(&by_uid_only, &allow(&["device-label"])),
+            "the display nickname is NOT a principal (#38): it must never admit"
+        );
 
-        // A pairing identity (user_id None) is admitted only by its nickname/groups.
+        // A pairing identity (user_id None) is admitted ONLY by its stable eid — never by
+        // its nickname, so no rename can ever change what it is granted.
         let pairing = PeerIdentity {
-            endpoint: EndpointId::from_bytes([0u8; 32]),
+            endpoint: EndpointId::from_bytes([3u8; 32]),
             name: "bob".into(),
             user_id: None,
             groups: vec![],
         };
-        assert!(caller_admits(&pairing, &allow(&["bob"])));
+        assert!(
+            caller_admits(&pairing, &allow(&[&pairing.endpoint.principal()])),
+            "eid arm is the pairing peer's one principal"
+        );
+        assert!(
+            !caller_admits(&pairing, &allow(&["bob"])),
+            "pairing peer's nickname must not admit"
+        );
         assert!(
             !caller_admits(&pairing, &allow(&["alice"])),
             "pairing peer has no user_id to match"

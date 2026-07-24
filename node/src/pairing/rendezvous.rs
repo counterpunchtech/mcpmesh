@@ -250,8 +250,8 @@ pub async fn handle_inviter_side(
             let nickname_c = hello.redeemer_nickname.clone();
             let (existing, collides) = tokio::task::spawn_blocking(move || {
                 let existing = store_c.resolve(&tls_id)?;
-                let collides = existing.is_none()
-                    && nickname_collision(&store_c, &nickname_c, &tls_id)?;
+                let collides =
+                    existing.is_none() && nickname_collision(&store_c, &nickname_c, &tls_id)?;
                 anyhow::Ok((existing, collides))
             })
             .await
@@ -343,9 +343,10 @@ pub async fn handle_inviter_side(
             // The redeemer's STABLE principal, captured BEFORE the entry moves into the store:
             // the verified `b64u:` user_id when a binding was presented (or already proven),
             // else the `eid:` device principal of the TLS-AUTHENTICATED endpoint (#38).
-            let principal = entry.user_id.clone().unwrap_or_else(|| {
-                mcpmesh_net::EndpointId::from_bytes(tls_id).principal()
-            });
+            let principal = entry
+                .user_id
+                .clone()
+                .unwrap_or_else(|| mcpmesh_net::EndpointId::from_bytes(tls_id).principal());
             // redb writes block + fsync — run on a blocking thread (mirrors `daemon::add_peer`'s
             // spawn_blocking + `.context(...)` + double-`?` join). A store write failure returns
             // here → the connection drops with a bare close (no explicit Refused frame), which
@@ -489,9 +490,7 @@ pub async fn redeem_invite(
     // applying it verbatim is what makes the name our gate resolves to (and our
     // `[services.*].allow` authorizes) point at THEIR endpoint. Refusing here keeps the
     // invariant that redeeming an invite grants the other side nothing.
-    if let Some(conflict) =
-        nickname_squat(&store, &invite.nickname, &invite.inviter_id)?
-    {
+    if let Some(conflict) = nickname_squat(&store, &invite.nickname, &invite.inviter_id)? {
         bail!(
             "this invite asks to be called '{}', but {conflict} \
              Ask them for an invite suggesting a different name.",

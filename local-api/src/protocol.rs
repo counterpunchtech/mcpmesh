@@ -40,7 +40,7 @@ pub enum BackendKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceInfo {
     pub name: String,
-    pub allow: Vec<String>,   // STABLE principals (b64u:/eid:) or roster names (#38) — never nicknames
+    pub allow: Vec<String>, // STABLE principals (b64u:/eid:) or roster names (#38) — never nicknames
     /// The HUMAN rendering of `allow`, index-aligned: each principal resolved to its peer's
     /// display nickname by the daemon (which owns the store); an unresolvable stable
     /// principal renders as a neutral placeholder — porcelain must show THESE, never raw

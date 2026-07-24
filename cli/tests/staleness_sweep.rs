@@ -74,16 +74,20 @@ fn initialize_frame(service: &str) -> serde_json::Value {
 async fn staleness_sweep_cuts_roster_session_but_not_pairing() {
     timeout(Duration::from_secs(60), async {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = Config::from_toml_str(&format!(
-            "[services.echo]\nrun = ['{STUB}']\nallow = [\"alice\", \"bob\"]\n"
-        ))
-        .unwrap();
 
         let root = SigningKey::from_bytes(&[9u8; 32]);
         let alice_client = client_endpoint().await;
         let bob_client = client_endpoint().await;
         let alice_id = *alice_client.id().as_bytes();
         let bob_id = *bob_client.id().as_bytes();
+
+        // "alice" is bare roster vocabulary (user_id); bob is admitted by his STABLE eid: principal
+        // — the nickname on his PeerEntry is display-only and never admits.
+        let bob_eid = format!("eid:{}", bob_client.id());
+        let cfg = Config::from_toml_str(&format!(
+            "[services.echo]\nrun = ['{STUB}']\nallow = [\"alice\", \"{bob_eid}\"]\n"
+        ))
+        .unwrap();
 
         // bob is a pairing peer; alice is rostered.
         let store = Arc::new(PeerStore::open(&dir.path().join("state.redb")).unwrap());

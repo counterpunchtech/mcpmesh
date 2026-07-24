@@ -446,9 +446,9 @@ impl MeshState {
             self_binding: self.self_binding(),
             grant: Box::new(move |principal, nickname, services| {
                 let mesh = grant_mesh.clone();
-                Box::pin(
-                    async move { grant_service_access(&mesh, &principal, &nickname, &services).await },
-                )
+                Box::pin(async move {
+                    grant_service_access(&mesh, &principal, &nickname, &services).await
+                })
             }),
             record_pairing: Box::new(move |nickname, sas, paired_at| {
                 record_mesh.record_pairing(nickname, sas, paired_at);

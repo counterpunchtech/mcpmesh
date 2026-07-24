@@ -58,13 +58,16 @@ async fn client_endpoint() -> iroh::Endpoint {
 async fn accept_loop_routes_mesh_alpn_to_a_gated_session() {
     timeout(Duration::from_secs(60), async {
         let dir = tempfile::tempdir().unwrap();
+
+        // Bind the dialing peer FIRST so its STABLE device principal (#38: `eid:<hex>`) can be
+        // baked into the service allow — post-#38 the allow holds principals, and the display
+        // nickname ("tester") never admits.
+        let client = client_endpoint().await;
         let cfg = Config::from_toml_str(&format!(
-            "[services.echo]\nrun = ['{STUB}']\nallow = [\"tester\"]\n"
+            "[services.echo]\nrun = ['{STUB}']\nallow = [\"eid:{}\"]\n",
+            client.id()
         ))
         .expect("parse config");
-
-        // The dialing peer, trusted as `tester` for `echo`.
-        let client = client_endpoint().await;
         let store = Arc::new(PeerStore::open(&dir.path().join("state.redb")).unwrap());
         store
             .add(PeerEntry {
@@ -301,10 +304,13 @@ async fn accept_loop_pair_alpn_with_no_live_invite_is_closed_early() {
     .expect("no-live-invite accept-gate test timed out");
 }
 
-/// A pairing grant emits exactly one `trust(event="pair")` audit record for the redeemer nickname
-/// (spec §11.3 trust-event class — pair). Builds a hermetic serving `MeshState`, installs a real
-/// temp-dir `AuditLog` via `set_audit`, and drives `grant_service_access`; the hook fires on
-/// `mesh.audit()` and lands one pair record targeted at the nickname. No secret material is written.
+/// A pairing grant emits exactly one `trust(event="pair")` audit record for the redeemer's
+/// DISPLAY nickname (spec §11.3 trust-event class — pair), while the CONFIG allow receives the
+/// redeemer's STABLE principal (#38 split: principal → authz surface, nickname → audit/log color
+/// only). Builds a hermetic serving `MeshState`, installs a real temp-dir `AuditLog` via
+/// `set_audit`, and drives `grant_service_access(mesh, principal, display_nickname, services)`;
+/// the hook fires on `mesh.audit()` and lands one pair record targeted at the nickname, and the
+/// config's `allow` gains the principal — never the nickname. No secret material is written.
 #[tokio::test]
 async fn trust_mutations_emit_audit_events() {
     use mcpmesh::audit::{AuditLog, AuditSink};
@@ -328,7 +334,7 @@ async fn trust_mutations_emit_audit_events() {
             store,
             Arc::new(LiveInvites::new()),
             "server".into(),
-            config_path,
+            config_path.clone(),
             Arc::new(RosterGate::empty()),
             Arc::new(ConnRegistry::new()),
             None,
@@ -339,8 +345,9 @@ async fn trust_mutations_emit_audit_events() {
         let audit_dir = dir.path().join("audit");
         mesh.set_audit(AuditSink::new(AuditLog::spawn(audit_dir.clone())));
 
-        // A pairing grant → one trust(event="pair") record targeted at "bob".
-        grant_service_access(&mesh, "bob", "bob", &["notes".to_string()])
+        // A pairing grant: the CONFIG receives the redeemer's stable principal ("b64u:BOB"),
+        // the audit record targets the display nickname ("bob") — #38's split.
+        grant_service_access(&mesh, "b64u:BOB", "bob", &["notes".to_string()])
             .await
             .unwrap();
 
@@ -359,7 +366,25 @@ async fn trust_mutations_emit_audit_events() {
         assert_eq!(pair, 1, "the pairing grant recorded one trust(pair) event");
         let body = std::fs::read_to_string(&file).unwrap();
         assert!(body.contains("\"kind\":\"trust\""));
-        assert!(body.contains("\"target\":\"bob\""));
+        assert!(
+            body.contains("\"target\":\"bob\""),
+            "the audit record targets the DISPLAY nickname, got: {body}"
+        );
+        assert!(
+            !body.contains("b64u:BOB"),
+            "the stable principal must not leak into the audit record, got: {body}"
+        );
+
+        // The config side of the split: `allow` gained the stable principal, not the nickname.
+        let cfg_body = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            cfg_body.contains("b64u:BOB"),
+            "the grant appends the stable principal to the service allow, got: {cfg_body}"
+        );
+        assert!(
+            !cfg_body.contains("\"bob\""),
+            "the display nickname must never land in the allow, got: {cfg_body}"
+        );
     })
     .await
     .expect("trust audit test timed out");

@@ -26,8 +26,7 @@ use crate::util::{blocking, epoch_now_u64};
 
 use super::accept::reload_accept_loop;
 use super::config_write::{
-    append_allow_to_config, remove_allow_from_config,
-    write_service_to_config,
+    append_allow_to_config, remove_allow_from_config, write_service_to_config,
 };
 use super::status::service_infos;
 use super::{MeshState, dial_service, pipe_session};
@@ -168,10 +167,7 @@ async fn reload_services_from_disk(mesh: &Arc<MeshState>, why: &str) -> Result<(
 /// roster vocabulary (a group name or bare roster user_id), which remains a legitimate
 /// principal. Resolution happens at WRITE time so what lands in config can never desync from
 /// a later rename.
-async fn resolve_allow_entries(
-    mesh: &Arc<MeshState>,
-    entries: Vec<String>,
-) -> Result<Vec<String>> {
+async fn resolve_allow_entries(mesh: &Arc<MeshState>, entries: Vec<String>) -> Result<Vec<String>> {
     if entries
         .iter()
         .all(|e| e.starts_with("b64u:") || e.starts_with("eid:"))
@@ -753,15 +749,15 @@ pub(crate) async fn revoke_service_access(mesh: &Arc<MeshState>, nickname: &str)
     let store = mesh.store.clone();
     let nick_r = nickname.to_string();
     let principals: Vec<String> = blocking("join revoke principal resolution", move || {
-        let (targets, others): (Vec<_>, Vec<_>) =
-            store.list()?.into_iter().partition(|e| e.nickname == nick_r);
+        let (targets, others): (Vec<_>, Vec<_>) = store
+            .list()?
+            .into_iter()
+            .partition(|e| e.nickname == nick_r);
         let mut principals = Vec::new();
         for target in &targets {
-            principals
-                .push(mcpmesh_net::EndpointId::from_bytes(target.endpoint_id).principal());
+            principals.push(mcpmesh_net::EndpointId::from_bytes(target.endpoint_id).principal());
             if let Some(user_id) = &target.user_id {
-                let shared_elsewhere =
-                    others.iter().any(|o| o.user_id.as_deref() == Some(user_id));
+                let shared_elsewhere = others.iter().any(|o| o.user_id.as_deref() == Some(user_id));
                 if !shared_elsewhere && !principals.contains(user_id) {
                     principals.push(user_id.clone());
                 }
@@ -909,9 +905,6 @@ mod tests {
         );
     }
 
-    /// `rename_peer` renames ALL of a person's devices (matched by user_id) to the new nickname AND
-    /// rewrites the old nickname → new in every service allow, so grants FOLLOW the rename. The happy
-    /// path also drives `build_services_audited` + `reload_accept_loop` under `reload_lock`.
     /// The typed `peer_rename` params, as the control dispatcher hands them to `rename_peer`.
     fn rename_params(user_id: Option<&str>, to: &str) -> PeerRenameParams {
         PeerRenameParams {
@@ -921,26 +914,33 @@ mod tests {
         }
     }
 
+    /// `rename_peer` renames ALL of a person's devices (matched by user_id) to the new nickname —
+    /// and touches NOTHING else (#38): `allow` holds stable principals (here the renamed person's
+    /// own `b64u:` user_id), so the config is byte-identical after the rename. Grants survive a
+    /// rename by construction — no allow rewrite happens because no grant names a nickname.
     #[tokio::test]
-    async fn rename_peer_renames_all_devices_and_carries_grants() {
+    async fn rename_peer_renames_all_devices_and_leaves_grants_untouched() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
+        // The grant names the renamed person's PRINCIPAL — the strongest case: even the
+        // renamed person's own grant must not be rewritten.
         std::fs::write(
             &config_path,
-            "[services.kb]\nsocket = \"/run/kb.sock\"\nallow = [\"alice-old\"]\n",
+            "[services.kb]\nsocket = \"/run/kb.sock\"\nallow = [\"b64u:BOB\"]\n",
         )
         .unwrap();
         let mesh = hermetic_mesh(config_path.clone()).await;
         // Two devices of ONE person (same user_id), both under the old nickname.
         mesh.store
-            .add(rename_entry(1, "alice-old", Some("b64u:ALICE")))
+            .add(rename_entry(1, "bob-old", Some("b64u:BOB")))
             .unwrap();
         mesh.store
-            .add(rename_entry(2, "alice-old", Some("b64u:ALICE")))
+            .add(rename_entry(2, "bob-old", Some("b64u:BOB")))
             .unwrap();
         let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+        let config_before = std::fs::read_to_string(&config_path).unwrap();
 
-        rename_peer(&state, rename_params(Some("b64u:ALICE"), "Alice"))
+        rename_peer(&state, rename_params(Some("b64u:BOB"), "Bobby"))
             .await
             .unwrap();
 
@@ -953,15 +953,20 @@ mod tests {
             .map(|e| e.nickname)
             .collect();
         assert!(
-            names.iter().all(|n| n == "Alice"),
+            names.iter().all(|n| n == "Bobby"),
             "all devices renamed, got {names:?}"
         );
-        // The grant followed: allow now names "Alice", not "alice-old".
-        let doc: toml::Table =
-            toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        // #38: the rename touched ONLY nicknames — the config (and its principal-keyed allow)
+        // is byte-identical, so the grant survived without any rewrite.
+        let config_after = std::fs::read_to_string(&config_path).unwrap();
+        assert_eq!(
+            config_before, config_after,
+            "rename must not rewrite the config"
+        );
+        let doc: toml::Table = toml::from_str(&config_after).unwrap();
         let allow = doc["services"]["kb"]["allow"].as_array().unwrap();
-        assert!(allow.iter().any(|v| v.as_str() == Some("Alice")));
-        assert!(!allow.iter().any(|v| v.as_str() == Some("alice-old")));
+        assert_eq!(allow.len(), 1);
+        assert_eq!(allow[0].as_str(), Some("b64u:BOB"));
     }
 
     /// `rename_peer` rejects an empty nickname, a request that names no contact, a no-such-contact
