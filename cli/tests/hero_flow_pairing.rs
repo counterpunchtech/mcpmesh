@@ -154,6 +154,9 @@ async fn four_command_hero_flow() {
         // is bound where a subprocess with XDG_RUNTIME_DIR=<bob_dir> resolves it. ──
         let bob_ep = mesh_endpoint().await;
         let bob_id = *bob_ep.id().as_bytes();
+        // Bob's STABLE device principal — what the pairing grant writes into allow (#38). Bob has
+        // no bound person identity in this flow, so the grant is his eid:, never his nickname.
+        let bob_eid = format!("eid:{}", bob_ep.id());
         let mem = MemoryLookup::new();
         mem.add_endpoint_info(alice_addr.clone());
         bob_ep
@@ -309,13 +312,14 @@ async fn four_command_hero_flow() {
         );
         assert!(alice_side.paired_at.is_some());
 
-        // ── The load-bearing authorization grant on DISK: `[services.notes].allow` now lists bob
-        // (functional truth, NOT `status`). Without this the paired peer is known-but-forbidden. ──
+        // ── The load-bearing authorization grant on DISK: `[services.notes].allow` now lists
+        // Bob's STABLE eid: principal — not his display nickname (#38) — (functional truth, NOT
+        // `status`). Without this the paired peer is known-but-forbidden. ──
         let after = Config::load(&alice_config).unwrap();
         assert_eq!(
             after.services.get("notes").unwrap().allow,
-            vec!["bob".to_string()],
-            "the pairing grant appended bob to [services.notes].allow"
+            vec![bob_eid.clone()],
+            "the pairing grant appended Bob's eid: principal to [services.notes].allow"
         );
 
         // Bob's raw client has done its job; drop it (independent from the subprocess connection).
@@ -325,8 +329,9 @@ async fn four_command_hero_flow() {
         // COMMAND 4 — `connect` (clause 3, THE PAYOFF): the REAL `mcpmesh connect alice/notes`
         // subprocess drives its stdio against Bob's control socket. Bob's daemon resolves nickname
         // `alice` → Alice's id (written by pairing), dials her `notes` by id (MemoryLookup resolves
-        // it on localhost), Alice's gate resolves Bob → `bob`, `select_service` ADMITS `bob` (now in
-        // allow, live after the grant's reload), the echo child answers, and MCPMESH_PEER_NAME=bob is
+        // it on localhost), Alice's gate resolves Bob's identity, `select_service` ADMITS his eid:
+        // principal (now in allow, live after the grant's reload), the echo child answers — display
+        // name `bob` still rides along: MCPMESH_PEER_NAME=bob is
         // injected — identity threaded through the freshly-paired trust, end to end.
         // ══════════════════════════════════════════════════════════════════════════════════
         let mut child = Command::new(MCPMESH)

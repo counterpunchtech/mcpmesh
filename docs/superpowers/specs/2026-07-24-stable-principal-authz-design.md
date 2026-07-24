@@ -24,10 +24,14 @@ unrepresentable.
      (signature drops the name param, gains the endpoint id).
 2. **Grant paths write stable principals.** The inviter-side pairing grant writes
    `b64u:<user_pk>` when the redeemer presented a binding, else `eid:<endpoint-id>`.
-   Operator-typed `allow` inputs (`serve --allow`, `register_service`) accept
-   `b64u:`/`eid:` verbatim; a bare name is resolved through the PeerStore to that peer's
-   stable principal at write time; an unresolvable bare name is kept verbatim (assumed
-   roster group).
+   Operator-typed `allow` inputs (`serve --allow`, `register_service`, `blob grant`) are
+   stored **VERBATIM** — a `b64u:`/`eid:` principal or a roster group/user_id name admits; a
+   bare display nickname does NOT (nicknames never authorize). The daemon does **no**
+   nickname→principal resolution at write time: the adversarial review (24-agent panel)
+   confirmed that resolution let a peer's self-asserted nickname shadow roster vocabulary
+   and silently misdirect a later operator grant, and made non-unique nicknames ambiguous.
+   The common case needs no manual grant (pairing auto-writes the principal); a manual
+   grant names a principal or a roster group; the doctor lint flags a stray nickname.
 3. **Admission diagnostics:** `caller_admits` logs at debug the caller's principal set and
    the allow list compared, so a refusal is diagnosable without source-diving.
 4. **Downstream reconciliation (the sweep decides the full list; known already):**
@@ -44,6 +48,33 @@ unrepresentable.
 5. **Unchanged:** outbound naming (`open_session` by nickname / `<peer>/<service>`
    mounts), the identity env injection (`MCPMESH_PEER_NAME` stays display), PeerStore
    schema (nickname remains the display handle), roster-mode group semantics.
+
+## Decisions settled by the touchpoint sweep (2026-07-24)
+
+1. **Bare strings = roster vocabulary.** Roster user_ids are bare operator-chosen handles
+   ("alice") matched via the user_id arm; groups are bare too, and the roster's
+   flat-namespace disjointness rule keeps them unambiguous. Both stay legal principals.
+   The doctor lint therefore flags bare `allow` entries only on a PURE-PAIRING node (no
+   org root pinned), where a bare string can only be a dead nickname grant.
+2. **Revoke/unpair hygiene rule.** Admission requires gate resolve FIRST — deleting a
+   `PeerEntry` already denies that device outright — so allow-stripping is hygiene, not
+   the security boundary. `remove_peer`/`revoke_service_access` resolve the entry BEFORE
+   removal and strip its `eid:` always, and its `b64u:` only when no other `PeerEntry`
+   shares that user_id (one device of a multi-device person never revokes the person).
+3. **`principal_set` keeps its borrowed return.** Signature becomes
+   `(eid: Option<&str>, user_id: Option<&str>, groups: &[String])` with the eid principal
+   PRE-RENDERED by callers. The one sanctioned renderer is a new
+   `mcpmesh_net::EndpointId::principal()` → `"eid:<iroh base32>"` (an explicit method, NOT
+   a `Display` impl — the surface-leak discipline stands; principals are a sanctioned
+   machine rendering, and HUMAN porcelain still never prints raw ids: status render maps
+   principals to store-resolved display names).
+4. **Plugin seam keeps parity.** The daemon's `_meta["mcpmesh/peer"]` injection gains an
+   `eid` field; `peer_audiences` swaps its name arm for it. Nickname-audience blob/plugin
+   grants stop matching — intended (release notes call it out). Blob-scope grants are
+   revoked on unpair (`remove_peer` strips the peer's principals from every scope, the
+   last-device `b64u:` rule as for service allow); legacy pre-0.8.0 nickname blob grants are
+   dead and re-granted by the operator (the doctor lint scans `[services.*].allow`, not the
+   blob sidecar — a manual `blob list` review covers the rare roster-mode blob case).
 
 ## Migration
 

@@ -142,17 +142,20 @@ async fn wait_for_len(registry: &ConnRegistry, target: usize) {
 async fn install_severs_a_revoked_roster_session_but_not_a_pairing_session() {
     timeout(Duration::from_secs(60), async {
         let dir = tempfile::tempdir().unwrap();
-        // One `echo` service admits BOTH the roster user_id "alice" and the pairing nickname "bob".
-        let cfg = Config::from_toml_str(&format!(
-            "[services.echo]\nrun = ['{STUB}']\nallow = [\"alice\", \"bob\"]\n"
-        ))
-        .expect("parse config");
 
         let root = SigningKey::from_bytes(&[9u8; 32]);
         let alice_client = client_endpoint().await;
         let bob_client = client_endpoint().await;
         let alice_id = *alice_client.id().as_bytes();
         let bob_id = *bob_client.id().as_bytes();
+
+        // One `echo` service admits BOTH the roster user_id "alice" (bare roster vocabulary) and
+        // bob's STABLE device principal `eid:<hex>` — nicknames never admit (0.8.0 #38).
+        let bob_eid = format!("eid:{}", bob_client.id());
+        let cfg = Config::from_toml_str(&format!(
+            "[services.echo]\nrun = ['{STUB}']\nallow = [\"alice\", \"{bob_eid}\"]\n"
+        ))
+        .expect("parse config");
 
         // The store carries a STALE pair entry for alice's endpoint (the AC's "including one holding
         // a stale pair entry") — masked by the roster identity — plus bob's real pairing entry.

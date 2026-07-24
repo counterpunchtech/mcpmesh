@@ -7,7 +7,7 @@ named pipe on Windows. Anything that can open the endpoint and parse JSON can sp
 language — [`local-api/examples/status.py`](../local-api/examples/status.py) is a complete client
 in ~60 lines of dependency-free Python.
 
-> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.2`, `api_minor` `2`) and evolves
+> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.3`, `api_minor` `3`) and evolves
 > **additively** (see [Versioning](#versioning)), but until a stable release this document — like the
 > wire format itself — may change without a migration path. Pin the mcpmesh version you build
 > against. Source of truth is the Rust in [`local-api/`](../local-api/src/protocol.rs); where this
@@ -79,7 +79,7 @@ porcelain verb starts the daemon) or runs `mcpmesh internal daemon` itself.
 **The server speaks first.** Immediately on accept, the daemon writes one `Hello` frame:
 
 ```json
-{"api":"mcpmesh-local/1","api_version":"1.2","api_minor":2,"stack_version":"…"}
+{"api":"mcpmesh-local/1","api_version":"1.3","api_minor":3,"stack_version":"…"}
 ```
 
 A client MUST read this frame first and check `api == "mcpmesh-local/1"` before sending anything. A
@@ -142,11 +142,11 @@ Methods split into two groups by audience:
 
 | `method` | `params` | `result` |
 |---|---|---|
-| `register_service` | `{name, backend, allow, ephemeral?}` — `backend` is `{"run":{"cmd":[…]}}` or `{"socket":{"path":"…"}}`; `allow` is a list of nicknames/groups; `ephemeral:true` (#36) keeps the registration in memory only and unregisters it when THIS connection closes (see [Ephemeral registration](#ephemeral-registration)) | `{}` (ack) |
+| `register_service` | `{name, backend, allow, ephemeral?}` — `backend` is `{"run":{"cmd":[…]}}` or `{"socket":{"path":"…"}}`; `allow` is a list of STABLE principals — `b64u:<user_id>`, `eid:<device id>`, or roster group/user_id names; a bare input naming a paired peer's nickname is RESOLVED to that peer's stable principal at write time (#38); `ephemeral:true` (#36) keeps the registration in memory only and unregisters it when THIS connection closes (see [Ephemeral registration](#ephemeral-registration)) | `{}` (ack) |
 | `status` | *(none)* | [`StatusResult`](#statusresult) |
 | `audit_summary` | *(none)* | `{per_peer:[[name,count],…], per_service:[[name,count],…], total_sessions}` — this node's **local** session tallies; nothing is transmitted |
 | `invite` | `{services:[…]}` | `{invite_line:"mcpmesh-invite:…", expires_at_epoch}` |
-| `pair` | `{invite_line}` | `{peer_nickname, sas_code, services:[…], app_label?, peer_user_id?}` — `app_label` echoes any opaque label the inviter attached (#31); `peer_user_id` is the inviter's stable `b64u:` identity when it presented a binding (#30). Fails (no dial attempted) if the invite's suggested nickname is already yours for a *different* peer, or already sits in a `[services.*].allow`; see [Nickname collisions](#nickname-collisions) |
+| `pair` | `{invite_line}` | `{peer_nickname, sas_code, services:[…], app_label?, peer_user_id?}` — `app_label` echoes any opaque label the inviter attached (#31); `peer_user_id` is the inviter's stable `b64u:` identity when it presented a binding (#30). Fails (no dial attempted) if the invite's suggested nickname is already yours for a *different* peer; see [Nickname collisions](#nickname-collisions) |
 | `peer_remove` | `{nickname}` | `{}` (ack) |
 | `peer_rename` | `{to, user_id?, nickname?}` — rename a person by `user_id`, else a provisional contact by `nickname` | `{}` (ack) |
 | `set_nickname` | `{nickname}` — rename **this node** live (#37, `api_minor >= 2`): validated (trimmed non-empty, no `/`), persisted to `[identity].nickname` under the daemon's own config lock (no lost-update window against a concurrent grant/registration), and effective for FUTURE invites/presentations immediately — no restart. Display-only: peers keep the nickname they stored at pairing time until a re-invite | `{}` (ack) |
@@ -164,27 +164,30 @@ Paths and files (`roster_install.path`, `org_join.user_key`, `blob_publish.path`
 `blob_fetch.dest_path`) are passed **as local paths, not bytes** — the same-uid daemon reads/writes
 them directly, which is within the trust boundary.
 
-### Nickname collisions
+### Nicknames are display-only; principals authorize (#38, 0.8.0)
 
-Nicknames are the daemon's authorization principal: the trust gate resolves an inbound endpoint to
-its nickname, and `[services.*].allow` admits by that nickname. So a nickname must never come to
-mean two different endpoints — whoever holds the name inherits every grant made to it.
+Authorization keys on STABLE principals — the `eid:` device principal (the TLS-authenticated
+endpoint id) and the `b64u:` user_id (a verified device→user binding), plus roster group/user_id
+names. A display nickname NEVER admits: names are self-asserted and rewritable (`set_nickname`,
+rename-by-fresh-invite), so no rename can change what a peer is granted — the 0.7.x class of
+silent grant desync is unrepresentable. `status` reports both the raw `allow` principals and an
+`allow_display` annotation (each principal resolved to its peer's display name by the daemon);
+porcelain shows the display form and never prints raw ids.
 
-Both halves of the pairing ceremony therefore refuse a name that is already meaningful:
+Nickname UNIQUENESS is still enforced, for display/routing clarity only (outbound
+`<peer>/<service>` routing is first-match by name):
 
-- **`pair` (redeemer side)** — an invite carries the inviter's *suggested* nickname, chosen by
-  them. The redeem fails, **before any dial**, if a stored peer already holds that nickname under a
-  different endpoint, or if no peer holds it but it already appears in some `[services.*].allow`.
-  Without this, redeeming a stranger's invite could silently repoint a trusted name at them —
-  breaking the rule that redeeming an invite grants the other side nothing.
-- **Inviter side** — symmetrically, a redeemer that self-asserts a nickname already belonging to a
-  different endpoint (or sitting unbacked in an `allow`) is refused with the generic
-  `pairing refused`, which deliberately leaks no detail about which names exist.
-- **`peer_rename`** — refuses a target name that is already taken or already granted.
+- **`pair` (redeemer side)** — the redeem fails, **before any dial**, if a stored peer already
+  holds the invite's suggested nickname under a different endpoint (your own dials to that name
+  would become ambiguous).
+- **Inviter side** — symmetrically, a redeemer self-asserting a name already belonging to a
+  different endpoint is refused with the generic `pairing refused` (no detail about which names
+  exist).
+- **`peer_rename`** — refuses a target name another contact already holds; it is a pure display
+  mutation (no grant is touched, no serving reload happens).
 
-Re-pairing with a peer you already know always passes: the only entry holding the name is that
-peer's own, so renaming a peer by redeeming a fresh invite from them keeps working. To reuse a name
-for someone new, `peer_remove` the old holder first.
+Re-pairing with a peer you already know always passes: renaming a peer by redeeming a fresh
+invite from them keeps working — and is fully safe, since no grant keys on the name.
 
 ### Ephemeral registration
 
@@ -224,7 +227,7 @@ Do not build on either — they may change or disappear without an `api_version`
 ```json
 {
   "stack_version": "…",
-  "services": [{"name": "notes", "allow": ["bob"], "backend": "run"}],
+  "services": [{"name": "notes", "allow": ["eid:9f2k…"], "allow_display": ["bob"], "backend": "run"}],
   "peers":    [{"name": "bob", "services": ["notes"], "user_id": "b64u:…"}],
   "self_user_id": "b64u:…",
   "roster":   {"org_id":"…","serial":42,"state":"approved","org_root_fingerprint":"tango-fig-cabbage"},
@@ -484,7 +487,8 @@ things:
   major: an added field, a new method, or a strictness change. It is bumped in the same change that
   makes it, and never resets except on a MAJOR bump. A client guards a feature it needs with
   `api_minor >= N` — e.g. strict params validation is `api_minor >= 1`; the `set_nickname` verb
-  and `StatusResult.self_nickname` are `api_minor >= 2` (#37). `api_minor` is itself
+  and `StatusResult.self_nickname` are `api_minor >= 2` (#37); STABLE-principal `allow`
+  strings + `ServiceInfo.allow_display` are `api_minor >= 3` (#38). `api_minor` is itself
   additive: a pre-1.1 daemon omits it and it reads as `0`.
 
 Changes remain **additive within a major**: new response fields are optional (absent-tolerant), so a

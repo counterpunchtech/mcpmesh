@@ -59,7 +59,9 @@ enum Cmd {
     Serve {
         /// Service name — how peers address it (`connect <peer>/<name>`).
         name: String,
-        /// Comma-separated nicknames/groups admitted to this service.
+        /// Comma-separated principals admitted to this service: paired-peer nicknames
+        /// (resolved to stable principals at write time), `b64u:` user_ids, `eid:` device
+        /// principals, or roster group names.
         #[arg(long)]
         allow: Option<String>,
         /// The command to run per session, after `--` (a stdio MCP server).
@@ -301,7 +303,8 @@ enum BlobCmd {
         /// Path to the local file to publish.
         file: PathBuf,
     },
-    /// Grant a scope to a principal (a roster group name or a user_id).
+    /// Grant a scope to a principal: a `b64u:` user_id, an `eid:` device principal, a roster
+    /// group name, or a paired peer's nickname (resolved to its stable principal at write time).
     Grant { scope: String, principal: String },
     /// List the daemon's blob scopes (name → hashes + grants).
     List,
@@ -543,8 +546,9 @@ fn run_serve(
         }
         println!("serving '{name}'");
         // The next exact instruction. Nothing is shared until someone is granted access, so the
-        // invite is ALWAYS the next step — `--allow` names nicknames, but only a redeemed invite
-        // (or a roster) makes a nickname resolve to a real peer.
+        // invite is ALWAYS the next step — `--allow` input resolves through your paired peers to
+        // stable principals at write time (#38), but only a redeemed invite (or a roster) makes
+        // a peer real in the first place.
         println!(
             "Next: run `mcpmesh invite {name}` to mint a one-time invite, and send it to the \
              person you want to share it with."
@@ -735,11 +739,26 @@ fn run_internal_blob(command: BlobCmd, json: bool) -> anyhow::Result<()> {
                     println!("{}", serde_json::to_value(&r)?);
                 } else {
                     for s in r.scopes {
+                        // Surface discipline (#38): a raw `eid:`/`b64u:` device/person
+                        // principal is a machine id — redact it to a neutral placeholder in
+                        // human output (roster group/user_id names show as-is). `--json`
+                        // carries the raw grants for tooling.
+                        let grants: Vec<String> = s
+                            .grants
+                            .iter()
+                            .map(|g| {
+                                if g.starts_with("eid:") || g.starts_with("b64u:") {
+                                    "a paired peer".to_owned()
+                                } else {
+                                    g.clone()
+                                }
+                            })
+                            .collect();
                         println!(
                             "{}: {} blob(s), granted to [{}]",
                             s.name,
                             s.hashes.len(),
-                            s.grants.join(", ")
+                            grants.join(", ")
                         );
                     }
                 }

@@ -527,6 +527,7 @@ mod tests {
             services: vec![ServiceInfo {
                 name: "kb".into(),
                 allow: vec![],
+                allow_display: vec![],
                 backend: BackendKind::Socket,
                 ephemeral: false,
             }],

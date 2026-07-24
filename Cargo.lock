@@ -2439,6 +2439,7 @@ version = "0.7.2"
 dependencies = [
  "anyhow",
  "async-trait",
+ "data-encoding",
  "iroh",
  "mcpmesh-codec",
  "mcpmesh-local-api",

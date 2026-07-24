@@ -187,16 +187,17 @@ pub(crate) fn write_service_to_config(
     write_config_doc(path, &doc)
 }
 
-/// Append `nickname` to each `[services.<svc>].allow` in the config at `path`, idempotently,
+/// Append `principal` (a STABLE authz principal — `b64u:`/`eid:`/roster name, #38; never a
+/// display nickname) to each `[services.<svc>].allow` in the config at `path`, idempotently,
 /// and atomically rewrite the file. Returns whether the config actually CHANGED (so the caller
 /// can skip a pointless reload).
 ///
 /// A service NOT present in config is logged + skipped: a pairing grant authorizes into an
-/// existing service, it never creates one. An already-present nickname is a no-op for that
+/// existing service, it never creates one. An already-present principal is a no-op for that
 /// service (idempotent re-pair). Returns `Ok(false)` with no write when nothing changed.
 pub(crate) fn append_allow_to_config(
     path: &Path,
-    nickname: &str,
+    principal: &str,
     services: &[String],
 ) -> Result<bool> {
     let existing = read_config_for_rmw(path)?;
@@ -230,10 +231,10 @@ pub(crate) fn append_allow_to_config(
             );
         };
         // Idempotent: append only if not already granted.
-        if allow_arr.iter().any(|v| v.as_str() == Some(nickname)) {
+        if allow_arr.iter().any(|v| v.as_str() == Some(principal)) {
             continue;
         }
-        allow_arr.push(toml::Value::String(nickname.to_string()));
+        allow_arr.push(toml::Value::String(principal.to_string()));
         changed = true;
     }
 
@@ -243,9 +244,10 @@ pub(crate) fn append_allow_to_config(
     Ok(changed)
 }
 
-/// Remove `nickname` from EVERY `[services.<svc>].allow` in the config at `path`, and atomically
-/// rewrite the file. Returns whether the config actually CHANGED (so the caller can skip a
-/// pointless reload). The exact inverse of [`append_allow_to_config`].
+/// Remove every entry in `principals` from EVERY `[services.<svc>].allow` in ONE atomic
+/// read-modify-write. `principals` are a peer's STABLE authz principals (#38: its device
+/// `eid:`s plus, when unshared, its `b64u:` user_id) — never display nicknames, and never
+/// bare roster names (a bare strip could hit a group). Returns whether the config changed.
 ///
 /// **Fail-safe leniency (vs. the grant's strictness).** A malformed service entry (a non-table
 /// `[services.<svc>]`, or a non-array `allow`) is SKIPPED, not an error: this is a removal that
@@ -253,7 +255,7 @@ pub(crate) fn append_allow_to_config(
 /// unpair on any error — so bailing on one weird entry would leave the peer LESS restricted (the
 /// opposite of fail-safe). A genuinely unparseable config still errors (exceptional corruption,
 /// same as the grant path). No `[services]` table → nothing to revoke (`Ok(false)`).
-pub(crate) fn remove_allow_from_config(path: &Path, nickname: &str) -> Result<bool> {
+pub(crate) fn remove_allow_from_config(path: &Path, principals: &[String]) -> Result<bool> {
     let existing = read_config_for_rmw(path)?;
     let mut doc: toml::Table = toml::from_str(&existing)
         .with_context(|| format!("parse existing config {}", path.display()))?;
@@ -263,58 +265,22 @@ pub(crate) fn remove_allow_from_config(path: &Path, nickname: &str) -> Result<bo
     };
 
     let mut changed = false;
-    for (_svc, entry) in services_tbl.iter_mut() {
-        // Skip a malformed service entry rather than bail (fail-safe — see the doc note).
-        let toml::Value::Table(entry) = entry else {
-            continue;
+    for (_, entry) in services_tbl.iter_mut() {
+        let toml::Value::Table(svc) = entry else {
+            continue; // malformed service entry → skip (fail-safe)
         };
-        let Some(toml::Value::Array(allow_arr)) = entry.get_mut("allow") else {
-            continue;
+        let Some(toml::Value::Array(allow)) = svc.get_mut("allow") else {
+            continue; // absent or malformed allow → skip (fail-safe)
         };
-        let before = allow_arr.len();
-        allow_arr.retain(|v| v.as_str() != Some(nickname));
-        if allow_arr.len() != before {
+        let before = allow.len();
+        allow.retain(|v| {
+            v.as_str()
+                .is_none_or(|s| !principals.iter().any(|p| p == s))
+        });
+        if allow.len() != before {
             changed = true;
         }
     }
-
-    if changed {
-        write_config_doc(path, &doc)?;
-    }
-    Ok(changed)
-}
-
-/// Replace `from` with `to` in every service's config `[services.<svc>].allow` (dedup — if `to` is
-/// already present, `from` is simply dropped). The rename analogue of [`remove_allow_from_config`],
-/// so a contact rename carries its grants to the new name. Returns whether the config changed.
-pub(crate) fn rename_allow_in_config(path: &Path, from: &str, to: &str) -> Result<bool> {
-    let existing = read_config_for_rmw(path)?;
-    let mut doc: toml::Table = toml::from_str(&existing)
-        .with_context(|| format!("parse existing config {}", path.display()))?;
-
-    let Some(toml::Value::Table(services_tbl)) = doc.get_mut("services") else {
-        return Ok(false); // no [services] table → nothing to rewrite
-    };
-
-    let mut changed = false;
-    for (_svc, entry) in services_tbl.iter_mut() {
-        let toml::Value::Table(entry) = entry else {
-            continue;
-        };
-        let Some(toml::Value::Array(allow_arr)) = entry.get_mut("allow") else {
-            continue;
-        };
-        if !allow_arr.iter().any(|v| v.as_str() == Some(from)) {
-            continue;
-        }
-        let has_to = allow_arr.iter().any(|v| v.as_str() == Some(to));
-        allow_arr.retain(|v| v.as_str() != Some(from));
-        if !has_to {
-            allow_arr.push(toml::Value::String(to.to_string()));
-        }
-        changed = true;
-    }
-
     if changed {
         write_config_doc(path, &doc)?;
     }
@@ -478,8 +444,9 @@ mod tests {
         // Granting into a service NOT in config → skipped, no change.
         assert!(!append_allow_to_config(&path, "carol", &["ghost".to_string()]).unwrap());
 
-        // Revoke bob → true, allow becomes empty.
-        assert!(remove_allow_from_config(&path, "bob").unwrap());
+        // Revoke bob's principals → true, allow becomes empty. (Principals-slice form, #38:
+        // one atomic RMW strips every listed principal.)
+        assert!(remove_allow_from_config(&path, &["bob".to_string()]).unwrap());
         let doc: toml::Table = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(
             doc["services"]["kb"]["allow"]
@@ -487,14 +454,14 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        // Revoking an absent nickname → no change (false).
-        assert!(!remove_allow_from_config(&path, "nobody").unwrap());
+        // Revoking absent principals → no change (false).
+        assert!(!remove_allow_from_config(&path, &["nobody".to_string()]).unwrap());
 
         // No [services] table at all → both grant + revoke are false (nothing to touch).
         let empty = dir.path().join("empty.toml");
         std::fs::write(&empty, "[identity]\nnickname = \"x\"\n").unwrap();
         assert!(!append_allow_to_config(&empty, "bob", &["kb".to_string()]).unwrap());
-        assert!(!remove_allow_from_config(&empty, "bob").unwrap());
+        assert!(!remove_allow_from_config(&empty, &["bob".to_string()]).unwrap());
     }
 
     /// Re-registering an existing service (kb does this idempotently on EVERY startup, with an
@@ -560,31 +527,5 @@ mod tests {
             vec!["alice".to_string(), "bob".to_string()],
             "union: existing grant kept, incoming appended"
         );
-    }
-
-    #[test]
-    fn rename_allow_in_config_replaces_following_grants_and_dedups() {
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = dir.path().join("config.toml");
-        std::fs::write(
-            &cfg,
-            "[services.kb]\nallow = [\"bob\", \"eng\"]\n[services.notes]\nallow = [\"bob\", \"bobby\"]\n",
-        )
-        .unwrap();
-        assert!(rename_allow_in_config(&cfg, "bob", "bobby").unwrap());
-        let after = Config::load(&cfg).unwrap();
-        let kb = &after.services.get("kb").unwrap().allow;
-        assert!(
-            kb.contains(&"bobby".to_string())
-                && !kb.contains(&"bob".to_string())
-                && kb.contains(&"eng".to_string())
-        );
-        // notes already had "bobby" → "bob" is dropped without a duplicate.
-        assert_eq!(
-            after.services.get("notes").unwrap().allow,
-            vec!["bobby".to_string()]
-        );
-        // Renaming an absent name changes nothing.
-        assert!(!rename_allow_in_config(&cfg, "nobody", "x").unwrap());
     }
 }

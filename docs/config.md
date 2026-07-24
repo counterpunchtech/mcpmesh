@@ -96,7 +96,7 @@ the service's public name (`mcpmesh serve notes …` writes `[services.notes]`).
 |---|---|---|
 | `run` | *(unset)* | The command to spawn per session — an ordinary stdio MCP server, e.g. `["npx", "-y", "@modelcontextprotocol/server-filesystem", "/home/alice/notes"]`. |
 | `socket` | *(unset)* | The local endpoint of an **already-running** MCP server the daemon dials instead of spawning (how plugin daemons register themselves). |
-| `allow` | `[]` | The nicknames/groups admitted to this service. Pairing appends to it; `mcpmesh pair --remove` prunes it. |
+| `allow` | `[]` | The STABLE principals admitted to this service (#38): `b64u:<user_id>`, `eid:<device id>`, or roster group/user_id names — never display nicknames (they cannot admit). Pairing appends the peer's principal; `mcpmesh pair --remove` prunes it; a bare nickname typed at `serve --allow`/`register_service` time is resolved to the peer's principal on write. |
 
 Exactly **one** of `run` / `socket` per service — both or neither makes that one service error
 (surfaced when it is dialed; the rest of the config still loads). Peers themselves are *not* in the
@@ -126,7 +126,7 @@ poll_interval = "30m"
 
 [services.notes]           # written by `mcpmesh serve notes -- npx …`
 run = ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/home/alice/notes"]
-allow = ["bob", "team-eng"]
+allow = ["b64u:9f2k…", "team-eng"]   # stable principals + roster names — never nicknames (#38)
 ```
 
 Source of truth: [`cli/src/config.rs`](../cli/src/config.rs) — where this document and the code

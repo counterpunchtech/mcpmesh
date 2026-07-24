@@ -245,20 +245,27 @@ pub async fn run_mesh_connection(
     }
 }
 
-/// Does this service's `allow` list admit the resolved caller? The flat authorization namespace:
-/// a nickname (`identity.name`), a roster user_id, or a group name. Extracted so the exact
-/// predicate `run_session` uses is unit-testable.
+/// Does this service's `allow` list admit the resolved caller? The flat authorization namespace
+/// is STABLE principals (#38): the device `eid:` (rendered from the AUTHENTICATED endpoint id),
+/// a user_id (roster bare handle or pairing `b64u:`), or a roster group name. The display
+/// nickname is NEVER matched — renames can never change what a peer is granted. Extracted so
+/// the exact predicate `run_session` uses is unit-testable.
 ///
 /// The expansion itself is THE shared `mcpmesh_local_api::principal_set` — the same implementation
 /// the plugin seam's `peer_audiences` and the blob-scope gate use, so the enforcement sites cannot
 /// drift.
 fn caller_admits(identity: &PeerIdentity, allow: &[String]) -> bool {
-    let principals = mcpmesh_local_api::principal_set(
-        Some(&identity.name),
-        identity.user_id.as_deref(),
-        &identity.groups,
-    );
-    allow.iter().any(|a| principals.contains(a.as_str()))
+    let eid = identity.endpoint.principal();
+    let principals =
+        mcpmesh_local_api::principal_set(Some(&eid), identity.user_id.as_deref(), &identity.groups);
+    let admitted = allow.iter().any(|a| principals.contains(a.as_str()));
+    if !admitted {
+        // The #38 diagnostic: a refusal names BOTH sides of the comparison, so a
+        // principal/allow mismatch is debuggable without source-diving. Debug-level —
+        // principals are the machine namespace, not porcelain output.
+        tracing::debug!(?principals, ?allow, "caller not admitted by allow list");
+    }
+    admitted
 }
 
 /// Drive one accepted session: enforce framing on the first frame, select a
@@ -284,10 +291,11 @@ async fn run_session(
     };
 
     // caller_allowed = services whose `allow` admits this resolved identity (the flat allow
-    // namespace is nicknames, user_ids, and group names). `caller_admits` checks all three arms:
-    // nickname (`identity.name`), roster user_id (`identity.user_id`, None in pairing mode), and
-    // group — so a roster caller named only by its user_id is admitted. The roster's flat-namespace
-    // disjointness rule guarantees a group and a user_id never collide, so checking all three is safe.
+    // namespace is STABLE principals: `eid:` device ids, user_ids, and group names — never
+    // nicknames, #38). `caller_admits` checks all three arms: the authenticated device eid,
+    // the user_id (`identity.user_id`, present for roster callers and bound pairing peers),
+    // and group — so a roster caller named only by its user_id is admitted. The roster's
+    // flat-namespace disjointness rule guarantees a group and a user_id never collide.
     let allowed: Vec<String> = services
         .iter()
         .filter(|(_, e)| caller_admits(identity, &e.allow))
@@ -516,36 +524,48 @@ mod tests {
         .expect("strike-out test timed out");
     }
 
-    /// `caller_admits` implements the flat namespace: nickname (name) OR user_id OR group. This
-    /// calls the PRODUCTION function so activating the user_id arm is a real red→green change.
+    /// `caller_admits` implements the flat STABLE-principal namespace (#38): the authenticated
+    /// device `eid:` OR user_id OR group — the display nickname NEVER admits. This calls the
+    /// PRODUCTION function so each arm (and the nickname refusal) is a real red→green change.
     #[test]
-    fn caller_admits_by_nickname_user_id_or_group() {
+    fn caller_admits_by_eid_user_id_or_group() {
         let allow = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
-        // A roster identity: name == user_id == "alice", groups team-eng+all.
+        // A roster identity: user_id "alice", groups team-eng+all, on device [1u8; 32].
         let roster = PeerIdentity {
-            endpoint: EndpointId::from_bytes([0u8; 32]),
+            endpoint: EndpointId::from_bytes([1u8; 32]),
             name: "alice".into(),
             user_id: Some("alice".into()),
             groups: vec!["team-eng".into(), "all".into()],
         };
         assert!(
             caller_admits(&roster, &allow(&["alice"])),
-            "user_id/name arm"
+            "user_id arm (bare roster handle is a principal)"
         );
         assert!(
             caller_admits(&roster, &allow(&["team-eng"])),
             "group arm (the group allow)"
         );
         assert!(
+            caller_admits(&roster, &allow(&[&roster.endpoint.principal()])),
+            "eid arm (the authenticated device principal admits)"
+        );
+        assert!(
             !caller_admits(&roster, &allow(&["bob"])),
             "unrelated name refused"
         );
+        assert!(
+            !caller_admits(
+                &roster,
+                &allow(&[&EndpointId::from_bytes([9u8; 32]).principal()])
+            ),
+            "an UNRELATED eid principal is refused"
+        );
 
-        // The load-bearing case: name != user_id proves the user_id arm is REQUIRED (name alone
-        // would not admit "alice"). Against a name-OR-groups-only predicate this FAILS.
+        // The load-bearing case: name != user_id proves the user_id arm is REQUIRED, and the
+        // nickname arm is GONE — an allow entry naming the display nickname must NOT admit.
         let by_uid_only = PeerIdentity {
-            endpoint: EndpointId::from_bytes([0u8; 32]),
+            endpoint: EndpointId::from_bytes([2u8; 32]),
             name: "device-label".into(),
             user_id: Some("alice".into()),
             groups: vec![],
@@ -554,15 +574,27 @@ mod tests {
             caller_admits(&by_uid_only, &allow(&["alice"])),
             "user_id arm admits independent of name"
         );
+        assert!(
+            !caller_admits(&by_uid_only, &allow(&["device-label"])),
+            "the display nickname is NOT a principal (#38): it must never admit"
+        );
 
-        // A pairing identity (user_id None) is admitted only by its nickname/groups.
+        // A pairing identity (user_id None) is admitted ONLY by its stable eid — never by
+        // its nickname, so no rename can ever change what it is granted.
         let pairing = PeerIdentity {
-            endpoint: EndpointId::from_bytes([0u8; 32]),
+            endpoint: EndpointId::from_bytes([3u8; 32]),
             name: "bob".into(),
             user_id: None,
             groups: vec![],
         };
-        assert!(caller_admits(&pairing, &allow(&["bob"])));
+        assert!(
+            caller_admits(&pairing, &allow(&[&pairing.endpoint.principal()])),
+            "eid arm is the pairing peer's one principal"
+        );
+        assert!(
+            !caller_admits(&pairing, &allow(&["bob"])),
+            "pairing peer's nickname must not admit"
+        );
         assert!(
             !caller_admits(&pairing, &allow(&["alice"])),
             "pairing peer has no user_id to match"

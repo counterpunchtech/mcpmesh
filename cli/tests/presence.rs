@@ -105,10 +105,12 @@ async fn dial_service_races_a_person_to_the_live_mirror_when_the_primary_is_dead
         // --- The client (dialer) endpoint. Capture its id so the mirror's gate can trust it. ---
         let client_ep = local_endpoint().await;
         let client_id = *client_ep.id().as_bytes();
+        let client_eid = format!("eid:{}", client_ep.id());
 
-        // The mirror's gate authorizes the client (nickname "client") for the echo service.
+        // The mirror's gate authorizes the client by its STABLE eid principal (#38 — the nickname
+        // "client" is display-only and never admits) for the echo service.
         let mirror_cfg = Config::from_toml_str(&format!(
-            "[services.echo]\nrun = ['{STUB}']\nallow = [\"client\"]\n"
+            "[services.echo]\nrun = ['{STUB}']\nallow = [\"{client_eid}\"]\n"
         ))
         .expect("parse mirror config");
         let mirror_store = PeerStore::open(&dir.path().join("mirror_state.redb")).unwrap();

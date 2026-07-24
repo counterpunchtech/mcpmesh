@@ -6,17 +6,24 @@
 //! subprocess or the pairing ceremony (trust is populated via the store, the `internal peer
 //! add` stand-in).
 //!
-//! The proof of injection is end-to-end: the served child is `echo_mcp_stub`, which echoes
-//! back `getenv("MCPMESH_PEER_NAME")` as `result.peer_name`. The connecting peer resolves (at
-//! the gate) to nickname `tester`; asserting `peer_name == "tester"` at the far end proves the
-//! gate-resolved identity threaded through `SessionBackend::run` all the way into the child's
-//! environment across the mesh.
+//! Authorization is by STABLE principal (#38): `[services.*].allow` holds the caller's
+//! `eid:` device principal (or a user_id / roster group name), never its display nickname.
+//! The nickname remains display-only — the proof of injection is still end-to-end: the
+//! served child is `echo_mcp_stub`, which echoes back `getenv("MCPMESH_PEER_NAME")` as
+//! `result.peer_name`. The connecting peer resolves (at the gate) to nickname `tester`;
+//! asserting `peer_name == "tester"` at the far end proves the gate-resolved identity
+//! threaded through `SessionBackend::run` all the way into the child's environment across
+//! the mesh — while its ADMISSION rode the `eid:` principal in `allow`.
 use std::sync::Arc;
 use std::time::Duration;
 
 use mcpmesh::allowlist::{AllowlistGate, PeerEntry, PeerStore};
 use mcpmesh::config::Config;
-use mcpmesh::daemon::build_services;
+use mcpmesh::control::{DaemonState, serve_control_io};
+use mcpmesh::daemon::{MeshState, STACK_VERSION, build_services, spawn_accept_loop};
+use mcpmesh::pairing::LiveInvites;
+use mcpmesh::roster::gate::RosterGate;
+use mcpmesh_local_api::{BackendSpec, connect_control_io};
 use mcpmesh_net::{SessionTransport, TrustGate, connect, serve};
 use serde_json::{Value, json};
 use tokio::time::timeout;
@@ -39,19 +46,23 @@ async fn daemon_serves_run_service_and_injects_caller_identity_over_the_mesh() {
     timeout(Duration::from_secs(60), async {
         let dir = tempfile::tempdir().unwrap();
 
-        // Config: one `run` service `echo` = the hermetic stub, admitting nickname `tester`.
-        // A TOML literal string ('..') for the path avoids any escape concerns.
+        // The "client machine": a second in-process endpoint, bound FIRST — its endpoint id
+        // is both the trust key we populate (the `internal peer add` stand-in) and, rendered
+        // as `eid:<hex>`, the STABLE principal the service's allow list names (#38).
+        let client = local_endpoint().await;
+        let client_id = *client.id().as_bytes();
+        let client_eid = format!("eid:{}", client.id());
+
+        // Config: one `run` service `echo` = the hermetic stub, admitting the client's
+        // `eid:` device principal (never the nickname — #38). A TOML literal string ('..')
+        // for the path avoids any escape concerns.
         let cfg = Config::from_toml_str(&format!(
-            "[services.echo]\nrun = ['{STUB}']\nallow = [\"tester\"]\n"
+            "[services.echo]\nrun = ['{STUB}']\nallow = [\"{client_eid}\"]\n"
         ))
         .expect("parse config");
 
-        // The "client machine": a second in-process endpoint. Its endpoint id is the trust
-        // key we populate (the `internal peer add` stand-in).
-        let client = local_endpoint().await;
-        let client_id = *client.id().as_bytes();
-
         // Populate trust: `internal peer add tester <client id>` → a PeerEntry in the store.
+        // The nickname `tester` is DISPLAY-ONLY; admission above is by eid.
         let store = PeerStore::open(&dir.path().join("state.redb")).unwrap();
         store
             .add(PeerEntry {
@@ -108,7 +119,8 @@ async fn daemon_serves_run_service_and_injects_caller_identity_over_the_mesh() {
             "the served child echoed the tools/call payload"
         );
         // The end-to-end env-injection proof: the child saw MCPMESH_PEER_NAME=tester — the
-        // gate-resolved identity flowed through run() into the spawned child's environment.
+        // gate-resolved DISPLAY identity flowed through run() into the spawned child's
+        // environment, even though admission rode the eid principal.
         assert_eq!(
             call_res["result"]["peer_name"], "tester",
             "the child's MCPMESH_PEER_NAME carried the gate-resolved nickname across the mesh"
@@ -135,28 +147,36 @@ async fn send_initialize(transport: &mut SessionTransport, service: &str) -> Val
     transport.recv_value().await.unwrap().unwrap()
 }
 
-/// The hot-reload's real purpose: after the live serve loop is SWAPPED (the exact mechanic
-/// `register_service` uses — `old.shutdown()` + `serve(endpoint.clone(), gate,
-/// build_services(new_cfg))`), a NEWLY-registered service is actually SERVED over the mesh.
-/// Before the swap the service is refused (-32054, not in the registry); after the swap a real
-/// second endpoint completes initialize + tools/call against it (with identity injected).
-/// This guards the FIX-1 reload path — a torn or lost-update config would yield a dead/wrong
+/// The hot-reload's real purpose, driven through the REAL `register_service` control verb
+/// (in-process `serve_control_io` over a duplex): after the daemon's live accept loop is
+/// hot-swapped, a NEWLY-registered service is actually SERVED over the mesh. Before the
+/// registration the service is refused (-32054, not in the registry); after it a real second
+/// endpoint completes initialize + tools/call against it (with identity injected). This
+/// guards the FIX-1 reload path — a torn or lost-update config would yield a dead/wrong
 /// registry — and proves the swap installs a LIVE serve, not just a fresh accept loop.
+///
+/// It is ALSO the canonical operator-input coverage (#38): allow entries are stored VERBATIM
+/// — the operator names the caller's `eid:` device principal (which admits it, resilient to
+/// any later rename) plus a bare roster name `ghost` (kept verbatim). A peer merely NICKNAMED
+/// `ghost` is NOT admitted — the display nickname never authorizes, and the daemon does no
+/// nickname→principal resolution (a self-asserted nickname could shadow roster vocabulary).
 #[tokio::test]
 async fn hot_reload_serves_a_newly_registered_service_over_the_mesh() {
     timeout(Duration::from_secs(60), async {
         let dir = tempfile::tempdir().unwrap();
 
-        // Two connectors, both trusted as `tester`. Distinct endpoints → distinct
-        // connections, so the post-swap dial cannot reuse the pre-swap (old-registry) one.
+        // Two connectors: `prober` dials pre-swap, `tester` post-swap. Distinct endpoints →
+        // distinct connections, so the post-swap dial cannot reuse the pre-swap
+        // (old-registry) one.
         let before = local_endpoint().await;
         let after = local_endpoint().await;
-        let store = PeerStore::open(&dir.path().join("state.redb")).unwrap();
-        for c in [&before, &after] {
+        let tester_eid = format!("eid:{}", after.id());
+        let store = Arc::new(PeerStore::open(&dir.path().join("state.redb")).unwrap());
+        for (ep, nick) in [(&before, "prober"), (&after, "tester")] {
             store
                 .add(PeerEntry {
-                    endpoint_id: *c.id().as_bytes(),
-                    nickname: "tester".into(),
+                    endpoint_id: *ep.id().as_bytes(),
+                    nickname: nick.into(),
                     services: vec!["echo".into()],
                     paired_at: None,
                     user_id: None,
@@ -164,43 +184,74 @@ async fn hot_reload_serves_a_newly_registered_service_over_the_mesh() {
                 })
                 .unwrap();
         }
-        let gate: Arc<dyn TrustGate> = Arc::new(AllowlistGate::new(Arc::new(store)));
+        let gate: Arc<dyn TrustGate> = Arc::new(AllowlistGate::new(store.clone()));
 
+        // The serving daemon: a real MeshState + its own accept loop over an EMPTY registry
+        // (`echo` is not yet registered), plus the control API served in-process — the exact
+        // composition `register_service` hot-reloads.
         let server = local_endpoint().await;
-
-        // Serve an EMPTY registry first — `echo` is not yet registered.
-        let handle = serve(
-            server.clone(),
-            gate.clone(),
-            build_services(&Config::from_toml_str("").unwrap()),
+        let addr = server.addr();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mesh = MeshState::new(
+            server,
+            gate,
+            store.clone(),
+            Arc::new(LiveInvites::new()),
+            "server".into(),
+            config_path.clone(),
+            Arc::new(RosterGate::empty()),
             Arc::new(mcpmesh_net::ConnRegistry::new()),
+            None,
+            None,
+            None,
+            None,
         );
+        let accept_task = spawn_accept_loop(
+            mesh.clone(),
+            Arc::new(build_services(&Config::load(&config_path).unwrap())),
+        );
+        mesh.set_accept_task(accept_task).await;
 
         // Pre-swap: `echo` is refused (unknown/unauthorized service, §5).
-        let mut t_before = connect(&before, server.addr(), "echo").await.unwrap();
+        let mut t_before = connect(&before, addr.clone(), "echo").await.unwrap();
         let refused = send_initialize(&mut t_before, "echo").await;
         assert_eq!(
             refused["error"]["code"], -32054,
             "echo must be UNSERVED before the reload: {refused}"
         );
 
-        // Hot-reload swap (the register_service mechanic): stop the old loop, serve a registry
-        // that now carries `echo` on the SAME endpoint.
-        handle.shutdown();
-        let cfg = Config::from_toml_str(&format!(
-            "[services.echo]\nrun = ['{STUB}']\nallow = [\"tester\"]\n"
-        ))
-        .unwrap();
-        let _new_handle = serve(
-            server.clone(),
-            gate.clone(),
-            build_services(&cfg),
-            Arc::new(mcpmesh_net::ConnRegistry::new()),
+        // The REAL hot-reload: `register_service` over the control API. The operator names
+        // the caller's stable `eid:` principal (admits it) plus a bare roster name `ghost`;
+        // both are stored VERBATIM (#38), persisted, and the accept loop hot-swaps.
+        let state = Arc::new(DaemonState::with_mesh(STACK_VERSION, mesh.clone()));
+        let (ctl_side, daemon_side) = tokio::io::duplex(64 * 1024);
+        let (d_read, d_write) = tokio::io::split(daemon_side);
+        tokio::spawn(serve_control_io(d_read, d_write, state));
+        let (c_read, c_write) = tokio::io::split(ctl_side);
+        let mut ctl = connect_control_io(c_read, c_write).await.unwrap();
+        ctl.register_service(
+            "echo",
+            BackendSpec::Run {
+                cmd: vec![STUB.into()],
+            },
+            vec![tester_eid.clone(), "ghost".into()],
+        )
+        .await
+        .expect("register_service");
+
+        // Stored VERBATIM (#38): exactly what the operator typed — the eid principal and the
+        // bare roster name, no resolution, no rewriting.
+        let persisted = Config::load(&config_path).unwrap();
+        assert_eq!(
+            persisted.services["echo"].allow,
+            vec![tester_eid.clone(), "ghost".to_string()],
+            "operator-typed allow is stored verbatim (#38)"
         );
 
         // Post-swap: a real second endpoint completes initialize + tools/call against the
-        // newly-served `echo`, identity injected.
-        let mut t_after = connect(&after, server.addr(), "echo").await.unwrap();
+        // newly-served `echo` — admitted via its eid principal, identity injected.
+        let mut t_after = connect(&after, addr.clone(), "echo").await.unwrap();
         let init = send_initialize(&mut t_after, "echo").await;
         assert_eq!(
             init["result"]["serverInfo"]["name"], "echo-stub",
@@ -218,6 +269,28 @@ async fn hot_reload_serves_a_newly_registered_service_over_the_mesh() {
         assert_eq!(
             call["result"]["peer_name"], "tester",
             "identity injection still holds through the reloaded serve loop"
+        );
+
+        // The verbatim `ghost` entry is roster vocabulary, NOT a nickname grant: a peer
+        // added to the store AFTER the registration with nickname `ghost` (no user_id, no
+        // groups) is trusted onto the mesh but NOT admitted to `echo` — the display
+        // nickname never admits (#38).
+        let ghost = local_endpoint().await;
+        store
+            .add(PeerEntry {
+                endpoint_id: *ghost.id().as_bytes(),
+                nickname: "ghost".into(),
+                services: vec![],
+                paired_at: None,
+                user_id: None,
+                last_addr: None,
+            })
+            .unwrap();
+        let mut t_ghost = connect(&ghost, addr, "echo").await.unwrap();
+        let ghost_refused = send_initialize(&mut t_ghost, "echo").await;
+        assert_eq!(
+            ghost_refused["error"]["code"], -32054,
+            "a bare allow entry kept verbatim must not admit a peer by NICKNAME: {ghost_refused}"
         );
     })
     .await

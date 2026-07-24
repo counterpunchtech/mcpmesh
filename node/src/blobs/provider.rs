@@ -166,10 +166,16 @@ impl AppBlobs {
         Ok((ticket, hash_hex))
     }
 
-    /// Grant a scope to a principal — any flat-namespace entry: a group name, a user_id,
-    /// or a nickname — persisted single-writer.
+    /// Grant a scope to a STABLE principal — a group name, a user_id, or an `eid:` device
+    /// principal (never a display nickname, #38) — persisted single-writer.
     pub fn grant(&self, scope: &str, principal: &str) -> Result<()> {
         self.scopes.grant(scope, principal)
+    }
+
+    /// Revoke `principals` from every scope (unpair hygiene, #38) — persisted single-writer.
+    /// Returns whether anything changed.
+    pub fn revoke_principals(&self, principals: &[String]) -> Result<bool> {
+        self.scopes.revoke_principals(principals)
     }
 
     /// The current scope table (name, hashes, grants) for `list`.
@@ -213,9 +219,9 @@ impl AppBlobs {
 ///    (the accept-time gate already vetted the endpoint; the GET hook is the per-hash boundary). A
 ///    missing endpoint id (never on an authenticated conn) is denied defensively.
 ///  - `GetRequestReceived`: resolve the endpoint via the trust gate to its identity and ALLOW iff a
-///    scope contains the hash AND grants one of the caller's principals — `groups ∪ {nickname} ∪
-///    {user_id}`, the shared `principal_set` — else `Permission`, BEFORE any bytes (the
-///    Intercept path blocks the transfer on the provider's `rx.await??`).
+///    scope contains the hash AND grants one of the caller's principals — `groups ∪ {eid} ∪
+///    {user_id}`, the shared `principal_set` (nicknames excluded, #38) — else `Permission`,
+///    BEFORE any bytes (the Intercept path blocks the transfer on the provider's `rx.await??`).
 ///  - get_many/observe/push (all routed through `mask.get`): DENY
 ///    explicitly — deny-by-default, the store is not a general filesystem surface. Belt-and-suspenders
 ///    with `APP_BLOB_EVENT_MASK`, which ALSO pins these types (get_many/push = `Disabled`, observe =
@@ -251,17 +257,18 @@ fn spawn_gate_loop(
                     let allow = msg.request.ranges.is_blob()
                         && identity.as_ref().is_some_and(|identity| {
                             // The grant namespace is THE flat principal set —
-                            // groups ∪ {nickname} ∪ {user_id} — via the ONE shared
+                            // groups ∪ {eid} ∪ {user_id} — via the ONE shared
                             // `principal_set` (same expansion as the mesh allow check and
-                            // the plugin seam). The nickname is deliberately INCLUDED: a
-                            // pairing-mode peer (no user binding) granted a scope by its
-                            // nickname can fetch, matching service `allow` semantics; a
-                            // plugin's attachment scopes may grant by audience strings,
-                            // which include nicknames. Excluding it silently broke
-                            // nickname-audience attachments once. Default-deny is untouched:
-                            // an unlisted principal still gets `Permission` before any bytes.
+                            // the plugin seam). Nicknames are deliberately EXCLUDED (#38):
+                            // scope grants are written as stable principals at grant time,
+                            // so a pairing-mode peer is granted (and fetches) by its
+                            // `eid:` device principal; legacy nickname-audience grants
+                            // stop matching BY DESIGN (the doctor lint + release notes
+                            // cover the migration). Default-deny is untouched: an unlisted
+                            // principal still gets `Permission` before any bytes.
+                            let eid = identity.endpoint.principal();
                             let principals: HashSet<&str> = mcpmesh_local_api::principal_set(
-                                Some(&identity.name),
+                                Some(&eid),
                                 identity.user_id.as_deref(),
                                 &identity.groups,
                             )
@@ -442,16 +449,16 @@ mod tests {
         .expect("timed out");
     }
 
-    /// Regression — the blob-scope grant namespace is the FULL flat principal set,
-    /// nickname included: a PAIRING-MODE peer (nickname only, `user_id: None`, no groups)
-    /// granted a scope by its nickname CAN fetch; a resolved-but-unlisted peer is still
-    /// denied (default-deny holds). Pins the ruling that aligned this gate with the mesh
-    /// `allow` semantics (nicknames were previously — wrongly — excluded here).
+    /// The #38 inversion for the blob-scope gate — grants hold STABLE principals only:
+    /// a PAIRING-MODE peer (unbound: `user_id: None`, no groups) granted by its `eid:`
+    /// device principal CAN fetch; a peer whose only "grant" names its display NICKNAME
+    /// is DENIED (nicknames are self-asserted/rewritable and never admit). Identities
+    /// carry their REAL authenticated endpoint bytes so the eid arm is honest.
     #[tokio::test]
-    async fn pairing_mode_nickname_grant_admits_and_unlisted_peer_stays_denied() {
+    async fn pairing_mode_eid_grant_admits_and_nickname_grant_stays_denied() {
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            let carol_ep = ep().await; // pairing-mode: nickname only
-            let mallory_ep = ep().await; // resolved by the gate, but granted nothing
+            let carol_ep = ep().await; // pairing-mode: granted by her eid: device principal
+            let mallory_ep = ep().await; // "granted" only by nickname — must stay denied
             let carol_id: EndpointId = carol_ep.id().into();
             let mallory_id: EndpointId = mallory_ep.id().into();
 
@@ -459,16 +466,16 @@ mod tests {
             entries.insert(
                 carol_id,
                 PeerIdentity {
-                    endpoint: [0u8; 32].into(),
+                    endpoint: carol_id, // the REAL authenticated bytes — the eid arm is honest
                     name: "carol".into(),
-                    user_id: None, // no device→user binding — nickname is the ONLY principal
+                    user_id: None, // no device→user binding — eid: is the ONLY principal
                     groups: vec![],
                 },
             );
             entries.insert(
                 mallory_id,
                 PeerIdentity {
-                    endpoint: [0u8; 32].into(),
+                    endpoint: mallory_id,
                     name: "mallory".into(),
                     user_id: None,
                     groups: vec![],
@@ -491,13 +498,19 @@ mod tests {
             provider.spawn_accept(&provider_ep);
 
             let src = pdir.path().join("attach.bin");
-            std::fs::write(&src, b"nickname-scoped bytes").unwrap();
+            std::fs::write(&src, b"eid-scoped bytes").unwrap();
             let (ticket, _hash) = provider
                 .publish_scope("kb-attach-carol", &src)
                 .await
                 .unwrap();
-            // Grant by NICKNAME — the kb attachment-scope shape (audience strings include nicknames).
-            provider.grant("kb-attach-carol", "carol").unwrap();
+            // Grant by the STABLE eid: device principal (iroh EndpointId Display is the same
+            // hex-lower encoding as `EndpointId::principal()`).
+            provider
+                .grant("kb-attach-carol", &format!("eid:{}", carol_ep.id()))
+                .unwrap();
+            // A NICKNAME entry on the same scope — display names must NEVER admit (#38), so
+            // this grants mallory nothing even though her resolved identity is named "mallory".
+            provider.grant("kb-attach-carol", "mallory").unwrap();
 
             let cdir = tempfile::tempdir().unwrap();
             let carol = AppBlobs::open_fetcher(cdir.path().join("c"), carol_ep.clone())
@@ -506,13 +519,14 @@ mod tests {
             let hash = carol
                 .fetch(&ticket)
                 .await
-                .expect("a pairing-mode peer granted by nickname fetches");
+                .expect("a pairing-mode peer granted by its eid: principal fetches");
             assert_eq!(
                 &carol.read_bytes(hash).await.unwrap()[..],
-                b"nickname-scoped bytes"
+                b"eid-scoped bytes"
             );
 
-            // DEFAULT-DENY: mallory resolves at accept time but holds no grant → Permission.
+            // NICKNAME NEVER ADMITS: mallory resolves at accept time and the scope lists the
+            // bare string "mallory", but her nickname is not a principal → Permission.
             let mallory = AppBlobs::open_fetcher(cdir.path().join("m"), mallory_ep.clone())
                 .await
                 .unwrap();
@@ -521,11 +535,11 @@ mod tests {
                     .await;
             assert!(
                 matches!(res, Ok(Err(_))),
-                "an unlisted peer is refused: {res:?}"
+                "a nickname-only grant is refused: {res:?}"
             );
         })
         .await
-        .expect("nickname-grant test timed out");
+        .expect("eid-grant test timed out");
     }
 
     /// A served GET records a `blob_fetch` audit line attributed to the authenticated peer, with the

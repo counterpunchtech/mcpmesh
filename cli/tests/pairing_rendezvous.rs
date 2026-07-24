@@ -401,11 +401,11 @@ async fn malformed_hello_is_refused_without_panicking_and_writes_no_entry() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Identity-confusion / privilege-escalation guard (T6 security fold-in). The redeemer's
-// self-asserted nickname becomes BOTH its resolved identity and the string appended to config
-// `allow`, so a name that matches an existing identity would let it assume that identity's
-// access. `handle_inviter_side` refuses such names BEFORE writing the PeerEntry / granting.
-// These five cases lock in the security property AND that legitimate re-pairing still works.
+// Display-uniqueness guard (#38 rework). Grants are principal-keyed, so a nickname confers NO
+// access anymore — the guard's residual purpose is display/routing clarity: a redeemer's
+// self-asserted name held by a DIFFERENT stored peer is refused before any write. These cases
+// lock in that residual property AND that legitimate (re-)pairing still works, with grants
+// landing as STABLE principals.
 // ---------------------------------------------------------------------------------------------
 
 /// A pre-seeded store peer (the `internal peer add` shape — no `paired_at`).
@@ -446,10 +446,11 @@ async fn collision_guard_allows_a_fresh_unique_nickname() {
             .unwrap()
             .expect("bob entry written");
         assert_eq!(entry.nickname, "bob");
+        // The grant lands as the STABLE eid principal (#38) — never the display name.
         let cfg = Config::load(&config_path).unwrap();
         assert_eq!(
             cfg.services.get("notes").unwrap().allow,
-            vec!["bob".to_string()]
+            vec![format!("eid:{}", redeemer.id())]
         );
     })
     .await
@@ -484,20 +485,29 @@ async fn collision_guard_allows_same_peer_re_pair() {
     .expect("same-peer re-pair test timed out");
 }
 
-/// Case 3 — the SAME peer re-pairing to an ADDITIONAL service is ALLOWED even though its name is
-/// already in the FIRST service's allow: the orphan-allow check is skipped because a store peer
-/// (same id) backs the name — that's the peer's own grant, not an orphan.
+/// Case 3 — the SAME peer re-pairing to an ADDITIONAL service is ALLOWED, and each grant is
+/// its own principal append: the first service's existing eid grant is untouched, the new
+/// service gains the same eid (#38 — one principal, appended per granted service).
 #[tokio::test]
 async fn collision_guard_allows_same_peer_additional_service() {
     timeout(Duration::from_secs(60), async {
         let (redeemer, addr, store, invites, inviter_id, config_path) = setup_full(&format!(
-            "[services.notes]\nrun = ['{STUB}']\nallow = [\"bob\"]\n\
+            "[services.notes]\nrun = ['{STUB}']\nallow = []\n\
              [services.kb]\nrun = ['{STUB}']\nallow = []\n"
         ))
         .await;
         let redeemer_id = *redeemer.id().as_bytes();
-        // Bob already paired to notes (SAME id), and "bob" is already in notes' allow.
+        // Bob already paired to notes (SAME id).
         seed_peer(&store, redeemer_id, "bob", &["notes"]);
+        // Pre-existing grant shape: notes already holds bob's eid principal (first
+        // `allow = []` in the config text above is notes').
+        let eid = format!("eid:{}", redeemer.id());
+        let cfg_text = std::fs::read_to_string(&config_path).unwrap();
+        std::fs::write(
+            &config_path,
+            cfg_text.replacen("allow = []", &format!("allow = [\"{eid}\"]"), 1),
+        )
+        .unwrap();
 
         let secret = [23u8; 32];
         invites.mint(make_invite(secret, inviter_id, &["kb"], FUTURE));
@@ -508,16 +518,10 @@ async fn collision_guard_allows_same_peer_additional_service() {
             reply["result"], "ok",
             "the same peer pairing to an additional service must be allowed: {reply}"
         );
-        // The grant added bob to kb's allow (and left notes' as-is).
+        // The grant added bob's eid to kb's allow (and left notes' as-is).
         let cfg = Config::load(&config_path).unwrap();
-        assert_eq!(
-            cfg.services.get("kb").unwrap().allow,
-            vec!["bob".to_string()]
-        );
-        assert_eq!(
-            cfg.services.get("notes").unwrap().allow,
-            vec!["bob".to_string()]
-        );
+        assert_eq!(cfg.services.get("kb").unwrap().allow, vec![eid.clone()]);
+        assert_eq!(cfg.services.get("notes").unwrap().allow, vec![eid.clone()]);
     })
     .await
     .expect("additional-service re-pair test timed out");
@@ -563,39 +567,6 @@ async fn collision_guard_refuses_impersonating_an_existing_peer() {
     .expect("impersonation test timed out");
 }
 
-/// Case 5 — orphan-allow: config pre-provisions "carol" in a service's allow but NO store peer
-/// holds that name; a redeemer that names itself "carol" is REFUSED (blocks inheriting a
-/// pre-provisioned grant not backed by a known peer).
-#[tokio::test]
-async fn collision_guard_refuses_an_orphan_allow_name() {
-    timeout(Duration::from_secs(60), async {
-        let (redeemer, addr, store, invites, inviter_id, _cfg) = setup_full(&format!(
-            "[services.notes]\nrun = ['{STUB}']\nallow = [\"carol\"]\n"
-        ))
-        .await;
-        let redeemer_id = *redeemer.id().as_bytes();
-        // No store peer named "carol" — but the name sits in notes' allow.
-
-        let secret = [25u8; 32];
-        invites.mint(make_invite(secret, inviter_id, &["notes"], FUTURE));
-        let reply =
-            drive_redeemer(&redeemer, addr, hello_frame(&secret, &redeemer_id, "carol")).await;
-
-        assert_eq!(
-            reply["result"], "refused",
-            "an orphan-allow name must be refused: {reply}"
-        );
-        assert_eq!(reply["reason"], "pairing refused");
-        assert!(
-            store.resolve(&redeemer_id).unwrap().is_none(),
-            "no entry may be written for an orphan-allow claim"
-        );
-        assert_eq!(invites.count(), 0, "the burned invite is not preserved");
-    })
-    .await
-    .expect("orphan-allow test timed out");
-}
-
 // ---------------------------------------------------------------------------------------------
 // Second-pairing MERGE semantics (the "reverse pairing clobbers the dial directory" fix).
 // `PeerStore::add` is a replace-on-endpoint_id upsert, so the rendezvous write sites must
@@ -609,8 +580,8 @@ async fn collision_guard_refuses_an_orphan_allow_name() {
 /// `services = ["notes"]`, his chosen name "alice", her proven user_id). Later BOB invites Alice
 /// back (to grant her his "code" service). Bob is now the INVITER: his side's write must MERGE
 /// into his existing alice-entry, not replace it with the fresh `{services: []}` dial-back row —
-/// and the authorization grant must admit her STORED nickname (the name his gate resolves her
-/// dials to), not her self-suggestion.
+/// and the authorization grant lands as her STABLE principal (#38: the stored `b64u:` user_id,
+/// since her earlier pairing proved a binding), never any nickname.
 #[tokio::test]
 async fn reverse_pairing_preserves_the_inviters_dial_directory_and_nickname() {
     timeout(Duration::from_secs(60), async {
@@ -668,12 +639,13 @@ async fn reverse_pairing_preserves_the_inviters_dial_directory_and_nickname() {
             Some("1000"),
             "the original pairing stamp is kept on the inviter side"
         );
-        // The authorization grant admits her STORED nickname — the name the gate resolves her to.
+        // The authorization grant lands as her stable principal: the binding-present branch
+        // writes the stored b64u: user_id (#38) — resilient to any rename on either side.
         let cfg = Config::load(&config_path).unwrap();
         assert_eq!(
             cfg.services.get("code").unwrap().allow,
-            vec!["alice".to_string()],
-            "the grant must target the stored nickname, not the self-suggestion"
+            vec!["b64u:ALICE".to_string()],
+            "the grant must target the stable principal, never a nickname"
         );
     })
     .await
@@ -722,7 +694,6 @@ async fn repeat_grant_unions_the_redeemers_dial_directory_and_applies_the_new_ni
             invite.encode(),
             bob_store.clone(),
             None,
-            &bob_dir.path().join("config.toml"),
         )
         .await
         .expect("the second redeem succeeds");
@@ -805,7 +776,6 @@ async fn redeem_refuses_an_invite_squatting_an_existing_peers_nickname() {
             invite.encode(),
             bob_store.clone(),
             None,
-            &bob_dir.path().join("config.toml"),
         )
         .await
         .expect_err("redeeming a nickname-squatting invite must fail");
@@ -901,7 +871,6 @@ async fn paired_and_granted_peer_is_admitted_to_the_service_end_to_end() {
             invite.encode(),
             bob_store.clone(),
             None,
-            &bob_dir.path().join("config.toml"),
         )
         .await
         .expect("redeem_invite dials, verifies the inviter id, sends the secret, succeeds");
@@ -932,12 +901,12 @@ async fn paired_and_granted_peer_is_admitted_to_the_service_end_to_end() {
         );
         assert!(alice_side.paired_at.is_some());
 
-        // ---- The GRANT took effect on disk: [services.notes].allow now lists bob ----
+        // ---- The GRANT took effect on disk as bob's STABLE principal (#38) ----
         let after = Config::load(&config_path).unwrap();
         assert_eq!(
             after.services.get("notes").unwrap().allow,
-            vec!["bob".to_string()],
-            "the pairing grant must append bob to [services.notes].allow"
+            vec![format!("eid:{}", bob.id())],
+            "the pairing grant must append bob's eid principal to [services.notes].allow"
         );
 
         // ---- BOTH sides computed the SAME sas_code (order-independent) ----
@@ -992,6 +961,144 @@ async fn paired_and_granted_peer_is_admitted_to_the_service_end_to_end() {
     })
     .await
     .expect("E2E admission test timed out");
+}
+
+/// THE #38 REGRESSION: a display rename can never desync a grant. Pre-0.8.0 this exact flow
+/// refused with `-32054`: pairing granted by NICKNAME, `peer_rename` (first-class since the
+/// 0.7.1 `set_nickname` era) rewrote the stored name, and the gate then resolved the peer to
+/// a name the allow list no longer contained. Post-#38 the grant is the peer's `eid:`
+/// principal, the rename touches only the display row, and admission is unchanged.
+#[tokio::test]
+async fn rename_after_pairing_keeps_the_peer_admitted() {
+    timeout(Duration::from_secs(60), async {
+        // ---- Alice serves notes; the REAL accept loop + gate + config (e2e harness) ----
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let db_path = dir.path().join("state.redb");
+        std::fs::write(
+            &config_path,
+            format!("[services.notes]\nrun = ['{STUB}']\nallow = []\n"),
+        )
+        .unwrap();
+        let store = Arc::new(PeerStore::open(&db_path).unwrap());
+        let gate: Arc<dyn TrustGate> = Arc::new(AllowlistGate::new(store.clone()));
+        let invites = Arc::new(LiveInvites::new());
+        let alice = inviter_endpoint().await;
+        let alice_id = *alice.id().as_bytes();
+        let alice_addr = alice.addr();
+        let cfg = Config::load(&config_path).unwrap();
+        let mesh = MeshState::new(
+            alice,
+            gate,
+            store.clone(),
+            invites.clone(),
+            "alice".into(),
+            config_path.clone(),
+            Arc::new(RosterGate::empty()),
+            Arc::new(ConnRegistry::new()),
+            None,
+            None,
+            None,
+            None,
+        );
+        let task = spawn_accept_loop(mesh.clone(), Arc::new(build_services(&cfg)));
+        mesh.set_accept_task(task).await;
+
+        // ---- Bob pairs (real invite, real dial) and is admitted ----
+        let secret = [61u8; 32];
+        let invite = Invite {
+            secret,
+            inviter_id: alice_id,
+            inviter_addr_json: serde_json::to_string(&alice_addr).unwrap(),
+            nickname: "alice".into(),
+            services: vec!["notes".into()],
+            expires_at_epoch: FUTURE,
+            app_label: None,
+        };
+        invites.mint(invite.clone());
+        let bob = redeemer_endpoint().await;
+        let bob_dir = tempfile::tempdir().unwrap();
+        let bob_store = Arc::new(PeerStore::open(&bob_dir.path().join("state.redb")).unwrap());
+        redeem_invite(bob.clone(), "bob".into(), invite.encode(), bob_store, None)
+            .await
+            .expect("pairing succeeds");
+        let mut t = connect(&bob, alice_addr.clone(), "notes").await.unwrap();
+        t.send_value(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18",
+                       "_meta": {"mcpmesh/service": "notes"},
+                       "capabilities": {}, "clientInfo": {"name": "bob", "version": "0"}}
+        }))
+        .await
+        .unwrap();
+        let init = t.recv_value().await.unwrap().unwrap();
+        assert_eq!(
+            init["result"]["serverInfo"]["name"], "echo-stub",
+            "paired peer admitted before the rename: {init}"
+        );
+        drop(t);
+
+        // ---- Alice renames bob → "robert" through the REAL rename handler ----
+        let state = mcpmesh::control::DaemonState::with_mesh("test", mesh.clone());
+        mcpmesh::daemon::rename_peer(
+            &state,
+            mcpmesh_local_api::PeerRenameParams {
+                to: "robert".into(),
+                user_id: None,
+                nickname: Some("bob".into()),
+            },
+        )
+        .await
+        .expect("rename succeeds");
+        assert_eq!(
+            store
+                .resolve(bob.id().as_bytes())
+                .unwrap()
+                .unwrap()
+                .nickname,
+            "robert",
+            "the display rename landed"
+        );
+        // The grant is untouched — allow still holds bob's eid principal, byte-identical.
+        let after = Config::load(&config_path).unwrap();
+        assert_eq!(
+            after.services.get("notes").unwrap().allow,
+            vec![format!("eid:{}", bob.id())],
+            "a rename must leave grants byte-identical (#38)"
+        );
+
+        // ---- THE PAYOFF: bob dials again and is STILL admitted (pre-#38: -32054) ----
+        let mut t = connect(&bob, alice_addr, "notes").await.unwrap();
+        t.send_value(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18",
+                       "_meta": {"mcpmesh/service": "notes"},
+                       "capabilities": {}, "clientInfo": {"name": "bob", "version": "0"}}
+        }))
+        .await
+        .unwrap();
+        let init = t.recv_value().await.unwrap().unwrap();
+        assert_eq!(
+            init["result"]["serverInfo"]["name"], "echo-stub",
+            "a renamed peer must STILL be admitted — the #38 regression: {init}"
+        );
+        // And the served child now sees the NEW display name — display followed the rename,
+        // authorization didn't move.
+        t.send_value(json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "echo", "arguments": {"text": "still-here"}}
+        }))
+        .await
+        .unwrap();
+        let call = t.recv_value().await.unwrap().unwrap();
+        assert_eq!(call["result"]["content"][0]["text"], "still-here");
+        assert_eq!(
+            call["result"]["peer_name"], "robert",
+            "display identity follows the rename while the grant stands"
+        );
+    })
+    .await
+    .expect("#38 regression test timed out");
 }
 
 /// **Self-sovereign identity adoption (device->user binding), end to end.** When BOTH sides present
@@ -1074,7 +1181,6 @@ async fn pairing_exchanges_and_stores_each_sides_verified_user_id() {
                 user_pk: b_pk,
                 sig: b_sig,
             }),
-            &bob_dir.path().join("config.toml"),
         )
         .await
         .expect("redeem succeeds and exchanges self-sovereign bindings");
@@ -1156,16 +1262,9 @@ async fn redeem_refuses_an_address_swap_and_writes_no_entry_p3() {
         let bob = redeemer_endpoint().await;
         let bob_dir = tempfile::tempdir().unwrap();
         let bob_store = Arc::new(PeerStore::open(&bob_dir.path().join("state.redb")).unwrap());
-        let err = redeem_invite(
-            bob,
-            "bob".into(),
-            invite.encode(),
-            bob_store.clone(),
-            None,
-            &bob_dir.path().join("config.toml"),
-        )
-        .await
-        .expect_err("a P3 id mismatch must fail the redeem");
+        let err = redeem_invite(bob, "bob".into(), invite.encode(), bob_store.clone(), None)
+            .await
+            .expect_err("a P3 id mismatch must fail the redeem");
         assert!(
             err.to_string().contains("address-swap") || err.to_string().contains("id mismatch"),
             "expected an address-swap / id-mismatch error, got: {err}"

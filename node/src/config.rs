@@ -33,7 +33,7 @@ pub struct ServiceCfg {
     pub run: Option<Vec<String>>,
     /// `socket`: dial this local UDS (an already-running MCP server).
     pub socket: Option<String>,
-    /// Nicknames/groups admitted to this service (one flat namespace).
+    /// STABLE principals admitted to this service (b64u:/eid:/roster names, #38 — never display nicknames).
     pub allow: Vec<String>,
 }
 

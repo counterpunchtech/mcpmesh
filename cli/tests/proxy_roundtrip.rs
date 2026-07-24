@@ -62,13 +62,15 @@ async fn connect_proxy_round_trips_an_echo_service_over_the_mesh() {
         let server_id = *server_ep.id().as_bytes();
         let server_addr = server_ep.addr();
 
-        // The connecting side is the in-process daemon's endpoint; capture its id first so the
-        // server's gate can trust it (the mesh peer the server sees is the daemon endpoint).
+        // The connecting side is the in-process daemon's endpoint; bind it FIRST so the
+        // server's allow list can hold its STABLE eid: principal (the mesh peer the server
+        // sees is the daemon endpoint; nicknames never admit — display only).
         let daemon_ep = local_endpoint().await;
         let daemon_id = *daemon_ep.id().as_bytes();
+        let daemon_eid = format!("eid:{}", daemon_ep.id());
 
         let server_cfg = Config::from_toml_str(&format!(
-            "[services.echo]\nrun = ['{STUB}']\nallow = [\"daemon\"]\n"
+            "[services.echo]\nrun = ['{STUB}']\nallow = [\"{daemon_eid}\"]\n"
         ))
         .expect("parse server config");
         let server_store = PeerStore::open(&dir.path().join("server_state.redb")).unwrap();

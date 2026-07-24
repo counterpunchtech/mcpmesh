@@ -23,7 +23,8 @@
 //! Shape — the strongest hermetic version the plan blesses: a real TWO-endpoint mesh over
 //! localhost (relay disabled, no discovery). Alice is the serving side — the daemon's own
 //! `build_services` + `serve` composition, gated by the REAL `AllowlistGate` over a real
-//! `PeerStore` (`[services.files] run=echo_mcp_stub, allow=["bob"]`). Bob is the consuming
+//! `PeerStore` (`[services.files] run=echo_mcp_stub, allow=["eid:<bob>"]` — the STABLE
+//! device principal; nicknames are display-only and never admit). Bob is the consuming
 //! side — an in-process daemon (`daemon::serving_state` + the REAL `serve_control`) whose
 //! control socket a REAL `mcpmesh connect` subprocess drives. Bob's daemon dials Alice by id;
 //! localhost has no discovery, so Bob's endpoint is seeded with Alice's `EndpointAddr` via a
@@ -82,11 +83,13 @@ async fn hero_flow_minus_pairing() {
         let bob_id = *bob_ep.id().as_bytes();
 
         // ── ALICE (serving side): the daemon's own build_services + serve composition. ──
-        // `[services.files] run=echo_mcp_stub, allow=["bob"]`; the REAL AllowlistGate over a
-        // real store that grants nickname `bob` (Bob's dialing endpoint id) the `files` service
-        // — the M2a stand-in for what `pair` will later write.
+        // `[services.files] run=echo_mcp_stub, allow=["eid:<bob>"]` — Bob's STABLE device
+        // principal (nicknames are display-only and never admit); the REAL AllowlistGate over
+        // a real store that knows Bob's endpoint under nickname `bob` — the M2a stand-in for
+        // what `pair` will later write.
+        let bob_principal = format!("eid:{}", bob_ep.id());
         let alice_cfg = Config::from_toml_str(&format!(
-            "[services.files]\nrun = ['{STUB}']\nallow = [\"bob\"]\n"
+            "[services.files]\nrun = ['{STUB}']\nallow = [\"{bob_principal}\"]\n"
         ))
         .expect("parse alice config");
         let alice_store = PeerStore::open(&dir.path().join("alice_state.redb")).unwrap();

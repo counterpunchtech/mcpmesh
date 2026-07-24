@@ -19,6 +19,11 @@ is caught by signatures, rollback by the strictly-increasing serial + freshness 
 that break that model (forgery, downgrade, cross-peer data leakage, local endpoint permission
 bypass, transport-vocabulary leaks into user-facing surfaces) are top priority.
 
+Note on identifiers (0.8.0, #38): authorization keys on stable principals (`eid:<endpoint id>`,
+`b64u:<user id>`) stored in config `allow` lists and blob grants — a sanctioned MACHINE surface.
+The user-facing discipline is unchanged: porcelain renders principals back to display names
+(`allow_display`) and never prints raw ids; display nicknames can never admit.
+
 Local endpoint permission bypass covers both platforms: on macOS/Linux the daemon's control socket
 lives in a `0700` directory it owns and checks the connecting process's uid; on Windows the
 equivalent is the control pipe's owner-only DACL, which grants access only to the owning user's SID.

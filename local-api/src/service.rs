@@ -5,7 +5,7 @@
 //! - UDS faces: [`ensure_private_dir`] + [`bind_uds`] + [`check_peer_uid`] (0700
 //!   symlink-refused owned runtime dir, 0600 socket, same-uid gate). The mcpmesh daemon's
 //!   own control socket (`cli/src/ipc.rs`) binds through the SAME rule.
-//! - THE audience-authz expansion: [`peer_audiences`] — `groups ∪ {name} ∪ {user_id}`,
+//! - THE audience-authz expansion: [`peer_audiences`] — `groups ∪ {eid} ∪ {user_id}`,
 //!   default-deny. The single implementation both kb and loc gate on.
 //! - `[services.*]` self-registration: [`register_service`] (empty allowlist; failures
 //!   logged, never silently swallowed).
@@ -68,7 +68,7 @@ pub use crate::transport::{bind_uds, check_peer_uid, ensure_private_dir};
 // THE audience-authz expansion (default-deny)
 // ---------------------------------------------------------------------------------------
 
-/// `peer_audiences = peer.groups ∪ {peer.name} ∪ {peer.user_id}` — THE ONE
+/// `peer_audiences = peer.groups ∪ {peer.eid} ∪ {peer.user_id}` — THE ONE
 /// implementation of the caller-audience expansion every plugin gates on (kb re-exports it
 /// as `effective_audiences`). An absent/empty peer yields an EMPTY set — default deny.
 ///
@@ -79,11 +79,12 @@ pub use crate::transport::{bind_uds, check_peer_uid, ensure_private_dir};
 /// `user_id` is the person's self-sovereign id (`b64u:<user_pk>`, present once a device→user
 /// binding is verified — pairing OR roster). Including it means content shared to a PERSON
 /// reaches ALL their devices (each presents the same verified user_id under a distinct
-/// nickname), whereas `name` (the nickname) scopes to one device and `groups` to a roster set —
-/// three legitimate granularities.
+/// nickname), whereas `eid` (the stable device principal) scopes to one device and `groups`
+/// to a roster set — three legitimate granularities.
 ///
-/// If authz is ever re-keyed on `endpoint_id` instead of the display nickname (a planned
-/// identity hardening), that change lands HERE, once.
+/// Re-keyed on stable identity in 0.8.0 (#38): the platform injection carries the device
+/// `eid:` principal and the display `name` is NEVER an audience — the identity hardening
+/// this doc long promised, landed here, once.
 pub fn peer_audiences(peer: &Value) -> Vec<String> {
     // The expansion itself is THE shared `principal_set` (crate::principals — the flat
     // namespace, one implementation for the mesh allow check, this seam, and the blob-scope
@@ -98,7 +99,7 @@ pub fn peer_audiences(peer: &Value) -> Vec<String> {
         })
         .unwrap_or_default();
     crate::principal_set(
-        peer.get("name").and_then(|v| v.as_str()),
+        peer.get("eid").and_then(|v| v.as_str()),
         peer.get("user_id").and_then(|v| v.as_str()),
         &groups,
     )
@@ -262,17 +263,31 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn peer_audiences_is_groups_union_name_union_user_id() {
-        let peer = json!({"name":"bob-laptop","user_id":"b64u:BOB","groups":["eng","ops"]});
+    fn peer_audiences_is_groups_union_eid_union_user_id() {
+        // The platform injection carries the stable device principal `eid:` alongside the
+        // display `name` — and the nickname is NEVER an audience (#38).
+        let peer = json!({
+            "name": "bob-laptop",
+            "eid": "eid:0707",
+            "user_id": "b64u:BOB",
+            "groups": ["eng", "ops"]
+        });
         let mut a = peer_audiences(&peer);
         a.sort();
-        assert_eq!(a, vec!["b64u:BOB", "bob-laptop", "eng", "ops"]);
+        assert_eq!(a, vec!["b64u:BOB", "eid:0707", "eng", "ops"]);
+        assert!(
+            !a.iter().any(|s| s == "bob-laptop"),
+            "display nickname must never be an audience"
+        );
         // DEFAULT-DENY: an absent/empty peer yields nothing.
         assert!(peer_audiences(&json!({})).is_empty());
-        // Empty-string name/user_id never become audiences.
+        // Empty-string eid/user_id never become audiences, and a name alone grants NOTHING.
         assert_eq!(
-            peer_audiences(&json!({"name":"bob","user_id":"","groups":[]})),
-            vec!["bob"]
+            peer_audiences(&json!({"name":"bob","eid":"eid:0707","user_id":"","groups":[]})),
+            vec!["eid:0707"]
+        );
+        assert!(
+            peer_audiences(&json!({"name":"bob","eid":"","user_id":"","groups":[]})).is_empty()
         );
     }
 

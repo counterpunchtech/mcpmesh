@@ -128,6 +128,35 @@ pub fn check_roster_url(org_root_pinned: bool, roster_url: Option<&str>) -> Verd
     }
 }
 
+/// Allow-vocabulary lint (#38, 0.8.0): `allow` entries are STABLE principals — `b64u:`,
+/// `eid:`, or (roster mode) bare group/user_id names. On a PURE-PAIRING node (no org root
+/// pinned) a bare entry can only be a dead pre-0.8.0 nickname grant, which no longer admits
+/// anyone — WARN with the migration pointer. Roster mode → bare entries are legitimate
+/// vocabulary → OK. `bare` carries `(service, entry)` pairs for the message.
+pub fn check_allow_principals(org_root_pinned: bool, bare: &[(String, String)]) -> Verdict {
+    if bare.is_empty() {
+        return Verdict::ok("allow entries are stable principals");
+    }
+    if org_root_pinned {
+        // On a mixed (roster + pairing) node a bare entry is AMBIGUOUS — a legitimate
+        // roster group/user_id, OR a dead pre-0.8.0 pairing nickname grant. We cannot tell
+        // them apart from config alone, so this is advisory, not OK-silent.
+        return Verdict::info(
+            "bare allow entries are treated as roster names; any that were pre-0.8.0              pairing-nickname grants no longer admit — re-pair those peers",
+        );
+    }
+    let listed: Vec<String> = bare
+        .iter()
+        .map(|(svc, entry)| format!("{svc}:\"{entry}\""))
+        .collect();
+    Verdict::warn(format!(
+        "nickname-keyed grants no longer admit anyone (0.8.0): {} — re-pair the peer \
+         (grants are now written as stable principals) or replace the entry with the \
+         peer's b64u:/eid: principal",
+        listed.join(", ")
+    ))
+}
+
 /// A private ed25519 key file's permission verdict. `present` = the file exists;
 /// `mode` = its `st_mode & 0o777`. A key must be 0600. Group/world-WRITABLE (`mode & 0o022`) → ERROR
 /// (an attacker could replace the key → identity takeover, catastrophic for org-root/user keys).
@@ -356,6 +385,8 @@ struct DoctorInputs {
     has_org_id: bool,
     network: crate::config::NetworkCfg,
     roster_url: Option<String>,
+    /// `(service, entry)` pairs for allow entries that are neither `b64u:` nor `eid:` (#38).
+    bare_allow_entries: Vec<(String, String)>,
     max_staleness_secs: i64,
     device_key: (bool, u32),
     user_key: (bool, u32),
@@ -479,6 +510,17 @@ fn gather() -> DoctorInputs {
     DoctorInputs {
         parse_ok,
         org_root_pinned: cfg.identity.org_root_pk.is_some(),
+        bare_allow_entries: cfg
+            .services
+            .iter()
+            .flat_map(|(name, svc)| {
+                svc.allow
+                    .iter()
+                    .filter(|a| !a.starts_with("b64u:") && !a.starts_with("eid:"))
+                    .map(|a| (name.clone(), a.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect(),
         has_org_id: cfg.identity.org_id.is_some(),
         network: cfg.network.clone(),
         roster_url: cfg.roster.url.clone(),
@@ -515,6 +557,10 @@ fn findings(inp: &DoctorInputs) -> Vec<(&'static str, Verdict)> {
         (
             "roster-url",
             check_roster_url(inp.org_root_pinned, inp.roster_url.as_deref()),
+        ),
+        (
+            "allow vocabulary",
+            check_allow_principals(inp.org_root_pinned, &inp.bare_allow_entries),
         ),
         (
             "roster-freshness",
@@ -649,6 +695,17 @@ mod tests {
     fn roster_url_warns_only_for_a_urlless_roster_node() {
         // Pairing mode (no org root) → OK regardless of url.
         assert_eq!(check_roster_url(false, None).level, Level::Ok);
+        // #38 allow-vocabulary lint: bare entries warn ONLY on a pure-pairing node.
+        let bare = vec![("kb".to_string(), "bob".to_string())];
+        assert_eq!(check_allow_principals(false, &[]).level, Level::Ok);
+        assert_eq!(check_allow_principals(true, &bare).level, Level::Info);
+        let v = check_allow_principals(false, &bare);
+        assert_eq!(v.level, Level::Warn);
+        assert!(
+            v.message.contains("re-pair") && v.message.contains("kb:\"bob\""),
+            "actionable + names the entry: {}",
+            v.message
+        );
         assert_eq!(check_roster_url(false, Some("https://x")).level, Level::Ok);
         // Roster mode WITH a url → OK.
         assert_eq!(
@@ -872,6 +929,7 @@ mod tests {
         // `DoctorInputs`, so this runs on macOS/Linux CI unchanged (it does not touch the FS).
         let inp = DoctorInputs {
             parse_ok: true,
+            bare_allow_entries: Vec::new(),
             org_root_pinned: false,
             has_org_id: false,
             network: net("default", &[], "default", &[]),

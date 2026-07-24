@@ -629,11 +629,16 @@ pub(crate) fn status_result(state: &DaemonState) -> Result<StatusResult> {
                 .lock()
                 .expect("ephemeral_services lock not poisoned")
                 .clone();
-            (
-                crate::daemon::service_infos(&cfg, &ephemeral),
-                crate::daemon::peer_infos(&mesh.store),
-                roster,
-            )
+            {
+                // One store read serves both the peer list and the allow-display
+                // annotation (fails open on corrupt rows, like `peer_infos`).
+                let entries = mesh.store.list().unwrap_or_default();
+                (
+                    crate::daemon::service_infos(&cfg, &ephemeral, &entries),
+                    crate::daemon::peer_infos(&mesh.store),
+                    roster,
+                )
+            }
         }
         None => (Vec::new(), Vec::new(), None),
     };
