@@ -39,7 +39,7 @@
 //! [`AllowlistGate`]: crate::allowlist::AllowlistGate
 //! [`Services`]: mcpmesh_net::Services
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -238,24 +238,20 @@ pub async fn handle_inviter_side(
             // once, so our entry for them carries a real dial directory). The merge rules below
             // preserve what that entry already knows instead of replace-clobbering it.
             //
-            // Identity-confusion guard (privilege-escalation defense) — BEFORE any write/grant,
-            // and only for a NEW peer. The redeemer's self-asserted nickname becomes BOTH its
-            // resolved identity (the gate maps endpoint_id → nickname) AND the string appended to
-            // config `allow`, so a name that matches an EXISTING identity would let the redeemer
-            // assume that identity's access (beyond `invite.services`). Refuse: (a) a name held
-            // by a DIFFERENT store peer (impersonation), or (b) a name backed by NO store peer
-            // but already sitting in some service's config `allow` (an orphan pre-provisioned
-            // grant). For an EXISTING same-id entry the self-suggested name is DISCARDED entirely
-            // (the stored nickname is preserved below), so no authority can derive from the
-            // suggestion and the guard has nothing to guard — same-id re-pairs keep passing.
-            // Blocking (redb + config read) → spawn_blocking.
+            // Display-uniqueness guard — BEFORE any write/grant, and only for a NEW peer. The
+            // redeemer's self-asserted nickname becomes its resolved DISPLAY identity (the gate
+            // maps endpoint_id → nickname); grants are principal-keyed (#38), so no access can
+            // derive from the name — but a duplicate display name would make this inviter's own
+            // records/routing ambiguous, so a name held by a DIFFERENT store peer is refused.
+            // For an EXISTING same-id entry the self-suggested name is DISCARDED entirely (the
+            // stored nickname is preserved below) — same-id re-pairs keep passing.
+            // Blocking (redb read) → spawn_blocking.
             let store_c = ctx.store.clone();
-            let config_path_c = ctx.config_path.clone();
             let nickname_c = hello.redeemer_nickname.clone();
             let (existing, collides) = tokio::task::spawn_blocking(move || {
                 let existing = store_c.resolve(&tls_id)?;
                 let collides = existing.is_none()
-                    && nickname_collision(&store_c, &config_path_c, &nickname_c, &tls_id)?;
+                    && nickname_collision(&store_c, &nickname_c, &tls_id)?;
                 anyhow::Ok((existing, collides))
             })
             .await
@@ -478,7 +474,6 @@ pub async fn redeem_invite(
     invite_line: String,
     store: Arc<PeerStore>,
     self_binding: Option<SelfBinding>,
-    config_path: &Path,
 ) -> anyhow::Result<PairResult> {
     let invite = Invite::decode(&invite_line)?;
 
@@ -495,7 +490,7 @@ pub async fn redeem_invite(
     // `[services.*].allow` authorizes) point at THEIR endpoint. Refusing here keeps the
     // invariant that redeeming an invite grants the other side nothing.
     if let Some(conflict) =
-        nickname_squat(&store, config_path, &invite.nickname, &invite.inviter_id)?
+        nickname_squat(&store, &invite.nickname, &invite.inviter_id)?
     {
         bail!(
             "this invite asks to be called '{}', but {conflict} \
@@ -624,89 +619,50 @@ pub async fn redeem_invite(
     })
 }
 
-/// Identity-confusion guard for pairing (a privilege-escalation defense). Returns `true` = REFUSE when
-/// a redeemer's self-asserted `nickname` would let it assume an EXISTING identity's access:
-///  - **(a) impersonation** — a store peer with this nickname exists under a DIFFERENT
-///    `endpoint_id` than the redeemer's authenticated `tls_id`; or
-///  - **(b) orphan-allow** — NO store peer has this nickname AND the name already appears in some
-///    config `[services.*].allow` (a pre-provisioned grant the redeemer would inherit).
+/// Display-uniqueness guard for pairing. Returns `true` = REFUSE when a redeemer's
+/// self-asserted `nickname` is already held by a DIFFERENT stored peer: a duplicate display
+/// name would make the inviter's own records ambiguous (status shows two peers as one, and
+/// outbound routing by name is first-match). NOT a privilege defense anymore (#38): grants
+/// are principal-keyed, so no name can inherit or confer access — this protects display and
+/// routing clarity only.
 ///
-/// A same-id re-pair (every same-name entry shares `tls_id`) passes both: that peer's own name is
-/// neither impersonation nor an orphan — which is precisely why (b) is gated on there being NO
-/// backing store peer. Blocking (redb read + config file read) — call on a blocking thread.
+/// A same-id re-pair (every same-name entry shares `tls_id`) passes: that peer's own name is
+/// no duplicate. Blocking (redb read) — call on a blocking thread.
 fn nickname_collision(
     store: &PeerStore,
-    config_path: &Path,
     nickname: &str,
     tls_id: &[u8; 32],
 ) -> anyhow::Result<bool> {
-    let same_name: Vec<PeerEntry> = store
+    Ok(store
         .list()?
         .into_iter()
-        .filter(|e| e.nickname == nickname)
-        .collect();
-    // (a) impersonation: any same-name entry belongs to a DIFFERENT endpoint.
-    if same_name.iter().any(|e| &e.endpoint_id != tls_id) {
-        return Ok(true);
-    }
-    // (b) orphan-allow: an unbacked name already sitting in some service's config allow.
-    if same_name.is_empty() && nickname_in_any_service_allow(config_path, nickname)? {
-        return Ok(true);
-    }
-    Ok(false)
+        .any(|e| e.nickname == nickname && &e.endpoint_id != tls_id))
 }
 
-/// Redeemer-side name-squatting guard — the mirror of [`nickname_collision`], run before we adopt
-/// an invite's *suggested* nickname. Returns `Some(reason)` = REFUSE when adopting the suggestion
-/// would repoint an already-meaningful name at the inviter's endpoint:
-///  - **impersonation** — a stored peer already holds this nickname under a DIFFERENT
-///    `endpoint_id`. Adopting it would make our gate resolve the inviter's dials to the name we
-///    granted the *other* peer, handing them that peer's access.
-///  - **orphan-allow** — no stored peer holds the name, but it already sits in some service's
-///    `[services.*].allow` (a pre-provisioned grant), which the inviter would silently inherit.
+/// Redeemer-side name-squatting guard — the mirror of [`nickname_collision`], run before we
+/// adopt an invite's *suggested* nickname. Returns `Some(reason)` = REFUSE when a stored peer
+/// already holds this nickname under a DIFFERENT `endpoint_id`: adopting it would make OUR
+/// outbound `<peer>/<service>` routing ambiguous (first-match by name) and our records show
+/// two peers as one. NOT an access defense anymore (#38): grants are principal-keyed, so a
+/// name confers nothing — this protects the redeemer's own routing/display clarity.
 ///
-/// Re-pairing with the SAME endpoint passes both, so rename-by-a-fresh-invite keeps working: the
-/// only entry sharing the name is that peer's own, and the name is not an orphan.
+/// Re-pairing with the SAME endpoint passes, so rename-by-a-fresh-invite keeps working — and
+/// post-#38 that rename is fully SAFE: no grant keys on the name it rewrites.
 ///
 /// The returned string is a reason phrase, spliced into the caller's guidance message.
 fn nickname_squat(
     store: &PeerStore,
-    config_path: &Path,
     nickname: &str,
     inviter_id: &[u8; 32],
 ) -> anyhow::Result<Option<String>> {
-    let same_name: Vec<PeerEntry> = store
+    let clashes = store
         .list()?
         .into_iter()
-        .filter(|e| e.nickname == nickname)
-        .collect();
-    if same_name.iter().any(|e| &e.endpoint_id != inviter_id) {
-        return Ok(Some(
-            "you already use that name for a different peer — \
-             accepting it would hand this invite's sender that peer's access. \
-             Unpair the existing peer first if you no longer need it."
-                .to_string(),
-        ));
-    }
-    if same_name.is_empty() && nickname_in_any_service_allow(config_path, nickname)? {
-        return Ok(Some(
-            "that name is already granted access to one of your services, \
-             so accepting it would hand this invite's sender that grant. \
-             Remove the name from the service's `allow` first if it is stale."
-                .to_string(),
-        ));
-    }
-    Ok(None)
-}
-
-/// Does `nickname` appear in ANY config `[services.*].allow`? Reads the CURRENT config on disk (the
-/// same file the grant appends to). A missing/empty config → `false` (nothing granted yet). Shared
-/// with the daemon's rename collision guard (`rename_plan`).
-pub fn nickname_in_any_service_allow(config_path: &Path, nickname: &str) -> anyhow::Result<bool> {
-    let cfg = crate::config::Config::load(config_path)
-        .map_err(|e| anyhow::anyhow!("load config for nickname collision check: {e}"))?;
-    Ok(cfg
-        .services
-        .values()
-        .any(|svc| svc.allow.iter().any(|a| a == nickname)))
+        .any(|e| e.nickname == nickname && &e.endpoint_id != inviter_id);
+    Ok(clashes.then(|| {
+        "you already use that name for a different peer — \
+         accepting it would make your own dials to that name ambiguous. \
+         Unpair the existing peer first if you no longer need it."
+            .to_string()
+    }))
 }

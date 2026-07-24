@@ -26,7 +26,7 @@ use crate::util::{blocking, epoch_now_u64};
 
 use super::accept::reload_accept_loop;
 use super::config_write::{
-    append_allow_to_config, remove_allow_from_config, rename_allow_in_config,
+    append_allow_to_config, remove_allow_from_config,
     write_service_to_config,
 };
 use super::status::service_infos;
@@ -335,7 +335,7 @@ pub(crate) async fn add_peer(state: &DaemonState, params: PeerAddParams) -> Resu
 /// **Fail-safe teardown order (DECLARED).** The pairing grant writes, in order, (1) the
 /// [`PeerEntry`] (identity — who the peer is) then (2) the config `allow` append (authorization —
 /// what it may open). Removal is that grant's LIFO inverse: undo (2) FIRST via
-/// `revoke_service_access` (strip the nickname from every `[services.*].allow`, the
+/// `revoke_service_access` (strip the peer's stable principals from every `[services.*].allow`, the
 /// security-relevant half), THEN undo (1) via [`PeerStore::remove`] (drop the identity row). This
 /// leaves the peer MORE restricted, never less, at every partial-failure point:
 ///  - revoke fails → we abort BEFORE touching the store: the peer is unchanged (still fully
@@ -413,7 +413,6 @@ struct RenamePlan {
 /// Blocking (redb + config read) — call on a blocking thread.
 fn rename_plan(
     store: &PeerStore,
-    config_path: &Path,
     user_id: Option<&str>,
     nickname: Option<&str>,
     to: &str,
@@ -436,23 +435,16 @@ fn rename_plan(
 
     let target_ids: std::collections::BTreeSet<[u8; 32]> =
         targets.iter().map(|e| e.endpoint_id).collect();
-    // (a) impersonation: a peer named `to` at an endpoint that is NOT one of the targets is a
-    // DIFFERENT contact — renaming onto it would let this person assume that identity's grants.
+    // (a) display-uniqueness: a peer named `to` at an endpoint that is NOT one of the targets is
+    // a DIFFERENT contact — a duplicate name would misdirect YOUR outbound dials
+    // (`PeerStore::entry_for` is first-match by nickname) and make status ambiguous. Grants are
+    // principal-keyed (#38) and unaffected by names; this guard protects routing/display only.
     if all
         .iter()
         .any(|e| e.nickname == to && !target_ids.contains(&e.endpoint_id))
     {
         anyhow::bail!("the nickname \"{to}\" is already used by another contact");
     }
-    // (b) orphan-allow: `to` sits in some service allow but backs NO peer — a pre-provisioned grant
-    // the renamed peer would inherit. (If a target is already named `to`, a backing peer exists.)
-    let backed_by_peer = all.iter().any(|e| e.nickname == to);
-    if !backed_by_peer
-        && crate::pairing::rendezvous::nickname_in_any_service_allow(config_path, to)?
-    {
-        anyhow::bail!("the nickname \"{to}\" is already granted access — pick another");
-    }
-
     let old_nicknames = targets.iter().map(|e| e.nickname.clone()).collect();
     Ok(Some(RenamePlan {
         targets,
@@ -461,10 +453,12 @@ fn rename_plan(
 }
 
 /// Handle a `peer_rename` control request (the Contacts rename). Renames a contact's
-/// nickname (nickname) authoritatively — all the person's `PeerEntry`s to `to`, and rewrites the old
-/// nickname → `to` in every `[services.*].allow` so grants follow — then reloads so the new name
-/// admits. Guarded against renaming onto another identity's name/grant. Held entirely under
-/// `reload_lock` (like grant/revoke/register) so guard→mutate→reload is one atomic critical section.
+/// display nickname — all the person's `PeerEntry`s to `to`. DISPLAY-ONLY (#38): grants are
+/// principal-keyed, so no `allow` rewrite and no serving reload happen (and none are needed —
+/// a rename can never change what a peer is granted). Guarded against duplicating another
+/// contact's display name (outbound-dial routing is first-match by nickname). Held under
+/// `reload_lock` so the guard and the store mutation stay one atomic critical section against
+/// concurrent config/store writers.
 pub async fn rename_peer(state: &DaemonState, params: PeerRenameParams) -> Result<()> {
     let mesh = state.mesh_required()?;
     let to = params.to.trim().to_string();
@@ -483,16 +477,9 @@ pub async fn rename_peer(state: &DaemonState, params: PeerRenameParams) -> Resul
     let _reload = mesh.reload_lock.lock().await;
 
     let store = mesh.store.clone();
-    let config_path = mesh.config_path.clone();
     let (uid_c, pn_c, to_c) = (user_id.clone(), nickname.clone(), to.clone());
     let plan = blocking("join rename plan", move || {
-        rename_plan(
-            &store,
-            &config_path,
-            uid_c.as_deref(),
-            pn_c.as_deref(),
-            &to_c,
-        )
+        rename_plan(&store, uid_c.as_deref(), pn_c.as_deref(), &to_c)
     })
     .await??;
     let RenamePlan {
@@ -503,17 +490,13 @@ pub async fn rename_peer(state: &DaemonState, params: PeerRenameParams) -> Resul
         None => return Ok(()), // no-op: already named `to`
     };
 
-    // Mutate on a blocking thread: rewrite each old nickname → `to` in the config allow lists, then
-    // upsert each target `PeerEntry` (same endpoint_id, new nickname).
+    // Mutate on a blocking thread: upsert each target `PeerEntry` (same endpoint_id, new
+    // nickname). That is the WHOLE rename now (#38): grants are principal-keyed, so no config
+    // rewrite and no serving reload — a rename is a pure display mutation with no serving blip
+    // (the #38 fix: a rename can never desync a grant, because no grant names a nickname).
     let store = mesh.store.clone();
-    let config_path = mesh.config_path.clone();
     let to_c = to.clone();
     blocking("join rename mutate", move || {
-        for old in &old_nicknames {
-            if old != &to_c {
-                rename_allow_in_config(&config_path, old, &to_c)?;
-            }
-        }
         for mut e in targets {
             e.nickname = to_c.clone();
             store.add(e)?;
@@ -521,10 +504,7 @@ pub async fn rename_peer(state: &DaemonState, params: PeerRenameParams) -> Resul
         anyhow::Ok(())
     })
     .await??;
-
-    // Reload so the rebuilt `Services` admit under the new nickname (select_service reads the allow
-    // baked in at build time).
-    reload_services_from_disk(mesh, "rename").await?;
+    let _ = old_nicknames; // display history only; nothing authz-bearing keys on it
     tracing::info!(to = %to, "renamed contact");
     Ok(())
 }
@@ -676,7 +656,6 @@ pub(crate) async fn redeem(state: &DaemonState, invite_line: String) -> Result<P
         invite_line,
         mesh.store.clone(),
         mesh.self_binding(),
-        &mesh.config_path,
     )
     .await
 }
@@ -740,10 +719,20 @@ pub async fn grant_service_access(
     Ok(())
 }
 
-/// Revoke a peer's AUTHORIZATION: remove `nickname` from EVERY service's config
-/// `[services.<svc>].allow` and hot-reload so the running registry stops admitting it. The exact
-/// INVERSE of [`grant_service_access`] (which appends the nickname to the named services' allow),
-/// and the authorization half of [`remove_peer`].
+/// Revoke a peer's AUTHORIZATION: resolve the nickname to its devices' STABLE principals
+/// (#38) and strip them from EVERY service's config `[services.<svc>].allow`, then hot-reload
+/// so the running registry stops admitting them. The exact INVERSE of
+/// [`grant_service_access`] (which appends the stable principal), and the authorization half
+/// of [`remove_peer`].
+///
+/// **The principal-strip rule (spec-settled):** each target device's `eid:` is stripped
+/// ALWAYS; the shared `b64u:` user_id is stripped ONLY when no OTHER stored peer entry
+/// carries it — unpairing one device of a multi-device person must never revoke the person.
+/// Bare strings in `allow` are NEVER stripped here: post-#38 a bare entry is roster
+/// vocabulary (a group or roster user_id), and a nickname-keyed strip could collide with a
+/// group name and revoke a whole roster group. (Note the boundary: admission requires gate
+/// RESOLVE first, so deleting the PeerEntry already denies the device outright — this strip
+/// is grant hygiene, not the security boundary.)
 ///
 /// Serialized against [`register_service`] / [`grant_service_access`] via `mesh.reload_lock` (the
 /// SAME lock — a concurrent config mutation must not read the same base config and clobber this
@@ -759,11 +748,40 @@ pub(crate) async fn revoke_service_access(mesh: &Arc<MeshState>, nickname: &str)
     // SAME serialization as register_service / grant: hold the whole remove→reload→swap section.
     let _reload = mesh.reload_lock.lock().await;
 
-    // 1. Idempotent allow-removal on a blocking thread (config IO blocks).
+    // 0. Resolve the target devices' stable principals BEFORE any teardown (the caller
+    //    `remove_peer` deletes the rows after this returns — ordering already safe).
+    let store = mesh.store.clone();
+    let nick_r = nickname.to_string();
+    let principals: Vec<String> = blocking("join revoke principal resolution", move || {
+        let (targets, others): (Vec<_>, Vec<_>) =
+            store.list()?.into_iter().partition(|e| e.nickname == nick_r);
+        let mut principals = Vec::new();
+        for target in &targets {
+            principals
+                .push(mcpmesh_net::EndpointId::from_bytes(target.endpoint_id).principal());
+            if let Some(user_id) = &target.user_id {
+                let shared_elsewhere =
+                    others.iter().any(|o| o.user_id.as_deref() == Some(user_id));
+                if !shared_elsewhere && !principals.contains(user_id) {
+                    principals.push(user_id.clone());
+                }
+            }
+        }
+        anyhow::Ok(principals)
+    })
+    .await??;
+    if principals.is_empty() {
+        // No stored device under this nickname → nothing resolvable to strip. (Legacy
+        // bare-nickname allow entries are deliberately untouched — doctor lints them.)
+        tracing::info!(peer = %nickname, changed = false, "revoked service access");
+        return Ok(false);
+    }
+
+    // 1. Idempotent allow-removal on a blocking thread (config IO blocks) — ONE atomic RMW
+    //    over all of the peer's principals.
     let config_path = mesh.config_path.clone();
-    let nickname_w = nickname.to_string();
     let changed = blocking("join revoke config write", move || {
-        remove_allow_from_config(&config_path, &nickname_w)
+        remove_allow_from_config(&config_path, &principals)
     })
     .await??;
 
@@ -1015,8 +1033,6 @@ mod tests {
     #[test]
     fn rename_plan_groups_by_user_id_and_guards_collisions() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = dir.path().join("config.toml");
-        std::fs::write(&cfg, "[services.kb]\nallow = [\"orphan\"]\n").unwrap();
         let store = PeerStore::open(&dir.path().join("s.redb")).unwrap();
         store
             .add(rename_entry(1, "bob-phone", Some("b64u:BOB")))
@@ -1029,7 +1045,7 @@ mod tests {
             .unwrap();
 
         // Renaming the PERSON by user_id targets BOTH of Bob's devices in one op.
-        let plan = rename_plan(&store, &cfg, Some("b64u:BOB"), None, "Bobby")
+        let plan = rename_plan(&store, Some("b64u:BOB"), None, "Bobby")
             .unwrap()
             .unwrap();
         assert_eq!(plan.targets.len(), 2);
@@ -1040,14 +1056,14 @@ mod tests {
                 .collect()
         );
 
-        // GUARD (a) impersonation: renaming Bob → "carol" (a DIFFERENT contact) is refused.
-        assert!(rename_plan(&store, &cfg, Some("b64u:BOB"), None, "carol").is_err());
-        // GUARD (b) orphan-allow: "orphan" sits in kb.allow but backs no peer → refused.
-        assert!(rename_plan(&store, &cfg, Some("b64u:BOB"), None, "orphan").is_err());
+        // GUARD (a) display-uniqueness: renaming Bob → "carol" (a DIFFERENT contact) is
+        // refused — a duplicate display name misdirects outbound dials. (The old orphan-allow
+        // guard (b) is GONE, #38: allow holds principals, so no name can inherit a grant.)
+        assert!(rename_plan(&store, Some("b64u:BOB"), None, "carol").is_err());
         // A provisional contact (no user_id) renames by nickname to a fresh name.
         store.add(rename_entry(4, "dave", None)).unwrap();
         assert_eq!(
-            rename_plan(&store, &cfg, None, Some("dave"), "Dave")
+            rename_plan(&store, None, Some("dave"), "Dave")
                 .unwrap()
                 .unwrap()
                 .targets
@@ -1056,11 +1072,11 @@ mod tests {
         );
         // Renaming to the current name is a no-op (Ok(None)).
         assert!(
-            rename_plan(&store, &cfg, Some("b64u:CAROL"), None, "carol")
+            rename_plan(&store, Some("b64u:CAROL"), None, "carol")
                 .unwrap()
                 .is_none()
         );
         // No matching contact → error.
-        assert!(rename_plan(&store, &cfg, Some("b64u:NOBODY"), None, "x").is_err());
+        assert!(rename_plan(&store, Some("b64u:NOBODY"), None, "x").is_err());
     }
 }

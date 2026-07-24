@@ -722,7 +722,6 @@ async fn repeat_grant_unions_the_redeemers_dial_directory_and_applies_the_new_ni
             invite.encode(),
             bob_store.clone(),
             None,
-            &bob_dir.path().join("config.toml"),
         )
         .await
         .expect("the second redeem succeeds");
@@ -805,7 +804,6 @@ async fn redeem_refuses_an_invite_squatting_an_existing_peers_nickname() {
             invite.encode(),
             bob_store.clone(),
             None,
-            &bob_dir.path().join("config.toml"),
         )
         .await
         .expect_err("redeeming a nickname-squatting invite must fail");
@@ -901,7 +899,6 @@ async fn paired_and_granted_peer_is_admitted_to_the_service_end_to_end() {
             invite.encode(),
             bob_store.clone(),
             None,
-            &bob_dir.path().join("config.toml"),
         )
         .await
         .expect("redeem_invite dials, verifies the inviter id, sends the secret, succeeds");
@@ -1074,7 +1071,6 @@ async fn pairing_exchanges_and_stores_each_sides_verified_user_id() {
                 user_pk: b_pk,
                 sig: b_sig,
             }),
-            &bob_dir.path().join("config.toml"),
         )
         .await
         .expect("redeem succeeds and exchanges self-sovereign bindings");
@@ -1162,7 +1158,6 @@ async fn redeem_refuses_an_address_swap_and_writes_no_entry_p3() {
             invite.encode(),
             bob_store.clone(),
             None,
-            &bob_dir.path().join("config.toml"),
         )
         .await
         .expect_err("a P3 id mismatch must fail the redeem");
