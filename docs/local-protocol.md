@@ -7,7 +7,7 @@ named pipe on Windows. Anything that can open the endpoint and parse JSON can sp
 language — [`local-api/examples/status.py`](../local-api/examples/status.py) is a complete client
 in ~60 lines of dependency-free Python.
 
-> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.2`, `api_minor` `2`) and evolves
+> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.3`, `api_minor` `3`) and evolves
 > **additively** (see [Versioning](#versioning)), but until a stable release this document — like the
 > wire format itself — may change without a migration path. Pin the mcpmesh version you build
 > against. Source of truth is the Rust in [`local-api/`](../local-api/src/protocol.rs); where this
@@ -79,7 +79,7 @@ porcelain verb starts the daemon) or runs `mcpmesh internal daemon` itself.
 **The server speaks first.** Immediately on accept, the daemon writes one `Hello` frame:
 
 ```json
-{"api":"mcpmesh-local/1","api_version":"1.2","api_minor":2,"stack_version":"…"}
+{"api":"mcpmesh-local/1","api_version":"1.3","api_minor":3,"stack_version":"…"}
 ```
 
 A client MUST read this frame first and check `api == "mcpmesh-local/1"` before sending anything. A
@@ -227,7 +227,7 @@ Do not build on either — they may change or disappear without an `api_version`
 ```json
 {
   "stack_version": "…",
-  "services": [{"name": "notes", "allow": ["bob"], "backend": "run"}],
+  "services": [{"name": "notes", "allow": ["eid:9f2k…"], "allow_display": ["bob"], "backend": "run"}],
   "peers":    [{"name": "bob", "services": ["notes"], "user_id": "b64u:…"}],
   "self_user_id": "b64u:…",
   "roster":   {"org_id":"…","serial":42,"state":"approved","org_root_fingerprint":"tango-fig-cabbage"},
@@ -487,7 +487,8 @@ things:
   major: an added field, a new method, or a strictness change. It is bumped in the same change that
   makes it, and never resets except on a MAJOR bump. A client guards a feature it needs with
   `api_minor >= N` — e.g. strict params validation is `api_minor >= 1`; the `set_nickname` verb
-  and `StatusResult.self_nickname` are `api_minor >= 2` (#37). `api_minor` is itself
+  and `StatusResult.self_nickname` are `api_minor >= 2` (#37); STABLE-principal `allow`
+  strings + `ServiceInfo.allow_display` are `api_minor >= 3` (#38). `api_minor` is itself
   additive: a pre-1.1 daemon omits it and it reads as `0`.
 
 Changes remain **additive within a major**: new response fields are optional (absent-tolerant), so a

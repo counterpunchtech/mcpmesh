@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 /// One scope: the blob hashes it contains + the principals it grants. Hashes are bare 64-char blake3
-/// hex (`Hash::to_hex()`); principals are flat names in the roster's `user_id ∪ groups` namespace.
+/// hex (`Hash::to_hex()`); principals are stable ids/names: `{eid} ∪ {user_id} ∪ groups` (#38 — never nicknames).
 /// `BTreeSet` for deterministic serialization + list ordering.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Scope {
@@ -47,6 +47,18 @@ impl BlobScopes {
             .or_default()
             .grants
             .insert(principal.to_string());
+    }
+
+    /// Remove `principals` from EVERY scope's grant set (unpair hygiene, #38). Returns whether
+    /// anything changed. Empty scopes are left in place (they still track published hashes).
+    pub fn revoke_principals(&mut self, principals: &[String]) -> bool {
+        let mut changed = false;
+        for sc in self.scopes.values_mut() {
+            for p in principals {
+                changed |= sc.grants.remove(p);
+            }
+        }
+        changed
     }
 
     /// SECURITY LINCHPIN (pure): ALLOW iff SOME scope contains `hash_hex` AND grants one of the
@@ -140,6 +152,20 @@ impl ScopeStore {
         self.persist(&snapshot)
     }
 
+    /// Revoke `principals` from every scope + persist (single-writer). The unpair-hygiene
+    /// inverse of `grant` — same lock/persist discipline. Returns whether anything changed.
+    pub fn revoke_principals(&self, principals: &[String]) -> Result<bool> {
+        let (changed, snapshot) = {
+            let mut g = self.inner.write().expect("scope lock not poisoned");
+            let changed = g.revoke_principals(principals);
+            (changed, g.clone())
+        };
+        if changed {
+            self.persist(&snapshot)?;
+        }
+        Ok(changed)
+    }
+
     /// Deterministic list rendering (delegates to `BlobScopes::list`).
     pub fn list(&self) -> Vec<(String, Vec<String>, Vec<String>)> {
         self.snapshot().list()
@@ -158,6 +184,35 @@ mod tests {
 
     fn principals<'a>(names: &'a [&'a str]) -> HashSet<&'a str> {
         names.iter().copied().collect()
+    }
+
+    /// Unpair hygiene (#38): `revoke_principals` strips exactly the named principals from
+    /// every scope, leaving other grants and the published hashes intact, so a fetch that
+    /// admitted before the revoke is denied after.
+    #[test]
+    fn revoke_principals_strips_grants_and_denies_after() {
+        let mut s = BlobScopes::default();
+        let hash = "aa".repeat(32);
+        s.publish_hash("docs", &hash);
+        s.grant("docs", "eid:beef");
+        s.grant("docs", "team-eng");
+        assert!(
+            s.allows(&hash, &principals(&["eid:beef"])),
+            "granted before revoke"
+        );
+
+        // Revoke the device principal only — the group grant and the hash survive.
+        assert!(s.revoke_principals(&["eid:beef".to_string()]));
+        assert!(
+            !s.allows(&hash, &principals(&["eid:beef"])),
+            "denied after revoke"
+        );
+        assert!(
+            s.allows(&hash, &principals(&["team-eng"])),
+            "an unrelated grant is untouched"
+        );
+        // Idempotent: revoking an absent principal changes nothing.
+        assert!(!s.revoke_principals(&["eid:beef".to_string()]));
     }
 
     #[test]

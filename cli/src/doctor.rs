@@ -138,7 +138,12 @@ pub fn check_allow_principals(org_root_pinned: bool, bare: &[(String, String)]) 
         return Verdict::ok("allow entries are stable principals");
     }
     if org_root_pinned {
-        return Verdict::ok("bare allow entries are roster names (groups/user_ids)");
+        // On a mixed (roster + pairing) node a bare entry is AMBIGUOUS — a legitimate
+        // roster group/user_id, OR a dead pre-0.8.0 pairing nickname grant. We cannot tell
+        // them apart from config alone, so this is advisory, not OK-silent.
+        return Verdict::info(
+            "bare allow entries are treated as roster names; any that were pre-0.8.0              pairing-nickname grants no longer admit — re-pair those peers",
+        );
     }
     let listed: Vec<String> = bare
         .iter()
@@ -693,7 +698,7 @@ mod tests {
         // #38 allow-vocabulary lint: bare entries warn ONLY on a pure-pairing node.
         let bare = vec![("kb".to_string(), "bob".to_string())];
         assert_eq!(check_allow_principals(false, &[]).level, Level::Ok);
-        assert_eq!(check_allow_principals(true, &bare).level, Level::Ok);
+        assert_eq!(check_allow_principals(true, &bare).level, Level::Info);
         let v = check_allow_principals(false, &bare);
         assert_eq!(v.level, Level::Warn);
         assert!(

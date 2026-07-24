@@ -739,11 +739,26 @@ fn run_internal_blob(command: BlobCmd, json: bool) -> anyhow::Result<()> {
                     println!("{}", serde_json::to_value(&r)?);
                 } else {
                     for s in r.scopes {
+                        // Surface discipline (#38): a raw `eid:`/`b64u:` device/person
+                        // principal is a machine id — redact it to a neutral placeholder in
+                        // human output (roster group/user_id names show as-is). `--json`
+                        // carries the raw grants for tooling.
+                        let grants: Vec<String> = s
+                            .grants
+                            .iter()
+                            .map(|g| {
+                                if g.starts_with("eid:") || g.starts_with("b64u:") {
+                                    "a paired peer".to_owned()
+                                } else {
+                                    g.clone()
+                                }
+                            })
+                            .collect();
                         println!(
                             "{}: {} blob(s), granted to [{}]",
                             s.name,
                             s.hashes.len(),
-                            s.grants.join(", ")
+                            grants.join(", ")
                         );
                     }
                 }

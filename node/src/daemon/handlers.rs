@@ -69,12 +69,8 @@ pub(crate) async fn blob_grant(
     principal: String,
 ) -> Result<()> {
     let mesh = state.mesh_required()?;
-    // Same write-time resolution as service allow entries (#38): a bare stored-peer
-    // nickname becomes that peer's stable principal; prefixed/roster entries pass verbatim.
-    let principal = resolve_allow_entries(mesh, vec![principal])
-        .await?
-        .pop()
-        .expect("one entry in, one out");
+    // Stored VERBATIM (#38), like service `allow`: a `b64u:`/`eid:` principal or a roster
+    // group/user_id name grants; a bare display nickname does not authorize anyone.
     let provider = mesh
         .app_blobs()
         .await
@@ -159,42 +155,6 @@ async fn reload_services_from_disk(mesh: &Arc<MeshState>, why: &str) -> Result<(
     Ok(())
 }
 
-/// Resolve operator-typed allow/grant entries into the STABLE principal namespace (#38), in
-/// one store pass on a blocking thread. The rules (spec `2026-07-24-stable-principal-authz`):
-/// a `b64u:`/`eid:`-prefixed entry passes verbatim; a bare name matching a stored peer's
-/// nickname resolves to that peer's stable principal (its verified `b64u:` user_id when
-/// bound, else its `eid:` device principal); an unresolvable bare name is kept verbatim —
-/// roster vocabulary (a group name or bare roster user_id), which remains a legitimate
-/// principal. Resolution happens at WRITE time so what lands in config can never desync from
-/// a later rename.
-async fn resolve_allow_entries(mesh: &Arc<MeshState>, entries: Vec<String>) -> Result<Vec<String>> {
-    if entries
-        .iter()
-        .all(|e| e.starts_with("b64u:") || e.starts_with("eid:"))
-    {
-        return Ok(entries); // nothing bare — skip the store pass
-    }
-    let store = mesh.store.clone();
-    blocking("join allow-entry resolution", move || {
-        let peers = store.list()?;
-        Ok(entries
-            .into_iter()
-            .map(|entry| {
-                if entry.starts_with("b64u:") || entry.starts_with("eid:") {
-                    return entry;
-                }
-                match peers.iter().find(|p| p.nickname == entry) {
-                    Some(p) => p.user_id.clone().unwrap_or_else(|| {
-                        mcpmesh_net::EndpointId::from_bytes(p.endpoint_id).principal()
-                    }),
-                    None => entry,
-                }
-            })
-            .collect())
-    })
-    .await?
-}
-
 /// Handle a `register_service` control request: write/update the `[services.*]` config entry
 /// (atomic), reload the registry, and hot-reload the mesh serve loop. Config writes block, so
 /// they run on `spawn_blocking` (the fs house rule).
@@ -215,9 +175,13 @@ pub(crate) async fn register_service(
         allow,
         ephemeral,
     } = params;
-    // Operator-typed allow input resolves to stable principals HERE, before either branch
-    // persists anything (#38) — the ephemeral registry shares the admit path with config.
-    let allow = resolve_allow_entries(mesh, allow).await?;
+    // `allow` entries are stored VERBATIM (#38): a `b64u:`/`eid:` principal or a roster
+    // group/user_id name admits; a bare display nickname does NOT (nicknames never authorize
+    // — the daemon deliberately does no nickname→principal resolution here, since a
+    // self-asserted nickname could shadow roster vocabulary and misdirect the grant, and a
+    // non-unique nickname is ambiguous). Pairing GRANTS write the peer's principal directly
+    // from its verified identity; a manual grant names a principal or a roster group. The
+    // doctor lint flags a stray nickname on a pure-pairing node.
 
     if ephemeral {
         // #36: in-memory only. Refuse a name that already exists on disk — an ephemeral entry
@@ -367,6 +331,38 @@ pub async fn remove_peer(state: &DaemonState, params: PeerRemoveParams) -> Resul
     // whether an allow was actually stripped — one half of the actual-removal signal.
     let revoked = revoke_service_access(mesh, &nickname).await?;
 
+    // BLOB hygiene (#38): strip the peer's stable principals from every blob scope too, BEFORE
+    // dropping the identity row (we need the entries to compute the principals). Roster mode
+    // only (the provider exists only there); a pure-pairing node is a no-op. The
+    // last-device b64u rule mirrors the service-allow revoke.
+    if let Some(provider) = mesh.app_blobs().await {
+        let store = mesh.store.clone();
+        let nick_r = nickname.clone();
+        let principals: Vec<String> = blocking("join blob-revoke principals", move || {
+            let (targets, others): (Vec<_>, Vec<_>) = store
+                .list()?
+                .into_iter()
+                .partition(|e| e.nickname == nick_r);
+            let mut principals = Vec::new();
+            for t in &targets {
+                principals.push(mcpmesh_net::EndpointId::from_bytes(t.endpoint_id).principal());
+                if let Some(uid) = &t.user_id
+                    && !others.iter().any(|o| o.user_id.as_deref() == Some(uid))
+                    && !principals.contains(uid)
+                {
+                    principals.push(uid.clone());
+                }
+            }
+            anyhow::Ok(principals)
+        })
+        .await??;
+        if !principals.is_empty()
+            && let Err(e) = provider.revoke_principals(&principals)
+        {
+            tracing::warn!(%e, "blob-scope revoke on unpair failed");
+        }
+    }
+
     // (1)⁻¹ IDENTITY: drop the PeerEntry (removes ALL entries sharing this nickname — nicknames are
     // not unique). redb writes block + fsync — run on a blocking thread. Capture
     // whether a PeerEntry was actually deleted — the other half of the actual-removal signal.
@@ -395,10 +391,11 @@ pub async fn remove_peer(state: &DaemonState, params: PeerRemoveParams) -> Resul
     Ok(())
 }
 
-/// The vetted plan for a rename: the target [`PeerEntry`]s (the person) and their current nicknames.
+/// The vetted plan for a rename: the target [`PeerEntry`]s (the person). Post-#38 a rename is
+/// a pure display mutation — the old nicknames are no longer needed (nothing authz-bearing
+/// keyed on them), so the plan carries only the entries to re-nickname.
 struct RenamePlan {
     targets: Vec<PeerEntry>,
-    old_nicknames: std::collections::BTreeSet<String>,
 }
 
 /// Identify the person's entries and run the rename COLLISION GUARD (privilege-escalation defense,
@@ -441,11 +438,7 @@ fn rename_plan(
     {
         anyhow::bail!("the nickname \"{to}\" is already used by another contact");
     }
-    let old_nicknames = targets.iter().map(|e| e.nickname.clone()).collect();
-    Ok(Some(RenamePlan {
-        targets,
-        old_nicknames,
-    }))
+    Ok(Some(RenamePlan { targets }))
 }
 
 /// Handle a `peer_rename` control request (the Contacts rename). Renames a contact's
@@ -478,10 +471,7 @@ pub async fn rename_peer(state: &DaemonState, params: PeerRenameParams) -> Resul
         rename_plan(&store, uid_c.as_deref(), pn_c.as_deref(), &to_c)
     })
     .await??;
-    let RenamePlan {
-        targets,
-        old_nicknames,
-    } = match plan {
+    let RenamePlan { targets } = match plan {
         Some(p) => p,
         None => return Ok(()), // no-op: already named `to`
     };
@@ -500,7 +490,6 @@ pub async fn rename_peer(state: &DaemonState, params: PeerRenameParams) -> Resul
         anyhow::Ok(())
     })
     .await??;
-    let _ = old_nicknames; // display history only; nothing authz-bearing keys on it
     tracing::info!(to = %to, "renamed contact");
     Ok(())
 }
@@ -1054,12 +1043,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(plan.targets.len(), 2);
-        assert_eq!(
-            plan.old_nicknames,
-            ["bob-laptop".to_string(), "bob-phone".to_string()]
-                .into_iter()
-                .collect()
-        );
 
         // GUARD (a) display-uniqueness: renaming Bob → "carol" (a DIFFERENT contact) is
         // refused — a duplicate display name misdirects outbound dials. (The old orphan-allow

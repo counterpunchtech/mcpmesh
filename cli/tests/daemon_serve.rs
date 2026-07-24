@@ -155,12 +155,11 @@ async fn send_initialize(transport: &mut SessionTransport, service: &str) -> Val
 /// guards the FIX-1 reload path — a torn or lost-update config would yield a dead/wrong
 /// registry — and proves the swap installs a LIVE serve, not just a fresh accept loop.
 ///
-/// It is ALSO the canonical operator-input-resolution coverage (#38): the operator types the
-/// bare stored nickname `tester` plus the unknown bare name `ghost`. At WRITE time the daemon
-/// resolves `tester` through the PeerStore to that peer's stable principal (its `eid:` here —
-/// no bound user_id) so the caller still admits after any future rename, while `ghost` is
-/// kept verbatim as roster vocabulary — and a peer merely NICKNAMED `ghost` is NOT admitted
-/// by it (the nickname never admits).
+/// It is ALSO the canonical operator-input coverage (#38): allow entries are stored VERBATIM
+/// — the operator names the caller's `eid:` device principal (which admits it, resilient to
+/// any later rename) plus a bare roster name `ghost` (kept verbatim). A peer merely NICKNAMED
+/// `ghost` is NOT admitted — the display nickname never authorizes, and the daemon does no
+/// nickname→principal resolution (a self-asserted nickname could shadow roster vocabulary).
 #[tokio::test]
 async fn hot_reload_serves_a_newly_registered_service_over_the_mesh() {
     timeout(Duration::from_secs(60), async {
@@ -168,8 +167,7 @@ async fn hot_reload_serves_a_newly_registered_service_over_the_mesh() {
 
         // Two connectors: `prober` dials pre-swap, `tester` post-swap. Distinct endpoints →
         // distinct connections, so the post-swap dial cannot reuse the pre-swap
-        // (old-registry) one. Distinct nicknames so the operator's bare `tester` resolves
-        // unambiguously to the post-swap caller's entry.
+        // (old-registry) one.
         let before = local_endpoint().await;
         let after = local_endpoint().await;
         let tester_eid = format!("eid:{}", after.id());
@@ -223,9 +221,9 @@ async fn hot_reload_serves_a_newly_registered_service_over_the_mesh() {
             "echo must be UNSERVED before the reload: {refused}"
         );
 
-        // The REAL hot-reload: `register_service` over the control API. The operator types
-        // the bare nickname `tester` and the unknown bare name `ghost`; the daemon resolves
-        // at write time (#38), persists, and hot-swaps the accept loop.
+        // The REAL hot-reload: `register_service` over the control API. The operator names
+        // the caller's stable `eid:` principal (admits it) plus a bare roster name `ghost`;
+        // both are stored VERBATIM (#38), persisted, and the accept loop hot-swaps.
         let state = Arc::new(DaemonState::with_mesh(STACK_VERSION, mesh.clone()));
         let (ctl_side, daemon_side) = tokio::io::duplex(64 * 1024);
         let (d_read, d_write) = tokio::io::split(daemon_side);
@@ -237,22 +235,22 @@ async fn hot_reload_serves_a_newly_registered_service_over_the_mesh() {
             BackendSpec::Run {
                 cmd: vec![STUB.into()],
             },
-            vec!["tester".into(), "ghost".into()],
+            vec![tester_eid.clone(), "ghost".into()],
         )
         .await
         .expect("register_service");
 
-        // Write-time resolution landed in config: the bare nickname became the peer's STABLE
-        // eid principal; the unresolvable bare name was kept verbatim (roster vocabulary).
+        // Stored VERBATIM (#38): exactly what the operator typed — the eid principal and the
+        // bare roster name, no resolution, no rewriting.
         let persisted = Config::load(&config_path).unwrap();
         assert_eq!(
             persisted.services["echo"].allow,
             vec![tester_eid.clone(), "ghost".to_string()],
-            "operator-typed allow resolved to stable principals at write time (#38)"
+            "operator-typed allow is stored verbatim (#38)"
         );
 
         // Post-swap: a real second endpoint completes initialize + tools/call against the
-        // newly-served `echo` — admitted via its RESOLVED eid principal, identity injected.
+        // newly-served `echo` — admitted via its eid principal, identity injected.
         let mut t_after = connect(&after, addr.clone(), "echo").await.unwrap();
         let init = send_initialize(&mut t_after, "echo").await;
         assert_eq!(

@@ -33,8 +33,9 @@ impl EndpointId {
         self.0
     }
 
-    /// THE sanctioned authz rendering of a device identity: `eid:<base32>`, using iroh's
-    /// canonical base32 form (what `peer_add` parses and `mcpmesh internal id` prints).
+    /// THE sanctioned authz rendering of a device identity: `eid:<hex>`, byte-identical to
+    /// `iroh::EndpointId`'s `Display` (HEXLOWER of the raw key bytes — what `peer_add` parses
+    /// and `mcpmesh internal id` prints).
     /// This is deliberately a NAMED method and not a `Display` impl — the surface-leak
     /// discipline stands: HUMAN porcelain never prints raw endpoint ids (status render
     /// maps principals back to store-resolved display names); this rendering exists for

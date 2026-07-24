@@ -487,8 +487,9 @@ pub async fn redeem_invite(
     // Client-side nickname-squatting check — the mirror of the inviter side's
     // [`nickname_collision`], and enforced BEFORE the dial so a squatting invite never reaches
     // the wire. `invite.nickname` is a stranger's SUGGESTION for what we should call them, and
-    // applying it verbatim is what makes the name our gate resolves to (and our
-    // `[services.*].allow` authorizes) point at THEIR endpoint. Refusing here keeps the
+    // applying it verbatim is what our gate resolves the inviter's DISPLAY name to (and what
+    // our own outbound `<peer>/<service>` routing keys on — first-match by name). Grants are
+    // principal-keyed (#38), so no access can follow the name; refusing here keeps the
     // invariant that redeeming an invite grants the other side nothing.
     if let Some(conflict) = nickname_squat(&store, &invite.nickname, &invite.inviter_id)? {
         bail!(

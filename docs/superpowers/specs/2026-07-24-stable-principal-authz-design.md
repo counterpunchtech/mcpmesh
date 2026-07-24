@@ -66,7 +66,11 @@ unrepresentable.
    principals to store-resolved display names).
 4. **Plugin seam keeps parity.** The daemon's `_meta["mcpmesh/peer"]` injection gains an
    `eid` field; `peer_audiences` swaps its name arm for it. Nickname-audience blob/plugin
-   grants stop matching — intended, covered by the doctor lint and release notes.
+   grants stop matching — intended (release notes call it out). Blob-scope grants are
+   revoked on unpair (`remove_peer` strips the peer's principals from every scope, the
+   last-device `b64u:` rule as for service allow); legacy pre-0.8.0 nickname blob grants are
+   dead and re-granted by the operator (the doctor lint scans `[services.*].allow`, not the
+   blob sidecar — a manual `blob list` review covers the rare roster-mode blob case).
 
 ## Migration
 

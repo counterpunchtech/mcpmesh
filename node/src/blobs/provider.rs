@@ -172,6 +172,12 @@ impl AppBlobs {
         self.scopes.grant(scope, principal)
     }
 
+    /// Revoke `principals` from every scope (unpair hygiene, #38) — persisted single-writer.
+    /// Returns whether anything changed.
+    pub fn revoke_principals(&self, principals: &[String]) -> Result<bool> {
+        self.scopes.revoke_principals(principals)
+    }
+
     /// The current scope table (name, hashes, grants) for `list`.
     pub fn list(&self) -> Vec<(String, Vec<String>, Vec<String>)> {
         self.scopes.list()
