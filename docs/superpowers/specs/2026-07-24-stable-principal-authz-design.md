@@ -24,10 +24,14 @@ unrepresentable.
      (signature drops the name param, gains the endpoint id).
 2. **Grant paths write stable principals.** The inviter-side pairing grant writes
    `b64u:<user_pk>` when the redeemer presented a binding, else `eid:<endpoint-id>`.
-   Operator-typed `allow` inputs (`serve --allow`, `register_service`) accept
-   `b64u:`/`eid:` verbatim; a bare name is resolved through the PeerStore to that peer's
-   stable principal at write time; an unresolvable bare name is kept verbatim (assumed
-   roster group).
+   Operator-typed `allow` inputs (`serve --allow`, `register_service`, `blob grant`) are
+   stored **VERBATIM** — a `b64u:`/`eid:` principal or a roster group/user_id name admits; a
+   bare display nickname does NOT (nicknames never authorize). The daemon does **no**
+   nickname→principal resolution at write time: the adversarial review (24-agent panel)
+   confirmed that resolution let a peer's self-asserted nickname shadow roster vocabulary
+   and silently misdirect a later operator grant, and made non-unique nicknames ambiguous.
+   The common case needs no manual grant (pairing auto-writes the principal); a manual
+   grant names a principal or a roster group; the doctor lint flags a stray nickname.
 3. **Admission diagnostics:** `caller_admits` logs at debug the caller's principal set and
    the allow list compared, so a refusal is diagnosable without source-diving.
 4. **Downstream reconciliation (the sweep decides the full list; known already):**
