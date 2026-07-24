@@ -45,6 +45,29 @@ unrepresentable.
    mounts), the identity env injection (`MCPMESH_PEER_NAME` stays display), PeerStore
    schema (nickname remains the display handle), roster-mode group semantics.
 
+## Decisions settled by the touchpoint sweep (2026-07-24)
+
+1. **Bare strings = roster vocabulary.** Roster user_ids are bare operator-chosen handles
+   ("alice") matched via the user_id arm; groups are bare too, and the roster's
+   flat-namespace disjointness rule keeps them unambiguous. Both stay legal principals.
+   The doctor lint therefore flags bare `allow` entries only on a PURE-PAIRING node (no
+   org root pinned), where a bare string can only be a dead nickname grant.
+2. **Revoke/unpair hygiene rule.** Admission requires gate resolve FIRST — deleting a
+   `PeerEntry` already denies that device outright — so allow-stripping is hygiene, not
+   the security boundary. `remove_peer`/`revoke_service_access` resolve the entry BEFORE
+   removal and strip its `eid:` always, and its `b64u:` only when no other `PeerEntry`
+   shares that user_id (one device of a multi-device person never revokes the person).
+3. **`principal_set` keeps its borrowed return.** Signature becomes
+   `(eid: Option<&str>, user_id: Option<&str>, groups: &[String])` with the eid principal
+   PRE-RENDERED by callers. The one sanctioned renderer is a new
+   `mcpmesh_net::EndpointId::principal()` → `"eid:<iroh base32>"` (an explicit method, NOT
+   a `Display` impl — the surface-leak discipline stands; principals are a sanctioned
+   machine rendering, and HUMAN porcelain still never prints raw ids: status render maps
+   principals to store-resolved display names).
+4. **Plugin seam keeps parity.** The daemon's `_meta["mcpmesh/peer"]` injection gains an
+   `eid` field; `peer_audiences` swaps its name arm for it. Nickname-audience blob/plugin
+   grants stop matching — intended, covered by the doctor lint and release notes.
+
 ## Migration
 
 None (pre-1.0). Release notes: nickname-keyed `allow` entries stop admitting — re-pair
