@@ -18,6 +18,11 @@ use crate::roster::gate::RosterGate;
 use crate::roster::transport::{self, RosterGossip};
 
 const PRESENCE_DOMAIN: &[u8] = b"mcpmesh/presence/1";
+
+/// The cap on the embedder-set app-metadata blob (#39), enforced on BOTH the local set path
+/// (`set_app_metadata`) AND the gossip RECEIVE path ([`Presence::verify`]) — a hostile roster
+/// member cannot inject a larger blob by signing an oversized beat directly onto the topic.
+pub const APP_METADATA_MAX_BYTES: usize = 256;
 pub const PRESENCE_SKEW_SECS: i64 = 120;
 pub const PRESENCE_TTL_SECS: i64 = 180;
 
@@ -83,6 +88,10 @@ impl Presence {
         // (a crafted `ts == i64::MIN` would panic the plain subtraction/`abs` in debug) — saturate.
         if self.t != "presence"
             || now.saturating_sub(self.ts).saturating_abs() >= PRESENCE_SKEW_SECS
+            // #39: an oversized `meta` is a protocol violation — a conforming node caps at
+            // set time, so a larger blob is a hostile injection. Drop the whole beat (cheap
+            // pre-signature reject) rather than surface an unbounded value downstream.
+            || self.meta.len() > APP_METADATA_MAX_BYTES
         {
             return None;
         }
@@ -420,6 +429,73 @@ mod tests {
             .unwrap()
             .1;
         assert_eq!(got.meta, "v=1.1.0", "older beat must not regress meta");
+    }
+
+    /// The RECEIVE path (#39): a signed beat carrying metadata is accepted against the roster,
+    /// recorded, and its meta surfaces — AND an oversized-meta beat is DROPPED at verify (the
+    /// 256B cap holds on gossip input, not just the local set path — a hostile roster member
+    /// cannot inject a larger blob by signing an oversized beat directly onto the topic).
+    #[test]
+    fn receive_path_records_capped_meta_and_drops_oversized() {
+        // A one-device roster for "alice" whose device IS the beat's signer.
+        let dk = SigningKey::from_bytes(&[5u8; 32]);
+        let eid = dk.verifying_key().to_bytes();
+        let root = SigningKey::from_bytes(&[9u8; 32]);
+        let signed = mint_signed(
+            &root,
+            Roster {
+                format: "mcpmesh-roster/1".into(),
+                org_id: "acme".into(),
+                serial: 1,
+                issued_at: "2000-01-01T00:00:00Z".into(),
+                expires_at: "2999-01-01T00:00:00Z".into(),
+                groups: vec![],
+                users: vec![RosterUser {
+                    user_id: "alice".into(),
+                    display_name: "Alice".into(),
+                    user_pk: encode_b64u(&[1u8; 32]),
+                    groups: vec![],
+                    devices: vec![RosterDevice {
+                        endpoint_id: encode_b64u(&eid),
+                        label: "laptop".into(),
+                        role: "primary".into(),
+                    }],
+                }],
+                revoked_endpoints: vec![],
+                sig: String::new(),
+            },
+        );
+        let view = load_installed(&signed, &root.verifying_key()).unwrap();
+        let now = 1_760_000_000;
+        let table = PresenceTable::new();
+
+        // A conforming beat (meta within cap) is accepted and its meta is recorded — this is a
+        // received PEER beat driven through the exact track-loop path (accept → record).
+        let good = Presence::signed(&dk, &eid, "alice", now, 1, "v=1.2.3");
+        let got = good
+            .accept(now, &view)
+            .expect("valid rostered beat accepts");
+        assert_eq!(got, eid);
+        table.record(got, "alice".into(), good.ts, good.meta.clone());
+        assert_eq!(
+            table
+                .active(now)
+                .into_iter()
+                .find(|(e, _)| *e == eid)
+                .unwrap()
+                .1
+                .meta,
+            "v=1.2.3"
+        );
+
+        // An OVERSIZED-meta beat — validly signed by the same device over the large preimage —
+        // is DROPPED at verify (returns None), so nothing oversized ever reaches the table.
+        let big = Presence::signed(&dk, &eid, "alice", now, 1, &"x".repeat(257));
+        assert!(
+            big.verify(now).is_none(),
+            "oversized meta must drop the beat"
+        );
+        assert!(big.accept(now, &view).is_none());
     }
 
     #[test]

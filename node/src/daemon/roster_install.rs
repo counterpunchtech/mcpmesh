@@ -472,10 +472,6 @@ pub(crate) async fn set_nickname(state: &DaemonState, nickname: String) -> Resul
     Ok(())
 }
 
-/// The ≤256-byte cap on the app-metadata blob (#39) — small enough to ride the presence
-/// heartbeat comfortably (a full beat stays under 768B).
-pub(crate) const APP_METADATA_MAX_BYTES: usize = 256;
-
 /// Handle a `set_app_metadata` control request (#39): validate the ≤256B cap and store the
 /// blob in memory; future presence heartbeats carry it (signed). `""` clears it. Roster mode
 /// only for VISIBILITY (the beat is roster-only) — but the store itself is unconditional, so a
@@ -483,9 +479,10 @@ pub(crate) const APP_METADATA_MAX_BYTES: usize = 256;
 /// write, no reload: this is ephemeral runtime state, not durable trust/identity.
 pub(crate) async fn set_app_metadata(state: &DaemonState, metadata: String) -> Result<()> {
     let mesh = state.mesh_required()?;
+    let cap = crate::roster::presence::APP_METADATA_MAX_BYTES;
     anyhow::ensure!(
-        metadata.len() <= APP_METADATA_MAX_BYTES,
-        "set_app_metadata: metadata is {} bytes; the cap is {APP_METADATA_MAX_BYTES}",
+        metadata.len() <= cap,
+        "set_app_metadata: metadata is {} bytes; the cap is {cap}",
         metadata.len()
     );
     mesh.set_app_metadata(metadata);

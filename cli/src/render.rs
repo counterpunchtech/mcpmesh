@@ -478,21 +478,25 @@ pub fn presence_lines(presence: &[PresencePeer]) -> Vec<String> {
             );
             if !p.meta.is_empty() {
                 line.push_str(" · app: ");
-                line.push_str(&truncate_meta(&p.meta));
+                line.push_str(&sanitize_meta(&p.meta));
             }
             line
         })
         .collect()
 }
 
-/// Truncate opaque app metadata for a human status line (≤48 chars + ellipsis). Char-boundary
-/// safe. The full value is always available via `status --json`.
-fn truncate_meta(meta: &str) -> String {
+/// Render opaque, PEER-CONTROLLED app metadata safe for a human status line: strip control
+/// characters FIRST (metadata is arbitrary embedder bytes from another node — an unescaped
+/// `\n`/ANSI escape could forge status lines or rewrite the operator's terminal), then
+/// truncate to ≤48 chars + ellipsis (char-boundary safe). The full raw value is available via
+/// `status --json` (JSON escapes control chars, so that surface is already safe).
+fn sanitize_meta(meta: &str) -> String {
     const MAX: usize = 48;
-    if meta.chars().count() <= MAX {
-        return meta.to_string();
+    let cleaned: String = meta.chars().filter(|c| !c.is_control()).collect();
+    if cleaned.chars().count() <= MAX {
+        return cleaned;
     }
-    let cut: String = meta.chars().take(MAX).collect();
+    let cut: String = cleaned.chars().take(MAX).collect();
     format!("{cut}…")
 }
 
@@ -1067,6 +1071,34 @@ mod tests {
                 && lines[1].contains("offline"),
             "the dead mirror renders offline: {lines:?}"
         );
+    }
+
+    /// #39 render safety: app metadata shows as `· app: <value>`, and PEER-CONTROLLED control
+    /// characters (newline / ANSI escape) are STRIPPED so a hostile meta cannot forge status
+    /// lines or rewrite the operator's terminal; a long value is truncated with an ellipsis.
+    #[test]
+    fn presence_meta_is_sanitized_and_truncated_in_status_lines() {
+        let peer = |meta: &str| PresencePeer {
+            user_id: "alice".into(),
+            device_label: "laptop".into(),
+            role: "primary".into(),
+            online: true,
+            meta: meta.into(),
+        };
+        // A benign value is shown after `app:`.
+        let l = presence_lines(&[peer("v=1.2.3")]);
+        assert!(l[0].contains("· app: v=1.2.3"), "benign meta shown: {l:?}");
+        // A newline/ANSI-injection attempt is neutralized — no control chars survive, so no
+        // forged second line and no escape sequence reaches the terminal.
+        let l = presence_lines(&[peer("\n  ghost · fake · primary · online\x1b[2K")]);
+        assert_eq!(l.len(), 1, "no forged extra line");
+        assert!(
+            !l[0].contains('\n') && !l[0].contains('\x1b'),
+            "control chars stripped: {l:?}"
+        );
+        // Over-long meta is truncated with an ellipsis.
+        let l = presence_lines(&[peer(&"x".repeat(200))]);
+        assert!(l[0].contains('…'), "long meta truncated: {l:?}");
     }
 
     #[test]
