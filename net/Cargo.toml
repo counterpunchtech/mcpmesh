@@ -12,6 +12,9 @@ readme = "README.md"
 workspace = true
 
 [dependencies]
+# The eid principal rendering (EndpointId::principal): the SAME HEXLOWER byte encoding
+# iroh's EndpointId Display uses — already in the lock via iroh.
+data-encoding = "2"
 iroh.workspace = true
 rmcp.workspace = true
 tokio.workspace = true

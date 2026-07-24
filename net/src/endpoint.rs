@@ -245,20 +245,27 @@ pub async fn run_mesh_connection(
     }
 }
 
-/// Does this service's `allow` list admit the resolved caller? The flat authorization namespace:
-/// a nickname (`identity.name`), a roster user_id, or a group name. Extracted so the exact
-/// predicate `run_session` uses is unit-testable.
+/// Does this service's `allow` list admit the resolved caller? The flat authorization namespace
+/// is STABLE principals (#38): the device `eid:` (rendered from the AUTHENTICATED endpoint id),
+/// a user_id (roster bare handle or pairing `b64u:`), or a roster group name. The display
+/// nickname is NEVER matched — renames can never change what a peer is granted. Extracted so
+/// the exact predicate `run_session` uses is unit-testable.
 ///
 /// The expansion itself is THE shared `mcpmesh_local_api::principal_set` — the same implementation
 /// the plugin seam's `peer_audiences` and the blob-scope gate use, so the enforcement sites cannot
 /// drift.
 fn caller_admits(identity: &PeerIdentity, allow: &[String]) -> bool {
-    let principals = mcpmesh_local_api::principal_set(
-        Some(&identity.name),
-        identity.user_id.as_deref(),
-        &identity.groups,
-    );
-    allow.iter().any(|a| principals.contains(a.as_str()))
+    let eid = identity.endpoint.principal();
+    let principals =
+        mcpmesh_local_api::principal_set(Some(&eid), identity.user_id.as_deref(), &identity.groups);
+    let admitted = allow.iter().any(|a| principals.contains(a.as_str()));
+    if !admitted {
+        // The #38 diagnostic: a refusal names BOTH sides of the comparison, so a
+        // principal/allow mismatch is debuggable without source-diving. Debug-level —
+        // principals are the machine namespace, not porcelain output.
+        tracing::debug!(?principals, ?allow, "caller not admitted by allow list");
+    }
+    admitted
 }
 
 /// Drive one accepted session: enforce framing on the first frame, select a
@@ -284,10 +291,11 @@ async fn run_session(
     };
 
     // caller_allowed = services whose `allow` admits this resolved identity (the flat allow
-    // namespace is nicknames, user_ids, and group names). `caller_admits` checks all three arms:
-    // nickname (`identity.name`), roster user_id (`identity.user_id`, None in pairing mode), and
-    // group — so a roster caller named only by its user_id is admitted. The roster's flat-namespace
-    // disjointness rule guarantees a group and a user_id never collide, so checking all three is safe.
+    // namespace is STABLE principals: `eid:` device ids, user_ids, and group names — never
+    // nicknames, #38). `caller_admits` checks all three arms: the authenticated device eid,
+    // the user_id (`identity.user_id`, present for roster callers and bound pairing peers),
+    // and group — so a roster caller named only by its user_id is admitted. The roster's
+    // flat-namespace disjointness rule guarantees a group and a user_id never collide.
     let allowed: Vec<String> = services
         .iter()
         .filter(|(_, e)| caller_admits(identity, &e.allow))

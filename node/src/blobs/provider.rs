@@ -251,17 +251,18 @@ fn spawn_gate_loop(
                     let allow = msg.request.ranges.is_blob()
                         && identity.as_ref().is_some_and(|identity| {
                             // The grant namespace is THE flat principal set —
-                            // groups ∪ {nickname} ∪ {user_id} — via the ONE shared
+                            // groups ∪ {eid} ∪ {user_id} — via the ONE shared
                             // `principal_set` (same expansion as the mesh allow check and
-                            // the plugin seam). The nickname is deliberately INCLUDED: a
-                            // pairing-mode peer (no user binding) granted a scope by its
-                            // nickname can fetch, matching service `allow` semantics; a
-                            // plugin's attachment scopes may grant by audience strings,
-                            // which include nicknames. Excluding it silently broke
-                            // nickname-audience attachments once. Default-deny is untouched:
-                            // an unlisted principal still gets `Permission` before any bytes.
+                            // the plugin seam). Nicknames are deliberately EXCLUDED (#38):
+                            // scope grants are written as stable principals at grant time,
+                            // so a pairing-mode peer is granted (and fetches) by its
+                            // `eid:` device principal; legacy nickname-audience grants
+                            // stop matching BY DESIGN (the doctor lint + release notes
+                            // cover the migration). Default-deny is untouched: an unlisted
+                            // principal still gets `Permission` before any bytes.
+                            let eid = identity.endpoint.principal();
                             let principals: HashSet<&str> = mcpmesh_local_api::principal_set(
-                                Some(&identity.name),
+                                Some(&eid),
                                 identity.user_id.as_deref(),
                                 &identity.groups,
                             )

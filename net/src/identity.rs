@@ -32,6 +32,20 @@ impl EndpointId {
     pub const fn to_bytes(self) -> [u8; 32] {
         self.0
     }
+
+    /// THE sanctioned authz rendering of a device identity: `eid:<base32>`, using iroh's
+    /// canonical base32 form (what `peer_add` parses and `mcpmesh internal id` prints).
+    /// This is deliberately a NAMED method and not a `Display` impl — the surface-leak
+    /// discipline stands: HUMAN porcelain never prints raw endpoint ids (status render
+    /// maps principals back to store-resolved display names); this rendering exists for
+    /// the MACHINE authz namespace (`allow` entries, blob grants, `principal_set`).
+    /// The encoding is byte-identical to `iroh::EndpointId`'s `Display` (HEXLOWER of the
+    /// raw key bytes) but total over ANY bytes — a zeroed test identity renders a
+    /// matchable `eid:` of zeros rather than failing point validation; production
+    /// identities are always gate-stamped from the authenticated TLS key.
+    pub fn principal(&self) -> String {
+        format!("eid:{}", data_encoding::HEXLOWER.encode(&self.0))
+    }
 }
 
 impl From<[u8; 32]> for EndpointId {
@@ -165,5 +179,20 @@ mod tests {
         assert_eq!(eid.to_bytes(), raw);
         assert_eq!(EndpointId::from(raw), eid);
         assert_eq!(<[u8; 32]>::from(eid), raw);
+    }
+}
+
+#[cfg(test)]
+mod principal_tests {
+    use super::*;
+    /// `principal()` must stay byte-identical to iroh's own EndpointId rendering — the
+    /// encoding `peer_add` parses and diagnostics print. Guards an iroh re-pin changing
+    /// the wire format out from under persisted `eid:` grants.
+    #[test]
+    fn eid_principal_tracks_irohs_endpoint_rendering() {
+        let key = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
+        let ours = EndpointId::from(key).principal();
+        assert_eq!(ours, format!("eid:{key}"));
+        assert!(ours.starts_with("eid:"));
     }
 }

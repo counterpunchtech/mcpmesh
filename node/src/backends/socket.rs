@@ -105,6 +105,9 @@ impl SocketBackend {
             // Whole-value overwrite: forged `groups`/`user_id` (authorization-relevant)
             // are dropped along with a forged `name`, not merged over.
             initialize["params"]["_meta"]["mcpmesh/peer"] = serde_json::json!({
+                // The stable device principal (`eid:<hex>` of the AUTHENTICATED endpoint
+                // id, #38) — the arm `peer_audiences` matches; `name` below is display-only.
+                "eid": id.endpoint.principal(),
                 "name": id.name,
                 // The peer's self-sovereign user_id: the org roster value in roster mode, else the
                 // one proven by a verified device->user binding at pairing (null only for a pairing

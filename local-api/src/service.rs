@@ -82,8 +82,9 @@ pub use crate::transport::{bind_uds, check_peer_uid, ensure_private_dir};
 /// nickname), whereas `name` (the nickname) scopes to one device and `groups` to a roster set —
 /// three legitimate granularities.
 ///
-/// If authz is ever re-keyed on `endpoint_id` instead of the display nickname (a planned
-/// identity hardening), that change lands HERE, once.
+/// Re-keyed on stable identity in 0.8.0 (#38): the platform injection carries the device
+/// `eid:` principal and the display `name` is NEVER an audience — the identity hardening
+/// this doc long promised, landed here, once.
 pub fn peer_audiences(peer: &Value) -> Vec<String> {
     // The expansion itself is THE shared `principal_set` (crate::principals — the flat
     // namespace, one implementation for the mesh allow check, this seam, and the blob-scope
@@ -98,7 +99,7 @@ pub fn peer_audiences(peer: &Value) -> Vec<String> {
         })
         .unwrap_or_default();
     crate::principal_set(
-        peer.get("name").and_then(|v| v.as_str()),
+        peer.get("eid").and_then(|v| v.as_str()),
         peer.get("user_id").and_then(|v| v.as_str()),
         &groups,
     )
