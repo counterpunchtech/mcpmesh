@@ -14,7 +14,7 @@ use std::time::Duration;
 use mcpmesh::allowlist::{AllowlistGate, PeerEntry, PeerStore};
 use mcpmesh::config::Config;
 use mcpmesh::daemon::{MeshState, build_services, spawn_accept_loop};
-use mcpmesh::pairing::rendezvous::{SelfBinding, redeem_invite};
+use mcpmesh::pairing::rendezvous::{GrantBackFn, SelfBinding, redeem_invite};
 use mcpmesh::pairing::sas::short_auth_code;
 use mcpmesh::pairing::{Invite, LiveInvites};
 use mcpmesh::roster::gate::RosterGate;
@@ -867,17 +867,40 @@ async fn paired_and_granted_peer_is_admitted_to_the_service_end_to_end() {
         let bob_id = *bob.id().as_bytes();
         let bob_dir = tempfile::tempdir().unwrap();
         let bob_store = Arc::new(PeerStore::open(&bob_dir.path().join("state.redb")).unwrap());
+        // #43: a recording grant-back hook captures the inviter principal the redeemer would
+        // grant its OWN services to. Alice presented no binding here → the principal is her eid.
+        let granted_back: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rec = granted_back.clone();
+        let grant_back: GrantBackFn = Box::new(move |principal, display| {
+            let rec = rec.clone();
+            Box::pin(async move {
+                rec.lock().unwrap().push((principal, display));
+                Ok(())
+            })
+        });
         let result = redeem_invite(
             bob.clone(),
             "bob".into(),
             invite.encode(),
             bob_store.clone(),
             None,
-            None,
+            Some(grant_back),
         )
         .await
         .expect("redeem_invite dials, verifies the inviter id, sends the secret, succeeds");
         assert_eq!(result.peer_nickname, "alice");
+        // #43: the mutual grant-back fired with the inviter's STABLE principal (its eid, since
+        // it presented no binding) and the redeemer's display name for it.
+        let back = granted_back.lock().unwrap().clone();
+        assert_eq!(
+            back,
+            vec![(
+                mcpmesh_net::EndpointId::from_bytes(alice_id).principal(),
+                "alice".to_string()
+            )],
+            "the redeemer grants the inviter back by its stable principal (#43)"
+        );
         // The PairResult carries the granted services (from the invite) so the porcelain can print
         // the "You can mount: alice/notes" line without re-decoding the invite (M2b T7).
         assert_eq!(result.services, vec!["notes".to_string()]);

@@ -909,6 +909,60 @@ mod tests {
     use super::*;
     use crate::daemon::testutil::hermetic_mesh;
 
+    /// #44: `service_allow_grant`/`service_allow_revoke` toggle a single principal on a single
+    /// service's allow, idempotently, WITHOUT touching peer identity. The "sharing switch".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn service_allow_grant_and_revoke_toggle_one_principal() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[services.kb]\nsocket = \"/run/kb.sock\"\nallow = []\n",
+        )
+        .unwrap();
+        let mesh = hermetic_mesh(config_path.clone()).await;
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+        let allow = || {
+            crate::config::Config::load(&config_path)
+                .unwrap()
+                .services
+                .get("kb")
+                .unwrap()
+                .allow
+                .clone()
+        };
+
+        // Grant → the principal lands in the service allow.
+        service_allow_grant(&state, "kb".into(), "eid:beef".into())
+            .await
+            .unwrap();
+        assert_eq!(allow(), vec!["eid:beef".to_string()]);
+        // Idempotent grant → still exactly one entry.
+        service_allow_grant(&state, "kb".into(), "eid:beef".into())
+            .await
+            .unwrap();
+        assert_eq!(allow(), vec!["eid:beef".to_string()]);
+
+        // Revoke → removed. Peer identity is not involved here at all (no PeerEntry touched).
+        service_allow_revoke(&state, "kb".into(), "eid:beef".into())
+            .await
+            .unwrap();
+        assert!(allow().is_empty());
+        // Idempotent revoke of an absent principal → clean no-op.
+        service_allow_revoke(&state, "kb".into(), "eid:beef".into())
+            .await
+            .unwrap();
+        assert!(allow().is_empty());
+
+        // Unknown service → clean no-op (both verbs), never an error.
+        service_allow_grant(&state, "ghost".into(), "eid:beef".into())
+            .await
+            .unwrap();
+        service_allow_revoke(&state, "ghost".into(), "eid:beef".into())
+            .await
+            .unwrap();
+    }
+
     /// The invite registration-check message shapes: silent on all-registered, names the missing
     /// service(s), lists what IS served (matching `status`) or says nothing is served yet, and
     /// always states the exact next command — never wire vocabulary.
