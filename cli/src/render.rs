@@ -878,6 +878,7 @@ mod tests {
                 rtt_ms: Some(23),
                 age_secs: Some(4),
                 meta: String::new(),
+                principal: None,
             },
             PeerReachability {
                 name: "bob".into(),
@@ -885,6 +886,7 @@ mod tests {
                 rtt_ms: None,
                 age_secs: Some(90),
                 meta: String::new(),
+                principal: None,
             },
             PeerReachability {
                 name: "carol".into(),
@@ -892,6 +894,7 @@ mod tests {
                 rtt_ms: None,
                 age_secs: None, // never probed
                 meta: String::new(),
+                principal: None,
             },
         ]);
         assert_eq!(lines[0], "  alice · online · 23ms");
@@ -1123,6 +1126,7 @@ mod tests {
             rtt_ms: Some(12),
             age_secs: Some(2),
             meta: meta.into(),
+            principal: None,
         };
         let l = reachability_lines(&[peer("v=2.0.0")]);
         assert!(l[0].contains("· app: v=2.0.0"), "benign meta shown: {l:?}");
@@ -1139,6 +1143,7 @@ mod tests {
             rtt_ms: None,
             age_secs: Some(30),
             meta: String::new(),
+            principal: None,
         }]);
         assert!(!l[0].contains("app:"), "no app segment without meta: {l:?}");
     }

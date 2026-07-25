@@ -359,6 +359,7 @@ async fn probe_carries_peer_app_metadata_into_reachability() {
         let a_ep = target_endpoint().await;
         let a_id = *a_ep.id().as_bytes();
         let a_addr = a_ep.addr();
+        let a_eid = format!("eid:{}", a_ep.id());
         let a_store = Arc::new(PeerStore::open(&dir.path().join("a.redb")).unwrap());
 
         // Prober B, paired with A (B names A "alice").
@@ -400,6 +401,13 @@ async fn probe_carries_peer_app_metadata_into_reachability() {
         assert_eq!(
             alice.meta, "v=4.2.0",
             "reachability surfaces the peer's app metadata"
+        );
+        // #42: the row carries A's stable eid principal, so an embedder joins probe + meta on
+        // the authenticated endpoint rather than the non-unique nickname.
+        assert_eq!(
+            alice.principal.as_deref(),
+            Some(a_eid.as_str()),
+            "reachability row carries the peer's eid principal"
         );
 
         a_control.abort();

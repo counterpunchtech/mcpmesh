@@ -153,6 +153,9 @@ pub fn reachability_of(mesh: &Arc<MeshState>) -> Vec<mcpmesh_local_api::PeerReac
                     rtt_ms: e.rtt_ms,
                     age_secs: Some(age as u64),
                     meta: e.meta.clone(),
+                    // #42: the eid: device principal, so a row joins to the authenticated
+                    // endpoint rather than the non-unique nickname.
+                    principal: Some(mcpmesh_net::EndpointId::from_bytes(eid).principal()),
                 });
             }
             None => {
@@ -163,6 +166,7 @@ pub fn reachability_of(mesh: &Arc<MeshState>) -> Vec<mcpmesh_local_api::PeerReac
                     rtt_ms: None,
                     age_secs: None, // never probed → consumer shows "checking…"
                     meta: String::new(),
+                    principal: Some(mcpmesh_net::EndpointId::from_bytes(eid).principal()),
                 });
             }
         }

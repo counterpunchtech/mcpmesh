@@ -95,6 +95,14 @@ pub struct PeerReachability {
     /// cache has a ~20s TTL), not a steady push. Additive: default + skip-if-empty.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub meta: String,
+    /// The peer's stable DEVICE principal `eid:<hex>` (#42) — the SAME rendering as
+    /// [`PeerInfo::principal`], so an embedder joins probe result + `meta` (app version) to a
+    /// peer by the AUTHENTICATED endpoint rather than the non-unique nickname. Always present
+    /// for a real row (`Option` only for additive round-trip). Machine-surface authz
+    /// vocabulary — the human `status` reachability line is unchanged. Additive:
+    /// `#[serde(default, skip_serializing_if = "Option::is_none")]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
 }
 
 /// Roster-mode status. Surface-clean roster VOCABULARY only: org_id, serial, a plain
@@ -810,14 +818,15 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   new methods, or a strictness change like params validation — bumped in the same change that
 ///   makes it. A client can guard with `api_minor >= N` for a feature it needs, or refuse a daemon
 ///   older than a minor it requires. It never resets except on a MAJOR bump.
-pub const API_VERSION: &str = "1.6";
+pub const API_VERSION: &str = "1.7";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
 /// never nicknames (#38); to 4 with the `set_app_metadata` verb + `PresencePeer.meta` (#39);
 /// to 5 with `PeerReachability.meta` — pairing-mode app metadata on the probe pong (#40);
-/// to 6 with `PeerInfo.principal` — the peer's eid: device principal on `status` (#41).
-pub const API_MINOR: u32 = 6;
+/// to 6 with `PeerInfo.principal` — the peer's eid: device principal on `status` (#41);
+/// to 7 with `PeerReachability.principal` — the same on reachability rows (#42).
+pub const API_MINOR: u32 = 7;
 
 #[cfg(test)]
 mod tests {
@@ -831,6 +840,7 @@ mod tests {
             rtt_ms: Some(42),
             age_secs: Some(3),
             meta: String::new(),
+            principal: None,
         };
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["name"], "bob");
@@ -844,6 +854,7 @@ mod tests {
             rtt_ms: None,
             age_secs: None,
             meta: String::new(),
+            principal: None,
         };
         let uv = serde_json::to_value(&unknown).unwrap();
         assert!(uv.get("rtt_ms").is_none() && uv.get("age_secs").is_none());
@@ -926,6 +937,28 @@ mod tests {
     }
 
     #[test]
+    fn peer_reachability_principal_is_additive() {
+        // Older payload (no principal) still deserializes; empty does not serialize; a set
+        // value round-trips alongside the #40 meta so an embedder joins on the principal.
+        let old = serde_json::json!({"name": "bob", "reachable": true});
+        let r: PeerReachability = serde_json::from_value(old).unwrap();
+        assert_eq!(r.principal, None);
+        assert!(serde_json::to_value(&r).unwrap().get("principal").is_none());
+        let full = PeerReachability {
+            name: "bob".into(),
+            reachable: true,
+            rtt_ms: Some(12),
+            age_secs: Some(3),
+            meta: "v=1.2.3".into(),
+            principal: Some("eid:0707".into()),
+        };
+        let back: PeerReachability =
+            serde_json::from_value(serde_json::to_value(&full).unwrap()).unwrap();
+        assert_eq!(back.principal.as_deref(), Some("eid:0707"));
+        assert_eq!(back.meta, "v=1.2.3");
+    }
+
+    #[test]
     fn peer_reachability_meta_is_additive() {
         // An older payload (no meta) still deserializes; an empty meta does not serialize.
         let old = serde_json::json!({"name": "bob", "reachable": true});
@@ -939,6 +972,7 @@ mod tests {
             rtt_ms: Some(12),
             age_secs: Some(3),
             meta: "v=1.2.3".into(),
+            principal: None,
         };
         let back: PeerReachability =
             serde_json::from_value(serde_json::to_value(&with).unwrap()).unwrap();
@@ -1575,6 +1609,7 @@ mod tests {
                 rtt_ms: Some(42),
                 age_secs: Some(3),
                 meta: String::new(),
+                principal: None,
             }],
         };
         let v = serde_json::to_value(&snap).unwrap();
