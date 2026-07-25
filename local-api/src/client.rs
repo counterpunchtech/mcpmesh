@@ -909,6 +909,7 @@ mod tests {
                         rtt_ms: Some(42),
                         age_secs: Some(3),
                         meta: String::new(),
+                        principal: None,
                     }],
                 },
                 StreamFrame::Event {

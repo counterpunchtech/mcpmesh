@@ -7,7 +7,7 @@ named pipe on Windows. Anything that can open the endpoint and parse JSON can sp
 language — [`local-api/examples/status.py`](../local-api/examples/status.py) is a complete client
 in ~60 lines of dependency-free Python.
 
-> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.6`, `api_minor` `6`) and evolves
+> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.7`, `api_minor` `7`) and evolves
 > **additively** (see [Versioning](#versioning)), but until a stable release this document — like the
 > wire format itself — may change without a migration path. Pin the mcpmesh version you build
 > against. Source of truth is the Rust in [`local-api/`](../local-api/src/protocol.rs); where this
@@ -234,7 +234,7 @@ Do not build on either — they may change or disappear without an `api_version`
   "roster":   {"org_id":"…","serial":42,"state":"approved","org_root_fingerprint":"tango-fig-cabbage"},
   "presence": [{"user_id":"b64u:…","device_label":"laptop","role":"primary","online":true,"meta":"v=1.2.3"}],
   "recent_pairings": [{"peer_nickname":"bob","sas_code":"tango-fig-cabbage","paired_at_epoch":1751760000}],
-  "reachability": [{"name":"bob","reachable":true,"rtt_ms":42,"age_secs":3,"meta":"v=1.2.3"}],
+  "reachability": [{"name":"bob","reachable":true,"rtt_ms":42,"age_secs":3,"meta":"v=1.2.3","principal":"eid:…"}],
   "self_nickname": "workbench"
 }
 ```
@@ -490,7 +490,8 @@ things:
   `api_minor >= N` — e.g. strict params validation is `api_minor >= 1`; the `set_app_metadata`
   verb + `PresencePeer.meta` are `api_minor >= 4` (#39); `PeerReachability.meta` — the same
   app metadata on the pairing-mode probe pong — is `api_minor >= 5` (#40); `PeerInfo.principal`
-  (a peer's eid: device principal) is `api_minor >= 6` (#41); the `set_nickname` verb
+  (a peer's eid: device principal) is `api_minor >= 6` (#41); `PeerReachability.principal` —
+  the same on reachability rows — is `api_minor >= 7` (#42); the `set_nickname` verb
   and `StatusResult.self_nickname` are `api_minor >= 2` (#37); STABLE-principal `allow`
   strings + `ServiceInfo.allow_display` are `api_minor >= 3` (#38). `api_minor` is itself
   additive: a pre-1.1 daemon omits it and it reads as `0`.
