@@ -12,9 +12,9 @@ use crate::protocol::{
     AuditSummaryResult, BackendSpec, BlobFetchParams, BlobFetchResult, BlobGrantParams,
     BlobPublishParams, BlobPublishResult, BlobScopeList, Hello, InviteParams, InviteResult,
     OpenSessionParams, OrgJoinParams, OrgJoinResult, PairParams, PairResult, PeerRemoveParams,
-    PeerRenameParams, RegisterServiceParams, Request, RosterInstallParams, RosterInstallResult,
-    ServiceAllowParams, SetAppMetadataParams, SetNicknameParams, SetRosterUrlParams, StatusResult,
-    StreamFrame,
+    PeerRenameParams, PeerServicesParams, PeerServicesResult, RegisterServiceParams, Request,
+    RosterInstallParams, RosterInstallResult, ServiceAllowParams, SetAppMetadataParams,
+    SetNicknameParams, SetRosterUrlParams, StatusResult, StreamFrame, UnregisterServiceParams,
 };
 use crate::transport::{connect_local, split_local};
 
@@ -304,6 +304,30 @@ impl ControlClient {
     pub async fn set_roster_url(&mut self, url: &str) -> Result<(), ClientError> {
         self.request_ack(Request::SetRosterUrl(SetRosterUrlParams {
             url: url.to_string(),
+        }))
+        .await
+    }
+
+    /// Discover which services a paired `peer` (a nickname, `eid:`, or `b64u:`) CURRENTLY grants
+    /// the caller (#52) — dials the peer and returns the service names its allow admits for the
+    /// caller's principal (only your own admitted services, never the peer's full registry).
+    pub async fn peer_services(&mut self, peer: &str) -> Result<Vec<String>, ClientError> {
+        self.request_typed::<PeerServicesResult>(
+            Request::PeerServices(PeerServicesParams {
+                peer: peer.to_string(),
+            }),
+            "peer_services",
+        )
+        .await
+        .map(|r| r.services)
+    }
+
+    /// Remove a service registration (#50) — the deregistration mirror of `register_service`.
+    /// Removes the whole entry (allow included) + any ephemeral registration of the name, then
+    /// hot-reloads. Idempotent: an unknown name is a clean no-op.
+    pub async fn unregister_service(&mut self, name: &str) -> Result<(), ClientError> {
+        self.request_ack(Request::UnregisterService(UnregisterServiceParams {
+            name: name.to_string(),
         }))
         .await
     }

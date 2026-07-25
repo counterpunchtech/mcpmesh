@@ -19,6 +19,7 @@
 //! identity cannot be baked in. `select_service` already stripped the
 //! caller's reserved `mcpmesh/*` `_meta` keys upstream, so the forwarded
 //! `initialize` is clean before it reaches the child.
+use std::collections::BTreeMap;
 use std::process::Stdio;
 
 use anyhow::{Context, Result};
@@ -43,6 +44,10 @@ const CONCURRENCY_RETRY_MS: u64 = 1000;
 /// [`SessionBackend::run`] (this backend is shared across callers).
 pub struct SpawnBackend {
     pub cmd: Vec<String>,
+    /// Per-service env vars (#51), overlaid on the inherited env; `MCPMESH_PEER_*` wins.
+    pub env: BTreeMap<String, String>,
+    /// Working directory to spawn in (#51); `None` inherits the daemon's cwd.
+    pub cwd: Option<String>,
     pub concurrency: std::sync::Arc<Semaphore>,
     /// This service's name (the registry key) — recorded as `service` in audit records.
     pub service: String,
@@ -119,12 +124,30 @@ impl SpawnBackend {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit()) // child diagnostics flow to the daemon's stderr
             .kill_on_drop(true); // session close (this future returning) kills the child
-        if let Some(id) = &identity {
-            command.env("MCPMESH_PEER_NAME", &id.name);
-            if let Some(user) = &id.user_id {
-                command.env("MCPMESH_PEER_USER", user);
+        // #51: per-service env + cwd. The service's env is applied FIRST, but with every
+        // `MCPMESH_*` key STRIPPED — those are ours, and a service definition must never be able
+        // to set (spoof) the injected identity, including `MCPMESH_PEER_USER` for an UNBOUND
+        // caller (which the injection below would otherwise leave untouched). Identity is then
+        // injected AUTHORITATIVELY: all three vars are set for a resolved caller, and REMOVED
+        // when there is no identity — a service can supply none of them by any path.
+        command.envs(self.env.iter().filter(|(k, _)| !k.starts_with("MCPMESH_")));
+        if let Some(cwd) = &self.cwd {
+            command.current_dir(cwd);
+        }
+        match &identity {
+            Some(id) => {
+                command.env("MCPMESH_PEER_NAME", &id.name);
+                match &id.user_id {
+                    Some(user) => command.env("MCPMESH_PEER_USER", user),
+                    None => command.env_remove("MCPMESH_PEER_USER"),
+                };
+                command.env("MCPMESH_PEER_GROUPS", id.groups.join(","));
             }
-            command.env("MCPMESH_PEER_GROUPS", id.groups.join(","));
+            None => {
+                command.env_remove("MCPMESH_PEER_NAME");
+                command.env_remove("MCPMESH_PEER_USER");
+                command.env_remove("MCPMESH_PEER_GROUPS");
+            }
         }
 
         let mut child = command

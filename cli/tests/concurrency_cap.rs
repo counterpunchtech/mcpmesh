@@ -38,6 +38,8 @@ async fn concurrency_cap_refuses_with_retry_after_ms_and_spawns_no_child() {
             service: "test".into(),
             audit: mcpmesh::audit::AuditSink::disabled(),
             limiter: mcpmesh::limits::RateLimiter::unlimited_shared(),
+            env: Default::default(),
+            cwd: None,
         };
         let identity = Some(PeerIdentity {
             endpoint: [1u8; 32].into(),

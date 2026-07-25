@@ -234,6 +234,8 @@ async fn hot_reload_serves_a_newly_registered_service_over_the_mesh() {
             "echo",
             BackendSpec::Run {
                 cmd: vec![STUB.into()],
+                env: Default::default(),
+                cwd: None,
             },
             vec![tester_eid.clone(), "ghost".into()],
         )

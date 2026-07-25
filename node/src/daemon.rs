@@ -30,7 +30,7 @@ mod reach;
 mod roster_install;
 mod status;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -57,6 +57,7 @@ pub use accept::spawn_accept_loop;
 pub use boot::serve_forever;
 pub use dial::{dial_service, pipe_session, race_dial};
 pub use handlers::{grant_service_access, remove_peer, rename_peer};
+pub(crate) use reach::caller_admitted_services;
 pub use reach::{REACH_TTL_SECS, ReachEntry, probe_peer, reachability_of};
 pub use roster_install::{
     install_roster_view_and_sever, should_staleness_sever, staleness_sweep_once,
@@ -64,8 +65,9 @@ pub use roster_install::{
 
 pub use boot::{NetPlan, net_plan};
 pub(crate) use handlers::{
-    add_peer, blob_fetch, blob_grant, blob_list, blob_publish, mint_invite, open_session, redeem,
-    register_service, service_allow_grant, service_allow_revoke, unregister_ephemeral,
+    add_peer, blob_fetch, blob_grant, blob_list, blob_publish, mint_invite, open_session,
+    peer_services, redeem, register_service, service_allow_grant, service_allow_revoke,
+    unregister_ephemeral, unregister_service,
 };
 pub(crate) use roster_install::{
     install_roster, org_join, set_app_metadata, set_nickname, set_roster_url,
@@ -623,7 +625,15 @@ pub fn build_services_with_ephemeral(
     let mut map: HashMap<String, ServiceEntry> = HashMap::new();
     for (name, svc) in &cfg.services {
         let backend = match svc.backend_result() {
-            Ok(Backend::Run(cmd)) => session_backend_run(cmd, name, cfg, audit, limiters),
+            Ok(Backend::Run(cmd)) => session_backend_run(
+                cmd,
+                &svc.env,
+                svc.cwd.as_deref(),
+                name,
+                cfg,
+                audit,
+                limiters,
+            ),
             Ok(Backend::Socket(path)) => session_backend_socket(path, name, audit, limiters),
             Err(e) => {
                 tracing::warn!(service = %name, %e, "skipping malformed service");
@@ -642,8 +652,8 @@ pub fn build_services_with_ephemeral(
     // shape; map it to the same SpawnBackend/SocketBackend the config path builds.
     for (name, eph) in ephemeral {
         let backend = match &eph.backend {
-            mcpmesh_local_api::BackendSpec::Run { cmd } => {
-                session_backend_run(cmd, name, cfg, audit, limiters)
+            mcpmesh_local_api::BackendSpec::Run { cmd, env, cwd } => {
+                session_backend_run(cmd, env, cwd.as_deref(), name, cfg, audit, limiters)
             }
             mcpmesh_local_api::BackendSpec::Socket { path } => {
                 session_backend_socket(path, name, audit, limiters)
@@ -660,8 +670,11 @@ pub fn build_services_with_ephemeral(
     Services::new(map)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn session_backend_run(
     cmd: &[String],
+    env: &BTreeMap<String, String>,
+    cwd: Option<&str>,
     name: &str,
     cfg: &Config,
     audit: &AuditSink,
@@ -669,6 +682,8 @@ fn session_backend_run(
 ) -> Arc<dyn SessionBackend> {
     Arc::new(SpawnBackend {
         cmd: cmd.to_vec(),
+        env: env.clone(),
+        cwd: cwd.map(str::to_string),
         concurrency: Arc::new(Semaphore::new(spawn_concurrency(cfg))),
         service: name.to_string(),
         audit: audit.clone(),

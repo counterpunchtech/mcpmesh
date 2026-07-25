@@ -52,6 +52,8 @@ async fn over_limit_request_is_throttled_dropped_and_the_session_survives() {
             service: "test".into(),
             audit: mcpmesh::audit::AuditSink::disabled(),
             limiter,
+            env: Default::default(),
+            cwd: None,
         };
         // A resolved caller identity — the RateGate is keyed on `endpoint` (SECURITY invariant 1:
         // the authenticated id, never the self-asserted name).

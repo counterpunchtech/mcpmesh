@@ -61,8 +61,11 @@ fn main() {
             let peer = std::env::var("MCPMESH_PEER_NAME").unwrap_or_default();
             let user = std::env::var("MCPMESH_PEER_USER").unwrap_or_default();
             let groups = std::env::var("MCPMESH_PEER_GROUPS").unwrap_or_default();
+            // #51 test hook: echo a non-MCPMESH env var so a test can prove per-service `env`
+            // reaches the child. Named without the MCPMESH_ prefix (which the spawner strips).
+            let test_env = std::env::var("SPAWN_TEST_ENV").unwrap_or_default();
             format!(
-                "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{text}\"}}],\"peer_name\":\"{peer}\",\"peer_user\":\"{user}\",\"peer_groups\":\"{groups}\"}}}}"
+                "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{text}\"}}],\"peer_name\":\"{peer}\",\"peer_user\":\"{user}\",\"peer_groups\":\"{groups}\",\"test_env\":\"{test_env}\"}}}}"
             )
         } else {
             continue;
