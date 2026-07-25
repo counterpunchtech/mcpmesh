@@ -296,3 +296,106 @@ async fn set_app_metadata_surfaces_in_status_presence() {
     .await
     .expect("app-metadata status test timed out");
 }
+
+/// #41 — dial by `eid:` targets the EXACT authenticated endpoint, unambiguously, even when a
+/// DIFFERENT stored peer shares the nickname (nicknames are not unique; first-match wins).
+/// A target serves echo (gated to the client's eid). The client's store holds two peers both
+/// nicknamed "twin" — the real target and a decoy — so a nickname dial is ambiguous, but
+/// `dial_service("eid:<target-hex>", …)` reaches the real endpoint and round-trips.
+#[tokio::test(flavor = "multi_thread")]
+async fn dial_by_eid_targets_the_exact_endpoint_despite_a_nickname_collision() {
+    timeout(Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+
+        // The target serves echo, authorizing the client by its stable eid principal (#38).
+        let target_ep = local_endpoint().await;
+        let target_id = *target_ep.id().as_bytes();
+        let target_addr = target_ep.addr();
+        let eid_target = format!("eid:{}", target_ep.id());
+        let client_ep = local_endpoint().await;
+        let client_id = *client_ep.id().as_bytes();
+        let client_eid = format!("eid:{}", client_ep.id());
+        let target_cfg = Config::from_toml_str(&format!(
+            "[services.echo]\nrun = ['{STUB}']\nallow = [\"{client_eid}\"]\n"
+        ))
+        .expect("parse target config");
+        let target_store = PeerStore::open(&dir.path().join("target.redb")).unwrap();
+        target_store
+            .add(PeerEntry {
+                endpoint_id: client_id,
+                nickname: "client".into(),
+                services: vec!["echo".into()],
+                paired_at: None,
+                user_id: None,
+                last_addr: None,
+            })
+            .unwrap();
+        let target_gate: Arc<dyn TrustGate> = Arc::new(AllowlistGate::new(Arc::new(target_store)));
+        let _target_serve = serve(
+            target_ep,
+            target_gate,
+            build_services(&target_cfg),
+            Arc::new(mcpmesh_net::ConnRegistry::new()),
+        );
+
+        // The client learns the target's addr (stand-in for discovery), then stores TWO peers
+        // both nicknamed "twin": the real target and a decoy endpoint → "twin" is ambiguous.
+        let mem = MemoryLookup::new();
+        mem.add_endpoint_info(target_addr);
+        client_ep.address_lookup().unwrap().add(mem);
+        let client_store = Arc::new(PeerStore::open(&dir.path().join("client.redb")).unwrap());
+        for eid in [target_id, [200u8; 32]] {
+            client_store
+                .add(PeerEntry {
+                    endpoint_id: eid,
+                    nickname: "twin".into(), // SAME nickname on two endpoints
+                    services: vec!["echo".into()],
+                    paired_at: None,
+                    user_id: None,
+                    last_addr: None,
+                })
+                .unwrap();
+        }
+        let gate: Arc<dyn TrustGate> = Arc::new(AllowlistGate::new(client_store.clone()));
+        let mesh = MeshState::new(
+            client_ep,
+            gate,
+            client_store,
+            Arc::new(LiveInvites::new()),
+            "client".into(),
+            dir.path().join("config.toml"),
+            Arc::new(RosterGate::empty()),
+            Arc::new(ConnRegistry::new()),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        // Dial by the target's EXACT eid principal → reaches the real target, not the decoy.
+        let mut transport = daemon::dial_service(&mesh, &eid_target, "echo")
+            .await
+            .expect("eid dial reaches the exact endpoint despite the nickname collision");
+        transport
+            .send_value(initialize_frame("echo"))
+            .await
+            .unwrap();
+        let init = transport.recv_value().await.unwrap().unwrap();
+        assert_eq!(
+            init["result"]["serverInfo"]["name"], "echo-stub",
+            "the eid dial landed on the serving target: {init}"
+        );
+
+        // An invalid eid principal is a clean resolution error (never a panic).
+        assert!(
+            daemon::dial_service(&mesh, "eid:nothex", "echo")
+                .await
+                .is_err(),
+            "an invalid eid principal must error, not panic"
+        );
+
+        std::mem::forget(dir);
+    })
+    .await
+    .expect("dial-by-eid test timed out");
+}

@@ -215,6 +215,10 @@ pub(crate) fn peer_infos(store: &PeerStore) -> Vec<PeerInfo> {
             // The peer's proven self-sovereign user_id (from a verified pairing binding), or `None`
             // for a nickname-only / `internal peer add` peer. A surface-clean opaque id, not a key.
             user_id: e.user_id,
+            // The peer's stable DEVICE principal (#41) — the eid: the backend injects and the
+            // allow lists use, so an embedder can map this nickname to the authenticated
+            // endpoint. Always present (the endpoint id is the peer's row key).
+            principal: Some(mcpmesh_net::EndpointId::from_bytes(e.endpoint_id).principal()),
         })
         .collect()
 }
@@ -269,10 +273,22 @@ mod tests {
             "status must show the live grant, got allow={:?}",
             kb.allow
         );
-        assert!(
-            status.peers.iter().any(|p| p.name == "alice"),
-            "status must show the live peer, got peers={:?}",
-            status.peers
+        let alice = status
+            .peers
+            .iter()
+            .find(|p| p.name == "alice")
+            .expect("status must show the live peer");
+        // #41: the peer carries its stable eid: device principal — the eid of its stored
+        // endpoint id ([9u8; 32] here) — so an embedder can map this nickname to the
+        // authenticated endpoint the backend injects.
+        assert_eq!(
+            alice.principal.as_deref(),
+            Some(
+                mcpmesh_net::EndpointId::from_bytes([9u8; 32])
+                    .principal()
+                    .as_str()
+            ),
+            "peer principal must be the eid: of its endpoint id"
         );
     }
 

@@ -331,6 +331,15 @@ mod tests {
     }
 
     #[test]
+    fn split_target_accepts_an_eid_principal() {
+        // An eid: principal carries no '/', so `eid:<hex>/<service>` splits cleanly (#41).
+        let hex = "a".repeat(64);
+        let (peer, service) = split_target(&format!("eid:{hex}/notes")).unwrap();
+        assert_eq!(peer, format!("eid:{hex}"));
+        assert_eq!(service, "notes");
+    }
+
+    #[test]
     fn split_target_requires_both_halves() {
         assert_eq!(
             split_target("alice/notes").unwrap(),
