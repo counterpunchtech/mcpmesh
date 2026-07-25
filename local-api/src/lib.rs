@@ -60,10 +60,11 @@ pub use protocol::{
     BackendKind, BackendSpec, BlobFetchParams, BlobFetchResult, BlobGrantParams, BlobPublishParams,
     BlobPublishResult, BlobScopeList, Hello, InviteParams, InviteResult, OpenSessionParams,
     OrgJoinParams, OrgJoinResult, PairParams, PairResult, PeerAddParams, PeerInfo,
-    PeerReachability, PeerRemoveParams, PeerRenameParams, PresencePeer, RecentPairing,
-    RegisterServiceParams, Request, RosterInstallParams, RosterInstallResult, RosterStatus,
-    ScopeInfo, ServiceAllowParams, ServiceInfo, SetAppMetadataParams, SetNicknameParams,
-    SetRosterUrlParams, StatusResult, StreamFrame, method_of,
+    PeerReachability, PeerRemoveParams, PeerRenameParams, PeerServicesParams, PeerServicesResult,
+    PresencePeer, RecentPairing, RegisterServiceParams, Request, RosterInstallParams,
+    RosterInstallResult, RosterStatus, ScopeInfo, ServiceAllowParams, ServiceInfo,
+    SetAppMetadataParams, SetNicknameParams, SetRosterUrlParams, StatusResult, StreamFrame,
+    UnregisterServiceParams, method_of,
 };
 
 #[cfg(feature = "client")]

@@ -19,7 +19,11 @@
 //! let mut control = node.control().await?;
 //! control.register_service(
 //!     "notes",
-//!     mcpmesh_local_api::BackendSpec::Run { cmd: vec!["my-mcp-server".into()] },
+//!     mcpmesh_local_api::BackendSpec::Run {
+//!         cmd: vec!["my-mcp-server".into()],
+//!         env: Default::default(),
+//!         cwd: None,
+//!     },
 //!     vec![],
 //! ).await?;
 //! let invite = control.invite(vec!["notes".into()]).await?;

@@ -44,6 +44,8 @@ async fn two_embedded_nodes_pair_and_run_an_mcp_session() {
             "notes",
             BackendSpec::Run {
                 cmd: vec![STUB.into()],
+                env: Default::default(),
+                cwd: None,
             },
             vec![],
         )

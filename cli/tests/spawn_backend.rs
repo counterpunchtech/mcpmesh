@@ -40,6 +40,8 @@ async fn run_backend_pumps_frames_and_injects_identity() {
             service: "test".into(),
             audit: mcpmesh::audit::AuditSink::disabled(),
             limiter: mcpmesh::limits::RateLimiter::unlimited_shared(),
+            env: Default::default(),
+            cwd: None,
         };
         // The gate-resolved identity, threaded through run_over per-caller (Task 9).
         let identity = Some(PeerIdentity {
@@ -112,6 +114,8 @@ async fn concurrency_cap_is_enforced() {
             service: "test".into(),
             audit: mcpmesh::audit::AuditSink::disabled(),
             limiter: mcpmesh::limits::RateLimiter::unlimited_shared(),
+            env: Default::default(),
+            cwd: None,
         };
         let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
         let session1 =
@@ -134,6 +138,8 @@ async fn concurrency_cap_is_enforced() {
             service: "test".into(),
             audit: mcpmesh::audit::AuditSink::disabled(),
             limiter: mcpmesh::limits::RateLimiter::unlimited_shared(),
+            env: Default::default(),
+            cwd: None,
         };
         // The backend HANDLES the cap: it sends -32053 + closes and returns Ok(()) — a clean
         // refusal, NOT a session error (so `serve` does not warn!("session ended with error")
@@ -163,4 +169,76 @@ async fn concurrency_cap_is_enforced() {
     })
     .await
     .expect("concurrency test timed out");
+}
+
+/// #51: a `run` backend applies per-service `env` (a normal var reaches the child) while the
+/// injected `MCPMESH_PEER_*` identity is AUTHORITATIVE — a service env cannot spoof it, even
+/// `MCPMESH_PEER_USER` for an UNBOUND caller (identity.user_id = None).
+#[tokio::test]
+async fn run_backend_env_reaches_child_but_identity_is_not_spoofable() {
+    timeout(Duration::from_secs(30), async {
+        let (server_io, client_io) = duplex(64 * 1024);
+        let (sr, sw) = split(server_io);
+        let backend_transport = NdjsonTransport::new(sr, sw, MAX_FRAME);
+        let (cr, cw) = split(client_io);
+        let mut client = NdjsonTransport::new(cr, cw, MAX_FRAME);
+
+        let mut env = std::collections::BTreeMap::new();
+        env.insert(
+            "SPAWN_TEST_ENV".to_string(),
+            "reached-the-child".to_string(),
+        );
+        // A malicious service definition trying to forge the caller's user_id (the caller is
+        // UNBOUND, so the injector would otherwise not overwrite this).
+        env.insert("MCPMESH_PEER_USER".to_string(), "b64u:FORGED".to_string());
+        let backend = SpawnBackend {
+            cmd: vec![STUB.to_string()],
+            concurrency: Arc::new(Semaphore::new(4)),
+            service: "test".into(),
+            audit: mcpmesh::audit::AuditSink::disabled(),
+            limiter: mcpmesh::limits::RateLimiter::unlimited_shared(),
+            env,
+            cwd: None,
+        };
+        let identity = Some(PeerIdentity {
+            endpoint: [0u8; 32].into(),
+            name: "bob".into(),
+            user_id: None, // UNBOUND — the spoof target
+            groups: vec![],
+        });
+        let initialize = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-11-25", "capabilities": {}}
+        });
+        let session = tokio::spawn(async move {
+            backend
+                .run_over(identity, initialize, backend_transport)
+                .await
+        });
+        let _init = client.recv_value().await.unwrap().unwrap();
+        client
+            .send_value(json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"arguments": {"text": "hi"}}
+            }))
+            .await
+            .unwrap();
+        let call = client.recv_value().await.unwrap().unwrap();
+        // Per-service env reached the child.
+        assert_eq!(
+            call["result"]["test_env"], "reached-the-child",
+            "per-service env must reach the child (#51)"
+        );
+        // The forged MCPMESH_PEER_USER was STRIPPED — the child sees the real (empty) user, not
+        // the spoof. Identity is authoritative, not settable by a service definition.
+        assert_eq!(
+            call["result"]["peer_user"], "",
+            "a service env must never spoof MCPMESH_PEER_USER (#51 security)"
+        );
+        assert_eq!(call["result"]["peer_name"], "bob", "real identity injected");
+        drop(client);
+        let _ = session.await.unwrap();
+    })
+    .await
+    .expect("env test timed out");
 }

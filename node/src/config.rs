@@ -5,6 +5,7 @@ use figment::{
     providers::{Format, Toml},
 };
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Default, Deserialize)]
@@ -35,6 +36,13 @@ pub struct ServiceCfg {
     pub socket: Option<String>,
     /// STABLE principals admitted to this service (b64u:/eid:/roster names, #38 — never display nicknames).
     pub allow: Vec<String>,
+    /// Per-service env vars for a `run` backend (#51). The `MCPMESH_PEER_*` identity vars win
+    /// over these. Ignored for a `socket` backend. Default empty.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// Working directory for a `run` backend (#51). Default: inherit the daemon's cwd.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 /// The resolved backend kind of a [`ServiceCfg`], borrowing the config as slices (no

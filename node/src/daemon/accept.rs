@@ -155,10 +155,10 @@ pub fn spawn_accept_loop(mesh: Arc<MeshState>, services: Arc<Services>) -> JoinH
                         // security boundary of the probe (mirrors the `gate.resolve` refusal in
                         // `gate_and_register`). The EndpointId is not logged (surface-leak discipline).
                         let remote = mcpmesh_net::EndpointId::from(conn.remote_id());
-                        if mesh.gate.resolve(&remote).is_none() {
+                        let Some(identity) = mesh.gate.resolve(&remote) else {
                             conn.close(mcpmesh_net::CLOSE_UNAUTHORIZED.into(), b"unauthorized");
                             return;
-                        }
+                        };
                         // The dialer opens the bi-stream and sends one ping frame (which is what
                         // makes `accept_bi` resolve — a silent QUIC stream is invisible to the peer);
                         // we ignore its content and write the single pong. `finish()` + `stopped()`
@@ -172,11 +172,19 @@ pub fn spawn_accept_loop(mesh: Arc<MeshState>, services: Arc<Services>) -> JoinH
                             // Omitted when empty so a metadata-less pong is byte-shape-identical
                             // to the pre-#40 pong.
                             let meta = mesh.app_metadata();
-                            let pong = if meta.is_empty() {
-                                serde_json::json!({ "stack_version": STACK_VERSION })
-                            } else {
-                                serde_json::json!({ "stack_version": STACK_VERSION, "meta": meta })
-                            };
+                            // #52: the pong ALSO carries the services THIS caller is currently
+                            // admitted to — the discovery answer, computed on the side that owns
+                            // the truth. Only the caller's own admitted services (never the full
+                            // registry). Empty list omitted (keeps a no-share pong compact).
+                            let services =
+                                crate::daemon::caller_admitted_services(&mesh, &identity);
+                            let mut pong = serde_json::json!({ "stack_version": STACK_VERSION });
+                            if !meta.is_empty() {
+                                pong["meta"] = serde_json::json!(meta);
+                            }
+                            if !services.is_empty() {
+                                pong["services"] = serde_json::json!(services);
+                            }
                             if write_frame(&mut send, &pong).await.is_ok() {
                                 let _ = send.finish();
                                 let _ = send.stopped().await;

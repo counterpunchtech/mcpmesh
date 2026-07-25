@@ -321,6 +321,8 @@ async fn register_service_and_peer_add_reflect_in_status() {
                 name: "echo".into(),
                 backend: BackendSpec::Run {
                     cmd: vec![STUB.to_string()],
+                    env: Default::default(),
+                    cwd: None,
                 },
                 allow: vec!["tester".into()],
                 ephemeral: false,
@@ -394,6 +396,8 @@ async fn concurrent_register_service_calls_all_persist() {
             name: "alpha".into(),
             backend: BackendSpec::Run {
                 cmd: vec![STUB.to_string()],
+                env: Default::default(),
+                cwd: None,
             },
             allow: vec!["x".into()],
             ephemeral: false,
@@ -402,6 +406,8 @@ async fn concurrent_register_service_calls_all_persist() {
             name: "beta".into(),
             backend: BackendSpec::Run {
                 cmd: vec![STUB.to_string()],
+                env: Default::default(),
+                cwd: None,
             },
             allow: vec!["y".into()],
             ephemeral: false,
@@ -650,6 +656,8 @@ async fn status_output_leaks_no_transport_vocabulary() {
                 name: "files".into(),
                 backend: BackendSpec::Run {
                     cmd: vec![STUB.to_string()],
+                    env: Default::default(),
+                    cwd: None,
                 },
                 allow: vec!["bob".into()],
                 ephemeral: false,

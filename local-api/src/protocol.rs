@@ -11,6 +11,8 @@
 //! Additive-only: new fields (capabilities on `Hello`, groups/user_id on
 //! `PeerInfo`, device on `OpenSession`) MUST land as
 //! `#[serde(default, skip_serializing_if = ...)]` so older payloads still deserialize.
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// The first exchange on any `*-local/N` socket (the family's hello convention).
@@ -304,6 +306,30 @@ pub struct SetAppMetadataParams {
     pub metadata: String,
 }
 
+/// Params of [`Request::PeerServices`] (#52): the peer to query — a nickname, an `eid:` device
+/// principal, or a `b64u:` user_id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerServicesParams {
+    pub peer: String,
+}
+
+/// Result of [`Request::PeerServices`] (#52): the services the queried peer CURRENTLY grants the
+/// caller — computed authoritatively on the peer (which owns the truth), always current, only
+/// the caller's own admitted services (never the peer's full registry).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerServicesResult {
+    pub services: Vec<String>,
+}
+
+/// Params of [`Request::UnregisterService`] (#50): the persistent (or ephemeral) service name
+/// to remove — the deregistration mirror of `register_service`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnregisterServiceParams {
+    pub name: String,
+}
+
 /// Params of [`Request::ServiceAllowGrant`] / [`Request::ServiceAllowRevoke`] (#44): toggle a
 /// single stable `principal` (`b64u:`/`eid:`) on a single `service`'s allow list, WITHOUT
 /// unpairing. The per-peer "sharing" switch primitive the embedder drives.
@@ -444,6 +470,14 @@ pub enum Request {
     SetAppMetadata(SetAppMetadataParams),
     /// Grant a single stable principal access to a single service's allow (#44) — the per-peer
     /// "sharing on" toggle, idempotent + serialized under the config lock. Ack result.
+    /// Remove a service registration (#50) — the deregistration mirror of `register_service`.
+    /// Removes the whole `[services.<name>]` entry (allow included) + any ephemeral one, then
+    /// hot-reloads. Idempotent. Ack result.
+    UnregisterService(UnregisterServiceParams),
+    /// Discover which services a paired peer CURRENTLY grants the caller (#52) — dials the peer
+    /// and returns the service names whose allow admits the caller's principal. Answers
+    /// [`PeerServicesResult`].
+    PeerServices(PeerServicesParams),
     ServiceAllowGrant(ServiceAllowParams),
     /// Revoke a single stable principal from a single service's allow (#44) — "sharing off"
     /// WITHOUT unpairing (the peer's identity row is untouched; only NEW sessions are refused).
@@ -822,8 +856,20 @@ pub fn method_of(v: &serde_json::Value) -> Option<&str> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendSpec {
-    Run { cmd: Vec<String> },
-    Socket { path: String },
+    Run {
+        cmd: Vec<String>,
+        /// Per-service environment variables (#51) for the spawned child. Overlaid on the
+        /// daemon's inherited env; the injected `MCPMESH_PEER_*` identity vars ALWAYS win over
+        /// these (identity is not spoofable by a service definition). Default empty.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        env: BTreeMap<String, String>,
+        /// Working directory to spawn the child in (#51). Default: inherit the daemon's cwd.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
+    Socket {
+        path: String,
+    },
 }
 
 pub const API_NAME: &str = "mcpmesh-local/1";
@@ -1112,6 +1158,8 @@ mod tests {
     fn backend_spec_roundtrips() {
         let run = BackendSpec::Run {
             cmd: vec!["notes-mcp".into(), "--stdio".into()],
+            env: Default::default(),
+            cwd: None,
         };
         let v = serde_json::to_value(&run).unwrap();
         assert_eq!(v["run"]["cmd"][0], "notes-mcp");
@@ -1131,6 +1179,8 @@ mod tests {
             name: "notes".into(),
             backend: BackendSpec::Run {
                 cmd: vec!["notes-mcp".into()],
+                env: Default::default(),
+                cwd: None,
             },
             allow: vec!["alice".into()],
             ephemeral: false,

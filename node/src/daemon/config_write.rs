@@ -130,6 +130,23 @@ pub(crate) fn write_identity_nickname(path: &Path, nickname: &str) -> Result<()>
 /// `serve --allow bob` still adds a grant; removal is the separate `revoke_service_access` path).
 /// Deliberately NOT routed through [`upsert_config_strings`] — this is a real merge, not a
 /// string-key upsert.
+/// Remove the WHOLE `[services.<name>]` entry (#50, the `unregister_service` verb). Idempotent:
+/// an unknown name, or no `[services]` table, changes nothing (`Ok(false)`). The allow list goes
+/// with it (grants are meaningless once the service is gone).
+pub(crate) fn remove_service_from_config(path: &Path, name: &str) -> Result<bool> {
+    let existing = read_config_for_rmw(path)?;
+    let mut doc: toml::Table = toml::from_str(&existing)
+        .with_context(|| format!("parse existing config {}", path.display()))?;
+    let Some(toml::Value::Table(services)) = doc.get_mut("services") else {
+        return Ok(false);
+    };
+    if services.remove(name).is_none() {
+        return Ok(false); // unknown service → no-op
+    }
+    write_config_doc(path, &doc)?;
+    Ok(true)
+}
+
 pub(crate) fn write_service_to_config(
     path: &Path,
     name: &str,
@@ -168,11 +185,21 @@ pub(crate) fn write_service_to_config(
 
     let mut entry = toml::Table::new();
     match backend {
-        BackendSpec::Run { cmd } => {
+        BackendSpec::Run { cmd, env, cwd } => {
             entry.insert(
                 "run".into(),
                 toml::Value::Array(cmd.iter().cloned().map(toml::Value::String).collect()),
             );
+            if let Some(cwd) = cwd {
+                entry.insert("cwd".into(), toml::Value::String(cwd.clone()));
+            }
+            if !env.is_empty() {
+                let env_tbl: toml::Table = env
+                    .iter()
+                    .map(|(k, v)| (k.clone(), toml::Value::String(v.clone())))
+                    .collect();
+                entry.insert("env".into(), toml::Value::Table(env_tbl));
+            }
         }
         BackendSpec::Socket { path } => {
             entry.insert("socket".into(), toml::Value::String(path.clone()));
@@ -556,6 +583,33 @@ mod tests {
             svc.allow,
             vec!["alice".to_string(), "bob".to_string()],
             "union: existing grant kept, incoming appended"
+        );
+    }
+
+    /// #51: a Run backend's `env` + `cwd` round-trip through the config write + load.
+    #[test]
+    fn run_backend_env_and_cwd_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "").unwrap();
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("GITHUB_TOKEN".to_string(), "ghp_x".to_string());
+        let spec = mcpmesh_local_api::BackendSpec::Run {
+            cmd: vec!["npx".into(), "server".into()],
+            env,
+            cwd: Some("/home/me/code".into()),
+        };
+        write_service_to_config(&path, "gh", &spec, &["eid:beef".to_string()]).unwrap();
+        let cfg = Config::load(&path).unwrap();
+        let svc = cfg.services.get("gh").unwrap();
+        assert_eq!(svc.cwd.as_deref(), Some("/home/me/code"));
+        assert_eq!(
+            svc.env.get("GITHUB_TOKEN").map(String::as_str),
+            Some("ghp_x")
+        );
+        assert_eq!(
+            svc.run.as_deref().unwrap(),
+            &["npx".to_string(), "server".to_string()]
         );
     }
 }

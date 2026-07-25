@@ -417,3 +417,61 @@ async fn probe_carries_peer_app_metadata_into_reachability() {
     .await
     .expect("probe-metadata test timed out");
 }
+
+/// #52 — a peer's currently-granted services surface on the probe, end to end: A's config grants
+/// B's eid a service; B probes A over `mcpmesh/ping/1` and its `ReachEntry.services` reports it,
+/// while a service A does NOT grant B is absent (only caller-admitted).
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_surfaces_the_services_the_peer_grants_the_caller() {
+    timeout(Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+
+        let a_ep = target_endpoint().await;
+        let a_id = *a_ep.id().as_bytes();
+        let a_addr = a_ep.addr();
+
+        let b_ep = dialer_endpoint().await;
+        let b_id = *b_ep.id().as_bytes();
+        let b_eid = format!("eid:{}", b_ep.id());
+        seed_lookup(&b_ep, a_addr.clone());
+        let b_store = Arc::new(PeerStore::open(&dir.path().join("b.redb")).unwrap());
+        seed_peer(&b_store, a_id, "alice");
+
+        // A's config: `shared` grants B's eid; `private` grants someone else. A trusts B (ping gate).
+        let config = dir.path().join("a-config.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "[services.shared]\nsocket = \"/run/s.sock\"\nallow = [\"{b_eid}\"]\n\
+                 [services.private]\nsocket = \"/run/p.sock\"\nallow = [\"eid:someoneelse\"]\n"
+            ),
+        )
+        .unwrap();
+        let a_store = Arc::new(PeerStore::open(&dir.path().join("a.redb")).unwrap());
+        seed_peer(&a_store, b_id, "beacon-b");
+        let a_mesh = assemble_mesh(a_ep, a_store, config);
+        let b_mesh = assemble_mesh(b_ep, b_store, dir.path().join("b-config.toml"));
+        let accept = spawn_accept_loop(
+            a_mesh.clone(),
+            Arc::new(build_services(&Config::from_toml_str("").unwrap())),
+        );
+
+        // B probes A → the pong reports the services A grants B: only `shared`.
+        let entry = probe_peer(&b_mesh, a_id).await;
+        assert!(entry.reachable);
+        assert_eq!(
+            entry.services,
+            vec!["shared".to_string()],
+            "probe surfaces exactly the caller-admitted services (#52)"
+        );
+        assert!(
+            !entry.services.contains(&"private".to_string()),
+            "never a service the peer does not grant the caller"
+        );
+
+        accept.abort();
+        std::mem::forget(dir);
+    })
+    .await
+    .expect("peer-services probe test timed out");
+}

@@ -20,9 +20,9 @@ use anyhow::{Context, Result};
 use mcpmesh_local_api::transport::{LocalListener, LocalStream};
 use mcpmesh_local_api::{
     API_NAME, API_VERSION, BlobFetchParams, BlobGrantParams, BlobPublishParams, Hello,
-    InviteParams, OpenSessionParams, OrgJoinParams, PairParams, RosterInstallParams,
-    ServiceAllowParams, SetAppMetadataParams, SetNicknameParams, SetRosterUrlParams, StatusResult,
-    method_of,
+    InviteParams, OpenSessionParams, OrgJoinParams, PairParams, PeerServicesParams,
+    RosterInstallParams, ServiceAllowParams, SetAppMetadataParams, SetNicknameParams,
+    SetRosterUrlParams, StatusResult, UnregisterServiceParams, method_of,
 };
 use mcpmesh_net::framing::{FrameReader, Inbound, write_frame};
 use serde_json::{Value, json};
@@ -493,6 +493,28 @@ async fn handle_request(req: &Value, state: &DaemonState) -> Value {
             "set_nickname",
             with_params(&params, |p: SetNicknameParams| {
                 crate::daemon::set_nickname(state, p.nickname)
+            })
+            .await
+            .map(unit),
+        ),
+        // Peer service discovery (#52): dial the peer, return the services it grants us.
+        Some("peer_services") => {
+            let p: PeerServicesParams = match params_of(&params) {
+                Ok(p) => p,
+                Err(e) => return error(id, -32602, format!("peer_services: {e}")),
+            };
+            respond(
+                id,
+                "peer_services",
+                crate::daemon::peer_services(state, p.peer).await,
+            )
+        }
+        // Deregistration (#50): remove a service registration, mirror of register_service.
+        Some("unregister_service") => respond(
+            id,
+            "unregister_service",
+            with_params(&params, |p: UnregisterServiceParams| {
+                crate::daemon::unregister_service(state, p.name)
             })
             .await
             .map(unit),

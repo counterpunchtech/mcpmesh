@@ -23,6 +23,9 @@ pub struct ReachEntry {
     /// The peer's app metadata (#40), read from its pong — empty when it set none, or when a
     /// hostile/oversized value was dropped on receive. Advisory display data, never authz.
     pub meta: String,
+    /// The services this peer currently grants US (#52), read from its pong — the discovery
+    /// answer. Only services whose allow admits our principal; empty if it shares nothing.
+    pub services: Vec<String>,
 }
 
 /// Advisory reachability TTL: a cache entry older than this is refreshed by a NON-BLOCKING
@@ -44,15 +47,16 @@ pub async fn probe_peer(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> ReachEn
     let started = std::time::Instant::now();
     let outcome = tokio::time::timeout(PROBE_TIMEOUT, probe_once(mesh, endpoint_id)).await;
     // `probe_once` returns the peer's (already length-capped) metadata on a reachable pong.
-    let (reachable, meta) = match outcome {
-        Ok(Ok(meta)) => (true, meta),
-        _ => (false, String::new()),
+    let (reachable, meta, services) = match outcome {
+        Ok(Ok((meta, services))) => (true, meta, services),
+        _ => (false, String::new(), Vec::new()),
     };
     let entry = ReachEntry {
         reachable,
         rtt_ms: reachable.then(|| started.elapsed().as_millis() as u64),
         probed_at: epoch_now_i64(),
         meta,
+        services,
     };
     mesh.reachability
         .lock()
@@ -64,7 +68,7 @@ pub async fn probe_peer(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> ReachEn
 /// The dial → ping → pong half of [`probe_peer`], separated so the whole exchange is one timeout
 /// unit. Reuses the real iroh 1.0.1 call shapes from `dial.rs`/`pairing::rendezvous`
 /// (`endpoint.connect`, `open_bi`, `write_frame`, `finish`, a framed read).
-async fn probe_once(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> Result<String> {
+async fn probe_once(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> Result<(String, Vec<String>)> {
     let id = iroh::EndpointId::from_bytes(&endpoint_id)
         .map_err(|e| anyhow::anyhow!("invalid endpoint id: {e}"))?;
     // Attach the pairing-persisted `last_addr` hint, exactly as `dial::dial_service` does
@@ -98,7 +102,7 @@ async fn probe_once(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> Result<Stri
         // SAME ≤256B cap the sender applies (an oversized/absent/non-string value ⇒ empty).
         // The channel is authenticated (this is a trust-gated paired peer), so no signature is
         // needed; the cap is the only receive-side hardening required.
-        Some(Inbound::Frame(v)) => Ok(pong_meta(&v)),
+        Some(Inbound::Frame(v)) => Ok((pong_meta(&v), pong_services(&v))),
         _ => anyhow::bail!("no pong from peer"),
     }
 }
@@ -106,6 +110,20 @@ async fn probe_once(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> Result<Stri
 /// Extract the optional app metadata from a pong frame, applying the receive cap (#40): a
 /// missing / non-string / over-`APP_METADATA_MAX_BYTES` value yields empty. Control-character
 /// hygiene is applied at RENDER time (`--json` carries it raw, JSON-escaped).
+/// Extract the caller-admitted service names from a pong (#52) — a JSON array of strings, or
+/// empty for a peer that shares nothing / an older peer without the field. Never panics on
+/// hostile shapes.
+fn pong_services(pong: &serde_json::Value) -> Vec<String> {
+    pong.get("services")
+        .and_then(|s| s.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn pong_meta(pong: &serde_json::Value) -> String {
     pong.get("meta")
         .and_then(|m| m.as_str())
@@ -122,6 +140,45 @@ fn pong_meta(pong: &serde_json::Value) -> String {
 ///
 /// Surface discipline: the cache is keyed by endpoint-id INTERNALLY, but every returned
 /// [`mcpmesh_local_api::PeerReachability`] carries only the peer's NICKNAME — never the endpoint-id.
+/// The services `identity` is currently admitted to on THIS node (#52) — the discovery answer
+/// the ping pong carries. Computes the caller's flat principal set (the SAME
+/// `mcpmesh_local_api::principal_set` admission uses) and returns every persistent OR ephemeral
+/// service whose `allow` names one of those principals. ONLY the caller's own admitted services
+/// — never the full registry. A best-effort config read (an unreadable config → empty).
+pub(crate) fn caller_admitted_services(
+    mesh: &Arc<MeshState>,
+    identity: &mcpmesh_net::PeerIdentity,
+) -> Vec<String> {
+    use std::collections::HashSet;
+    let eid = identity.endpoint.principal();
+    let principals: HashSet<&str> =
+        mcpmesh_local_api::principal_set(Some(&eid), identity.user_id.as_deref(), &identity.groups)
+            .into_iter()
+            .collect();
+    let admits = |allow: &[String]| allow.iter().any(|a| principals.contains(a.as_str()));
+
+    let mut out: Vec<String> = Vec::new();
+    if let Ok(cfg) = crate::config::Config::load(&mesh.config_path) {
+        for (name, svc) in &cfg.services {
+            if admits(&svc.allow) {
+                out.push(name.clone());
+            }
+        }
+    }
+    for (name, eph) in mesh
+        .ephemeral_services
+        .lock()
+        .expect("ephemeral_services lock not poisoned")
+        .iter()
+    {
+        if admits(&eph.allow) && !out.contains(name) {
+            out.push(name.clone());
+        }
+    }
+    out.sort();
+    out
+}
+
 pub fn reachability_of(mesh: &Arc<MeshState>) -> Vec<mcpmesh_local_api::PeerReachability> {
     let now = epoch_now_i64();
     // (nickname, endpoint_id) for every paired peer — reuse the allowlist store's peer scan
@@ -196,6 +253,49 @@ mod tests {
     /// the ≤256B cap — a missing, non-string, or OVERSIZED value (a compromised paired peer
     /// signing nothing, just sending bytes over the authenticated channel) yields empty, so the
     /// prober never caches or surfaces an unbounded/garbage blob.
+    #[test]
+    fn pong_services_parses_the_array_and_tolerates_hostile_shapes() {
+        use super::pong_services;
+        assert_eq!(
+            pong_services(&serde_json::json!({"services": ["notes", "kb"]})),
+            vec!["notes".to_string(), "kb".to_string()]
+        );
+        assert!(pong_services(&serde_json::json!({"stack_version": "1"})).is_empty());
+        assert!(pong_services(&serde_json::json!({"services": 42})).is_empty());
+        assert!(pong_services(&serde_json::json!({"services": [1, {"x": 2}]})).is_empty());
+    }
+
+    /// #52: `caller_admitted_services` returns exactly the services whose allow admits the
+    /// caller's principal — its eid, user_id, or a group — never the full registry.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn caller_admitted_services_returns_only_admitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let caller_eid = mcpmesh_net::EndpointId::from_bytes([7u8; 32]).principal();
+        std::fs::write(
+            &config_path,
+            format!(
+                "[services.shared]\nsocket = \"/run/a.sock\"\nallow = [\"{caller_eid}\"]\n                 [services.grouped]\nsocket = \"/run/b.sock\"\nallow = [\"team-eng\"]\n                 [services.private]\nsocket = \"/run/c.sock\"\nallow = [\"eid:other\"]\n"
+            ),
+        )
+        .unwrap();
+        let mesh = crate::daemon::testutil::hermetic_mesh(config_path).await;
+
+        // The caller: its eid admits `shared`; its group admits `grouped`; `private` is neither.
+        let identity = mcpmesh_net::PeerIdentity {
+            endpoint: mcpmesh_net::EndpointId::from_bytes([7u8; 32]),
+            name: "bob".into(),
+            user_id: None,
+            groups: vec!["team-eng".into()],
+        };
+        let admitted = super::caller_admitted_services(&mesh, &identity);
+        assert_eq!(admitted, vec!["grouped".to_string(), "shared".to_string()]);
+        assert!(
+            !admitted.contains(&"private".to_string()),
+            "never a non-admitted service"
+        );
+    }
+
     #[test]
     fn pong_meta_extracts_within_cap_and_drops_the_rest() {
         assert_eq!(

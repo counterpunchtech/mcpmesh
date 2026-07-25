@@ -27,7 +27,7 @@ use crate::util::{blocking, epoch_now_u64};
 use super::accept::reload_accept_loop;
 use super::config_write::{
     append_allow_to_config, remove_allow_from_config, remove_principal_from_service,
-    write_service_to_config,
+    remove_service_from_config, write_service_to_config,
 };
 use super::status::service_infos;
 use super::{MeshState, dial_service, pipe_session};
@@ -678,6 +678,86 @@ pub(crate) async fn redeem(state: &DaemonState, invite_line: String) -> Result<P
     .await
 }
 
+/// Handle a `peer_services` control request (#52): resolve `peer` to its endpoint, probe it
+/// over `mcpmesh/ping/1`, and return the services its pong reports the caller is admitted to.
+/// Authoritative + current (a fresh probe), only the caller's own admitted services.
+pub(crate) async fn peer_services(
+    state: &DaemonState,
+    peer: String,
+) -> Result<mcpmesh_local_api::PeerServicesResult> {
+    let mesh = state.mesh_required()?;
+    let endpoint_id = resolve_peer_endpoint(mesh, &peer).await?;
+    let entry = crate::daemon::probe_peer(mesh, endpoint_id).await;
+    anyhow::ensure!(
+        entry.reachable,
+        "peer '{peer}' is unreachable — cannot fetch its shared services"
+    );
+    Ok(mcpmesh_local_api::PeerServicesResult {
+        services: entry.services,
+    })
+}
+
+/// Resolve a `peer` selector to a stored endpoint id (#52): an `eid:<hex>` decodes directly;
+/// else a stored `PeerEntry` by nickname; else the first device under a `b64u:` user_id.
+async fn resolve_peer_endpoint(mesh: &Arc<MeshState>, peer: &str) -> Result<[u8; 32]> {
+    if let Some(hex) = peer.strip_prefix("eid:") {
+        let bytes = data_encoding::HEXLOWER
+            .decode(hex.as_bytes())
+            .map_err(|_| anyhow::anyhow!("invalid eid principal: not lowercase hex"))?;
+        return bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid eid principal: expected 32 bytes"));
+    }
+    let store = mesh.store.clone();
+    let peer_owned = peer.to_string();
+    let eid = tokio::task::spawn_blocking(move || -> Result<Option<[u8; 32]>> {
+        if let Some(e) = store.entry_for(&peer_owned)? {
+            return Ok(Some(e.endpoint_id));
+        }
+        Ok(store
+            .entries_for_user(&peer_owned)?
+            .first()
+            .map(|e| e.endpoint_id))
+    })
+    .await
+    .context("join peer resolve for peer_services")??;
+    eid.with_context(|| format!("no paired peer '{peer}' — 'mcpmesh status' lists your peers"))
+}
+
+/// Handle an `unregister_service` control request/// Handle an `unregister_service` control request (#50): remove the whole `[services.<name>]`
+/// entry (allow list included) AND drop any in-memory ephemeral registration of that name,
+/// then hot-reload so the running registry stops serving it. Idempotent (unknown name → clean
+/// no-op), serialized under the SAME `reload_lock` as `register_service`/#44. In-flight
+/// sessions finish (the reload rebuilds the registry without it; no NEW sessions admitted).
+pub(crate) async fn unregister_service(state: &DaemonState, name: String) -> Result<()> {
+    let mesh = state.mesh_required()?;
+    let _reload = mesh.reload_lock.lock().await;
+
+    // Drop an in-memory ephemeral registration of this name (if any).
+    let dropped_ephemeral = mesh
+        .ephemeral_services
+        .lock()
+        .expect("ephemeral_services lock not poisoned")
+        .remove(&name)
+        .is_some();
+
+    // Remove the persistent config entry (if any).
+    let config_path = mesh.config_path.clone();
+    let name_w = name.clone();
+    let removed_config = blocking("join unregister config write", move || {
+        remove_service_from_config(&config_path, &name_w)
+    })
+    .await??;
+
+    // Reload only if something actually changed (else the running registry already excludes it).
+    if dropped_ephemeral || removed_config {
+        reload_services_from_disk(mesh, "unregister").await?;
+    }
+    tracing::info!(service = %name, dropped_ephemeral, removed_config, "unregistered service");
+    Ok(())
+}
+
 /// Grant a freshly-paired peer AUTHORIZATION to the services its invite named: append
 /// `redeemer_nickname` to each service's config `[services.<svc>].allow` (idempotently) and
 /// hot-reload so the running registry admits it. This is the load-bearing half of pairing.
@@ -917,7 +997,37 @@ mod tests {
     use super::*;
     use crate::daemon::testutil::hermetic_mesh;
 
-    /// #44: `service_allow_grant`/`service_allow_revoke` toggle a single principal on a single
+    /// #50: `unregister_service` removes the whole config entry (allow included), idempotently,
+    /// without touching peer identity.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unregister_service_removes_the_entry_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[services.kb]\nsocket = \"/run/kb.sock\"\nallow = [\"eid:beef\"]\n             [services.notes]\nsocket = \"/run/notes.sock\"\nallow = []\n",
+        )
+        .unwrap();
+        let mesh = hermetic_mesh(config_path.clone()).await;
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+        let has = |name: &str| {
+            crate::config::Config::load(&config_path)
+                .unwrap()
+                .services
+                .contains_key(name)
+        };
+
+        assert!(has("kb") && has("notes"));
+        unregister_service(&state, "kb".into()).await.unwrap();
+        assert!(!has("kb"), "kb removed");
+        assert!(has("notes"), "other services untouched");
+        // Idempotent: unregistering an unknown / already-gone name is a clean no-op.
+        unregister_service(&state, "kb".into()).await.unwrap();
+        unregister_service(&state, "ghost".into()).await.unwrap();
+        assert!(has("notes"));
+    }
+
+    /// #44: `service_allow_grant`/`service_allow_revoke` toggle
     /// service's allow, idempotently, WITHOUT touching peer identity. The "sharing switch".
     #[tokio::test(flavor = "multi_thread")]
     async fn service_allow_grant_and_revoke_toggle_one_principal() {

@@ -538,7 +538,15 @@ fn run_serve(
     let allow = split_csv(allow);
     with_daemon(async move |mut client| {
         client
-            .register_service(&name, BackendSpec::Run { cmd }, allow)
+            .register_service(
+                &name,
+                BackendSpec::Run {
+                    cmd,
+                    env: Default::default(),
+                    cwd: None,
+                },
+                allow,
+            )
             .await?;
         if json {
             println!("{}", mcpmesh::json::serve_json(&name));
