@@ -66,6 +66,16 @@ pub struct PeerInfo {
     /// `#[serde(default, skip_serializing_if = "Option::is_none")]` so older payloads round-trip.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_id: Option<String>,
+    /// The peer's stable DEVICE principal `eid:<hex>` (#41) — the SAME rendering the socket
+    /// backend injects into `_meta["mcpmesh/peer"]` and that appears in `[services.*].allow`.
+    /// Always present for a real peer (`Option` only for additive round-trip). Distinct from
+    /// `user_id` (the person-level `b64u:`, present only when the peer proved a binding): a
+    /// nickname is not unique, so an embedder keys caller-scoped decisions (dial the caller
+    /// back, "the requester's own data") on THIS, the authenticated endpoint. Machine-surface
+    /// authz vocabulary (like the allow lists) — human porcelain still shows the nickname.
+    /// Additive: `#[serde(default, skip_serializing_if = "Option::is_none")]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
 }
 
 /// Advisory reachability of a paired peer (pairing-mode liveness). Surface-clean:
@@ -800,13 +810,14 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   new methods, or a strictness change like params validation — bumped in the same change that
 ///   makes it. A client can guard with `api_minor >= N` for a feature it needs, or refuse a daemon
 ///   older than a minor it requires. It never resets except on a MAJOR bump.
-pub const API_VERSION: &str = "1.5";
+pub const API_VERSION: &str = "1.6";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
 /// never nicknames (#38); to 4 with the `set_app_metadata` verb + `PresencePeer.meta` (#39);
-/// to 5 with `PeerReachability.meta` — pairing-mode app metadata on the probe pong (#40).
-pub const API_MINOR: u32 = 5;
+/// to 5 with `PeerReachability.meta` — pairing-mode app metadata on the probe pong (#40);
+/// to 6 with `PeerInfo.principal` — the peer's eid: device principal on `status` (#41).
+pub const API_MINOR: u32 = 6;
 
 #[cfg(test)]
 mod tests {
@@ -895,6 +906,25 @@ mod tests {
 
     /// `PresencePeer.meta` is additive — an older payload (no meta) still deserializes, and an
     /// empty meta does not serialize.
+    #[test]
+    fn peer_info_principal_is_additive() {
+        // An older payload (no principal) still deserializes; empty does not serialize.
+        let old = serde_json::json!({"name": "bob", "services": ["notes"]});
+        let p: PeerInfo = serde_json::from_value(old).unwrap();
+        assert_eq!(p.principal, None);
+        assert!(serde_json::to_value(&p).unwrap().get("principal").is_none());
+        // A bound peer carries BOTH the person user_id AND the device principal (#41).
+        let full = PeerInfo {
+            name: "bob".into(),
+            services: vec!["notes".into()],
+            user_id: Some("b64u:BOB".into()),
+            principal: Some("eid:0707".into()),
+        };
+        let back: PeerInfo = serde_json::from_value(serde_json::to_value(&full).unwrap()).unwrap();
+        assert_eq!(back.user_id.as_deref(), Some("b64u:BOB"));
+        assert_eq!(back.principal.as_deref(), Some("eid:0707"));
+    }
+
     #[test]
     fn peer_reachability_meta_is_additive() {
         // An older payload (no meta) still deserializes; an empty meta does not serialize.
@@ -1326,6 +1356,7 @@ mod tests {
                 services: vec!["notes".into()],
                 // A paired peer that proved a self-sovereign user_id at pairing (surface-clean id).
                 user_id: Some("b64u:alicepk".into()),
+                principal: None,
             }],
             roster: None,
             presence: vec![],

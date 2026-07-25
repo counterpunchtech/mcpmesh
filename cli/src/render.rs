@@ -782,6 +782,7 @@ mod tests {
             name: name.into(),
             services: services.iter().map(|s| s.to_string()).collect(),
             user_id: None,
+            principal: None,
         }
     }
 

@@ -49,6 +49,14 @@ pub async fn dial_service(
     peer: &str,
     service: &str,
 ) -> Result<SessionTransport> {
+    // #41: an explicit `eid:<hex>` DEVICE principal dials that EXACT authenticated endpoint —
+    // the one the socket backend injects into `_meta` and the allow lists use. No nickname
+    // ambiguity (nicknames are not unique), no person→device race: it targets one device
+    // precisely, which is the whole point of dialing the verified caller back. Resolved FIRST.
+    if let Some(hex) = peer.strip_prefix("eid:") {
+        return dial_by_eid(mesh, hex, service).await;
+    }
+
     // Person→device: `peer` names a roster user with active devices → staggered race.
     if let Some(view) = mesh.roster.view() {
         let devices = view.devices_for_user(peer);
@@ -98,6 +106,36 @@ pub async fn dial_service(
     connect_with_timeout(&mesh.endpoint, addr, service, DIAL_TIMEOUT)
         .await
         .with_context(|| format!("dial {peer}/{service}"))
+}
+
+/// Dial an EXACT endpoint named by its `eid:<hex>` device principal (#41). Decodes the 64-hex
+/// endpoint id, attaches the pairing-persisted `last_addr` hint when a stored [`PeerEntry`] is
+/// present at that id (cold-dial reachability, issue #27), else a bare-id discovery dial. The
+/// peer's own gate remains the security boundary — dialing is outbound and authorizes nothing
+/// on our side. An invalid hex / wrong length is a clear resolution error, never a panic.
+async fn dial_by_eid(mesh: &Arc<MeshState>, hex: &str, service: &str) -> Result<SessionTransport> {
+    let bytes = data_encoding::HEXLOWER
+        .decode(hex.as_bytes())
+        .map_err(|_| anyhow::anyhow!("invalid eid principal: not lowercase hex"))?;
+    let endpoint_id_bytes: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid eid principal: expected 32 bytes (64 hex chars)"))?;
+    let endpoint_id = iroh::EndpointId::from_bytes(&endpoint_id_bytes)
+        .map_err(|e| anyhow::anyhow!("invalid eid principal: {e}"))?;
+    // Best-effort last_addr hint from a stored peer at this exact endpoint (blocking redb read
+    // on the blocking pool). An unknown eid still dials bare-id via discovery.
+    let store = mesh.store.clone();
+    let last_addr = tokio::task::spawn_blocking(move || store.resolve(&endpoint_id_bytes))
+        .await
+        .context("join eid peer resolve")?
+        .ok()
+        .flatten()
+        .and_then(|e| e.last_addr);
+    let addr = stored_dial_addr(last_addr.as_deref(), endpoint_id);
+    connect_with_timeout(&mesh.endpoint, addr, service, DIAL_TIMEOUT)
+        .await
+        .with_context(|| format!("dial eid:{hex}/{service}"))
 }
 
 /// Assemble the single-nickname dial [`iroh::EndpointAddr`]: the stored `endpoint_id` plus,
