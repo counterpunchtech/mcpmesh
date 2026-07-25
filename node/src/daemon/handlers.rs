@@ -656,7 +656,15 @@ pub(crate) async fn redeem(state: &DaemonState, invite_line: String) -> Result<P
                 if served.is_empty() {
                     return Ok(()); // we serve nothing → nothing to grant back
                 }
-                grant_service_access(&mesh, &principal, &display, &served).await
+                // BEST-EFFORT (#43): the pairing (store write + inviter-side grant) already
+                // succeeded and the one-time invite is burned, so a grant-back failure must NOT
+                // fail the ceremony (which would strand the user in a paired-but-errored state
+                // with no invite to retry). Log it; the operator can re-grant via
+                // `service_allow_grant`. The reload_lock inside serializes it safely.
+                if let Err(e) = grant_service_access(&mesh, &principal, &display, &served).await {
+                    tracing::warn!(%e, "mutual grant-back failed (pairing still succeeded)");
+                }
+                Ok(())
             })
         });
     crate::pairing::rendezvous::redeem_invite(
