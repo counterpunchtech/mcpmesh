@@ -65,7 +65,7 @@ pub use roster_install::{
 pub use boot::{NetPlan, net_plan};
 pub(crate) use handlers::{
     add_peer, blob_fetch, blob_grant, blob_list, blob_publish, mint_invite, open_session, redeem,
-    register_service, unregister_ephemeral,
+    register_service, service_allow_grant, service_allow_revoke, unregister_ephemeral,
 };
 pub(crate) use roster_install::{
     install_roster, org_join, set_app_metadata, set_nickname, set_roster_url,

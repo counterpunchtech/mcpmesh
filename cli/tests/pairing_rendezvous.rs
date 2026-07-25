@@ -694,6 +694,7 @@ async fn repeat_grant_unions_the_redeemers_dial_directory_and_applies_the_new_ni
             invite.encode(),
             bob_store.clone(),
             None,
+            None,
         )
         .await
         .expect("the second redeem succeeds");
@@ -775,6 +776,7 @@ async fn redeem_refuses_an_invite_squatting_an_existing_peers_nickname() {
             "bob".into(),
             invite.encode(),
             bob_store.clone(),
+            None,
             None,
         )
         .await
@@ -870,6 +872,7 @@ async fn paired_and_granted_peer_is_admitted_to_the_service_end_to_end() {
             "bob".into(),
             invite.encode(),
             bob_store.clone(),
+            None,
             None,
         )
         .await
@@ -1019,9 +1022,16 @@ async fn rename_after_pairing_keeps_the_peer_admitted() {
         let bob = redeemer_endpoint().await;
         let bob_dir = tempfile::tempdir().unwrap();
         let bob_store = Arc::new(PeerStore::open(&bob_dir.path().join("state.redb")).unwrap());
-        redeem_invite(bob.clone(), "bob".into(), invite.encode(), bob_store, None)
-            .await
-            .expect("pairing succeeds");
+        redeem_invite(
+            bob.clone(),
+            "bob".into(),
+            invite.encode(),
+            bob_store,
+            None,
+            None,
+        )
+        .await
+        .expect("pairing succeeds");
         let mut t = connect(&bob, alice_addr.clone(), "notes").await.unwrap();
         t.send_value(json!({
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -1181,6 +1191,7 @@ async fn pairing_exchanges_and_stores_each_sides_verified_user_id() {
                 user_pk: b_pk,
                 sig: b_sig,
             }),
+            None,
         )
         .await
         .expect("redeem succeeds and exchanges self-sovereign bindings");
@@ -1262,9 +1273,16 @@ async fn redeem_refuses_an_address_swap_and_writes_no_entry_p3() {
         let bob = redeemer_endpoint().await;
         let bob_dir = tempfile::tempdir().unwrap();
         let bob_store = Arc::new(PeerStore::open(&bob_dir.path().join("state.redb")).unwrap());
-        let err = redeem_invite(bob, "bob".into(), invite.encode(), bob_store.clone(), None)
-            .await
-            .expect_err("a P3 id mismatch must fail the redeem");
+        let err = redeem_invite(
+            bob,
+            "bob".into(),
+            invite.encode(),
+            bob_store.clone(),
+            None,
+            None,
+        )
+        .await
+        .expect_err("a P3 id mismatch must fail the redeem");
         assert!(
             err.to_string().contains("address-swap") || err.to_string().contains("id mismatch"),
             "expected an address-swap / id-mismatch error, got: {err}"

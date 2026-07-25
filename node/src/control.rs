@@ -21,7 +21,8 @@ use mcpmesh_local_api::transport::{LocalListener, LocalStream};
 use mcpmesh_local_api::{
     API_NAME, API_VERSION, BlobFetchParams, BlobGrantParams, BlobPublishParams, Hello,
     InviteParams, OpenSessionParams, OrgJoinParams, PairParams, RosterInstallParams,
-    SetAppMetadataParams, SetNicknameParams, SetRosterUrlParams, StatusResult, method_of,
+    ServiceAllowParams, SetAppMetadataParams, SetNicknameParams, SetRosterUrlParams, StatusResult,
+    method_of,
 };
 use mcpmesh_net::framing::{FrameReader, Inbound, write_frame};
 use serde_json::{Value, json};
@@ -492,6 +493,26 @@ async fn handle_request(req: &Value, state: &DaemonState) -> Value {
             "set_nickname",
             with_params(&params, |p: SetNicknameParams| {
                 crate::daemon::set_nickname(state, p.nickname)
+            })
+            .await
+            .map(unit),
+        ),
+        // Per-peer access toggle (#44): grant/revoke a single principal on a single service's
+        // allow WITHOUT unpairing, under the SAME reload_lock as the pairing grant.
+        Some("service_allow_grant") => respond(
+            id,
+            "service_allow_grant",
+            with_params(&params, |p: ServiceAllowParams| {
+                crate::daemon::service_allow_grant(state, p.service, p.principal)
+            })
+            .await
+            .map(unit),
+        ),
+        Some("service_allow_revoke") => respond(
+            id,
+            "service_allow_revoke",
+            with_params(&params, |p: ServiceAllowParams| {
+                crate::daemon::service_allow_revoke(state, p.service, p.principal)
             })
             .await
             .map(unit),

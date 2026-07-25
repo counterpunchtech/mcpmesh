@@ -255,6 +255,36 @@ pub(crate) fn append_allow_to_config(
 /// unpair on any error — so bailing on one weird entry would leave the peer LESS restricted (the
 /// opposite of fail-safe). A genuinely unparseable config still errors (exceptional corruption,
 /// same as the grant path). No `[services]` table → nothing to revoke (`Ok(false)`).
+/// Remove a SINGLE `principal` from a SINGLE service's `[services.<service>].allow` (#44,
+/// the `service_allow_revoke` verb). Idempotent: an absent principal, an unknown service, or a
+/// malformed/absent allow all change nothing (`Ok(false)`) — never an error. Distinct from
+/// [`remove_allow_from_config`] (which strips a peer's principals from EVERY service on unpair).
+pub(crate) fn remove_principal_from_service(
+    path: &Path,
+    service: &str,
+    principal: &str,
+) -> Result<bool> {
+    let existing = read_config_for_rmw(path)?;
+    let mut doc: toml::Table = toml::from_str(&existing)
+        .with_context(|| format!("parse existing config {}", path.display()))?;
+    let Some(toml::Value::Table(services_tbl)) = doc.get_mut("services") else {
+        return Ok(false);
+    };
+    let Some(toml::Value::Table(svc)) = services_tbl.get_mut(service) else {
+        return Ok(false); // unknown service → nothing to revoke
+    };
+    let Some(toml::Value::Array(allow)) = svc.get_mut("allow") else {
+        return Ok(false); // absent/malformed allow → nothing to revoke
+    };
+    let before = allow.len();
+    allow.retain(|v| v.as_str().is_none_or(|s| s != principal));
+    if allow.len() == before {
+        return Ok(false); // principal not present → no-op
+    }
+    write_config_doc(path, &doc)?;
+    Ok(true)
+}
+
 pub(crate) fn remove_allow_from_config(path: &Path, principals: &[String]) -> Result<bool> {
     let existing = read_config_for_rmw(path)?;
     let mut doc: toml::Table = toml::from_str(&existing)
