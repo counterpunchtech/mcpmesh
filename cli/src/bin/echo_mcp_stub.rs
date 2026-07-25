@@ -52,7 +52,7 @@ fn main() {
         let id = extract_id(&line);
         let resp = if line.contains("\"method\":\"initialize\"") {
             format!(
-                "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{{}},\"serverInfo\":{{\"name\":\"echo-stub\",\"version\":\"0.1.0\"}}}}}}"
+                "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{{}},\"serverInfo\":{{\"name\":\"echo-stub\",\"version\":\"0.1.0\"}}}}}}"
             )
         } else if line.contains("\"method\":\"tools/call\"") {
             let text = extract_text(&line);

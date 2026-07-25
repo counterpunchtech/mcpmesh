@@ -679,12 +679,12 @@ The KB application's milestones live in the companion spec and begin after platf
 ```
 # Bob's proxy → daemon (UDS) → dials Alice, ALPN mcpmesh/mcp/1; TLS mutual auth;
 # Alice's gate: pair entry found (bob). Stream opened.
-→ {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18",
+→ {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25",
     "_meta":{"mcpmesh/service":"notes"},"capabilities":{},"clientInfo":{…}}}
 # Alice's daemon: "notes" allowed for bob → spawns child, forwards initialize
 # (mcpmesh/* _meta stripped, §6.3; env: MCPMESH_PEER_NAME=bob), returns the
 # child's response verbatim:
-← {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{…},
+← {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{…},
     "serverInfo":{"name":"filesystem-server","version":"…"}}}
 → {"jsonrpc":"2.0","method":"notifications/initialized"}
 → {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_file",…}}

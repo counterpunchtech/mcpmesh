@@ -73,7 +73,7 @@ fi
 #    (The first dial can take a moment while npx fetches the server, hence the waits.)
 echo "==> proving a live end-to-end MCP exchange (initialize + a real tool call)"
 mcp_exchange() {
-    printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"loopback-demo","version":"0.0.0"}}}'
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"loopback-demo","version":"0.0.0"}}}'
     sleep 20
     printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
     printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"'"$FRIEND_HOME"'/notes/hello.md"}}}'

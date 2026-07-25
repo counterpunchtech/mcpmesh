@@ -66,7 +66,7 @@ fn mint_view(root: &SigningKey, serial: u64, eid: [u8; 32], uid: &str) -> Roster
 }
 fn initialize_frame(service: &str) -> serde_json::Value {
     json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
-        "protocolVersion":"2025-06-18","_meta":{"mcpmesh/service":service},
+        "protocolVersion":"2025-11-25","_meta":{"mcpmesh/service":service},
         "capabilities":{},"clientInfo":{"name":"t","version":"0"}}})
 }
 

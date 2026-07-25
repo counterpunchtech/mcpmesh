@@ -47,7 +47,7 @@ async fn concurrency_cap_refuses_with_retry_after_ms_and_spawns_no_child() {
         });
         let initialize = json!({
             "jsonrpc": "2.0", "id": 7, "method": "initialize",
-            "params": {"protocolVersion": "2025-06-18", "capabilities": {}}
+            "params": {"protocolVersion": "2025-11-25", "capabilities": {}}
         });
 
         let session = tokio::spawn(async move {

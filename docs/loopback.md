@@ -100,7 +100,7 @@ Mount it in your AI client (`mcpmesh use demo-friend/notes` prints the steps), o
 with raw MCP frames — an `initialize`, then an actual tool call that reads the friend's note:
 
 ```sh
-{ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"loopback-demo","version":"0.0.0"}}}'
+{ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"loopback-demo","version":"0.0.0"}}}'
   sleep 20
   printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
   printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"'"$FRIEND_HOME"'/notes/hello.md"}}}'

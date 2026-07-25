@@ -110,7 +110,7 @@ async fn one_shot_piped_connect_yields_the_response() {
             &mut child_in,
             &json!({
                 "jsonrpc": "2.0", "id": 1, "method": "initialize",
-                "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                "params": {"protocolVersion": "2025-11-25", "capabilities": {},
                            "clientInfo": {"name": "one-shot", "version": "0"}}
             }),
         )
@@ -234,7 +234,7 @@ async fn one_shot_connect_by_user_id_yields_the_response() {
             &mut child_in,
             &json!({
                 "jsonrpc": "2.0", "id": 7, "method": "initialize",
-                "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                "params": {"protocolVersion": "2025-11-25", "capabilities": {},
                            "clientInfo": {"name": "by-user-id", "version": "0"}}
             }),
         )

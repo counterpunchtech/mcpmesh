@@ -107,7 +107,7 @@ async fn accept_loop_routes_mesh_alpn_to_a_gated_session() {
             .send_value(json!({
                 "jsonrpc": "2.0", "id": 1, "method": "initialize",
                 "params": {
-                    "protocolVersion": "2025-06-18",
+                    "protocolVersion": "2025-11-25",
                     "_meta": {"mcpmesh/service": "echo"},
                     "capabilities": {}, "clientInfo": {"name": "tester", "version": "0"}
                 }

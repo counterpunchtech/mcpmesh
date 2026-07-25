@@ -145,7 +145,7 @@ async fn connect_proxy_round_trips_an_echo_service_over_the_mesh() {
             &mut child_in,
             &json!({
                 "jsonrpc": "2.0", "id": 1, "method": "initialize",
-                "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                "params": {"protocolVersion": "2025-11-25", "capabilities": {},
                            "clientInfo": {"name": "ai", "version": "0"}}
             }),
         )

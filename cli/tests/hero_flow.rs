@@ -165,7 +165,7 @@ async fn hero_flow_minus_pairing() {
             &mut child_in,
             &json!({
                 "jsonrpc": "2.0", "id": 1, "method": "initialize",
-                "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                "params": {"protocolVersion": "2025-11-25", "capabilities": {},
                            "clientInfo": {"name": "ai", "version": "0"}}
             }),
         )

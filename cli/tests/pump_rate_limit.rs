@@ -63,7 +63,7 @@ async fn over_limit_request_is_throttled_dropped_and_the_session_survives() {
         });
         let initialize = json!({
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"protocolVersion": "2025-06-18", "capabilities": {}}
+            "params": {"protocolVersion": "2025-11-25", "capabilities": {}}
         });
 
         let session = tokio::spawn(async move {

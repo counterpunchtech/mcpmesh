@@ -93,7 +93,7 @@ async fn daemon_serves_run_service_and_injects_caller_identity_over_the_mesh() {
             .send_value(json!({
                 "jsonrpc": "2.0", "id": 1, "method": "initialize",
                 "params": {
-                    "protocolVersion": "2025-06-18",
+                    "protocolVersion": "2025-11-25",
                     "_meta": {"mcpmesh/service": "echo"},
                     "capabilities": {}, "clientInfo": {"name": "tester", "version": "0"}
                 }
@@ -137,7 +137,7 @@ async fn send_initialize(transport: &mut SessionTransport, service: &str) -> Val
         .send_value(json!({
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": {
-                "protocolVersion": "2025-06-18",
+                "protocolVersion": "2025-11-25",
                 "_meta": {"mcpmesh/service": service},
                 "capabilities": {}
             }

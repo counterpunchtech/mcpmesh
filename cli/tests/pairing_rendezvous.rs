@@ -956,7 +956,7 @@ async fn paired_and_granted_peer_is_admitted_to_the_service_end_to_end() {
             .send_value(json!({
                 "jsonrpc": "2.0", "id": 1, "method": "initialize",
                 "params": {
-                    "protocolVersion": "2025-06-18",
+                    "protocolVersion": "2025-11-25",
                     "_meta": {"mcpmesh/service": "notes"},
                     "capabilities": {}, "clientInfo": {"name": "bob", "version": "0"}
                 }
@@ -1058,7 +1058,7 @@ async fn rename_after_pairing_keeps_the_peer_admitted() {
         let mut t = connect(&bob, alice_addr.clone(), "notes").await.unwrap();
         t.send_value(json!({
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"protocolVersion": "2025-06-18",
+            "params": {"protocolVersion": "2025-11-25",
                        "_meta": {"mcpmesh/service": "notes"},
                        "capabilities": {}, "clientInfo": {"name": "bob", "version": "0"}}
         }))
@@ -1104,7 +1104,7 @@ async fn rename_after_pairing_keeps_the_peer_admitted() {
         let mut t = connect(&bob, alice_addr, "notes").await.unwrap();
         t.send_value(json!({
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"protocolVersion": "2025-06-18",
+            "params": {"protocolVersion": "2025-11-25",
                        "_meta": {"mcpmesh/service": "notes"},
                        "capabilities": {}, "clientInfo": {"name": "bob", "version": "0"}}
         }))

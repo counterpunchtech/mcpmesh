@@ -41,7 +41,7 @@ impl SessionBackend for EchoBackend {
         let id = initialize["id"].clone();
         transport
             .send_value(json!({"jsonrpc":"2.0","id":id,"result":{
-                "protocolVersion":"2025-06-18","capabilities":{},
+                "protocolVersion":"2025-11-25","capabilities":{},
                 "serverInfo":{"name":"echo-stub","version":"0.1.0"}}}))
             .await?;
         while let Some(frame) = transport.recv_value().await? {
@@ -108,7 +108,7 @@ async fn known_peer_completes_initialize_and_echo() -> anyhow::Result<()> {
         transport
             .send_value(
                 json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
-                "protocolVersion":"2025-06-18",
+                "protocolVersion":"2025-11-25",
                 "_meta": {"mcpmesh/service": "echo"},
                 "capabilities":{}, "clientInfo":{"name":"test","version":"0"}}}),
             )
@@ -414,7 +414,7 @@ async fn two_machine_connect() -> anyhow::Result<()> {
         transport
             .send_value(
                 json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
-                "protocolVersion":"2025-06-18",
+                "protocolVersion":"2025-11-25",
                 "_meta": {"mcpmesh/service": "echo"},
                 "capabilities":{}, "clientInfo":{"name":"smoke","version":"0"}}}),
             )
