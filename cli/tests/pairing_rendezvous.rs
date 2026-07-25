@@ -14,7 +14,7 @@ use std::time::Duration;
 use mcpmesh::allowlist::{AllowlistGate, PeerEntry, PeerStore};
 use mcpmesh::config::Config;
 use mcpmesh::daemon::{MeshState, build_services, spawn_accept_loop};
-use mcpmesh::pairing::rendezvous::{SelfBinding, redeem_invite};
+use mcpmesh::pairing::rendezvous::{GrantBackFn, SelfBinding, redeem_invite};
 use mcpmesh::pairing::sas::short_auth_code;
 use mcpmesh::pairing::{Invite, LiveInvites};
 use mcpmesh::roster::gate::RosterGate;
@@ -694,6 +694,7 @@ async fn repeat_grant_unions_the_redeemers_dial_directory_and_applies_the_new_ni
             invite.encode(),
             bob_store.clone(),
             None,
+            None,
         )
         .await
         .expect("the second redeem succeeds");
@@ -775,6 +776,7 @@ async fn redeem_refuses_an_invite_squatting_an_existing_peers_nickname() {
             "bob".into(),
             invite.encode(),
             bob_store.clone(),
+            None,
             None,
         )
         .await
@@ -865,16 +867,40 @@ async fn paired_and_granted_peer_is_admitted_to_the_service_end_to_end() {
         let bob_id = *bob.id().as_bytes();
         let bob_dir = tempfile::tempdir().unwrap();
         let bob_store = Arc::new(PeerStore::open(&bob_dir.path().join("state.redb")).unwrap());
+        // #43: a recording grant-back hook captures the inviter principal the redeemer would
+        // grant its OWN services to. Alice presented no binding here → the principal is her eid.
+        let granted_back: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rec = granted_back.clone();
+        let grant_back: GrantBackFn = Box::new(move |principal, display| {
+            let rec = rec.clone();
+            Box::pin(async move {
+                rec.lock().unwrap().push((principal, display));
+                Ok(())
+            })
+        });
         let result = redeem_invite(
             bob.clone(),
             "bob".into(),
             invite.encode(),
             bob_store.clone(),
             None,
+            Some(grant_back),
         )
         .await
         .expect("redeem_invite dials, verifies the inviter id, sends the secret, succeeds");
         assert_eq!(result.peer_nickname, "alice");
+        // #43: the mutual grant-back fired with the inviter's STABLE principal (its eid, since
+        // it presented no binding) and the redeemer's display name for it.
+        let back = granted_back.lock().unwrap().clone();
+        assert_eq!(
+            back,
+            vec![(
+                mcpmesh_net::EndpointId::from_bytes(alice_id).principal(),
+                "alice".to_string()
+            )],
+            "the redeemer grants the inviter back by its stable principal (#43)"
+        );
         // The PairResult carries the granted services (from the invite) so the porcelain can print
         // the "You can mount: alice/notes" line without re-decoding the invite (M2b T7).
         assert_eq!(result.services, vec!["notes".to_string()]);
@@ -1019,9 +1045,16 @@ async fn rename_after_pairing_keeps_the_peer_admitted() {
         let bob = redeemer_endpoint().await;
         let bob_dir = tempfile::tempdir().unwrap();
         let bob_store = Arc::new(PeerStore::open(&bob_dir.path().join("state.redb")).unwrap());
-        redeem_invite(bob.clone(), "bob".into(), invite.encode(), bob_store, None)
-            .await
-            .expect("pairing succeeds");
+        redeem_invite(
+            bob.clone(),
+            "bob".into(),
+            invite.encode(),
+            bob_store,
+            None,
+            None,
+        )
+        .await
+        .expect("pairing succeeds");
         let mut t = connect(&bob, alice_addr.clone(), "notes").await.unwrap();
         t.send_value(json!({
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -1181,6 +1214,7 @@ async fn pairing_exchanges_and_stores_each_sides_verified_user_id() {
                 user_pk: b_pk,
                 sig: b_sig,
             }),
+            None,
         )
         .await
         .expect("redeem succeeds and exchanges self-sovereign bindings");
@@ -1262,9 +1296,16 @@ async fn redeem_refuses_an_address_swap_and_writes_no_entry_p3() {
         let bob = redeemer_endpoint().await;
         let bob_dir = tempfile::tempdir().unwrap();
         let bob_store = Arc::new(PeerStore::open(&bob_dir.path().join("state.redb")).unwrap());
-        let err = redeem_invite(bob, "bob".into(), invite.encode(), bob_store.clone(), None)
-            .await
-            .expect_err("a P3 id mismatch must fail the redeem");
+        let err = redeem_invite(
+            bob,
+            "bob".into(),
+            invite.encode(),
+            bob_store.clone(),
+            None,
+            None,
+        )
+        .await
+        .expect_err("a P3 id mismatch must fail the redeem");
         assert!(
             err.to_string().contains("address-swap") || err.to_string().contains("id mismatch"),
             "expected an address-swap / id-mismatch error, got: {err}"

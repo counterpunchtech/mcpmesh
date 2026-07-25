@@ -304,6 +304,16 @@ pub struct SetAppMetadataParams {
     pub metadata: String,
 }
 
+/// Params of [`Request::ServiceAllowGrant`] / [`Request::ServiceAllowRevoke`] (#44): toggle a
+/// single stable `principal` (`b64u:`/`eid:`) on a single `service`'s allow list, WITHOUT
+/// unpairing. The per-peer "sharing" switch primitive the embedder drives.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceAllowParams {
+    pub service: String,
+    pub principal: String,
+}
+
 /// Params of [`Request::SetNickname`]: this node's new self-nickname (#37). Display-only
 /// semantics: it names this node in FUTURE invites/presentations; peers keep the nickname
 /// they stored at pairing time until a re-invite.
@@ -432,6 +442,13 @@ pub enum Request {
     /// presence — no per-peer session. Ack result. Tag `"set_app_metadata"`. In-memory (lost
     /// on restart; the embedder re-sets on startup).
     SetAppMetadata(SetAppMetadataParams),
+    /// Grant a single stable principal access to a single service's allow (#44) — the per-peer
+    /// "sharing on" toggle, idempotent + serialized under the config lock. Ack result.
+    ServiceAllowGrant(ServiceAllowParams),
+    /// Revoke a single stable principal from a single service's allow (#44) — "sharing off"
+    /// WITHOUT unpairing (the peer's identity row is untouched; only NEW sessions are refused).
+    /// Idempotent. Ack result.
+    ServiceAllowRevoke(ServiceAllowParams),
     /// Publish a LOCAL file INTO a scope: the daemon adds the bytes to its gated
     /// app-blob store and records the hash in `scope`. `path` is a local file the same-uid daemon
     /// reads. Answers a [`BlobPublishResult`] carrying the `mcpmesh/blob/1` ticket + hash.
@@ -818,15 +835,16 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   new methods, or a strictness change like params validation — bumped in the same change that
 ///   makes it. A client can guard with `api_minor >= N` for a feature it needs, or refuse a daemon
 ///   older than a minor it requires. It never resets except on a MAJOR bump.
-pub const API_VERSION: &str = "1.7";
+pub const API_VERSION: &str = "1.8";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
 /// never nicknames (#38); to 4 with the `set_app_metadata` verb + `PresencePeer.meta` (#39);
 /// to 5 with `PeerReachability.meta` — pairing-mode app metadata on the probe pong (#40);
 /// to 6 with `PeerInfo.principal` — the peer's eid: device principal on `status` (#41);
-/// to 7 with `PeerReachability.principal` — the same on reachability rows (#42).
-pub const API_MINOR: u32 = 7;
+/// to 7 with `PeerReachability.principal` — the same on reachability rows (#42); to 8 with the
+/// `service_allow_grant`/`service_allow_revoke` per-peer access verbs (#44).
+pub const API_MINOR: u32 = 8;
 
 #[cfg(test)]
 mod tests {

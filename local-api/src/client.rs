@@ -13,7 +13,8 @@ use crate::protocol::{
     BlobPublishParams, BlobPublishResult, BlobScopeList, Hello, InviteParams, InviteResult,
     OpenSessionParams, OrgJoinParams, OrgJoinResult, PairParams, PairResult, PeerRemoveParams,
     PeerRenameParams, RegisterServiceParams, Request, RosterInstallParams, RosterInstallResult,
-    SetAppMetadataParams, SetNicknameParams, SetRosterUrlParams, StatusResult, StreamFrame,
+    ServiceAllowParams, SetAppMetadataParams, SetNicknameParams, SetRosterUrlParams, StatusResult,
+    StreamFrame,
 };
 use crate::transport::{connect_local, split_local};
 
@@ -303,6 +304,35 @@ impl ControlClient {
     pub async fn set_roster_url(&mut self, url: &str) -> Result<(), ClientError> {
         self.request_ack(Request::SetRosterUrl(SetRosterUrlParams {
             url: url.to_string(),
+        }))
+        .await
+    }
+
+    /// Grant a stable `principal` (`b64u:`/`eid:`) access to `service` WITHOUT (re)pairing (#44)
+    /// — the per-peer "sharing on" toggle. Idempotent; an unknown service is a clean no-op.
+    pub async fn service_allow_grant(
+        &mut self,
+        service: &str,
+        principal: &str,
+    ) -> Result<(), ClientError> {
+        self.request_ack(Request::ServiceAllowGrant(ServiceAllowParams {
+            service: service.to_string(),
+            principal: principal.to_string(),
+        }))
+        .await
+    }
+
+    /// Revoke a stable `principal` from `service`'s allow WITHOUT unpairing (#44) — the
+    /// "sharing off" toggle. The peer's identity row is untouched; it just cannot open NEW
+    /// sessions (in-flight ones run to completion). Idempotent.
+    pub async fn service_allow_revoke(
+        &mut self,
+        service: &str,
+        principal: &str,
+    ) -> Result<(), ClientError> {
+        self.request_ack(Request::ServiceAllowRevoke(ServiceAllowParams {
+            service: service.to_string(),
+            principal: principal.to_string(),
         }))
         .await
     }

@@ -26,7 +26,8 @@ use crate::util::{blocking, epoch_now_u64};
 
 use super::accept::reload_accept_loop;
 use super::config_write::{
-    append_allow_to_config, remove_allow_from_config, write_service_to_config,
+    append_allow_to_config, remove_allow_from_config, remove_principal_from_service,
+    write_service_to_config,
 };
 use super::status::service_infos;
 use super::{MeshState, dial_service, pipe_session};
@@ -635,12 +636,44 @@ pub(crate) async fn mint_invite(
 /// daemon inside its rendezvous handler — see [`grant_service_access`].
 pub(crate) async fn redeem(state: &DaemonState, invite_line: String) -> Result<PairResult> {
     let mesh = state.mesh_required()?;
+    // #43: the redeemer-side MUTUAL grant hook — grant the inviter access to ALL services this
+    // node serves (the same stable-principal + reload discipline as the inviter-side grant).
+    let grant_mesh = mesh.clone();
+    let grant_back: crate::pairing::rendezvous::GrantBackFn =
+        Box::new(move |principal, display| {
+            let mesh = grant_mesh.clone();
+            Box::pin(async move {
+                let served: Vec<String> = match Config::load(&mesh.config_path) {
+                    Ok(cfg) => cfg.services.keys().cloned().collect(),
+                    Err(e) => {
+                        // A config we can't read means we can't know what we serve; the mutual
+                        // grant is best-effort (the pairing itself already succeeded), so log
+                        // and skip rather than fail the ceremony.
+                        tracing::warn!(%e, "mutual grant-back skipped: config unreadable");
+                        return Ok(());
+                    }
+                };
+                if served.is_empty() {
+                    return Ok(()); // we serve nothing → nothing to grant back
+                }
+                // BEST-EFFORT (#43): the pairing (store write + inviter-side grant) already
+                // succeeded and the one-time invite is burned, so a grant-back failure must NOT
+                // fail the ceremony (which would strand the user in a paired-but-errored state
+                // with no invite to retry). Log it; the operator can re-grant via
+                // `service_allow_grant`. The reload_lock inside serializes it safely.
+                if let Err(e) = grant_service_access(&mesh, &principal, &display, &served).await {
+                    tracing::warn!(%e, "mutual grant-back failed (pairing still succeeded)");
+                }
+                Ok(())
+            })
+        });
     crate::pairing::rendezvous::redeem_invite(
         mesh.endpoint.clone(),
         mesh.self_nickname(),
         invite_line,
         mesh.store.clone(),
         mesh.self_binding(),
+        Some(grant_back),
     )
     .await
 }
@@ -701,6 +734,45 @@ pub async fn grant_service_access(
         "pair".into(),
         Some(display_nickname.to_string()),
     ));
+    Ok(())
+}
+
+/// Grant a SINGLE stable `principal` access to a SINGLE `service` (#44, the
+/// `service_allow_grant` verb) — the per-peer "sharing on" toggle primitive. A thin wrapper
+/// over [`grant_service_access`] (one-element service list; the principal doubles as the
+/// audit display handle). Idempotent + serialized under `reload_lock`, exactly like a pairing
+/// grant; an unknown service logs + no-ops.
+pub(crate) async fn service_allow_grant(
+    state: &DaemonState,
+    service: String,
+    principal: String,
+) -> Result<()> {
+    let mesh = state.mesh_required()?;
+    grant_service_access(mesh, &principal, &principal, &[service]).await
+}
+
+/// Revoke a SINGLE stable `principal` from a SINGLE `service`'s allow (#44, the
+/// `service_allow_revoke` verb) — the per-peer "sharing off" toggle, WITHOUT unpairing (the
+/// peer's `PeerEntry` identity is untouched; only NEW sessions are refused, in-flight ones run
+/// to completion, mirroring [`remove_peer`]). Idempotent + serialized under `reload_lock`,
+/// mirroring [`grant_service_access`]. An absent principal / unknown service is a clean no-op.
+pub(crate) async fn service_allow_revoke(
+    state: &DaemonState,
+    service: String,
+    principal: String,
+) -> Result<()> {
+    let mesh = state.mesh_required()?;
+    let _reload = mesh.reload_lock.lock().await;
+    let config_path = mesh.config_path.clone();
+    let (svc_w, principal_w) = (service.clone(), principal.clone());
+    let changed = blocking("join service-allow revoke config write", move || {
+        remove_principal_from_service(&config_path, &svc_w, &principal_w)
+    })
+    .await??;
+    if changed {
+        reload_services_from_disk(mesh, "service-allow-revoke").await?;
+    }
+    tracing::info!(%service, %principal, changed, "service allow revoked");
     Ok(())
 }
 
@@ -844,6 +916,60 @@ where
 mod tests {
     use super::*;
     use crate::daemon::testutil::hermetic_mesh;
+
+    /// #44: `service_allow_grant`/`service_allow_revoke` toggle a single principal on a single
+    /// service's allow, idempotently, WITHOUT touching peer identity. The "sharing switch".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn service_allow_grant_and_revoke_toggle_one_principal() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[services.kb]\nsocket = \"/run/kb.sock\"\nallow = []\n",
+        )
+        .unwrap();
+        let mesh = hermetic_mesh(config_path.clone()).await;
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+        let allow = || {
+            crate::config::Config::load(&config_path)
+                .unwrap()
+                .services
+                .get("kb")
+                .unwrap()
+                .allow
+                .clone()
+        };
+
+        // Grant → the principal lands in the service allow.
+        service_allow_grant(&state, "kb".into(), "eid:beef".into())
+            .await
+            .unwrap();
+        assert_eq!(allow(), vec!["eid:beef".to_string()]);
+        // Idempotent grant → still exactly one entry.
+        service_allow_grant(&state, "kb".into(), "eid:beef".into())
+            .await
+            .unwrap();
+        assert_eq!(allow(), vec!["eid:beef".to_string()]);
+
+        // Revoke → removed. Peer identity is not involved here at all (no PeerEntry touched).
+        service_allow_revoke(&state, "kb".into(), "eid:beef".into())
+            .await
+            .unwrap();
+        assert!(allow().is_empty());
+        // Idempotent revoke of an absent principal → clean no-op.
+        service_allow_revoke(&state, "kb".into(), "eid:beef".into())
+            .await
+            .unwrap();
+        assert!(allow().is_empty());
+
+        // Unknown service → clean no-op (both verbs), never an error.
+        service_allow_grant(&state, "ghost".into(), "eid:beef".into())
+            .await
+            .unwrap();
+        service_allow_revoke(&state, "ghost".into(), "eid:beef".into())
+            .await
+            .unwrap();
+    }
 
     /// The invite registration-check message shapes: silent on all-registered, names the missing
     /// service(s), lists what IS served (matching `status`) or says nothing is served yet, and

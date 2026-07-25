@@ -131,6 +131,15 @@ pub type GrantFn = Box<
         + Sync,
 >;
 
+/// The redeemer-side MUTUAL grant hook (#43): `(inviter_principal, inviter_display)` → grant
+/// the inviter access to ALL services THIS node serves. Symmetric with [`GrantFn`] (the
+/// inviter side); the daemon supplies it (`None` in tests, which assert only the store write).
+pub type GrantBackFn = Box<
+    dyn Fn(String, String) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// The ceremony-surface hook: `(peer_nickname, sas_code, paired_at_epoch)` → park the completed
 /// pairing where `status` can show the inviter's human the short authentication code. Display-only
 /// state, never a trust input.
@@ -475,6 +484,7 @@ pub async fn redeem_invite(
     invite_line: String,
     store: Arc<PeerStore>,
     self_binding: Option<SelfBinding>,
+    grant_back: Option<GrantBackFn>,
 ) -> anyhow::Result<PairResult> {
     let invite = Invite::decode(&invite_line)?;
 
@@ -598,6 +608,18 @@ pub async fn redeem_invite(
     })
     .await
     .context("join redeemer store write")??;
+
+    // #43: MUTUAL grant. The inviter granted us its services on its side (its `GrantFn`);
+    // symmetrically we now grant the INVITER access to ALL services WE serve, under the SAME
+    // stable-principal rule (its verified `b64u:` when it presented a binding, else its
+    // `eid:`). One ceremony ⇒ both directions admitted; the SAS already covered both humans.
+    // The daemon supplies the hook; tests pass `None` (they assert the store write only).
+    if let Some(grant_back) = grant_back {
+        let inviter_principal = peer_user_id
+            .clone()
+            .unwrap_or_else(|| mcpmesh_net::EndpointId::from_bytes(invite.inviter_id).principal());
+        grant_back(inviter_principal, invite.nickname.clone()).await?;
+    }
 
     // Display-only SAS, order-independent → equals the inviter's. Both humans read it
     // aloud to catch a whole-invite forgery out-of-band.
