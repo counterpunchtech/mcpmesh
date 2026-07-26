@@ -91,7 +91,11 @@ RMW): read-modify-write `doc["network"]["relay_mode"] = "custom"` and
 `discovery_urls`, all other tables). `[network]` round-trips are already covered by existing
 config_write tests.
 
-`API_MINOR` → 10. Bump **0.10.2** (additive verb; existing configs/pairings unaffected).
+`API_MINOR` → 9. Bump **0.10.2** (additive verb; existing configs/pairings unaffected).
+
+(Note: 0.10.1 added `unregister_service`/`peer_services`/Run env-cwd but the `API_MINOR`
+bump to 9 was missed — the field is still 8 on disk. This change legitimately takes it to 9;
+consumers gating those 0.10.1 verbs on minor ≥ 9 will match from this release forward.)
 
 ## Non-goals
 

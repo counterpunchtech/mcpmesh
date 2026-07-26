@@ -356,6 +356,31 @@ pub struct SetRosterUrlParams {
     pub url: String,
 }
 
+/// Params of [`Request::SetRelays`] (#53): the node's desired CUSTOM relay set. Declarative —
+/// "make the custom relay set exactly this" — applied as a live insert/remove diff against the
+/// running endpoint (iroh 1.0.3 `Endpoint::insert_relay`/`remove_relay`) when the node is already
+/// in `relay_mode = "custom"`, then persisted to `[network]`. Each entry must parse as an iroh
+/// `RelayUrl`; an empty list is rejected (custom mode requires ≥1 relay — fully disabling relays
+/// is a `relay_mode = "disabled"` restart, not this verb). Switching a node that is currently
+/// `default`/`disabled` onto custom persists the config but needs a restart to take effect (iroh
+/// cannot live-transition the relay MODE) — signalled by [`SetRelaysResult::restart_required`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetRelaysParams {
+    pub relay_urls: Vec<String>,
+}
+
+/// Result of [`Request::SetRelays`] (#53).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetRelaysResult {
+    /// The persisted `relay_urls` differed from the prior config (a no-op edit → `false`).
+    pub changed: bool,
+    /// `true` iff the node's current `relay_mode` is not `custom`, so the new set was persisted
+    /// but NOT applied live — a node restart is required for it to take effect. `false` on the
+    /// live custom→custom path (already applied to the running endpoint).
+    pub restart_required: bool,
+}
+
 /// Params of [`Request::BlobPublish`]: the scope to publish into and the LOCAL file to add.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -468,6 +493,14 @@ pub enum Request {
     /// presence — no per-peer session. Ack result. Tag `"set_app_metadata"`. In-memory (lost
     /// on restart; the embedder re-sets on startup).
     SetAppMetadata(SetAppMetadataParams),
+    /// Set this node's CUSTOM relay set LIVE (#53): validate each URL as an iroh `RelayUrl`, diff
+    /// against the running endpoint's current custom relays and apply the delta via iroh 1.0.3
+    /// `Endpoint::insert_relay`/`remove_relay` (no endpoint rebuild, no dropped sessions), then
+    /// persist `[network] relay_mode="custom" relay_urls=[…]` under `reload_lock`. When the node
+    /// is currently `default`/`disabled`, the config is persisted but the live mode transition
+    /// isn't possible — [`SetRelaysResult::restart_required`] is `true`. Answers a
+    /// [`SetRelaysResult`]. Tag `"set_relays"`.
+    SetRelays(SetRelaysParams),
     /// Grant a single stable principal access to a single service's allow (#44) — the per-peer
     /// "sharing on" toggle, idempotent + serialized under the config lock. Ack result.
     /// Remove a service registration (#50) — the deregistration mirror of `register_service`.
@@ -881,7 +914,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   new methods, or a strictness change like params validation — bumped in the same change that
 ///   makes it. A client can guard with `api_minor >= N` for a feature it needs, or refuse a daemon
 ///   older than a minor it requires. It never resets except on a MAJOR bump.
-pub const API_VERSION: &str = "1.8";
+pub const API_VERSION: &str = "1.9";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -889,8 +922,10 @@ pub const API_VERSION: &str = "1.8";
 /// to 5 with `PeerReachability.meta` — pairing-mode app metadata on the probe pong (#40);
 /// to 6 with `PeerInfo.principal` — the peer's eid: device principal on `status` (#41);
 /// to 7 with `PeerReachability.principal` — the same on reachability rows (#42); to 8 with the
-/// `service_allow_grant`/`service_allow_revoke` per-peer access verbs (#44).
-pub const API_MINOR: u32 = 8;
+/// `service_allow_grant`/`service_allow_revoke` per-peer access verbs (#44); to 9 covering the
+/// `unregister_service` (#50) / `peer_services` (#52) / Run `env`+`cwd` (#51) surface that shipped
+/// in 0.10.1 without a bump, PLUS the `set_relays` live relay-set verb (#53).
+pub const API_MINOR: u32 = 9;
 
 #[cfg(test)]
 mod tests {

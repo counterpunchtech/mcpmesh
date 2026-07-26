@@ -267,6 +267,10 @@ async fn boot_node(paths: NodePaths, config: Option<Config>) -> Result<BootedNod
     // trust-event hooks can re-thread/read it.
     mesh.set_audit(audit.clone());
     mesh.set_limits(limiters.clone());
+    // Seed the live relay posture from the boot `[network]` so the `set_relays` verb (#53) diffs
+    // against runtime truth, not the on-disk config (the `.config()` embedder front door may
+    // never persist the boot config to disk).
+    mesh.set_applied_relays(&cfg.network.relay_mode, &cfg.network.relay_urls);
     // Self-sovereign pairing identity: load
     // (or mint) this person's UserKey and precompute this daemon's binding over `our_id`, so the
     // pairing handlers PRESENT it and paired peers store a VERIFIED `user_id`. The key path mirrors

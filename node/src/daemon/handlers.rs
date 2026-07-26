@@ -3,6 +3,7 @@
 //! app-blob verbs, and the `open_session` dial-and-pipe — each one serialized against the
 //! others through `MeshState::reload_lock` wherever it mutates config.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,7 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use mcpmesh_local_api::{
     BlobFetchResult, BlobPublishResult, BlobScopeList, InviteResult, PairResult, PeerAddParams,
-    PeerRemoveParams, PeerRenameParams, RegisterServiceParams, ScopeInfo,
+    PeerRemoveParams, PeerRenameParams, RegisterServiceParams, ScopeInfo, SetRelaysResult,
 };
 use mcpmesh_net::errors::{ERR_UNREACHABLE, synthesized};
 use mcpmesh_net::framing::{FrameReader, write_frame};
@@ -27,7 +28,7 @@ use crate::util::{blocking, epoch_now_u64};
 use super::accept::reload_accept_loop;
 use super::config_write::{
     append_allow_to_config, remove_allow_from_config, remove_principal_from_service,
-    remove_service_from_config, write_service_to_config,
+    remove_service_from_config, write_relays, write_service_to_config,
 };
 use super::status::service_infos;
 use super::{MeshState, dial_service, pipe_session};
@@ -756,6 +757,129 @@ pub(crate) async fn unregister_service(state: &DaemonState, name: String) -> Res
     }
     tracing::info!(service = %name, dropped_ephemeral, removed_config, "unregistered service");
     Ok(())
+}
+
+/// Set this node's CUSTOM relay set LIVE (#53, the `set_relays` verb). `relay_urls` is the
+/// DESIRED custom set; the daemon computes a diff against the currently-persisted set and, when
+/// the node is already in `relay_mode = "custom"`, applies the delta to the RUNNING endpoint via
+/// iroh 1.0.3 `Endpoint::insert_relay`/`remove_relay` — no endpoint rebuild, no dropped sessions
+/// — then persists `[network] relay_mode="custom" relay_urls=[…]`. Serialized under the SAME
+/// `reload_lock` as every other config mutator.
+///
+/// - **Validation is atomic and up front:** an empty list is rejected (custom mode requires ≥1
+///   relay; fully disabling relays is a `relay_mode="disabled"` restart, not this verb), and every
+///   URL must parse as an iroh `RelayUrl` — a single bad entry aborts with NOTHING applied.
+/// - **Idempotent:** if the desired set (order-independent) equals the persisted set, no writes
+///   and no endpoint calls happen (`changed = false`).
+/// - **Mode transitions are NOT live:** iroh cannot swap a running endpoint's relay MODE
+///   (`default`'s built-in map / a `disabled` no-relay endpoint). So when the node's current mode
+///   is not `custom`, the new set is PERSISTED but not applied live and `restart_required = true`
+///   is returned. On the custom→custom path `restart_required = false` (already live).
+pub(crate) async fn set_relays(
+    state: &DaemonState,
+    relay_urls: Vec<String>,
+) -> Result<SetRelaysResult> {
+    let mesh = state.mesh_required()?;
+
+    // Validate atomically, BEFORE the lock and before any mutation: non-empty + every URL a
+    // well-formed iroh RelayUrl. A malformed entry must abort with nothing half-applied.
+    anyhow::ensure!(
+        !relay_urls.is_empty(),
+        "set_relays: relay_urls is empty (custom mode requires at least one relay; \
+         disable relays via a relay_mode=\"disabled\" restart)"
+    );
+    let parsed: Vec<iroh::RelayUrl> = relay_urls
+        .iter()
+        .map(|u| {
+            u.parse::<iroh::RelayUrl>()
+                .map_err(|e| anyhow::anyhow!("set_relays: relay url {u:?}: {e}"))
+        })
+        .collect::<Result<_>>()?;
+
+    let _reload = mesh.reload_lock.lock().await;
+
+    // The LIVE relay posture (seeded at boot, updated on each edit) is the runtime truth we diff
+    // against — NOT the on-disk config, which the `.config()` embedder front door may never have
+    // written. Only `custom` mode can be live-reconfigured; any other current mode means the
+    // switch onto custom is a MODE transition iroh can't do live → persist + `restart_required`.
+    let posture = mesh.applied_relays();
+    let restart_required = posture.mode != "custom";
+
+    // Diff on the NORMALIZED relay URL (iroh's canonical `RelayUrl` form — trailing slash, lowercased
+    // host, default port dropped), NOT the raw strings: the running endpoint's relay map keys on the
+    // normalized value, so a re-spelling of the same relay (a trailing slash, host case) must count
+    // as unchanged. Diffing raw strings would `remove_relay` a relay the caller meant to KEEP.
+    let desired_norm: Vec<String> = parsed.iter().map(|r| r.to_string()).collect();
+    let current_norm: Vec<String> = posture
+        .urls
+        .iter()
+        .filter_map(|u| u.parse::<iroh::RelayUrl>().ok().map(|r| r.to_string()))
+        .collect();
+    let desired_set: BTreeSet<&str> = desired_norm.iter().map(String::as_str).collect();
+    let current_set: BTreeSet<&str> = current_norm.iter().map(String::as_str).collect();
+
+    // Idempotent on BOTH paths: an unchanged set → no writes, no endpoint calls. (On the
+    // restart-required path `current_norm` is the last-persisted set we tracked, so a repeat call
+    // with the same set before a restart is a clean no-op too.)
+    if current_set == desired_set {
+        return Ok(SetRelaysResult {
+            changed: false,
+            restart_required,
+        });
+    }
+
+    // Persist FIRST — it is the ONLY fallible step (iroh's insert/remove can't fail on an open
+    // endpoint). Persisting before the live mutation keeps the critical section atomic: a write
+    // error leaves the endpoint, the posture, AND the config all untouched (nothing applied). We
+    // persist the NORMALIZED forms so config/posture always match the live map's keys.
+    let config_path = mesh.config_path.clone();
+    let persisted = desired_norm.clone();
+    blocking("set_relays config write", move || {
+        write_relays(&config_path, &persisted)
+    })
+    .await??;
+
+    // Apply the delta to the running endpoint ONLY on the custom→custom path (iroh can't live-
+    // transition the relay MODE). These calls are infallible on an open endpoint.
+    if !restart_required {
+        // Insert the newly-added relays (desired − current).
+        for (ru, norm) in parsed.iter().zip(desired_norm.iter()) {
+            if !current_set.contains(norm.as_str()) {
+                mesh.endpoint
+                    .insert_relay(ru.clone(), Arc::new(iroh::RelayConfig::from(ru.clone())))
+                    .await;
+            }
+        }
+        // Remove the dropped relays (current − desired). `current_norm` came from parsing, so each
+        // re-parses to the same `RelayUrl` the live map holds.
+        for norm in &current_norm {
+            if !desired_set.contains(norm.as_str())
+                && let Ok(ru) = norm.parse::<iroh::RelayUrl>()
+            {
+                mesh.endpoint.remove_relay(&ru).await;
+            }
+        }
+    }
+
+    // Track the persisted set as the new posture. On the custom path the live endpoint now matches;
+    // on the restart-required path the endpoint is UNCHANGED, so keep the (non-custom) mode — that
+    // makes a repeat call idempotent yet still `restart_required` until an actual restart.
+    let new_mode = if restart_required {
+        &posture.mode
+    } else {
+        "custom"
+    };
+    mesh.set_applied_relays(new_mode, &desired_norm);
+
+    tracing::info!(
+        count = desired_norm.len(),
+        restart_required,
+        "set custom relay set"
+    );
+    Ok(SetRelaysResult {
+        changed: true,
+        restart_required,
+    })
 }
 
 /// Grant a freshly-paired peer AUTHORIZATION to the services its invite named: append

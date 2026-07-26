@@ -121,6 +121,33 @@ pub(crate) fn write_identity_nickname(path: &Path, nickname: &str) -> Result<()>
     upsert_config_strings(path, "identity", &[("nickname", nickname)])
 }
 
+/// Set `[network].relay_mode = "custom"` + `[network].relay_urls = [urls…]` (the `set_relays`
+/// control arm, #53). `relay_urls` is a TOML ARRAY, so this can't use [`upsert_config_strings`]
+/// (string-keys only); it does the same surgical RMW by hand. Every other `[network]` key
+/// (`discovery_mode`, `discovery_urls`) and every other table is preserved. The mode is forced
+/// to `"custom"` so a later restart's `build_endpoint`/`net_plan` reproduces exactly this set.
+pub(crate) fn write_relays(path: &Path, urls: &[String]) -> Result<()> {
+    let existing = read_config_for_rmw(path)?;
+    let mut doc: toml::Table = toml::from_str(&existing)
+        .with_context(|| format!("parse existing config {}", path.display()))?;
+    let entry = doc
+        .entry("network".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let toml::Value::Table(network) = entry else {
+        anyhow::bail!("[network] in {} is not a table", path.display());
+    };
+    network.insert("relay_mode".into(), toml::Value::String("custom".into()));
+    network.insert(
+        "relay_urls".into(),
+        toml::Value::Array(
+            urls.iter()
+                .map(|u| toml::Value::String(u.clone()))
+                .collect(),
+        ),
+    );
+    write_config_doc(path, &doc)
+}
+
 /// Upsert `[services.<name>]` (atomic, surgical RMW), updating the backend while UNIONING the
 /// incoming `allow` into any grants already on disk. Registration OWNS the backend; the allowlist
 /// is co-owned by the pairing grant (`grant_service_access` appends nicknames). A re-registration
@@ -610,6 +637,57 @@ mod tests {
         assert_eq!(
             svc.run.as_deref().unwrap(),
             &["npx".to_string(), "server".to_string()]
+        );
+    }
+
+    /// `write_relays` (#53) forces `relay_mode = "custom"`, writes the URL ARRAY, and preserves
+    /// every other `[network]` key (`discovery_*`) plus other tables. Round-trips via `Config::load`
+    /// and overwrites a prior `relay_urls` on a second call.
+    #[test]
+    fn write_relays_sets_custom_mode_and_preserves_other_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[network]\nrelay_mode = \"default\"\ndiscovery_mode = \"custom\"\n\
+             discovery_urls = [\"https://dns.acme.com\"]\n[identity]\nnickname = \"dev\"\n",
+        )
+        .unwrap();
+
+        write_relays(
+            &path,
+            &[
+                "https://relay1.acme.com".into(),
+                "https://relay2.acme.com".into(),
+            ],
+        )
+        .unwrap();
+
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.network.relay_mode, "custom");
+        assert_eq!(
+            cfg.network.relay_urls,
+            vec![
+                "https://relay1.acme.com".to_string(),
+                "https://relay2.acme.com".to_string()
+            ]
+        );
+        // Other [network] keys are preserved.
+        assert_eq!(cfg.network.discovery_mode, "custom");
+        assert_eq!(
+            cfg.network.discovery_urls,
+            vec!["https://dns.acme.com".to_string()]
+        );
+        // Other tables are preserved.
+        let doc: toml::Table = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(doc["identity"]["nickname"].as_str(), Some("dev"));
+
+        // A second call overwrites the array wholesale (not append).
+        write_relays(&path, &["https://relay3.acme.com".into()]).unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(
+            cfg.network.relay_urls,
+            vec!["https://relay3.acme.com".to_string()]
         );
     }
 }

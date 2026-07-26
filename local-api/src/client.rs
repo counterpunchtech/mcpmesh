@@ -14,7 +14,8 @@ use crate::protocol::{
     OpenSessionParams, OrgJoinParams, OrgJoinResult, PairParams, PairResult, PeerRemoveParams,
     PeerRenameParams, PeerServicesParams, PeerServicesResult, RegisterServiceParams, Request,
     RosterInstallParams, RosterInstallResult, ServiceAllowParams, SetAppMetadataParams,
-    SetNicknameParams, SetRosterUrlParams, StatusResult, StreamFrame, UnregisterServiceParams,
+    SetNicknameParams, SetRelaysParams, SetRelaysResult, SetRosterUrlParams, StatusResult,
+    StreamFrame, UnregisterServiceParams,
 };
 use crate::transport::{connect_local, split_local};
 
@@ -368,6 +369,27 @@ impl ControlClient {
         self.request_ack(Request::SetAppMetadata(SetAppMetadataParams {
             metadata: metadata.to_string(),
         }))
+        .await
+    }
+
+    /// Set this node's CUSTOM relay set LIVE (#53). `relay_urls` is the desired set (each must
+    /// parse as an iroh `RelayUrl`; empty is rejected). When the node is already in
+    /// `relay_mode = "custom"`, the daemon diffs against the running endpoint and applies the
+    /// delta live (iroh `insert_relay`/`remove_relay`) — no restart, no dropped sessions — then
+    /// persists `[network]`. When the node is currently `default`/`disabled`, the config is
+    /// persisted but the live mode transition isn't possible: the returned
+    /// [`SetRelaysResult::restart_required`] is `true`. Idempotent (an unchanged set → `changed:
+    /// false`, no writes).
+    pub async fn set_relays(
+        &mut self,
+        relay_urls: &[String],
+    ) -> Result<SetRelaysResult, ClientError> {
+        self.request_typed::<SetRelaysResult>(
+            Request::SetRelays(SetRelaysParams {
+                relay_urls: relay_urls.to_vec(),
+            }),
+            "set_relays",
+        )
         .await
     }
 

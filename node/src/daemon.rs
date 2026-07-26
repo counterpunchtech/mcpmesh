@@ -66,7 +66,7 @@ pub use roster_install::{
 pub use boot::{NetPlan, net_plan};
 pub(crate) use handlers::{
     add_peer, blob_fetch, blob_grant, blob_list, blob_publish, mint_invite, open_session,
-    peer_services, redeem, register_service, service_allow_grant, service_allow_revoke,
+    peer_services, redeem, register_service, service_allow_grant, service_allow_revoke, set_relays,
     unregister_ephemeral, unregister_service,
 };
 pub(crate) use roster_install::{
@@ -88,6 +88,16 @@ const SPAWN_CONCURRENCY: usize = 4;
 /// 1 so a `max_sessions = 0` misconfig bounds to one session rather than refusing every session.
 pub(crate) fn spawn_concurrency(cfg: &Config) -> usize {
     (cfg.limits.max_sessions.max(1)) as usize
+}
+
+/// The relay posture applied to the live endpoint — the runtime "current set" [`MeshState`]
+/// tracks for the `set_relays` verb (#53). `mode` is the `[network].relay_mode` the endpoint was
+/// built with (or last switched to live); `urls` is the custom relay set (only meaningful when
+/// `mode == "custom"`). Default (`mode == ""`) is a pre-seed placeholder overwritten at boot.
+#[derive(Clone, Default)]
+pub(crate) struct RelayPosture {
+    pub(crate) mode: String,
+    pub(crate) urls: Vec<String>,
 }
 
 /// The mesh half of the daemon: the endpoint, the trust gate + its backing store, the live
@@ -142,6 +152,13 @@ pub struct MeshState {
     /// by redb's write lock; this gives the config path an equivalent.
     pub(crate) reload_lock: tokio::sync::Mutex<()>,
     pub(crate) config_path: PathBuf,
+    /// The relay posture (mode + custom URL set) currently APPLIED to the live endpoint — the
+    /// runtime truth the `set_relays` verb (#53) diffs against. Seeded at boot from `[network]`
+    /// via [`set_applied_relays`](Self::set_applied_relays) and updated on each successful LIVE
+    /// `set_relays`. In-memory on purpose: the `.config()` embedder front door may never persist
+    /// the boot config to disk (see `NodeBuilder::config`), so the config FILE is not a reliable
+    /// "current set" — this is. `Mutex` because `set_relays` mutates it under the reload lock.
+    pub(crate) applied_relays: std::sync::Mutex<RelayPosture>,
     /// The roster-mode gate handle (hot-swapped on install; consulted for the sever set + status).
     /// `RosterGate::empty()` in a pure-pairing daemon — where [`ComposedGate`] then falls through to
     /// pairing for everything, exactly as a pairing-only build behaved. In a roster daemon this is the SAME
@@ -282,6 +299,7 @@ impl MeshState {
             poll_loop: tokio::sync::Mutex::new(None),
             reload_lock: tokio::sync::Mutex::new(()),
             config_path,
+            applied_relays: std::sync::Mutex::new(RelayPosture::default()),
             roster,
             conn_registry,
             gossip,
@@ -383,6 +401,27 @@ impl MeshState {
             .self_nickname
             .write()
             .expect("self_nickname lock not poisoned") = nickname;
+    }
+
+    /// Seed / update the live relay posture (#53). Called at boot from `[network]` and after each
+    /// successful LIVE `set_relays`.
+    pub(crate) fn set_applied_relays(&self, mode: &str, urls: &[String]) {
+        *self
+            .applied_relays
+            .lock()
+            .expect("applied_relays lock not poisoned") = RelayPosture {
+            mode: mode.to_string(),
+            urls: urls.to_vec(),
+        };
+    }
+
+    /// The relay posture currently applied to the live endpoint — the runtime "current set" the
+    /// `set_relays` verb (#53) diffs a desired set against.
+    pub(crate) fn applied_relays(&self) -> RelayPosture {
+        self.applied_relays
+            .lock()
+            .expect("applied_relays lock not poisoned")
+            .clone()
     }
 
     pub fn set_audit(&self, sink: AuditSink) {

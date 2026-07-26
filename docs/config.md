@@ -57,7 +57,7 @@ are in the [operator runbook §5](operator.md#5-self-hosting-relay--discovery-10
 | Key | Default | Meaning |
 |---|---|---|
 | `relay_mode` | `"default"` | `"default"` (public infrastructure) \| `"custom"` (your own relays — requires `relay_urls`) \| `"disabled"` (**hermetic**: no relay AND no discovery; localhost/LAN only). |
-| `relay_urls` | `[]` | Your self-hosted relay URLs. Required when `relay_mode = "custom"`. |
+| `relay_urls` | `[]` | Your self-hosted relay URLs. Required when `relay_mode = "custom"`. **Live-editable** at runtime via the `set_relays` control verb (#53) — when already in `custom` mode, adding/removing relays is applied to the running endpoint with no restart and no dropped peer sessions; see [local-protocol.md](local-protocol.md). |
 | `discovery_mode` | `"default"` | `"default"` \| `"custom"` (your own discovery service — requires `discovery_urls`). Ignored when `relay_mode = "disabled"`. |
 | `discovery_urls` | `[]` | Your self-hosted discovery URLs, used for both publishing and resolving peer addresses. Required when `discovery_mode = "custom"`. |
 

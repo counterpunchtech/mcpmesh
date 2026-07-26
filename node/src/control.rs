@@ -22,7 +22,7 @@ use mcpmesh_local_api::{
     API_NAME, API_VERSION, BlobFetchParams, BlobGrantParams, BlobPublishParams, Hello,
     InviteParams, OpenSessionParams, OrgJoinParams, PairParams, PeerServicesParams,
     RosterInstallParams, ServiceAllowParams, SetAppMetadataParams, SetNicknameParams,
-    SetRosterUrlParams, StatusResult, UnregisterServiceParams, method_of,
+    SetRelaysParams, SetRosterUrlParams, StatusResult, UnregisterServiceParams, method_of,
 };
 use mcpmesh_net::framing::{FrameReader, Inbound, write_frame};
 use serde_json::{Value, json};
@@ -496,6 +496,17 @@ async fn handle_request(req: &Value, state: &DaemonState) -> Value {
             })
             .await
             .map(unit),
+        ),
+        // Set this node's CUSTOM relay set LIVE (#53): validated + diffed against the running
+        // endpoint and applied via iroh insert_relay/remove_relay (custom→custom), then persisted
+        // under `reload_lock`. Answers a SetRelaysResult { changed, restart_required }.
+        Some("set_relays") => respond(
+            id,
+            "set_relays",
+            with_params(&params, |p: SetRelaysParams| {
+                crate::daemon::set_relays(state, p.relay_urls)
+            })
+            .await,
         ),
         // Peer service discovery (#52): dial the peer, return the services it grants us.
         Some("peer_services") => {
