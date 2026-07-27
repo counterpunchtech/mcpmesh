@@ -185,11 +185,17 @@ impl AppBlobs {
         self.scopes.revoke_from_scope(scope, principals)
     }
 
+    /// Does this scope exist? The handlers use it to reject an unknown scope rather than acking it.
+    pub fn has_scope(&self, scope: &str) -> bool {
+        self.scopes.has_scope(scope)
+    }
+
     /// Remove a hash from ONE scope (#62, `blob_unpublish`).
     ///
-    /// This is the AUTHORIZATION half and takes effect at once: the scope gate requires the hash to
-    /// be listed in some scope, so an unpublished hash is immediately unfetchable. The BYTES remain
-    /// in the store until [`gc`](Self::gc) runs — do not describe this to a user as deletion.
+    /// This is the AUTHORIZATION half and takes effect at once for NEW requests: the scope gate
+    /// requires the hash to be listed in some scope, so a subsequent GET is refused at the request
+    /// hook. The BYTES remain in the store — there is no reclaim (#80) — so do not describe this to
+    /// a user as deletion. A transfer already streaming is not interrupted.
     pub fn unpublish(&self, scope: &str, hash_hex: &str) -> Result<bool> {
         self.scopes.unpublish_hash(scope, hash_hex)
     }

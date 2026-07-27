@@ -7,7 +7,7 @@ named pipe on Windows. Anything that can open the endpoint and parse JSON can sp
 language — [`local-api/examples/status.py`](../local-api/examples/status.py) is a complete client
 in ~60 lines of dependency-free Python.
 
-> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.14`, `api_minor` `14`) and evolves
+> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.15`, `api_minor` `15`) and evolves
 > **additively** (see [Versioning](#versioning)), but until a stable release this document — like the
 > wire format itself — may change without a migration path. Pin the mcpmesh version you build
 > against. Source of truth is the Rust in [`local-api/`](../local-api/src/protocol.rs); where this
@@ -163,8 +163,28 @@ Methods split into two groups by audience:
 | `set_roster_url` | `{url}` | `{}` (ack) |
 | `blob_publish` | `{scope, path}` | `{ticket:"mcpmesh/blob/1…", hash}` |
 | `blob_grant` | `{scope, principal}` | `{}` (ack) |
+| `blob_revoke` | `{scope, principals}` — withdraw principals from ONE scope's grants (#62, `api_minor >= 15`). The blob analogue of `service_allow_revoke`: un-shares a file without unpairing the person. **Scoped** — grants on other scopes are untouched. A principal that held no grant is a clean no-op; an unknown **scope** is `-32040`, not a silent ack. | `{}` (ack) |
+| `blob_unpublish` | `{scope, hash}` — remove a blake3 hash from ONE scope (#62, `api_minor >= 15`). Refuses **subsequent** GETs from that scope; does **not** delete bytes and does **not** interrupt a transfer in flight — see the note below. `hash` must parse as blake3 (case-insensitive); garbage is an error, not a silent no-op. An already-absent hash is a clean no-op; an unknown **scope** is `-32040`. | `{}` (ack) |
 | `blob_list` | *(none)* | `{scopes:[{name, hashes:[…], grants:[…]}]}` |
 | `blob_fetch` | `{ticket, dest_path}` | `{hash, bytes_len}` |
+
+> **`blob_unpublish` withdraws access, it does not delete data.** The bytes stay in the provider's
+> local store. The authorization effect applies to **new requests from that scope**: a subsequent
+> GET is refused at the request hook, even for a caller holding the ticket — a hash is not a
+> capability. Two limits to be precise about:
+>
+> - **A transfer already streaming is not interrupted.** Unlike `service_allow_revoke` (#54), these
+>   verbs do not sever live connections; a large blob mid-flight completes.
+> - **Other scopes still serve it.** If the same hash is published into another scope that grants
+>   the caller, it remains fetchable there — unpublish is per-scope, never a global delete.
+>
+> So if you have promised a user that a file is *deleted*, this verb does not deliver that promise.
+>
+> There is currently **no reclaim**: `<data_dir>/blobs/` grows monotonically. `iroh-blobs` exposes
+> no on-demand sweep (its `delete` is crate-private and it directs users to garbage collection,
+> which it only supports as a periodic background policy configured at store construction), so a
+> reclaim path needs its own design. Tracked in
+> [#80](https://github.com/counterpunchtech/mcpmesh/issues/80).
 
 Paths and files (`roster_install.path`, `org_join.user_key`, `blob_publish.path`,
 `blob_fetch.dest_path`) are passed **as local paths, not bytes** — the same-uid daemon reads/writes
@@ -651,7 +671,8 @@ things:
   `reachability` frame (#58) is `api_minor >= 12`, `PeerReachability.path` (#64) is
   `api_minor >= 13`, and the `run`-backend `MCPMESH_PEER_EID` identity var (#60) is
   `api_minor >= 14`; ephemeral-service grant/revoke plus the `-32040`
-  no-such-service error (#55, #69) are `api_minor >= 11`; the pushed `reachability` stream frame (#58)
+  no-such-service error (#55, #69) are `api_minor >= 11`; the `blob_revoke` / `blob_unpublish` verbs
+  (#62) are `api_minor >= 15`; the pushed `reachability` stream frame (#58)
   is `api_minor >= 12`; the `set_nickname` verb
   and `StatusResult.self_nickname` are `api_minor >= 2` (#37); STABLE-principal `allow`
   strings + `ServiceInfo.allow_display` are `api_minor >= 3` (#38). `api_minor` is itself

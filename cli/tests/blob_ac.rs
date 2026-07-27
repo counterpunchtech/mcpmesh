@@ -255,3 +255,102 @@ async fn ac2_revoked_and_ungranted_fetches_are_refused() {
     .await
     .expect("AC2 timed out");
 }
+
+/// #62: `blob_unpublish` and `blob_revoke` withdraw access OVER THE WIRE, without unpairing.
+///
+/// The scope gate requires a hash to be listed in some scope AND that scope to grant a caller
+/// principal. So removing either the hash (unpublish) or the grant (revoke) must refuse a fetch that
+/// worked a moment earlier — and must leave everything else alone, which is the whole point of the
+/// per-scope form versus unpair hygiene.
+#[tokio::test(flavor = "multi_thread")]
+async fn unpublish_and_revoke_withdraw_access_per_scope() {
+    timeout(Duration::from_secs(90), async {
+        let root = SigningKey::from_bytes(&[19u8; 32]);
+        let provider_ep = provider_endpoint().await;
+        let alice_ep = caller_endpoint().await;
+        let alice_id = *alice_ep.id().as_bytes();
+
+        let roster = Arc::new(RosterGate::empty());
+        let view = mint_view(&root, 1, &[(alice_id, "alice")], &[]);
+        let (mesh, dir) = serving_provider(provider_ep.clone(), roster.clone(), view).await;
+        seed_addr(&alice_ep, &provider_ep);
+
+        // Two blobs in two scopes, both granted to alice.
+        let doomed_src = dir.path().join("doomed.bin");
+        let kept_src = dir.path().join("kept.bin");
+        std::fs::write(&doomed_src, vec![1u8; 4096]).unwrap();
+        std::fs::write(&kept_src, vec![2u8; 4096]).unwrap();
+        let provider = mesh.app_blobs().await.unwrap();
+        let (doomed_ticket, doomed_hash) =
+            provider.publish_scope("docs", &doomed_src).await.unwrap();
+        let (kept_ticket, _) = provider.publish_scope("photos", &kept_src).await.unwrap();
+        provider.grant("docs", "alice").unwrap();
+        provider.grant("photos", "alice").unwrap();
+
+        let fetch = |ticket: String, tag: &'static str| {
+            let ep = alice_ep.clone();
+            async move {
+                let d = tempfile::tempdir().unwrap();
+                let f = AppBlobs::open_fetcher(d.path().join(tag), ep)
+                    .await
+                    .unwrap();
+                timeout(Duration::from_secs(15), f.fetch(&ticket)).await
+            }
+        };
+
+        // Setup: both fetch.
+        assert!(
+            matches!(fetch(doomed_ticket.clone(), "a").await, Ok(Ok(_))),
+            "granted blob fetches before unpublish"
+        );
+        assert!(matches!(fetch(kept_ticket.clone(), "b").await, Ok(Ok(_))));
+
+        // UNPUBLISH the first: its hash leaves "docs", so the gate denies it.
+        provider.unpublish("docs", &doomed_hash).unwrap();
+        let after = fetch(doomed_ticket.clone(), "c").await;
+        assert!(
+            matches!(after, Ok(Err(_))),
+            "an unpublished hash must be refused at the request hook: {after:?}"
+        );
+        // ...and the OTHER scope's blob is untouched — unpublish is not a global delete.
+        assert!(
+            matches!(fetch(kept_ticket.clone(), "d").await, Ok(Ok(_))),
+            "unpublishing from one scope must not affect another"
+        );
+
+        // A THIRD blob in a third scope, so the revoke below has something to over-withdraw FROM.
+        // Without it this test cannot distinguish a per-scope revoke from the global unpair-hygiene
+        // sweep — review proved the whole suite stayed green with `blob_revoke` wired to the global
+        // form, because every other scope had already been made unreachable by the unpublish above.
+        let other_src = dir.path().join("other.bin");
+        std::fs::write(&other_src, vec![3u8; 4096]).unwrap();
+        let (other_ticket, _) = provider.publish_scope("audio", &other_src).await.unwrap();
+        provider.grant("audio", "alice").unwrap();
+        assert!(matches!(fetch(other_ticket.clone(), "e0").await, Ok(Ok(_))));
+
+        // REVOKE alice from "photos" ONLY.
+        provider
+            .revoke_from_scope("photos", &["alice".to_string()])
+            .unwrap();
+        let revoked = fetch(kept_ticket, "e").await;
+        assert!(
+            matches!(revoked, Ok(Err(_))),
+            "a revoked grant must refuse the fetch: {revoked:?}"
+        );
+        // THE over-withdrawal assertion: the untouched scope must still serve. This is what fails
+        // if `blob_revoke` is wired to `revoke_principals` (every scope) instead of the scoped form.
+        let untouched = fetch(other_ticket, "f").await;
+        assert!(
+            matches!(untouched, Ok(Ok(_))),
+            "revoking one scope must not withdraw grants on another: {untouched:?}"
+        );
+        assert!(
+            roster
+                .view()
+                .is_some_and(|v| v.resolve(&alice_id).is_some()),
+            "alice is still rostered — access was withdrawn, the relationship was not"
+        );
+    })
+    .await
+    .expect("blob unpublish/revoke AC timed out");
+}

@@ -82,22 +82,20 @@ impl BlobScopes {
     /// changed.
     ///
     /// This is the AUTHORIZATION boundary: [`allows`](Self::allows) requires the hash to be in some
-    /// scope, so an unpublished hash is immediately unfetchable. It does NOT delete bytes — the
-    /// store still holds them until `blob_gc` runs. A hash published into several scopes stays
-    /// reachable through the others.
+    /// scope, so a subsequent GET for it is refused. It does NOT delete bytes — the store keeps them and
+    /// there is no reclaim verb (#80). A hash published into several scopes stays reachable through
+    /// the others, and a transfer already streaming is not interrupted.
     pub fn unpublish_hash(&mut self, scope: &str, hash_hex: &str) -> bool {
         self.scopes
             .get_mut(scope)
             .is_some_and(|sc| sc.hashes.remove(hash_hex))
     }
 
-    /// Every hash any scope references — the GC liveness root (#62). mcpmesh creates no persistent
-    /// blob tags, so this is the ONLY root: a blob absent from this set is referenced by nothing.
-    pub fn live_hashes(&self) -> std::collections::BTreeSet<String> {
-        self.scopes
-            .values()
-            .flat_map(|sc| sc.hashes.iter().cloned())
-            .collect()
+    /// Does this scope exist at all? Lets a caller distinguish "no such scope" (an operator typo,
+    /// which must be an ERROR) from "the principal/hash was not there" (genuinely idempotent).
+    /// Answering `{}` to both is the #55 defect, and #62 reintroduced it before review caught it.
+    pub fn has_scope(&self, scope: &str) -> bool {
+        self.scopes.contains_key(scope)
     }
 
     /// SECURITY LINCHPIN (pure): ALLOW iff SOME scope contains `hash_hex` AND grants one of the
@@ -126,14 +124,23 @@ impl BlobScopes {
     }
 }
 
-/// The single-writer scope store. An in-RAM `RwLock<BlobScopes>` serves the hot
-/// authz read (`snapshot`, a cheap clone taken per GET — no lock held across the async reply); every
-/// mutation (`publish_hash`/`grant`) takes the write lock, mutates, and atomically persists the JSON
-/// sidecar (`crate::roster::atomic_write_str` = write-new + rename). All mutations flow through
-/// the daemon control path, so there is exactly one writer.
+/// The scope store. An in-RAM `RwLock<BlobScopes>` serves the hot authz read (`snapshot`, a cheap
+/// clone taken per GET — no lock held across the async reply); every mutation
+/// (`publish_hash`/`grant`/`revoke_*`/`unpublish_hash`) mutates and atomically persists the JSON
+/// sidecar (`crate::roster::atomic_write_str` = write-new + rename).
+///
+/// **`write_lock` serializes mutate-AND-persist as one unit.** An earlier version dropped the
+/// `inner` write lock before persisting, which serialized the mutation but NOT the file write: two
+/// concurrent revokes could persist out of order and the slower one would write back a snapshot
+/// still containing the grant the other had just removed. Memory was correct, disk was not, and the
+/// stale grant came back on restart — a fail-OPEN loss of a revocation, on an authorization
+/// surface. Control connections are one task each, so concurrent verbs are ordinary usage, not an
+/// exotic race (#62 review, reproduced).
 pub struct ScopeStore {
     path: PathBuf,
     inner: RwLock<BlobScopes>,
+    /// Held across mutate+persist so the file write order matches the mutation order.
+    write_lock: std::sync::Mutex<()>,
 }
 
 impl ScopeStore {
@@ -143,6 +150,7 @@ impl ScopeStore {
         Self {
             path,
             inner: RwLock::new(BlobScopes::default()),
+            write_lock: std::sync::Mutex::new(()),
         }
     }
 
@@ -161,6 +169,7 @@ impl ScopeStore {
         Ok(Self {
             path,
             inner: RwLock::new(scopes),
+            write_lock: std::sync::Mutex::new(()),
         })
     }
 
@@ -173,6 +182,10 @@ impl ScopeStore {
     /// Publish a hash into a scope + persist (single-writer). The write lock is dropped before the
     /// fs write so a slow fsync never blocks a concurrent authz read.
     pub fn publish_hash(&self, scope: &str, hash_hex: &str) -> Result<()> {
+        let _w = self
+            .write_lock
+            .lock()
+            .expect("scope write lock not poisoned");
         let snapshot = {
             let mut g = self.inner.write().expect("scope lock not poisoned");
             g.publish_hash(scope, hash_hex);
@@ -183,6 +196,10 @@ impl ScopeStore {
 
     /// Grant a scope to a principal + persist (single-writer). Same lock/persist discipline.
     pub fn grant(&self, scope: &str, principal: &str) -> Result<()> {
+        let _w = self
+            .write_lock
+            .lock()
+            .expect("scope write lock not poisoned");
         let snapshot = {
             let mut g = self.inner.write().expect("scope lock not poisoned");
             g.grant(scope, principal);
@@ -194,6 +211,10 @@ impl ScopeStore {
     /// Revoke `principals` from ONE scope + persist (#62, `blob_revoke`). Same lock/persist
     /// discipline. Returns whether anything changed.
     pub fn revoke_from_scope(&self, scope: &str, principals: &[String]) -> Result<bool> {
+        let _w = self
+            .write_lock
+            .lock()
+            .expect("scope write lock not poisoned");
         let (changed, snapshot) = {
             let mut g = self.inner.write().expect("scope lock not poisoned");
             let changed = g.revoke_from_scope(scope, principals);
@@ -203,9 +224,21 @@ impl ScopeStore {
         Ok(changed)
     }
 
+    /// Does this scope exist? See [`BlobScopes::has_scope`].
+    pub fn has_scope(&self, scope: &str) -> bool {
+        self.inner
+            .read()
+            .expect("scope lock not poisoned")
+            .has_scope(scope)
+    }
+
     /// Remove a hash from ONE scope + persist (#62, `blob_unpublish`). Returns whether anything
     /// changed. Removes REACHABILITY, not bytes — see [`BlobScopes::unpublish_hash`].
     pub fn unpublish_hash(&self, scope: &str, hash_hex: &str) -> Result<bool> {
+        let _w = self
+            .write_lock
+            .lock()
+            .expect("scope write lock not poisoned");
         let (changed, snapshot) = {
             let mut g = self.inner.write().expect("scope lock not poisoned");
             let changed = g.unpublish_hash(scope, hash_hex);
@@ -218,6 +251,10 @@ impl ScopeStore {
     /// Revoke `principals` from every scope + persist (single-writer). The unpair-hygiene
     /// inverse of `grant` — same lock/persist discipline. Returns whether anything changed.
     pub fn revoke_principals(&self, principals: &[String]) -> Result<bool> {
+        let _w = self
+            .write_lock
+            .lock()
+            .expect("scope write lock not poisoned");
         let (changed, snapshot) = {
             let mut g = self.inner.write().expect("scope lock not poisoned");
             let changed = g.revoke_principals(principals);
@@ -307,27 +344,11 @@ mod tests {
             "still reachable via the scope that still lists it"
         );
         assert!(
-            s.live_hashes().contains("abc123"),
-            "and still LIVE for GC — reclaiming it here would destroy data another scope references"
+            s.scopes["backup"].hashes.contains("abc123"),
+            "the other scope still lists it — unpublish is per-scope, never a global delete"
         );
     }
 
-    /// #62: the GC root is exactly the union of scope hashes.
-    #[test]
-    fn live_hashes_is_the_union_of_every_scope() {
-        let mut s = BlobScopes::default();
-        s.publish_hash("a", "h1");
-        s.publish_hash("b", "h2");
-        s.publish_hash("b", "h1");
-        let live = s.live_hashes();
-        assert_eq!(live.len(), 2);
-        assert!(live.contains("h1") && live.contains("h2"));
-
-        // An emptied scope contributes nothing — this is what makes GC reclaim it.
-        s.unpublish_hash("a", "h1");
-        s.unpublish_hash("b", "h1");
-        assert!(!s.live_hashes().contains("h1"));
-    }
     use std::collections::HashSet;
 
     fn principals<'a>(names: &'a [&'a str]) -> HashSet<&'a str> {
