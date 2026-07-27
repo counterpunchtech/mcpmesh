@@ -164,6 +164,15 @@ impl Node {
         for task in self.booted.background {
             task.abort();
         }
+        // End the app-blob request gate loop and WAIT for it (#61). That task owns the
+        // `Arc<dyn TrustGate>`, which on a pairing daemon holds the `PeerStore` — and therefore the
+        // redb data-dir lock. Aborting without awaiting only schedules the drop, so a fresh node on
+        // the same root could still hit `DataDirInUse`. Was unreachable while the provider was
+        // roster-only (an embedded node never built one) and became reachable the moment app blobs
+        // were enabled in pairing mode.
+        if let Some(blobs) = mesh.app_blobs.lock().await.take() {
+            blobs.shutdown().await;
+        }
         mesh.endpoint.close().await;
     }
 

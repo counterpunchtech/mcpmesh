@@ -208,9 +208,10 @@ pub struct MeshState {
     /// loop reads it FRESH each beat via [`presence_ctx`](Self::presence_ctx). Empty = unset.
     /// In-memory only (lost on restart; the embedder re-sets on startup).
     pub(crate) app_metadata: Arc<std::sync::RwLock<String>>,
-    /// The gated per-scope app-blob provider. `None` in a pure-pairing daemon and
-    /// until [`set_app_blobs`](Self::set_app_blobs) installs it (roster mode only — grants use roster
-    /// vocabulary). Behind a `tokio::sync::Mutex<Option<..>>` set post-construction (like
+    /// The gated per-scope app-blob provider. Present in BOTH trust modes since #61 — grants are
+    /// flat principals (`eid:` device / `b64u:` user / roster group or user name), so the scope gate
+    /// never needed a roster. `None` only until [`set_app_blobs`](Self::set_app_blobs) installs it,
+    /// or if the store failed to build. Behind a `tokio::sync::Mutex<Option<..>>` set post-construction (like
     /// `accept_task`/`poll_loop`), so `MeshState::new`'s signature is unchanged and no existing caller
     /// breaks. The accept loop's `APP_BLOB_ALPN` arm reads it per-connection.
     pub(crate) app_blobs: tokio::sync::Mutex<Option<Arc<crate::blobs::provider::AppBlobs>>>,
@@ -466,7 +467,7 @@ impl MeshState {
             .collect()
     }
 
-    /// Install the gated app-blob provider post-construction (roster mode only).
+    /// Install the gated app-blob provider post-construction (both trust modes, #61).
     /// Called by `serve_forever` BEFORE `spawn_accept_loop`, so the `APP_BLOB_ALPN` arm always sees
     /// it once serving begins.
     pub async fn set_app_blobs(&self, provider: Arc<crate::blobs::provider::AppBlobs>) {

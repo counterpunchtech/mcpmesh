@@ -354,3 +354,94 @@ async fn unpublish_and_revoke_withdraw_access_per_scope() {
     .await
     .expect("blob unpublish/revoke AC timed out");
 }
+
+/// #61: a PURE-PAIRING daemon serves app blobs. No org root key, no roster — the trust gate is the
+/// pairing `AllowlistGate` alone, and the grant is the caller's `eid:` device principal.
+///
+/// Before this, the provider was only constructed and the ALPN only advertised inside
+/// `if roster_mode`, so content-addressed transfer was unavailable in the mode the quickstart
+/// teaches — even though the scope gate never needed a roster.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pairing_mode_daemon_serves_app_blobs() {
+    timeout(Duration::from_secs(90), async {
+        let provider_ep = provider_endpoint().await;
+        let caller_ep = caller_endpoint().await;
+        let caller_id = *caller_ep.id().as_bytes();
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(PeerStore::open(&dir.path().join("state.redb")).unwrap());
+        // The caller is PAIRED — the only trust relationship in play.
+        store
+            .add(mcpmesh::allowlist::PeerEntry {
+                endpoint_id: caller_id,
+                nickname: "carol".into(),
+                services: vec![],
+                paired_at: None,
+                user_id: None, // unbound: the eid: principal is the ONLY one she has
+                last_addr: None,
+            })
+            .unwrap();
+        // NOT a ComposedGate — a bare pairing gate, exactly what a no-org daemon runs.
+        let gate: Arc<dyn mcpmesh_net::TrustGate> = Arc::new(AllowlistGate::new(store.clone()));
+        let mesh = MeshState::new(
+            provider_ep.clone(),
+            gate.clone(),
+            store,
+            Arc::new(LiveInvites::new()),
+            "provider".into(),
+            dir.path().join("config.toml"),
+            Arc::new(RosterGate::empty()), // no roster installed, ever
+            Arc::new(ConnRegistry::new()),
+            None,
+            None,
+            None,
+            None,
+        );
+        let scopes = Arc::new(ScopeStore::new(dir.path().join("scopes.json")));
+        let provider = AppBlobs::load(
+            dir.path().join("blobs"),
+            scopes,
+            gate,
+            provider_ep.clone(),
+            mcpmesh::audit::AuditSink::disabled(),
+        )
+        .await
+        .unwrap();
+        mesh.set_app_blobs(provider).await;
+        let accept = spawn_accept_loop(mesh.clone(), Arc::new(build_services(&Default::default())));
+        mesh.set_accept_task(accept).await;
+        seed_addr(&caller_ep, &provider_ep);
+
+        let src = dir.path().join("attachment.bin");
+        std::fs::write(&src, vec![9u8; 4096]).unwrap();
+        let p = mesh.app_blobs().await.unwrap();
+        let (ticket, _hash) = p.publish_scope("attachments", &src).await.unwrap();
+        p.grant("attachments", &format!("eid:{}", caller_ep.id()))
+            .unwrap();
+
+        let cdir = tempfile::tempdir().unwrap();
+        let carol = AppBlobs::open_fetcher(cdir.path().join("c"), caller_ep.clone())
+            .await
+            .unwrap();
+        carol
+            .fetch(&ticket)
+            .await
+            .expect("a paired peer granted by eid: fetches from a pairing-mode daemon");
+
+        // And the gate still bites: an UNPAIRED endpoint is refused at accept time (401), before
+        // any request — advertising the ALPN in pairing mode must not open it to strangers.
+        let stranger_ep = caller_endpoint().await;
+        seed_addr(&stranger_ep, &provider_ep);
+        let sdir = tempfile::tempdir().unwrap();
+        let stranger = AppBlobs::open_fetcher(sdir.path().join("s"), stranger_ep)
+            .await
+            .unwrap();
+        let res = timeout(Duration::from_secs(15), stranger.fetch(&ticket)).await;
+        assert!(
+            matches!(res, Ok(Err(_))),
+            "an unpaired stranger must be refused pre-request: {res:?}"
+        );
+    })
+    .await
+    .expect("pairing-mode app-blob test timed out");
+}

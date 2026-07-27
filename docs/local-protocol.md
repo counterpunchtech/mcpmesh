@@ -7,7 +7,7 @@ named pipe on Windows. Anything that can open the endpoint and parse JSON can sp
 language — [`local-api/examples/status.py`](../local-api/examples/status.py) is a complete client
 in ~60 lines of dependency-free Python.
 
-> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.15`, `api_minor` `15`) and evolves
+> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.16`, `api_minor` `16`) and evolves
 > **additively** (see [Versioning](#versioning)), but until a stable release this document — like the
 > wire format itself — may change without a migration path. Pin the mcpmesh version you build
 > against. Source of truth is the Rust in [`local-api/`](../local-api/src/protocol.rs); where this
@@ -671,7 +671,8 @@ things:
   `reachability` frame (#58) is `api_minor >= 12`, `PeerReachability.path` (#64) is
   `api_minor >= 13`, and the `run`-backend `MCPMESH_PEER_EID` identity var (#60) is
   `api_minor >= 14`; ephemeral-service grant/revoke plus the `-32040`
-  no-such-service error (#55, #69) are `api_minor >= 11`; the `blob_revoke` / `blob_unpublish` verbs
+  no-such-service error (#55, #69) are `api_minor >= 11`; app blobs in PAIRING mode (#61) are
+  `api_minor >= 16`; the `blob_revoke` / `blob_unpublish` verbs
   (#62) are `api_minor >= 15`; the pushed `reachability` stream frame (#58)
   is `api_minor >= 12`; the `set_nickname` verb
   and `StatusResult.self_nickname` are `api_minor >= 2` (#37); STABLE-principal `allow`
