@@ -19,7 +19,9 @@ use std::time::Duration;
 
 use mcpmesh::allowlist::{AllowlistGate, PeerEntry, PeerStore};
 use mcpmesh::config::Config;
-use mcpmesh::daemon::{MeshState, build_services, revoke_service_allow, spawn_accept_loop};
+use mcpmesh::daemon::{
+    MeshState, build_services, revoke_service_access, revoke_service_allow, spawn_accept_loop,
+};
 use mcpmesh::pairing::LiveInvites;
 use mcpmesh::roster::gate::RosterGate;
 use mcpmesh_net::registry::ConnRegistry;
@@ -393,4 +395,57 @@ async fn removing_a_peer_severs_its_live_connection() {
     })
     .await
     .expect("peer-remove sever test timed out");
+}
+
+/// #99: SWAP-BEFORE-SEVER on the UNPAIR path (`revoke_service_access`), which reaches the sever
+/// through the config rebuild rather than #94's targeted swap.
+///
+/// Same invariant, different branch: the new registry must be installed before any connection is
+/// cut, so a peer racing a redial across the sever meets the post-revoke registry. The observer
+/// fires at the top of the sever with the live registry as of that instant.
+#[tokio::test]
+async fn the_unpair_path_swaps_the_registry_before_it_severs() {
+    timeout(Duration::from_secs(60), async {
+        let (mesh, addr, _registry, peers, _dir) = paired_mesh(&["alice"]).await;
+        let alice = &peers[0];
+
+        let conn = dial(&alice.endpoint, addr).await;
+        let mut session = open_session(&conn, "echo").await;
+        assert!(
+            session_served(session.as_mut()).await,
+            "served before revoke"
+        );
+
+        // Record EVERY sever, not just the last: a reversal that severs twice would otherwise
+        // hide the stale first observation behind a fresh second one.
+        let seen: Arc<std::sync::Mutex<Vec<Vec<String>>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let sink = seen.clone();
+        mesh.set_sever_observer(move |live| {
+            sink.lock().expect("observer sink not poisoned").push(
+                live.get("echo")
+                    .map(|e| e.allow.clone())
+                    .unwrap_or_default(),
+            );
+        });
+
+        revoke_service_access(&mesh, "alice")
+            .await
+            .expect("unpair revoke succeeds");
+
+        let observed = seen.lock().expect("observer sink not poisoned").clone();
+        assert!(
+            !observed.is_empty(),
+            "the unpair must have severed, firing the observer"
+        );
+        for at_sever in &observed {
+            assert!(
+                !at_sever.contains(&alice.principal),
+                "the rebuilt registry must be installed BEFORE every sever — at one sever `echo` \
+                 still admitted {at_sever:?}, so the peer that sever cut could have redialled \
+                 straight back in (all observations: {observed:?})"
+            );
+        }
+    })
+    .await
+    .expect("unpair swap-before-sever test timed out");
 }
