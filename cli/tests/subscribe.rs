@@ -328,3 +328,133 @@ async fn dial_failure_emits_error_event() {
     .await
     .expect("dial-failure test timed out");
 }
+
+/// #58: a reachability FLIP is pushed to a live subscriber — no `status` poll needed.
+///
+/// Covers the issue's headline case end to end: a peer that comes UP produces a pushed frame, and
+/// one that goes DOWN produces another. An earlier version of this test only ever drove
+/// `unknown → unreachable`, and review proved it still passed with flip detection deleted
+/// entirely — so it is deliberately built around real transitions in both directions.
+///
+/// The mesh here has auditing ENABLED, so the subscribe loop is running its two-ring `select!`
+/// (audit + reachability) rather than the single-tap path.
+#[tokio::test(flavor = "multi_thread")]
+async fn reachability_flips_are_pushed_to_subscribers() {
+    timeout(Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(&config, "").unwrap();
+
+        // --- The peer we probe: a real node running the daemon accept loop, so it answers the
+        //     trust-gated `mcpmesh/ping/1` probe. ---
+        let peer_ep = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .alpns(vec![ALPN_MCP.to_vec(), mcpmesh_net::ALPN_PING.to_vec()])
+            .bind()
+            .await
+            .expect("bind peer endpoint");
+        let peer_id = *peer_ep.id().as_bytes();
+        let peer_addr = peer_ep.addr();
+
+        // --- Our node. ---
+        let our_ep = local_endpoint().await;
+        let our_id = *our_ep.id().as_bytes();
+        let mem = MemoryLookup::new();
+        mem.add_endpoint_info(peer_addr);
+        let our_ep = our_ep;
+
+        // Each side trusts the other (the ping probe is trust-gated on both ends).
+        let peer_store = Arc::new(PeerStore::open(&dir.path().join("peer.redb")).unwrap());
+        peer_store
+            .add(PeerEntry {
+                endpoint_id: our_id,
+                nickname: "us".into(),
+                services: vec![],
+                paired_at: None,
+                user_id: None,
+                last_addr: None,
+            })
+            .unwrap();
+        let our_store = Arc::new(PeerStore::open(&dir.path().join("our.redb")).unwrap());
+        our_store
+            .add(PeerEntry {
+                endpoint_id: peer_id,
+                nickname: "bob".into(),
+                services: vec![],
+                paired_at: None,
+                user_id: None,
+                last_addr: Some(
+                    serde_json::to_string(&peer_ep.addr()).expect("serialize peer addr"),
+                ),
+            })
+            .unwrap();
+
+        let peer_mesh = assemble_mesh(peer_ep, peer_store, dir.path().join("peer.toml"));
+        std::fs::write(dir.path().join("peer.toml"), "").unwrap();
+        let peer_accept = daemon::spawn_accept_loop(
+            peer_mesh.clone(),
+            Arc::new(build_services_audited(
+                &Config::default(),
+                &AuditSink::disabled(),
+                &MeshLimiters::unlimited(),
+            )),
+        );
+
+        let mesh = assemble_mesh(our_ep, our_store, config);
+        // Auditing ON, so the subscribe loop runs the two-ring select.
+        mesh.set_audit(AuditSink::new(AuditLog::spawn(dir.path().join("audit"))));
+
+        let socket = dir.path().join("s.sock");
+        let listener = mcpmesh::ipc::bind_control_socket(&socket).await.unwrap();
+        let state = Arc::new(DaemonState::with_mesh(STACK_VERSION, mesh.clone()));
+        let _control = tokio::spawn(serve_control(listener, state));
+
+        let mut sub = SubClient::connect(&socket).await;
+        assert_eq!(sub.next().await["type"], "snapshot");
+
+        // --- UP: first probe finds the peer reachable. That IS news (the snapshot reports an
+        //     unprobed peer as offline), so it must be pushed. ---
+        let up = daemon::probe_peer(&mesh, peer_id).await;
+        assert!(up.reachable, "the live peer must probe reachable");
+        let frame = sub.next().await;
+        assert_eq!(frame["type"], "reachability", "got {frame}");
+        assert_eq!(frame["peer"]["reachable"], true, "came online: {frame}");
+        assert_eq!(frame["peer"]["name"], "bob", "got {frame}");
+        // The row carries the peer's authenticated endpoint id, rendered independently of the
+        // implementation's own helper so this pins the VALUE, not just the call.
+        assert_eq!(
+            frame["peer"]["principal"],
+            format!(
+                "eid:{}",
+                peer_id
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            ),
+            "got {frame}"
+        );
+
+        // --- Steady state: a re-probe that re-confirms UP is not a transition. ---
+        let _ = daemon::probe_peer(&mesh, peer_id).await;
+        assert!(
+            timeout(Duration::from_millis(600), sub.reader.next())
+                .await
+                .is_err(),
+            "an unchanged re-probe must push nothing"
+        );
+
+        // --- DOWN: kill the peer, probe again. ---
+        peer_accept.abort();
+        drop(peer_mesh);
+        let down = daemon::probe_peer(&mesh, peer_id).await;
+        assert!(!down.reachable, "the dead peer must probe unreachable");
+        let frame = sub.next().await;
+        assert_eq!(frame["type"], "reachability", "got {frame}");
+        assert_eq!(frame["peer"]["reachable"], false, "went offline: {frame}");
+        assert_eq!(frame["peer"]["name"], "bob", "got {frame}");
+
+        let _ = mem;
+    })
+    .await
+    .expect("reachability flip test timed out");
+}

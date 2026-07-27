@@ -570,6 +570,14 @@ pub fn render_frame(frame: &StreamFrame) -> String {
             active_sessions.len(),
             reachability.len(),
         ),
+        // #58: a liveness transition. Renders the nickname and the new state only — the row also
+        // carries the `eid:` principal for programmatic joins, but the DISPLAY surface stays
+        // endpoint-id-free, exactly as every other frame here.
+        StreamFrame::Reachability { peer } => format!(
+            "[reachability] {} is now {}",
+            peer.name,
+            if peer.reachable { "online" } else { "offline" }
+        ),
         StreamFrame::Event { record } => {
             let peer = record
                 .peer
@@ -601,12 +609,45 @@ pub fn render_frame(frame: &StreamFrame) -> String {
         StreamFrame::Lagged { dropped } => {
             format!("(lagged {dropped} events — reconnect for a fresh snapshot)")
         }
+        // `#[non_exhaustive]`: render an unknown frame kind rather than refusing to compile
+        // against a newer local-api. The daemon and CLI ship in lockstep, so this is defensive.
+        _ => "[unknown frame]".to_string(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use mcpmesh_local_api::{PeerInfo, ServiceInfo};
+
+    /// #58: the pushed liveness frame renders as a legible line naming the peer and the new
+    /// state — and, like every other frame here, shows NO endpoint id even though the row carries
+    /// one for programmatic joins.
+    #[test]
+    fn render_frame_shows_a_reachability_transition() {
+        use mcpmesh_local_api::{PeerReachability, StreamFrame};
+        let frame = |reachable| StreamFrame::Reachability {
+            peer: PeerReachability {
+                name: "bob".into(),
+                reachable,
+                rtt_ms: reachable.then_some(12),
+                age_secs: Some(0),
+                meta: String::new(),
+                principal: Some("eid:beef".into()),
+            },
+        };
+        let up = super::render_frame(&frame(true));
+        assert!(up.contains("bob") && up.contains("online"), "got {up}");
+        let down = super::render_frame(&frame(false));
+        assert!(
+            down.contains("bob") && down.contains("offline"),
+            "got {down}"
+        );
+        assert!(
+            !up.contains("eid:"),
+            "the DISPLAY surface stays endpoint-id-free: {up}"
+        );
+    }
+
     use serde_json::json;
 
     use super::*;

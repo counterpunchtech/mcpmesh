@@ -34,9 +34,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 record.peer.as_deref().unwrap_or("-"),
                 record.service.as_deref().unwrap_or("-"),
             ),
+            // A peer went online or offline (#58). Pushed on TRANSITION only, so this is the
+            // signal to flip a liveness indicator — or to flush whatever you queued for a peer
+            // that was unreachable — without polling `status`.
+            StreamFrame::Reachability { peer } => println!(
+                "reachability: {} is now {}",
+                peer.name,
+                if peer.reachable { "online" } else { "offline" }
+            ),
             // We read too slowly and the daemon skipped `dropped` records for us; a reconnect
             // would deliver a fresh snapshot to resync from.
             StreamFrame::Lagged { dropped } => println!("(lagged: {dropped} events skipped)"),
+            // `StreamFrame` is `#[non_exhaustive]`: a daemon newer than this client may push a
+            // frame kind it has never heard of. Ignore it rather than failing — that is the
+            // documented contract, and it is what makes new frame kinds additive.
+            other => println!("(unrecognized frame: {other:?})"),
         }
     }
     println!("stream closed");

@@ -251,6 +251,19 @@ pub struct MeshState {
     /// authorization input (advisory presence only). std `Mutex` — held only for the tiny
     /// insert/clone, never across an await.
     pub(crate) reachability: std::sync::Mutex<std::collections::HashMap<[u8; 32], ReachEntry>>,
+    /// Live fan-out of reachability TRANSITIONS to `subscribe`rs (#58) — the pushed liveness
+    /// signal that replaces polling `status`.
+    ///
+    /// A SEPARATE ring from the audit broadcast on purpose: the audit sender is the same call that
+    /// appends to the on-disk log, so routing probe results through it would either write them into
+    /// the audit file or split record-from-broadcast. Keeping them apart leaves the audit log's
+    /// schema exactly as it is. Sends are best-effort — no subscribers is the common case and a
+    /// `send` error there is expected, never an error.
+    pub(crate) reach_bcast: tokio::sync::broadcast::Sender<mcpmesh_local_api::PeerReachability>,
+    /// Monotonic probe ticket source (#58 review). Probes of one peer overlap and complete out of
+    /// order; each takes a ticket at START so a slow earlier probe cannot overwrite a fast later
+    /// one — see [`ReachEntry::seq`].
+    pub(crate) probe_seq: std::sync::atomic::AtomicU64,
     /// EPHEMERAL service registrations (#36): in-memory only, never written to config, torn down
     /// when the registering control connection closes. Keyed by service name → its backend spec +
     /// allow list. Overlaid onto the config-built registry on every hot-reload
@@ -268,6 +281,11 @@ pub struct EphemeralService {
     pub backend: mcpmesh_local_api::BackendSpec,
     pub allow: Vec<String>,
 }
+
+/// Ring depth of the reachability transition fan-out (#58). Transitions are rare relative to audit
+/// records — a peer going up or down, not every request — so a shallow ring is ample; a subscriber
+/// that still falls behind gets the same `Lagged` frame the audit ring uses.
+const REACH_BROADCAST_DEPTH: usize = 64;
 
 /// Cap on the [`MeshState::recent_pairings`] ring: enough for a burst of ceremonies (a person
 /// pairing several devices back-to-back) while keeping `status` output and memory tiny.
@@ -332,6 +350,8 @@ impl MeshState {
             self_binding: std::sync::OnceLock::new(),
             recent_pairings: std::sync::Mutex::new(std::collections::VecDeque::new()),
             reachability: std::sync::Mutex::new(std::collections::HashMap::new()),
+            reach_bcast: tokio::sync::broadcast::channel(REACH_BROADCAST_DEPTH).0,
+            probe_seq: std::sync::atomic::AtomicU64::new(0),
             ephemeral_services: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
