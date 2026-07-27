@@ -26,11 +26,20 @@ constructs exactly this state today.
   the names whose `allow` admits the caller. This is strictly simpler than the current
   config-then-overlay merge, and it deletes the `!out.contains(name)` dedup — the registry is
   already keyed by name, with the overlay having won at build time.
-- `service_infos` (the `status` answer) takes the live registry and derives the **set of names and
-  each `allow`** from it. `ServiceEntry` carries only `allow` and an opaque backend, so the
-  `backend` kind and the `ephemeral` flag are still looked up from config / the ephemeral map as
-  **metadata** for a name the registry has already admitted to the list. Overlay wins for a
-  duplicate name, matching `build_services_with_ephemeral`.
+- `service_infos` (the `status` answer) takes the live registry and derives **everything** from it.
+
+### The registry is self-describing (revised after adversarial review)
+
+The first implementation kept `ServiceEntry` as `{backend, allow}` and looked the `backend` kind and
+`ephemeral` flag up from config as metadata, dropping any entry found in neither source. **That was
+a real defect, and the inverse of the one being fixed:** if `[services.x]` was removed from
+`config.toml`, renamed, or made malformed after boot, `status` dropped `x` **while the accept path
+went on serving it** — so a live grant became invisible and unrevokable ("it isn't in status, so
+there is nothing to revoke"), and `status` disagreed with `peer_services` and with the accept path.
+
+`ServiceEntry` therefore carries `kind: ServiceKind` and `ephemeral: bool`, set once at build time.
+`service_infos` consults config for nothing. The failure mode is structurally impossible rather than
+guarded against, and the `status` path no longer clones the ephemeral map on every call.
 
 ### `mint_invite` deliberately keeps the config view
 

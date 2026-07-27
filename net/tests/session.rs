@@ -76,6 +76,8 @@ fn service_with_allow(name: &str, allow: Vec<String>) -> mcpmesh_net::Services {
         ServiceEntry {
             backend: Arc::new(EchoBackend) as Arc<dyn SessionBackend>,
             allow,
+            kind: mcpmesh_net::ServiceKind::Run,
+            ephemeral: false,
         },
     );
     mcpmesh_net::Services::new(services)

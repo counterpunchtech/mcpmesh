@@ -789,17 +789,14 @@ pub(crate) fn status_result(state: &DaemonState) -> Result<StatusResult> {
             // current). A pure-pairing daemon (no mesh, or an empty roster gate) yields None → no
             // roster block.
             let roster = crate::daemon::roster_status(mesh, Some(&cfg));
-            let ephemeral = mesh
-                .ephemeral_services
-                .lock()
-                .expect("ephemeral_services lock not poisoned")
-                .clone();
+            // #100: `status` no longer needs the ephemeral map — the live registry carries the
+            // `ephemeral` flag per entry, so this whole-map clone on every status call is gone.
             {
                 // One store read serves both the peer list and the allow-display
                 // annotation (fails open on corrupt rows, like `peer_infos`).
                 let entries = mesh.store.list().unwrap_or_default();
                 (
-                    crate::daemon::service_infos(&mesh.live_services(), &cfg, &ephemeral, &entries),
+                    crate::daemon::service_infos(&mesh.live_services(), &entries),
                     crate::daemon::peer_infos(&mesh.store),
                     roster,
                 )

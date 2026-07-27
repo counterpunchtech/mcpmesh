@@ -69,14 +69,8 @@ pub(crate) use reach::caller_admitted_services;
 pub fn service_infos_for_test(
     mesh: &std::sync::Arc<MeshState>,
 ) -> Vec<mcpmesh_local_api::ServiceInfo> {
-    let cfg = crate::config::Config::load(&mesh.config_path).expect("config loads");
-    let ephemeral = mesh
-        .ephemeral_services
-        .lock()
-        .expect("ephemeral_services lock not poisoned")
-        .clone();
     let peers = mesh.store.list().unwrap_or_default();
-    service_infos(&mesh.live_services(), &cfg, &ephemeral, &peers)
+    service_infos(&mesh.live_services(), &peers)
 }
 
 /// Mint an invite (#100 test seam) — pins that `mint_invite` keeps the KNOWN-names view.
@@ -870,6 +864,11 @@ pub fn build_services_with_ephemeral(
             ServiceEntry {
                 backend,
                 allow: svc.allow.clone(),
+                kind: match svc.backend_result() {
+                    Ok(Backend::Socket(_)) => mcpmesh_net::ServiceKind::Socket,
+                    _ => mcpmesh_net::ServiceKind::Run,
+                },
+                ephemeral: false,
             },
         );
     }
@@ -889,6 +888,13 @@ pub fn build_services_with_ephemeral(
             ServiceEntry {
                 backend,
                 allow: eph.allow.clone(),
+                kind: match &eph.backend {
+                    mcpmesh_local_api::BackendSpec::Socket { .. } => {
+                        mcpmesh_net::ServiceKind::Socket
+                    }
+                    mcpmesh_local_api::BackendSpec::Run { .. } => mcpmesh_net::ServiceKind::Run,
+                },
+                ephemeral: true,
             },
         );
     }
@@ -1028,7 +1034,7 @@ pub(crate) mod testutil {
         let endpoint = build_endpoint(iroh::SecretKey::from_bytes(&[7u8; 32]), &hermetic, false)
             .await
             .unwrap();
-        MeshState::new(
+        let mesh = MeshState::new(
             endpoint,
             gate,
             store,
@@ -1041,7 +1047,27 @@ pub(crate) mod testutil {
             None,
             None,
             None,
-        )
+        );
+        // Model a BOOTED daemon: `MeshState::new` installs an EMPTY registry, and boot then swaps
+        // in the built services before the control socket exists. #100 made that load-bearing —
+        // `status` and `peer_services` now answer from the registry, so a harness that left it
+        // empty was asserting against a state no live daemon is ever observable in.
+        let cfg = crate::config::Config::load(&mesh.config_path).unwrap_or_default();
+        let ephemeral = mesh
+            .ephemeral_services
+            .lock()
+            .expect("ephemeral_services lock not poisoned")
+            .clone();
+        crate::daemon::accept::swap_services(
+            &mesh,
+            crate::daemon::build_services_with_ephemeral(
+                &cfg,
+                &mesh.audit(),
+                &mesh.limits(),
+                &ephemeral,
+            ),
+        );
+        mesh
     }
 }
 

@@ -558,6 +558,13 @@ async fn peer_services_does_not_report_a_config_service_pending_a_reload() {
             admitted.contains(&"room".to_string()),
             "the live ephemeral service must still be reported (got {admitted:?})"
         );
+        // Positive control on the CONFIG path: without this, an implementation that answered only
+        // from the ephemeral map would still pass. `kept` is a config service in the live registry
+        // whose allow admits this caller.
+        assert!(
+            admitted.contains(&"kept".to_string()),
+            "a LIVE config service that admits the caller must still be reported (got {admitted:?})"
+        );
         assert!(
             !admitted.contains(&"late".to_string()),
             "a config service that is not in the live registry must NOT be reported as usable — \
@@ -624,7 +631,114 @@ async fn status_hides_a_pending_service_but_an_invite_can_still_name_it() {
                 "mint_invite must accept a config service pending a reload — an invite is \
                  redeemed later, after reloads",
             );
+        // ...and still REJECT a name in neither source. Without this, dropping the existence
+        // check entirely (or returning a superset) would pass the positive case above.
+        mcpmesh::daemon::mint_invite_for_test(&mesh, &["nope".to_string()])
+            .await
+            .expect_err(
+                "mint_invite must still reject a service in neither config nor the overlay",
+            );
     })
     .await
     .expect("status live-registry test timed out");
+}
+
+/// #100 metadata, the two cases the first round of tests missed.
+///
+/// 1. **Overlay precedence.** A name held by BOTH config and an ephemeral registration must report
+///    `ephemeral: true` — the live entry IS the overlay's (`build_services_with_ephemeral` inserts
+///    it last). With no both-held name in the fixture, inverting the precedence went undetected.
+/// 2. **`BackendKind::Socket`.** Every earlier fixture used a `run` backend, so the socket arm had
+///    zero coverage and could have returned `Run` unnoticed.
+#[tokio::test]
+async fn status_metadata_honours_overlay_precedence_and_the_socket_backend() {
+    timeout(Duration::from_secs(90), async {
+        let (mesh, _addr, _peer, principal, dir) = mesh_with_ephemeral_room().await;
+
+        // `room` exists in config too — with a DIFFERENT backend shape, so a precedence inversion
+        // shows up in `backend` as well as in the `ephemeral` flag.
+        std::fs::write(
+            dir.path().join("config.toml"),
+            format!(
+                "[services.kept]\nrun = ['{STUB}']\nallow = [\"{principal}\"]\n\
+                 [services.room]\nsocket = \"/run/room.sock\"\nallow = [\"{principal}\"]\n\
+                 [services.sock]\nsocket = \"/run/s.sock\"\nallow = [\"{principal}\"]\n"
+            ),
+        )
+        .unwrap();
+        // A config-changing grant forces the real rebuild, so the registry sees all three.
+        grant_service_allow(&mesh, "sock".to_string(), "b64u:carol".to_string())
+            .await
+            .expect("grant on the socket service");
+
+        let listed = mcpmesh::daemon::service_infos_for_test(&mesh);
+        let room = listed.iter().find(|s| s.name == "room").expect("room");
+        assert!(
+            room.ephemeral,
+            "a name held by BOTH sources must report the OVERLAY's entry — the overlay is what the \
+             accept path serves"
+        );
+        assert_eq!(
+            room.backend,
+            mcpmesh_local_api::BackendKind::Run,
+            "and the overlay's BACKEND SHAPE too — config declares this name as a socket, the \
+             ephemeral registration as run, and the registry holds the latter"
+        );
+
+        let sock = listed.iter().find(|s| s.name == "sock").expect("sock");
+        assert_eq!(
+            sock.backend,
+            mcpmesh_local_api::BackendKind::Socket,
+            "a socket-backed config service must report Socket, not Run"
+        );
+        assert!(!sock.ephemeral, "a config service is not ephemeral");
+    })
+    .await
+    .expect("status metadata test timed out");
+}
+
+/// #100 withholds only what is genuinely not live: after a REAL reload the previously-pending
+/// config service IS reported. Without this, an implementation that simply never reported config
+/// services would pass every other test here.
+#[tokio::test]
+async fn a_pending_config_service_is_reported_once_it_is_actually_live() {
+    timeout(Duration::from_secs(90), async {
+        let (mesh, _addr, _peer, principal, dir) = mesh_with_ephemeral_room().await;
+        grant_service_allow(&mesh, "room".to_string(), principal.clone())
+            .await
+            .expect("first grant");
+
+        std::fs::write(
+            dir.path().join("config.toml"),
+            format!(
+                "[services.kept]\nrun = ['{STUB}']\nallow = [\"{principal}\"]\n\
+                 [services.late]\nrun = ['{STUB}']\nallow = [\"{principal}\"]\n"
+            ),
+        )
+        .unwrap();
+        // Overlay-only grant: no reload, so `late` is still not live.
+        grant_service_allow(&mesh, "room".to_string(), "b64u:carol".to_string())
+            .await
+            .expect("overlay-only grant");
+        let before = mcpmesh::daemon::service_infos_for_test(&mesh);
+        assert!(
+            !before.iter().any(|s| s.name == "late"),
+            "not live yet, so not reported"
+        );
+
+        // A CONFIG-changing grant takes the rebuild path, making `late` genuinely live.
+        grant_service_allow(&mesh, "late".to_string(), "b64u:dave".to_string())
+            .await
+            .expect("config grant reloads");
+
+        let after = mcpmesh::daemon::service_infos_for_test(&mesh);
+        assert!(
+            after.iter().any(|s| s.name == "late"),
+            "once the registry actually holds it, it MUST be reported — #100 withholds only what \
+             is not live, it does not stop reporting config services (got {:?})",
+            after.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    })
+    .await
+    .expect("pending-then-live test timed out");
 }

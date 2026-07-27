@@ -107,6 +107,22 @@ pub trait SessionBackend: Send + Sync + 'static {
 pub struct ServiceEntry {
     pub backend: Arc<dyn SessionBackend>,
     pub allow: Vec<String>,
+    /// Which backend shape answers this service. Carried HERE rather than looked up from
+    /// `config.toml` at report time (#100): the registry is the authority on what is being
+    /// served, and a config file that has since been edited, had the entry removed, or been made
+    /// malformed must not be able to hide a service the accept path is still admitting peers to.
+    pub kind: ServiceKind,
+    /// True if this entry came from an ephemeral registration (#36) rather than config — in-memory
+    /// only, tied to the registering control connection, gone on restart.
+    pub ephemeral: bool,
+}
+
+/// The backend shape of a [`ServiceEntry`] — kind only, never the command or socket path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ServiceKind {
+    Run,
+    Socket,
 }
 
 /// The service registry, keyed by distinct service name. Each [`ServiceEntry`]
@@ -160,6 +176,8 @@ impl Services {
                         ServiceEntry {
                             backend: Arc::clone(&entry.backend),
                             allow,
+                            kind: entry.kind,
+                            ephemeral: entry.ephemeral,
                         },
                     )
                 })
@@ -521,6 +539,8 @@ mod tests {
                         ServiceEntry {
                             backend: Arc::new(InertBackend),
                             allow: allow.iter().map(|a| (*a).to_string()).collect(),
+                            kind: ServiceKind::Run,
+                            ephemeral: false,
                         },
                     )
                 })

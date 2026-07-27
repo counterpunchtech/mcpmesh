@@ -8,7 +8,7 @@ use mcpmesh_local_api::{BackendKind, PeerInfo, PresencePeer, RosterStatus, Servi
 use mcpmesh_trust::roster::validate::RosterState;
 
 use crate::allowlist::PeerStore;
-use crate::config::{Backend, Config};
+use crate::config::Config;
 use crate::pairing;
 use crate::util::epoch_now_i64;
 
@@ -155,8 +155,6 @@ fn display_principal(principal: &str, peers: &[crate::allowlist::PeerEntry]) -> 
 
 pub(crate) fn service_infos(
     live: &mcpmesh_net::Services,
-    cfg: &Config,
-    ephemeral: &std::collections::HashMap<String, crate::daemon::EphemeralService>,
     peers: &[crate::allowlist::PeerEntry],
 ) -> Vec<ServiceInfo> {
     // #100: the LIVE registry decides which services exist and what each admits — it is what the
@@ -169,34 +167,19 @@ pub(crate) fn service_infos(
     // matching `build_services_with_ephemeral`.
     let mut out: Vec<ServiceInfo> = live
         .iter()
-        .filter_map(|(name, entry)| {
-            let (backend, is_ephemeral) = match ephemeral.get(name) {
-                Some(eph) => (
-                    match &eph.backend {
-                        mcpmesh_local_api::BackendSpec::Run { .. } => BackendKind::Run,
-                        mcpmesh_local_api::BackendSpec::Socket { .. } => BackendKind::Socket,
-                    },
-                    true,
-                ),
-                None => match cfg.services.get(name).map(|svc| svc.backend_result()) {
-                    Some(Ok(Backend::Run(_))) => (BackendKind::Run, false),
-                    Some(Ok(Backend::Socket(_))) => (BackendKind::Socket, false),
-                    // In the registry but in neither source: it was built from a config that has
-                    // since changed on disk. Report nothing rather than guess a backend kind.
-                    _ => return None,
-                },
-            };
-            Some(ServiceInfo {
-                name: name.clone(),
-                allow: entry.allow.clone(),
-                allow_display: entry
-                    .allow
-                    .iter()
-                    .map(|p| display_principal(p, peers))
-                    .collect(),
-                backend,
-                ephemeral: is_ephemeral,
-            })
+        .map(|(name, entry)| ServiceInfo {
+            name: name.clone(),
+            allow: entry.allow.clone(),
+            allow_display: entry
+                .allow
+                .iter()
+                .map(|p| display_principal(p, peers))
+                .collect(),
+            backend: match entry.kind {
+                mcpmesh_net::ServiceKind::Socket => BackendKind::Socket,
+                _ => BackendKind::Run,
+            },
+            ephemeral: entry.ephemeral,
         })
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -252,15 +235,19 @@ pub(crate) fn peer_infos(store: &PeerStore) -> Vec<PeerInfo> {
 #[cfg(test)]
 mod tests {
     use crate::allowlist::PeerEntry;
-    use crate::daemon::config_write::append_allow_to_config;
     use crate::daemon::testutil::hermetic_mesh;
 
     /// `status` reflects the LIVE config + store on every call. A pairing grant
     /// (grant_service_access → allow-append) and a rendezvous PeerEntry write land durably
     /// WITHOUT touching `DaemonState`; `status` must still show the just-granted allow + the
     /// just-paired peer (the Jetson-proof "status says `allowed: no one yet` right after
-    /// pairing" confusion). Models the flows faithfully by mutating the config + store directly
-    /// (exactly what grant + rendezvous do to the durable state).
+    /// pairing" confusion).
+    ///
+    /// Drives the REAL `grant_service_access` rather than hand-writing the config. It used to do
+    /// the latter and claim it was "exactly what grant does" — it was not: the real verb writes
+    /// config AND reloads the live registry. #100 made that gap visible, because `status` now
+    /// answers from the registry, so a bare config append no longer shows up (correctly — that is
+    /// the state the accept path would refuse).
     #[tokio::test(flavor = "multi_thread")]
     async fn status_reads_the_live_config_and_store() {
         let dir = tempfile::tempdir().unwrap();
@@ -275,13 +262,9 @@ mod tests {
 
         // Durable mutations exactly as grant + rendezvous perform them: append the grant to the
         // config, and write the peer's PeerEntry straight to the store.
-        append_allow_to_config(
-            &config_path,
-            "alice",
-            &["kb".to_string()],
-            &std::collections::HashSet::new(),
-        )
-        .unwrap();
+        crate::daemon::grant_service_access(&mesh, "alice", "alice", &["kb".to_string()])
+            .await
+            .unwrap();
         mesh.store
             .add(PeerEntry {
                 endpoint_id: [9u8; 32],
