@@ -373,7 +373,7 @@ Crash/exit of a backend mid-session → the QUIC stream is closed; the caller's 
 
 Most generic servers neither know nor care who is calling — they get nothing. Backends that opt in receive the resolved identity:
 
-- **`run` backends:** env vars on the spawned child — `MCPMESH_PEER_NAME`, `MCPMESH_PEER_USER` (roster mode), `MCPMESH_PEER_GROUPS` (comma-separated). Zero-code-change friendly.
+- **`run` backends:** env vars on the spawned child — `MCPMESH_PEER_EID` (the stable `eid:` device principal, ALWAYS present for a resolved caller — key per-caller state on this, #60), `MCPMESH_PEER_NAME` (display only), `MCPMESH_PEER_USER` (roster mode / a bound pairing peer), `MCPMESH_PEER_GROUPS` (comma-separated). Zero-code-change friendly.
 - **`socket` backends:** the daemon injects `_meta["mcpmesh/peer"] = { "name", "user_id"?, "groups" }` into the `initialize` request it forwards. The local UDS hop is trusted; the backend treats this as authoritative.
 
 **Reserved namespace (normative):** `_meta` keys under `mcpmesh/*` are platform-reserved on the wire. The serving daemon MUST delete all caller-supplied `mcpmesh/*` keys from the inbound `initialize` before acting on it, MUST strip `mcpmesh/service` before forwarding `initialize` to any backend (run or socket), and for opted-in socket backends MUST then set `mcpmesh/peer` itself — a backend only ever sees a daemon-authored value or nothing. This is the single enumerated exception to verbatim pass-through (D6), asserted as exactly-this-and-nothing-else by the transparency suite (§17). Same-uid local processes are inside the trust boundary per P12/P14.

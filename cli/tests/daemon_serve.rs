@@ -125,6 +125,17 @@ async fn daemon_serves_run_service_and_injects_caller_identity_over_the_mesh() {
             call_res["result"]["peer_name"], "tester",
             "the child's MCPMESH_PEER_NAME carried the gate-resolved nickname across the mesh"
         );
+        // #60: and the STABLE device principal, which is what a `run` server must key per-caller
+        // scoping on. It is UNCONDITIONAL — this caller presented no device->user binding, so
+        // `peer_user` is empty and the nickname was previously the ONLY identifier the child had.
+        assert_eq!(
+            call_res["result"]["peer_eid"], client_eid,
+            "the child's MCPMESH_PEER_EID carried the authenticated endpoint principal"
+        );
+        assert_eq!(
+            call_res["result"]["peer_user"], "",
+            "setup: an unbound pairing caller — exactly the case that had no stable principal"
+        );
     })
     .await
     .expect("daemon serve integration test timed out");

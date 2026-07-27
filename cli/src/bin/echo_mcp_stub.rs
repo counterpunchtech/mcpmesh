@@ -6,7 +6,8 @@
 //! stripped `initialize` line, then relays the reply). `tools/call` draws a result
 //! echoing `params.arguments.text` AND the injected identity env — `MCPMESH_PEER_NAME`
 //! (`peer_name`), `MCPMESH_PEER_USER` (`peer_user`, roster mode only) and
-//! `MCPMESH_PEER_GROUPS` (`peer_groups`, comma-joined) — so the tests prove the full
+//! `MCPMESH_PEER_GROUPS` (`peer_groups`, comma-joined) and `MCPMESH_PEER_EID` (`peer_eid`,
+//! the stable device principal, #60) — so the tests prove the full
 //! identity env injection (roster user_id + groups, not just the nickname). It loops until
 //! stdin EOF.
 //!
@@ -61,11 +62,17 @@ fn main() {
             let peer = std::env::var("MCPMESH_PEER_NAME").unwrap_or_default();
             let user = std::env::var("MCPMESH_PEER_USER").unwrap_or_default();
             let groups = std::env::var("MCPMESH_PEER_GROUPS").unwrap_or_default();
+            // #60: the STABLE device principal, always present for a resolved caller.
+            let eid = std::env::var("MCPMESH_PEER_EID").unwrap_or_default();
             // #51 test hook: echo a non-MCPMESH env var so a test can prove per-service `env`
             // reaches the child. Named without the MCPMESH_ prefix (which the spawner strips).
             let test_env = std::env::var("SPAWN_TEST_ENV").unwrap_or_default();
+            // #60 test hook: `MCPMESH_HOME` is an MCPMESH_* var the identity injector NEVER sets,
+            // so it is the one the per-service env strip alone protects. Echoed so a test can
+            // prove the strip works, rather than proving injection-overwrite by accident.
+            let mesh_home = std::env::var("MCPMESH_HOME").unwrap_or_default();
             format!(
-                "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{text}\"}}],\"peer_name\":\"{peer}\",\"peer_user\":\"{user}\",\"peer_groups\":\"{groups}\",\"test_env\":\"{test_env}\"}}}}"
+                "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{text}\"}}],\"peer_name\":\"{peer}\",\"peer_user\":\"{user}\",\"peer_groups\":\"{groups}\",\"peer_eid\":\"{eid}\",\"test_env\":\"{test_env}\",\"mesh_home\":\"{mesh_home}\"}}}}"
             )
         } else {
             continue;

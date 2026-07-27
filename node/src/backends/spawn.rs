@@ -10,10 +10,14 @@
 //! re-serializes through `serde_json::Value` (keys re-sorted, no arbitrary_precision),
 //! the shared property with the mesh transport — see [`super`].
 //!
-//! Identity reaches a `run` child as ENV, not `_meta`: `MCPMESH_PEER_NAME`
-//! (always, when resolved), `MCPMESH_PEER_USER` (the self-sovereign user_id — set
-//! in roster mode, and in pairing mode once a device->user binding is verified),
-//! and `MCPMESH_PEER_GROUPS` (comma-joined). It arrives PER-CALLER through `run`
+//! Identity reaches a `run` child as ENV, not `_meta`: `MCPMESH_PEER_EID` (the STABLE `eid:<hex>`
+//! device principal — ALWAYS present for a resolved caller, #60), `MCPMESH_PEER_NAME` (the display
+//! nickname), `MCPMESH_PEER_USER` (the self-sovereign user_id — set in roster mode, and in pairing
+//! mode once a device->user binding is verified), and `MCPMESH_PEER_GROUPS` (comma-joined).
+//!
+//! Scope per caller on `MCPMESH_PEER_EID` (or `MCPMESH_PEER_USER` when you want person-level rather
+//! than device-level), NEVER on `MCPMESH_PEER_NAME`: a nickname collides and changes under a rename,
+//! which is the whole argument of #38/#41. It arrives PER-CALLER through `run`
 //! (`Option<PeerIdentity>`), not as a construction field: `serve` builds each
 //! backend once per service and reuses it across all callers, so the injected
 //! identity cannot be baked in. `select_service` already stripped the
@@ -130,7 +134,16 @@ impl SpawnBackend {
         // caller (which the injection below would otherwise leave untouched). Identity is then
         // injected AUTHORITATIVELY: all three vars are set for a resolved caller, and REMOVED
         // when there is no identity — a service can supply none of them by any path.
-        command.envs(self.env.iter().filter(|(k, _)| !k.starts_with("MCPMESH_")));
+        // Case-INSENSITIVE: Windows environment keys compare case-insensitively (std's `EnvKey`
+        // uses `CompareStringOrdinal(bIgnoreCase)`), so an exact-case filter would let
+        // `Mcpmesh_Home` through to arrive as `MCPMESH_HOME`. The identity vars below are immune
+        // either way (the authoritative `env`/`env_remove` wins on the same case-folded key), but
+        // `MCPMESH_HOME` — which sandboxes ALL daemon state — is protected by this filter ALONE.
+        command.envs(
+            self.env
+                .iter()
+                .filter(|(k, _)| !k.to_ascii_uppercase().starts_with("MCPMESH_")),
+        );
         if let Some(cwd) = &self.cwd {
             command.current_dir(cwd);
         }
@@ -142,11 +155,22 @@ impl SpawnBackend {
                     None => command.env_remove("MCPMESH_PEER_USER"),
                 };
                 command.env("MCPMESH_PEER_GROUPS", id.groups.join(","));
+                // #60: the caller's STABLE device principal, `eid:<hex>` — the authenticated
+                // endpoint id. UNCONDITIONAL, unlike `MCPMESH_PEER_USER`: it is the one identifier
+                // that is always present and can never collide or change under a rename.
+                //
+                // Without it a `run` server had only the display nickname for an unbound pairing
+                // peer, so any per-caller scoping (a filesystem server rooted per person, per-caller
+                // state) was keyed on exactly what #38/#41 say must never authorize. The socket
+                // backend already carries the full principal set in `_meta["mcpmesh/peer"]`; this
+                // closes the same hole for `run`.
+                command.env("MCPMESH_PEER_EID", id.endpoint.principal());
             }
             None => {
                 command.env_remove("MCPMESH_PEER_NAME");
                 command.env_remove("MCPMESH_PEER_USER");
                 command.env_remove("MCPMESH_PEER_GROUPS");
+                command.env_remove("MCPMESH_PEER_EID");
             }
         }
 

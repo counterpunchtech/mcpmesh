@@ -980,7 +980,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   new methods, or a strictness change like params validation — bumped in the same change that
 ///   makes it. A client can guard with `api_minor >= N` for a feature it needs, or refuse a daemon
 ///   older than a minor it requires. It never resets except on a MAJOR bump.
-pub const API_VERSION: &str = "1.13";
+pub const API_VERSION: &str = "1.14";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -1000,8 +1000,11 @@ pub const API_VERSION: &str = "1.13";
 /// about an unknown service name — a name in neither the config nor the ephemeral registry now
 /// answers [`ERR_NO_SUCH_SERVICE`] instead of a silent `{}` (#55, #69); to 12 with the pushed
 /// [`StreamFrame::Reachability`] liveness transition frame (#58); to 13 with
-/// [`PeerReachability::path`] — direct-vs-relay attribution on every reachability row (#64).
-pub const API_MINOR: u32 = 13;
+/// [`PeerReachability::path`] — direct-vs-relay attribution on every reachability row (#64); to 14
+/// with the `run`-backend `MCPMESH_PEER_EID` identity var — the caller's stable device principal,
+/// unconditionally present, so a `run` server can scope per caller without keying on a nickname
+/// (#60).
+pub const API_MINOR: u32 = 14;
 
 #[cfg(test)]
 mod tests {
