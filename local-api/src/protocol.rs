@@ -914,7 +914,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   new methods, or a strictness change like params validation — bumped in the same change that
 ///   makes it. A client can guard with `api_minor >= N` for a feature it needs, or refuse a daemon
 ///   older than a minor it requires. It never resets except on a MAJOR bump.
-pub const API_VERSION: &str = "1.9";
+pub const API_VERSION: &str = "1.10";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -924,8 +924,13 @@ pub const API_VERSION: &str = "1.9";
 /// to 7 with `PeerReachability.principal` — the same on reachability rows (#42); to 8 with the
 /// `service_allow_grant`/`service_allow_revoke` per-peer access verbs (#44); to 9 covering the
 /// `unregister_service` (#50) / `peer_services` (#52) / Run `env`+`cwd` (#51) surface that shipped
-/// in 0.10.1 without a bump, PLUS the `set_relays` live relay-set verb (#53).
-pub const API_MINOR: u32 = 9;
+/// in 0.10.1 without a bump, PLUS the `set_relays` live relay-set verb (#53); to 10 when
+/// `service_allow_revoke`/`peer_remove` became IMMEDIATE — no verb shape changed, but their
+/// observable contract did: a revoked principal's next session is refused even on a connection it
+/// already holds, and its live connections are severed. Previously both waited for the peer to
+/// disconnect on its own, which is unbounded (#54). A consumer can guard on
+/// `api_minor >= 10` before telling a user that revocation has taken effect.
+pub const API_MINOR: u32 = 10;
 
 #[cfg(test)]
 mod tests {

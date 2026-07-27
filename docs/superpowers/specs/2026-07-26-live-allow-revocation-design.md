@@ -56,17 +56,33 @@ Principal → endpoint resolution (`node/src/daemon/sever.rs`, new):
 
 | Principal form | Resolution |
 |---|---|
-| `eid:<b32>` | decode directly to one `EndpointId` |
-| `b64u:<…>` / bare | every `PeerStore` entry whose `user_id` matches, plus the roster view's devices for that user |
+| `eid:<hexlower>` | the stored/roster device whose rendered principal matches (rendered, not parsed — `EndpointId::principal()` is HEXLOWER) |
+| `b64u:<…>` | every `PeerStore` entry whose `user_id` matches |
+| bare (roster vocabulary) | every roster-view device whose `user_id` OR whose GROUP list matches |
+
+An unrecognized principal resolves to the empty set and severs nothing — failing to "sever
+nothing" is the safe direction, since over-severing cuts peers the operator never revoked.
 
 Call sites:
-- `service_allow_revoke(service, principal)` — sever the principal's endpoints.
+- `service_allow_revoke(service, principal)` — sever the principal's endpoints, but **only when the
+  strip actually changed the config**. A strip that removed nothing means this principal was not in
+  that allow; severing anyway would show the operator a disconnect that looks like the revoke
+  landed while access is unchanged (e.g. `allow = ["b64u:alice"]` and a caller revoking alice's
+  `eid:` — she is still admitted via the user_id and is served again the moment she redials). A
+  false "revocation took effect" signal is worse here than a missed sever.
 - `revoke_service_access(nickname)` (the authorization half of `peer_remove`) — it already resolves
-  the target devices; sever those endpoints.
+  the target devices; sever those endpoints, **unconditionally**. `remove_peer` deletes the
+  `PeerEntry` immediately after, so the peer loses gate resolve entirely and cannot be re-admitted —
+  there is no false-signal risk, and the unpair genuinely took effect.
 
 **Ordering: swap-before-sever**, mirroring `roster_install.rs:60-67`. Swap `Services` first so no
-new session admits the peer, then sever. A connection check-registering across the swap is caught
-by the registry's lock-serialized recheck.
+new session admits the peer, then sever.
+
+Note what does *not* protect this path: the registry's check-register recheck runs
+`gate.should_sever_now`, which is structurally `false` for a pairing-only peer — that is H2's own
+premise. So a connection registering across the swap is NOT caught by that recheck. It is safe for
+a different reason: because the swap lands first, any connection that registers afterwards resolves
+its sessions against the already-updated registry.
 
 **Granularity — connection, not session (accepted trade-off).** `sever_matching` closes the whole
 QUIC connection, so revoking one service also drops that peer's in-flight sessions to services it
@@ -90,8 +106,13 @@ over-reach into roster semantics. Pairing-mode severing is driven by the explici
 
 1. **Unit** — `LiveServices` get/store returns the stored registry; store is visible to a prior
    `get()`-holder only on its next `get()`.
-2. **Integration, H1** — peer connects, completes a session, `service_allow_revoke`, then opens a
-   **new** bi-stream on the **same** connection → refused. Fails before Part A.
+2. **Integration, Part A in ISOLATION** — peer connects; a service that admits nobody refuses its
+   session; the peer is then GRANTED that service; a **new** bi-stream on the **same** connection is
+   served, with the connection still up. Built on the grant path deliberately: a grant never severs,
+   so this can only pass if the connection re-read the registry. Fails with Part A reverted alone.
+   (The revoke-side "new session refused" test is a contract test, not a Part-A regression test —
+   the sever also closes the connection, so it passes with either half present. Adversarial review
+   caught that the original version of this plan had NO isolating coverage of Part A.)
 3. **Integration, H2** — peer connected with a live session; revoke → connection closed. Fails
    before Part B.
 4. **Regression** — revoking principal X does **not** sever an unrelated connected principal Y.
@@ -102,6 +123,14 @@ over-reach into roster semantics. Pairing-mode severing is driven by the explici
 
 ## Out of scope
 
-Per-session (rather than per-connection) revocation granularity. The blob/gossip ALPN arms — they
-carry their own gates and are untouched. #55 (ephemeral-service grant silently no-ops) is a
-separate issue.
+Per-session (rather than per-connection) revocation granularity.
+
+Two consequences are accepted rather than fixed, and are documented in `local-protocol.md` instead:
+
+- **The sever is not ALPN-scoped.** `ConnRegistry` tracks gossip and blob connections under the same
+  endpoint id with no protocol discriminator, so a revoke closes those too. Availability only —
+  each of those arms keeps its own gate — and the peer reconnects. Scoping it would mean threading
+  an ALPN through the registry, which is a larger change than this fix warrants.
+- **Ephemeral services cannot be revoked by this verb**, because their `allow` is in-memory and the
+  strip edits `config.toml`. The `changed` gate means this is now an honest no-op (no sever, no
+  false signal) rather than a silent contradiction. The mirror of #55; worth its own issue.

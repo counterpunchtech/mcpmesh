@@ -68,7 +68,7 @@ fn gate_and_register(
 /// The loop is started ONCE (`serve_forever`) and then runs for the process lifetime. A
 /// hot-reload no longer restarts it: `swap_services` (shared by `register_service` and the pairing
 /// `grant_service_access`) swaps `mesh.services` in place, which the loop and every connection it
-/// has already accepted read live ().
+/// has already accepted read live (#54).
 ///
 /// Takes `Arc<MeshState>` (not the individual parts): the arms read the gate/limits/handles off
 /// it, and the `mcpmesh/pair/1` branch hands the rendezvous the narrow per-connection
@@ -81,7 +81,7 @@ fn gate_and_register(
 pub fn spawn_accept_loop(mesh: Arc<MeshState>, services: Arc<Services>) -> JoinHandle<()> {
     // INSTALL `services` as the live handle, then serve from that handle forever. The loop
     // captures only `mesh`: a reload swaps `mesh.services` IN PLACE, so connections this loop has
-    // already accepted resolve their next session against the new registry (). The old
+    // already accepted resolve their next session against the new registry (#54). The old
     // shape captured an `Arc<Services>` here, which is why aborting + respawning the loop could
     // never reach an open connection.
     mesh.services.store(services);
@@ -270,7 +270,7 @@ pub fn spawn_accept_loop(mesh: Arc<MeshState>, services: Arc<Services>) -> JoinH
 
 /// Hot-swap the live service registry every accepted connection reads.
 ///
-/// Replaces the former abort-and-respawn of the accept loop (): the loop reads
+/// Replaces the former abort-and-respawn of the accept loop (#54): the loop reads
 /// `mesh.services` per connection and `run_mesh_connection` reads it per session, so a swap
 /// reaches connections that are ALREADY open — which respawning could not, because the
 /// per-connection tasks are independent `tokio::spawn`s that aborting the loop never touched.

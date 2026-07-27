@@ -137,7 +137,7 @@ impl Services {
 /// a roster install) is visible to the very next session on an ALREADY-OPEN connection. The
 /// previous design handed each connection an `Arc<Services>` captured when the accept loop was
 /// spawned, so a revoked peer kept opening admitted sessions for the whole lifetime of its
-/// connection — the verb reported success and did nothing ().
+/// connection — the verb reported success and did nothing (#54).
 ///
 /// In-flight sessions deliberately keep the snapshot they were admitted under: a session's service
 /// resolution is fixed at admit. Cutting those is the revoke path's
@@ -272,7 +272,7 @@ pub async fn run_mesh_connection(
     // 2. Sessions: one bi-stream each; a connection may carry several.
     //    `accept_bi()` yields `(send, recv)`.
     while let Ok((send, recv)) = conn.accept_bi().await {
-        // Read the LIVE registry PER SESSION (): a revoke landing between two sessions on
+        // Read the LIVE registry PER SESSION (#54): a revoke landing between two sessions on
         // this same connection is honored by the second one. Before this, each connection carried
         // an `Arc<Services>` captured when the accept loop was spawned, so a revoked peer kept
         // opening admitted sessions until it happened to disconnect.
@@ -458,7 +458,7 @@ mod tests {
     use super::*;
     use crate::framing::{FrameReader, Inbound};
 
-    /// : a swap is visible to the NEXT read, while a handle already taken keeps the
+    /// #54: a swap is visible to the NEXT read, while a handle already taken keeps the
     /// snapshot it was given — the exact split the accept path relies on (next session honors a
     /// revoke; the in-flight session it was admitted under is not rewritten under it).
     #[test]
