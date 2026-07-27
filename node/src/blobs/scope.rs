@@ -61,6 +61,45 @@ impl BlobScopes {
         changed
     }
 
+    /// Remove `principals` from ONE scope's grant set (#62, the `blob_revoke` verb). Returns
+    /// whether anything changed.
+    ///
+    /// Deliberately NOT [`revoke_principals`](Self::revoke_principals), which strips from EVERY
+    /// scope: that is unpair hygiene, and using it for a per-scope revoke would silently withdraw
+    /// access the caller never asked to touch. An absent scope is a clean `false`.
+    pub fn revoke_from_scope(&mut self, scope: &str, principals: &[String]) -> bool {
+        let Some(sc) = self.scopes.get_mut(scope) else {
+            return false;
+        };
+        let mut changed = false;
+        for p in principals {
+            changed |= sc.grants.remove(p);
+        }
+        changed
+    }
+
+    /// Remove `hash_hex` from ONE scope (#62, the `blob_unpublish` verb). Returns whether anything
+    /// changed.
+    ///
+    /// This is the AUTHORIZATION boundary: [`allows`](Self::allows) requires the hash to be in some
+    /// scope, so an unpublished hash is immediately unfetchable. It does NOT delete bytes — the
+    /// store still holds them until `blob_gc` runs. A hash published into several scopes stays
+    /// reachable through the others.
+    pub fn unpublish_hash(&mut self, scope: &str, hash_hex: &str) -> bool {
+        self.scopes
+            .get_mut(scope)
+            .is_some_and(|sc| sc.hashes.remove(hash_hex))
+    }
+
+    /// Every hash any scope references — the GC liveness root (#62). mcpmesh creates no persistent
+    /// blob tags, so this is the ONLY root: a blob absent from this set is referenced by nothing.
+    pub fn live_hashes(&self) -> std::collections::BTreeSet<String> {
+        self.scopes
+            .values()
+            .flat_map(|sc| sc.hashes.iter().cloned())
+            .collect()
+    }
+
     /// SECURITY LINCHPIN (pure): ALLOW iff SOME scope contains `hash_hex` AND grants one of the
     /// caller's `principals` (`{user_id} ∪ groups`). Default-deny — an in-scope hash with no matching
     /// grant, a hash in no scope, and an empty principal set all return `false`. Hashes are never
@@ -152,6 +191,30 @@ impl ScopeStore {
         self.persist(&snapshot)
     }
 
+    /// Revoke `principals` from ONE scope + persist (#62, `blob_revoke`). Same lock/persist
+    /// discipline. Returns whether anything changed.
+    pub fn revoke_from_scope(&self, scope: &str, principals: &[String]) -> Result<bool> {
+        let (changed, snapshot) = {
+            let mut g = self.inner.write().expect("scope lock not poisoned");
+            let changed = g.revoke_from_scope(scope, principals);
+            (changed, g.clone())
+        };
+        self.persist(&snapshot)?;
+        Ok(changed)
+    }
+
+    /// Remove a hash from ONE scope + persist (#62, `blob_unpublish`). Returns whether anything
+    /// changed. Removes REACHABILITY, not bytes — see [`BlobScopes::unpublish_hash`].
+    pub fn unpublish_hash(&self, scope: &str, hash_hex: &str) -> Result<bool> {
+        let (changed, snapshot) = {
+            let mut g = self.inner.write().expect("scope lock not poisoned");
+            let changed = g.unpublish_hash(scope, hash_hex);
+            (changed, g.clone())
+        };
+        self.persist(&snapshot)?;
+        Ok(changed)
+    }
+
     /// Revoke `principals` from every scope + persist (single-writer). The unpair-hygiene
     /// inverse of `grant` — same lock/persist discipline. Returns whether anything changed.
     pub fn revoke_principals(&self, principals: &[String]) -> Result<bool> {
@@ -180,6 +243,91 @@ impl ScopeStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #62: a per-scope revoke must NOT behave like the global unpair-hygiene revoke. Wiring
+    /// `blob_revoke` to `revoke_principals` would silently withdraw access from every other scope
+    /// the caller never mentioned — this test is what distinguishes the two.
+    #[test]
+    fn revoke_from_scope_touches_only_that_scope() {
+        let mut s = BlobScopes::default();
+        s.grant("photos", "b64u:alice");
+        s.grant("notes", "b64u:alice");
+
+        assert!(s.revoke_from_scope("photos", &["b64u:alice".to_string()]));
+        assert!(
+            !s.scopes["photos"].grants.contains("b64u:alice"),
+            "revoked from the named scope"
+        );
+        assert!(
+            s.scopes["notes"].grants.contains("b64u:alice"),
+            "the OTHER scope's grant must survive — this is not unpair hygiene"
+        );
+
+        // Idempotent, and an unknown scope is a clean no-op rather than an error.
+        assert!(!s.revoke_from_scope("photos", &["b64u:alice".to_string()]));
+        assert!(!s.revoke_from_scope("nope", &["b64u:alice".to_string()]));
+    }
+
+    /// #62: unpublish removes REACHABILITY immediately — the authz property, independent of GC.
+    /// The grant is deliberately left alone: the person still has access to the scope, just not to
+    /// that blob.
+    #[test]
+    fn unpublish_denies_the_hash_without_touching_the_grant() {
+        let mut s = BlobScopes::default();
+        s.publish_hash("photos", "abc123");
+        s.grant("photos", "b64u:alice");
+        let who: HashSet<&str> = ["b64u:alice"].into_iter().collect();
+        assert!(s.allows("abc123", &who), "reachable before");
+
+        assert!(s.unpublish_hash("photos", "abc123"));
+        assert!(
+            !s.allows("abc123", &who),
+            "an unpublished hash must be unfetchable at once — no GC needed for the security half"
+        );
+        assert!(
+            s.scopes["photos"].grants.contains("b64u:alice"),
+            "the grant survives: access to the SCOPE is unchanged"
+        );
+        assert!(!s.unpublish_hash("photos", "abc123"), "idempotent");
+    }
+
+    /// #62: the same bytes published into two scopes stay reachable through the other one — so
+    /// unpublish is not a global delete, and GC must not reclaim a hash another scope still holds.
+    #[test]
+    fn unpublish_is_scoped_and_leaves_other_references_live() {
+        let mut s = BlobScopes::default();
+        s.publish_hash("photos", "abc123");
+        s.publish_hash("backup", "abc123");
+        s.grant("backup", "b64u:alice");
+
+        s.unpublish_hash("photos", "abc123");
+        let who: HashSet<&str> = ["b64u:alice"].into_iter().collect();
+        assert!(
+            s.allows("abc123", &who),
+            "still reachable via the scope that still lists it"
+        );
+        assert!(
+            s.live_hashes().contains("abc123"),
+            "and still LIVE for GC — reclaiming it here would destroy data another scope references"
+        );
+    }
+
+    /// #62: the GC root is exactly the union of scope hashes.
+    #[test]
+    fn live_hashes_is_the_union_of_every_scope() {
+        let mut s = BlobScopes::default();
+        s.publish_hash("a", "h1");
+        s.publish_hash("b", "h2");
+        s.publish_hash("b", "h1");
+        let live = s.live_hashes();
+        assert_eq!(live.len(), 2);
+        assert!(live.contains("h1") && live.contains("h2"));
+
+        // An emptied scope contributes nothing — this is what makes GC reclaim it.
+        s.unpublish_hash("a", "h1");
+        s.unpublish_hash("b", "h1");
+        assert!(!s.live_hashes().contains("h1"));
+    }
     use std::collections::HashSet;
 
     fn principals<'a>(names: &'a [&'a str]) -> HashSet<&'a str> {

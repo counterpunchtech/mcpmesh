@@ -178,6 +178,22 @@ impl AppBlobs {
         self.scopes.revoke_principals(principals)
     }
 
+    /// Revoke `principals` from ONE scope (#62, `blob_revoke`) — the per-file un-share, the blob
+    /// analogue of #44. Distinct from [`revoke_principals`](Self::revoke_principals), which is
+    /// unpair hygiene across every scope.
+    pub fn revoke_from_scope(&self, scope: &str, principals: &[String]) -> Result<bool> {
+        self.scopes.revoke_from_scope(scope, principals)
+    }
+
+    /// Remove a hash from ONE scope (#62, `blob_unpublish`).
+    ///
+    /// This is the AUTHORIZATION half and takes effect at once: the scope gate requires the hash to
+    /// be listed in some scope, so an unpublished hash is immediately unfetchable. The BYTES remain
+    /// in the store until [`gc`](Self::gc) runs — do not describe this to a user as deletion.
+    pub fn unpublish(&self, scope: &str, hash_hex: &str) -> Result<bool> {
+        self.scopes.unpublish_hash(scope, hash_hex)
+    }
+
     /// The current scope table (name, hashes, grants) for `list`.
     pub fn list(&self) -> Vec<(String, Vec<String>, Vec<String>)> {
         self.scopes.list()

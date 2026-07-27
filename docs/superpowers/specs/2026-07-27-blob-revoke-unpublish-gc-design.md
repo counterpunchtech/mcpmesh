@@ -1,4 +1,4 @@
-# Blob revoke, unpublish, and GC (#62)
+# Blob revoke and unpublish (#62)
 
 **Status:** accepted · **Issue:** #62 · **Target:** 0.13.3 (additive verbs → PATCH)
 
@@ -36,30 +36,30 @@ the security property.
 **It does not delete bytes**, and the docs must say so plainly. Shipping "unpublish" while implying
 deletion would be the exact false promise the issue says it refuses to make to users.
 
-### 3. `blob_gc {}` — the reclaim
+### 3. GC — descoped mid-implementation, and why
 
-`iroh_blobs::store::gc::gc_run_once(store, live)` is public; `Blobs::delete` is `pub(crate)` and the
-crate's own docs say *"Users should rely only on garbage collection for blob deletion."* So GC is
-the supported path, not a workaround.
+The plan was a `blob_gc` verb calling `gc_run_once(store, live)`. **That function is not reachable:**
+`iroh_blobs::store::gc` is a private module, and only `GcConfig` / `ProtectCb` / `ProtectOutcome`
+are re-exported. `Blobs::delete` is likewise `pub(crate)`, with the crate's own docs directing users
+to GC. So iroh-blobs 0.103.0 supports **only periodic background GC**, configured on the store at
+load time — not an on-demand sweep.
 
-`live` = every hash in every scope. mcpmesh creates no persistent tags (`add_path`'s `TempTag` is
-dropped at the end of `publish_path`), so the scope table is the **only** root — which is why "GC
-deletes what no scope references" is exact rather than approximate.
+That is a materially different design from the one specced: automatic rather than explicit, with a
+config surface (interval, enable/disable) and a destructive failure mode if the liveness callback is
+wrong. It is implementable and safe — `ProtectOutcome::Abort` exists precisely so a callback whose
+hash source errored can skip the run rather than delete on a guess — but it deserves its own design
+pass rather than being redesigned inside this change.
 
-**Fail-safe:** if the scope snapshot cannot be read, the verb **errors** rather than running with an
-empty live set. An empty `live` would delete every blob on the node. This is the one destructive
-verb on the surface and it must never run on a guess.
-
-**Explicit only, never automatic.** No background GC, no GC-on-unpublish. An embedder that wants
-retention runs it; nobody gets surprise deletion. Returns `{ retained }` so the caller can sanity-
-check the root set before trusting the outcome.
+Split out to its own issue with the research attached. Shipping revoke + unpublish now is not a
+punt: together they answer ask 1 in full and the *authorization* half of ask 2, which is the half
+that is a security property. Ask 2's byte-deletion half and ask 3 need the GC design.
 
 ## Surface + versioning
 
-- `Request::{BlobRevoke, BlobUnpublish, BlobGc}` + params structs; `BlobGcResult { retained }`.
+- `Request::{BlobRevoke, BlobUnpublish}` + params structs.
 - `API_MINOR` 14 → 15, `API_VERSION` "1.14" → "1.15".
 - `docs/local-protocol.md`: the three verbs, and explicitly that **unpublish removes reachability,
-  not bytes** — bytes go on `blob_gc`.
+  not bytes** — bytes remain in the store, and there is no reclaim yet.
 - Workspace version → **0.13.3** (additive verbs → PATCH).
 
 ## Explicitly NOT in scope
@@ -77,8 +77,6 @@ one and deserves its own design rather than a tail-end addition here.
 2. **Unit — unpublish removes reachability.** `allows(hash, principals)` is true before and false
    after, with the grant untouched — the authz property, independent of GC.
 3. **Unit — unpublish is scoped.** A hash published into two scopes stays reachable via the other.
-4. **Integration — GC reclaims exactly the unreferenced.** Publish two blobs, unpublish one, GC:
-   the unpublished hash is gone from the store and the retained one is still fetchable.
-5. **Integration — GC is fail-safe.** With an unreadable scope store the verb errors and deletes
-   nothing.
-6. **Regression** — unpair hygiene (`revoke_principals` across all scopes) still works.
+4. **Integration — an unpublished blob is refused over the wire.** The gate denies a fetch for a
+   hash removed from its scope, while a peer's other granted blob still fetches.
+5. **Regression** — unpair hygiene (`revoke_principals` across all scopes) still works.
