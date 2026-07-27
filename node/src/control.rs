@@ -799,7 +799,7 @@ pub(crate) fn status_result(state: &DaemonState) -> Result<StatusResult> {
                 // annotation (fails open on corrupt rows, like `peer_infos`).
                 let entries = mesh.store.list().unwrap_or_default();
                 (
-                    crate::daemon::service_infos(&cfg, &ephemeral, &entries),
+                    crate::daemon::service_infos(&mesh.live_services(), &cfg, &ephemeral, &entries),
                     crate::daemon::peer_infos(&mesh.store),
                     roster,
                 )

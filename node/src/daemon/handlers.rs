@@ -30,7 +30,6 @@ use super::config_write::{
     append_allow_to_config, remove_allow_from_config, remove_principal_from_service,
     remove_service_from_config, write_relays, write_service_to_config,
 };
-use super::status::service_infos;
 use super::{MeshState, dial_service, pipe_session};
 
 /// A minted pairing invite lives at most 24h.
@@ -667,10 +666,9 @@ pub(crate) async fn mint_invite(
         .lock()
         .expect("ephemeral_services lock not poisoned")
         .clone();
-    let served: Vec<String> = service_infos(&cfg, &ephemeral, &[])
-        .into_iter()
-        .map(|s| s.name)
-        .collect();
+    // #100: the KNOWN-names view, not the live-registry one. An invite is redeemed later, after
+    // reloads, so a service the operator has just added to `config.toml` must still mint.
+    let served: Vec<String> = crate::daemon::known_service_names(&cfg, &ephemeral);
     if let Some(msg) = unregistered_service_error(&services, &served) {
         anyhow::bail!(msg);
     }

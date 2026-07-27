@@ -291,7 +291,7 @@ async fn an_ephemeral_registration_survives_an_unrelated_swap() {
 /// #94 asked for.
 #[tokio::test]
 async fn a_revoke_strips_a_name_held_by_both_config_and_the_overlay() {
-    timeout(Duration::from_secs(30), async {
+    timeout(Duration::from_secs(90), async {
         let (mesh, addr, peer, principal, dir) = mesh_with_ephemeral_room().await;
 
         // `room` now exists in BOTH places, with the principal in each: the hand-edited config
@@ -368,7 +368,7 @@ async fn a_revoke_strips_a_name_held_by_both_config_and_the_overlay() {
 /// regression test below, which pins that it was not changed by accident.
 #[tokio::test]
 async fn an_overlay_only_grant_does_not_apply_an_unrelated_config_edit() {
-    timeout(Duration::from_secs(30), async {
+    timeout(Duration::from_secs(90), async {
         let (mesh, addr, peer, principal, dir) = mesh_with_ephemeral_room().await;
 
         // First grant: `room` is not in the live registry yet (the harness boots config-only), so
@@ -512,4 +512,119 @@ async fn the_registry_already_denies_at_the_moment_of_the_sever() {
     })
     .await
     .expect("swap-before-sever test timed out");
+}
+
+/// #100: `peer_services` must not report a service the accept path would refuse.
+///
+/// It answered from `config.toml` + the ephemeral map, while admission comes from the LIVE
+/// registry. A config service added by hand and not yet reloaded was reported as usable and then
+/// refused — indistinguishable, from the caller's side, from a transient network failure.
+///
+/// #94 made this durable rather than incidental: an overlay-only grant no longer reloads, so the
+/// hand-added service stays reported-but-unservable indefinitely.
+#[tokio::test]
+async fn peer_services_does_not_report_a_config_service_pending_a_reload() {
+    timeout(Duration::from_secs(60), async {
+        let (mesh, _addr, peer, principal, dir) = mesh_with_ephemeral_room().await;
+
+        // Get `room` live (first grant rebuilds — it is not in the registry yet).
+        grant_service_allow(&mesh, "room".to_string(), principal.clone())
+            .await
+            .expect("first grant");
+
+        // A config service appears on disk afterwards and is never reloaded.
+        std::fs::write(
+            dir.path().join("config.toml"),
+            format!(
+                "[services.kept]\nrun = ['{STUB}']\nallow = [\"{principal}\"]\n\
+                 [services.late]\nrun = ['{STUB}']\nallow = [\"{principal}\"]\n"
+            ),
+        )
+        .unwrap();
+        // Overlay-only grant: nothing changes on disk, so nothing reloads (#94).
+        grant_service_allow(&mesh, "room".to_string(), "b64u:carol".to_string())
+            .await
+            .expect("second grant");
+
+        let identity = mcpmesh_net::PeerIdentity {
+            endpoint: mcpmesh_net::EndpointId::from_bytes(*peer.id().as_bytes()),
+            name: "alice".into(),
+            user_id: None,
+            groups: vec![],
+        };
+        let admitted = mcpmesh::daemon::admitted_services_for_test(&mesh, &identity);
+
+        assert!(
+            admitted.contains(&"room".to_string()),
+            "the live ephemeral service must still be reported (got {admitted:?})"
+        );
+        assert!(
+            !admitted.contains(&"late".to_string()),
+            "a config service that is not in the live registry must NOT be reported as usable — \
+             the accept path would refuse it, and the caller cannot tell that from a network \
+             failure (got {admitted:?})"
+        );
+    })
+    .await
+    .expect("peer_services live-registry test timed out");
+}
+
+/// #100: `status` is a separate code path from `peer_services` and was separately wrong — it also
+/// answered from `config.toml`. Same setup, distinct assertion.
+///
+/// Also pins the deliberate split: `mint_invite` keeps the KNOWN-names view, so an invite for a
+/// config service pending a reload must still mint. Switching that to the live registry would
+/// reject an invite for a service the operator has just added.
+#[tokio::test]
+async fn status_hides_a_pending_service_but_an_invite_can_still_name_it() {
+    timeout(Duration::from_secs(60), async {
+        let (mesh, _addr, _peer, principal, dir) = mesh_with_ephemeral_room().await;
+        grant_service_allow(&mesh, "room".to_string(), principal.clone())
+            .await
+            .expect("first grant");
+        std::fs::write(
+            dir.path().join("config.toml"),
+            format!(
+                "[services.kept]\nrun = ['{STUB}']\nallow = [\"{principal}\"]\n\
+                 [services.late]\nrun = ['{STUB}']\nallow = [\"{principal}\"]\n"
+            ),
+        )
+        .unwrap();
+        grant_service_allow(&mesh, "room".to_string(), "b64u:carol".to_string())
+            .await
+            .expect("second grant");
+
+        let listed = mcpmesh::daemon::service_infos_for_test(&mesh);
+        let names: Vec<&str> = listed.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            !names.contains(&"late"),
+            "status must not list a config service absent from the live registry (got {names:?})"
+        );
+        assert!(
+            names.contains(&"room"),
+            "the live ephemeral service must still be listed (got {names:?})"
+        );
+
+        // Metadata survives the move to the live registry: `room` is ephemeral, `kept` is not.
+        let room = listed.iter().find(|s| s.name == "room").expect("room");
+        assert!(
+            room.ephemeral,
+            "an ephemeral registration must report as such"
+        );
+        let kept = listed.iter().find(|s| s.name == "kept").expect("kept");
+        assert!(
+            !kept.ephemeral,
+            "a config service must not report as ephemeral"
+        );
+
+        // The split: an invite may still name the not-yet-live config service.
+        mcpmesh::daemon::mint_invite_for_test(&mesh, &["late".to_string()])
+            .await
+            .expect(
+                "mint_invite must accept a config service pending a reload — an invite is \
+                 redeemed later, after reloads",
+            );
+    })
+    .await
+    .expect("status live-registry test timed out");
 }

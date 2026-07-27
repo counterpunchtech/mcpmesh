@@ -154,51 +154,77 @@ fn display_principal(principal: &str, peers: &[crate::allowlist::PeerEntry]) -> 
 }
 
 pub(crate) fn service_infos(
+    live: &mcpmesh_net::Services,
     cfg: &Config,
     ephemeral: &std::collections::HashMap<String, crate::daemon::EphemeralService>,
     peers: &[crate::allowlist::PeerEntry],
 ) -> Vec<ServiceInfo> {
-    let mut out: Vec<ServiceInfo> = cfg
-        .services
+    // #100: the LIVE registry decides which services exist and what each admits — it is what the
+    // accept path authorizes from. Reading config instead reported a hand-added service that had
+    // not been reloaded as though it were servable.
+    //
+    // `ServiceEntry` carries only `allow` and an opaque backend, so the `backend` KIND and the
+    // `ephemeral` flag are looked up from config / the ephemeral map as metadata for a name the
+    // registry has already admitted. Ephemeral is checked first: it wins for a duplicate name,
+    // matching `build_services_with_ephemeral`.
+    let mut out: Vec<ServiceInfo> = live
         .iter()
-        .filter_map(|(name, svc)| {
-            let backend = match svc.backend_result() {
-                Ok(Backend::Run(_)) => BackendKind::Run,
-                Ok(Backend::Socket(_)) => BackendKind::Socket,
-                Err(_) => return None,
+        .filter_map(|(name, entry)| {
+            let (backend, is_ephemeral) = match ephemeral.get(name) {
+                Some(eph) => (
+                    match &eph.backend {
+                        mcpmesh_local_api::BackendSpec::Run { .. } => BackendKind::Run,
+                        mcpmesh_local_api::BackendSpec::Socket { .. } => BackendKind::Socket,
+                    },
+                    true,
+                ),
+                None => match cfg.services.get(name).map(|svc| svc.backend_result()) {
+                    Some(Ok(Backend::Run(_))) => (BackendKind::Run, false),
+                    Some(Ok(Backend::Socket(_))) => (BackendKind::Socket, false),
+                    // In the registry but in neither source: it was built from a config that has
+                    // since changed on disk. Report nothing rather than guess a backend kind.
+                    _ => return None,
+                },
             };
             Some(ServiceInfo {
                 name: name.clone(),
-                allow: svc.allow.clone(),
-                allow_display: svc
+                allow: entry.allow.clone(),
+                allow_display: entry
                     .allow
                     .iter()
                     .map(|p| display_principal(p, peers))
                     .collect(),
                 backend,
-                ephemeral: false,
+                ephemeral: is_ephemeral,
             })
         })
         .collect();
-    // Ephemeral registrations (#36): in-memory only, flagged so a consumer knows they vanish on
-    // disconnect/restart. Same surface discipline — kind only, never the command/path.
-    for (name, eph) in ephemeral {
-        let backend = match &eph.backend {
-            mcpmesh_local_api::BackendSpec::Run { .. } => BackendKind::Run,
-            mcpmesh_local_api::BackendSpec::Socket { .. } => BackendKind::Socket,
-        };
-        out.push(ServiceInfo {
-            name: name.clone(),
-            allow: eph.allow.clone(),
-            allow_display: eph
-                .allow
-                .iter()
-                .map(|p| display_principal(p, peers))
-                .collect(),
-            backend,
-            ephemeral: true,
-        });
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// The service names the daemon KNOWS, live or pending a reload — config plus ephemeral
+/// registrations (#100).
+///
+/// Deliberately NOT the live-registry view `service_infos` uses. `mint_invite` asks "is this a
+/// known service name", and an invite is redeemed later, after reloads — so an invite for a service
+/// the operator has just added to `config.toml` must still mint.
+pub(crate) fn known_service_names(
+    cfg: &Config,
+    ephemeral: &std::collections::HashMap<String, crate::daemon::EphemeralService>,
+) -> Vec<String> {
+    let mut out: Vec<String> = cfg
+        .services
+        .iter()
+        .filter(|(_, svc)| svc.backend_result().is_ok())
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in ephemeral.keys() {
+        if !out.contains(name) {
+            out.push(name.clone());
+        }
     }
+    out.sort();
     out
 }
 
