@@ -165,7 +165,18 @@ Methods split into two groups by audience:
 | `blob_grant` | `{scope, principal}` | `{}` (ack) |
 | `blob_revoke` | `{scope, principals}` — withdraw principals from ONE scope's grants (#62, `api_minor >= 15`). The blob analogue of `service_allow_revoke`: un-shares a file without unpairing the person. **Scoped** — grants on other scopes are untouched. A principal that held no grant is a clean no-op; an unknown **scope** is `-32040`, not a silent ack. | `{}` (ack) |
 | `blob_unpublish` | `{scope, hash}` — remove a blake3 hash from ONE scope (#62, `api_minor >= 15`). Refuses **subsequent** GETs from that scope; does **not** delete bytes and does **not** interrupt a transfer in flight — see the note below. `hash` must parse as blake3 (case-insensitive); garbage is an error, not a silent no-op. An already-absent hash is a clean no-op; an unknown **scope** is `-32040`. | `{}` (ack) |
-| `blob_republish` | `{scope, hash}` — make a blob this daemon ALREADY holds servable **from here**, in a scope it controls (#83, `api_minor >= 18`). No filesystem round-trip and no third copy: `blob_publish {scope, path}` was the only route back in and re-imported bytes the store already held. The blob must be held **COMPLETE** — an absent hash, or partial bytes from an interrupted fetch, answer `-32041`, because advertising what we cannot serve turns the publisher going offline into a hang at every fetcher. **Grants nobody** — the returned ticket names THIS node; share it with `blob_grant`. Idempotent. | `{ticket, hash}` |
+| `blob_republish` | `{scope, hash}` — make a blob this daemon ALREADY holds servable **from here**, in a scope it controls (#83, `api_minor >= 18`). No filesystem round-trip and no third copy: `blob_publish {scope, path}` was the only route back in and re-imported bytes the store already held. The blob must be held **COMPLETE** — an absent hash, or partial bytes from an interrupted fetch, answer `-32041`, because advertising what we cannot serve turns the publisher going offline into a hang at every fetcher. **Grants nobody NEW** — but see the warning below: it re-exposes the hash to every principal the target scope already grants. The returned ticket names THIS node. Idempotent. | `{ticket, hash}` |
+
+> **`blob_republish` can undo a `blob_unpublish`.** Unpublish removes reachability, not bytes
+> (there is no reclaim — #80), so the blob stays complete in the local store indefinitely and
+> `blob_republish` will happily re-add it to the same scope, whose grants unpublish never touched.
+> Every principal that scope grants regains access immediately, with no grant call and no warning.
+>
+> Do **not** call `blob_republish` unconditionally after each fetch as hygiene — call it when a user
+> asks to re-share. Note also that a recipient's re-advertisement is outside the original
+> publisher's control entirely: content addressing means `blob_revoke`/`blob_unpublish` bind only
+> the node they run on. Treat them as "stop serving from here", never as "unshare from everyone".
+
 | `blob_list` | *(none)* | `{scopes:[{name, hashes:[…], grants:[…]}]}` |
 | `blob_fetch` | `{ticket, dest_path}` | `{hash, bytes_len}` |
 

@@ -218,25 +218,35 @@ impl AppBlobs {
     /// partial bytes are refused exactly like absent ones — advertising what we cannot serve would
     /// convert the publisher going offline into a hang at every fetcher.
     ///
-    /// Idempotent (the scope's hash set is a set), so a client may call it unconditionally after a
-    /// fetch.
+    /// Idempotent (the scope's hash set is a set).
+    ///
+    /// **Do NOT call this unconditionally after every fetch.** Republishing into a scope
+    /// re-exposes the hash to every principal that scope ALREADY grants — including a hash an
+    /// operator deliberately withdrew with `blob_unpublish`, which removes reachability but not
+    /// the bytes, so `has()` stays true forever and a later republish silently restores access with
+    /// no grant call and no warning. Republish when the user asks to share, not as fetch hygiene.
     ///
     /// **Grants nobody.** The republisher chooses a scope they already control; inheriting the
     /// original publisher's grant list would be a silent authorization transfer. Sharing is
     /// `blob_grant`'s job.
-    pub async fn republish(&self, scope: &str, hash_hex: &str) -> Result<String> {
+    pub async fn republish(&self, scope: &str, hash_hex: &str) -> Result<(String, String)> {
         // Scope first: a typo'd scope must not report as a missing blob.
         if !self.scopes.has_scope(scope) {
             anyhow::bail!(crate::daemon::NoSuchBlobScope(scope.to_string()));
         }
-        let hash: Hash = hash_hex
-            .parse()
-            .with_context(|| format!("parse blob hash '{hash_hex}'"))?;
+        // Parse (panic-safe) AND NORMALIZE before touching the scope. The gate compares against
+        // the canonical lowercase hex (`msg.request.hash.to_hex()`), so inserting the caller's raw
+        // string would record an entry that authorizes nothing: `blob_list` would show the file as
+        // shared, every fetcher would be denied, and `blob_unpublish` — which normalizes — could
+        // never remove it. That is #62's silent-no-op defect re-entered from the other side.
+        // `blob_publish` is safe only because it stores `tag.hash.to_hex()`.
+        let hash = crate::blobs::parse_blob_hash(hash_hex)?;
+        let canonical = hash.to_hex().to_string();
         if !self.store.blobs().has(hash).await.unwrap_or(false) {
-            anyhow::bail!(crate::daemon::NoSuchBlob(hash_hex.to_string()));
+            anyhow::bail!(crate::daemon::NoSuchBlob(canonical));
         }
-        self.scopes.publish_hash(scope, hash_hex)?;
-        Ok(self.ticket_for(hash).await.to_string())
+        self.scopes.publish_hash(scope, &canonical)?;
+        Ok((self.ticket_for(hash).await.to_string(), canonical))
     }
 
     /// Mint a ticket for a hash this node holds, addressed to this node.
@@ -568,7 +578,7 @@ mod tests {
 
             // B republishes into a scope IT controls and grants C.
             b.grant("b-room", "carol").unwrap();
-            let b_ticket = b.republish("b-room", &hash_hex).await.unwrap();
+            let (b_ticket, _canon) = b.republish("b-room", &hash_hex).await.unwrap();
             assert_ne!(b_ticket, a_ticket, "the ticket must name B, not A");
 
             // A goes away — the laptop closes.
@@ -639,7 +649,7 @@ mod tests {
             b.spawn_accept(&b_ep);
             b.fetch(&a_ticket).await.unwrap();
             b.grant("b-room", "someone-else").unwrap();
-            let b_ticket = b.republish("b-room", &hash_hex).await.unwrap();
+            let (b_ticket, _canon) = b.republish("b-room", &hash_hex).await.unwrap();
 
             // mallory — granted by A, never by B — is refused by B.
             let mdir = tempfile::tempdir().unwrap();
@@ -662,6 +672,54 @@ mod tests {
         .expect("grant-isolation test timed out");
     }
 
+    /// #83 review: a NON-CANONICAL rendering of a hash must not create an entry that authorizes
+    /// nothing. The gate compares against canonical lowercase hex, so recording the caller's raw
+    /// string (a valid 52-char base32 form, or uppercase hex) would put a row in `blob_list` that
+    /// looks shared, denies every fetcher, and cannot be removed — `blob_unpublish` normalizes and
+    /// would find nothing to delete, acking a no-op. That is #62's defect from the other side.
+    #[tokio::test]
+    async fn a_non_canonical_hash_is_normalized_before_it_is_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = AppBlobs::open_fetcher(dir.path().join("blobs"), ep().await)
+            .await
+            .unwrap();
+        provider.grant("room", "b64u:alice").unwrap();
+        let src = dir.path().join("f.bin");
+        std::fs::write(&src, b"canonical me").unwrap();
+        let (_t, canonical) = provider.publish_path(&src).await.unwrap();
+
+        // The SAME hash in its base32 rendering — what `Hash`'s Display produces, and a form a
+        // client can legitimately hold. (Uppercase HEX is not an alternative spelling: iroh's
+        // parser rejects it outright, which the review's own probe confirmed.)
+        let parsed = crate::blobs::parse_blob_hash(&canonical).unwrap();
+        let base32 = data_encoding::BASE32_NOPAD
+            .encode(parsed.as_bytes())
+            .to_ascii_lowercase();
+        assert_ne!(base32, canonical, "the fixture must actually differ");
+        let (_ticket, returned) = provider
+            .republish("room", &base32)
+            .await
+            .expect("an alternative rendering of a held hash must republish");
+
+        assert_eq!(
+            returned, canonical,
+            "the RESULT must carry canonical hex — blob_publish does, and the docs promise the two \
+             are interchangeable"
+        );
+        let recorded: Vec<String> = provider
+            .list()
+            .into_iter()
+            .filter(|(name, _, _)| name == "room")
+            .flat_map(|(_, hashes, _)| hashes)
+            .collect();
+        assert_eq!(
+            recorded,
+            vec![canonical],
+            "the SCOPE must record canonical hex — the gate compares against it, so a raw-string \
+             entry would authorize nobody and be unremovable"
+        );
+    }
+
     /// Republish is idempotent (the scope hash set is a set), so a client may call it
     /// unconditionally after every fetch without special-casing the second time.
     #[tokio::test]
@@ -678,15 +736,17 @@ mod tests {
         provider.republish("room", &hash_hex).await.unwrap();
         provider.republish("room", &hash_hex).await.unwrap();
 
-        let hashes: Vec<String> = provider
+        // Constrain the SCOPE NAME too: without it, a mutation inserting into a hardcoded scope,
+        // or into every scope, passes.
+        let rooms: Vec<(String, Vec<String>)> = provider
             .list()
             .into_iter()
-            .flat_map(|(_, hashes, _)| hashes)
+            .map(|(name, hashes, _)| (name, hashes))
             .collect();
         assert_eq!(
-            hashes.iter().filter(|h| **h == hash_hex).count(),
-            1,
-            "one entry, not two"
+            rooms,
+            vec![("room".to_string(), vec![hash_hex.clone()])],
+            "exactly one entry, in the NAMED scope, not two and not elsewhere"
         );
     }
 
