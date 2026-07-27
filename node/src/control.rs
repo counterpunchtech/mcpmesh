@@ -384,7 +384,7 @@ async fn run_subscription(
 /// methods (`status`, `shutdown`) to [`dispatch`]. Params are deserialized per-method into
 /// the local-api param structs via [`with_params`] (never `from_value::<Request>` on the
 /// whole message).
-async fn handle_request(req: &Value, state: &DaemonState) -> Value {
+pub(crate) async fn handle_request(req: &Value, state: &DaemonState) -> Value {
     let id = req.get("id").cloned().unwrap_or(Value::Null);
     let params = req.get("params").cloned().unwrap_or(Value::Null);
     match method_of(req) {
@@ -643,6 +643,13 @@ fn respond<T: serde::Serialize>(id: Value, method: &str, r: anyhow::Result<T>) -
         Err(e) if e.downcast_ref::<InvalidParams>().is_some() => {
             error(id, -32602, format!("{method} failed: {e}"))
         }
+        // #55: "no such service" is BRANCHABLE, not a generic failure — a caller distinguishing
+        // "register it first" from "the daemon broke" cannot parse `-32000` messages reliably.
+        Err(e) if e.downcast_ref::<crate::daemon::NoSuchService>().is_some() => error(
+            id,
+            mcpmesh_local_api::ERR_NO_SUCH_SERVICE,
+            format!("{method} failed: {e}"),
+        ),
         Err(e) => error(id, -32000, format!("{method} failed: {e}")),
     }
 }
