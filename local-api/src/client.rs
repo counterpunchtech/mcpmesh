@@ -992,6 +992,7 @@ mod tests {
                     record: Box::new(AuditRecord::session_open(
                         "2026-07-03T14:02:11.480Z".into(),
                         Some("bob".into()),
+                        Some("eid:beef".into()),
                         "notes".into(),
                     )),
                 },

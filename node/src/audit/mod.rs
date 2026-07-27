@@ -163,6 +163,7 @@ mod tests {
             &AuditRecord::trust(
                 "2026-06-30T23:59:59.000Z".into(),
                 "pair".into(),
+                None,
                 Some("bob".into()),
             ),
         )
@@ -172,6 +173,7 @@ mod tests {
             &AuditRecord::session_open(
                 "2026-07-01T00:00:00.000Z".into(),
                 Some("bob".into()),
+                Some("eid:beef".into()),
                 "notes".into(),
             ),
         )
@@ -181,6 +183,7 @@ mod tests {
             &AuditRecord::proxied_notification(
                 "2026-07-01T00:00:01.000Z".into(),
                 Some("bob".into()),
+                Some("eid:beef".into()),
                 "notes".into(),
                 "tools/list".into(),
                 None,
@@ -193,6 +196,7 @@ mod tests {
             &AuditRecord::proxied_notification(
                 "2026-07-01T00:00:02.000Z".into(),
                 Some("alice".into()),
+                Some("eid:beef".into()),
                 "notes".into(),
                 "tools/call".into(),
                 Some("read_file".into()),
@@ -253,6 +257,7 @@ mod tests {
             &AuditRecord::session_open(
                 "2026-06-30T10:00:00.000Z".into(),
                 Some("bob".into()),
+                Some("eid:beef".into()),
                 "notes".into(),
             ),
         )
@@ -262,6 +267,7 @@ mod tests {
             &AuditRecord::session_open(
                 "2026-07-01T10:00:00.000Z".into(),
                 Some("bob".into()),
+                Some("eid:beef".into()),
                 "notes".into(),
             ),
         )
@@ -271,13 +277,14 @@ mod tests {
             &AuditRecord::session_open(
                 "2026-07-01T11:00:00.000Z".into(),
                 Some("alice".into()),
+                Some("eid:beef".into()),
                 "notes".into(),
             ),
         )
         .unwrap();
         crate::audit::log::append_record(
             dir.path(),
-            &AuditRecord::session_open("2026-07-01T12:00:00.000Z".into(), None, "kb".into()),
+            &AuditRecord::session_open("2026-07-01T12:00:00.000Z".into(), None, None, "kb".into()),
         )
         .unwrap();
         crate::audit::log::append_record(
@@ -285,6 +292,7 @@ mod tests {
             &AuditRecord::proxied_notification(
                 "2026-07-01T13:00:00.000Z".into(),
                 Some("bob".into()),
+                Some("eid:beef".into()),
                 "notes".into(),
                 "tools/list".into(),
                 None,
@@ -297,6 +305,7 @@ mod tests {
             &AuditRecord::trust(
                 "2026-07-01T14:00:00.000Z".into(),
                 "pair".into(),
+                None,
                 Some("carol".into()),
             ),
         )

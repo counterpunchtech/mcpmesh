@@ -712,8 +712,21 @@ pub struct AuditRecord {
     pub kind: AuditKind,
     /// The gate-resolved authenticated peer (attributed by the endpoint_id-keyed trust gate). Absent on
     /// local-only events with no remote peer (a manual roster install).
+    ///
+    /// DISPLAY rendering — prefers the `b64u:` user_id when a device→user binding exists, else the
+    /// nickname. Not guaranteed stable, and it never distinguishes two devices of one person: key
+    /// per-peer decisions on [`principal`](Self::principal) instead.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peer: Option<String>,
+    /// The caller's STABLE device principal, `eid:<hex>` — the authenticated endpoint id, which no
+    /// rename can change and no peer can spoof (#57). The SAME value [`PeerInfo::principal`] (#41)
+    /// and [`PeerReachability::principal`] (#42) carry, so the three join directly — a `Snapshot`
+    /// frame's event half and peer half no longer have to be matched on nickname.
+    ///
+    /// Absent exactly when `peer` is: a local-only event with no remote peer. Added additively in
+    /// `api_minor` 12; older records simply omit it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -747,6 +760,7 @@ impl AuditRecord {
             ts,
             kind,
             peer: None,
+            principal: None,
             service: None,
             method: None,
             tool: None,
@@ -759,9 +773,15 @@ impl AuditRecord {
         }
     }
 
-    pub fn session_open(ts: String, peer: Option<String>, service: String) -> Self {
+    pub fn session_open(
+        ts: String,
+        peer: Option<String>,
+        principal: Option<String>,
+        service: String,
+    ) -> Self {
         let mut r = Self::base(ts, AuditKind::SessionOpen);
         r.peer = peer;
+        r.principal = principal;
         r.service = Some(service);
         r
     }
@@ -775,9 +795,15 @@ impl AuditRecord {
         self
     }
 
-    pub fn session_close(ts: String, peer: Option<String>, service: String) -> Self {
+    pub fn session_close(
+        ts: String,
+        peer: Option<String>,
+        principal: Option<String>,
+        service: String,
+    ) -> Self {
         let mut r = Self::base(ts, AuditKind::SessionClose);
         r.peer = peer;
+        r.principal = principal;
         r.service = Some(service);
         r
     }
@@ -789,6 +815,7 @@ impl AuditRecord {
     pub fn proxied_request(
         ts: String,
         peer: Option<String>,
+        principal: Option<String>,
         service: String,
         method: String,
         tool: Option<String>,
@@ -799,6 +826,7 @@ impl AuditRecord {
     ) -> Self {
         let mut r = Self::base(ts, AuditKind::Request);
         r.peer = peer;
+        r.principal = principal;
         r.service = Some(service);
         r.method = Some(method);
         r.tool = tool;
@@ -814,6 +842,7 @@ impl AuditRecord {
     pub fn proxied_notification(
         ts: String,
         peer: Option<String>,
+        principal: Option<String>,
         service: String,
         method: String,
         tool: Option<String>,
@@ -821,6 +850,7 @@ impl AuditRecord {
     ) -> Self {
         let mut r = Self::base(ts, AuditKind::Request);
         r.peer = peer;
+        r.principal = principal;
         r.service = Some(service);
         r.method = Some(method);
         r.tool = tool;
@@ -828,17 +858,34 @@ impl AuditRecord {
         r
     }
 
-    pub fn blob_fetch(ts: String, peer: Option<String>, hash: String, status: String) -> Self {
+    pub fn blob_fetch(
+        ts: String,
+        peer: Option<String>,
+        principal: Option<String>,
+        hash: String,
+        status: String,
+    ) -> Self {
         let mut r = Self::base(ts, AuditKind::BlobFetch);
         r.peer = peer;
+        r.principal = principal;
         r.target = Some(hash);
         r.status = Some(status);
         r
     }
 
-    pub fn trust(ts: String, event: String, target: Option<String>) -> Self {
+    /// A trust event. `principal` is the STABLE identity the event acted ON where the caller knows
+    /// it (a pairing grant, a revoke) — trust records carry no `peer`, but the principal is exactly
+    /// what an auditor needs to attribute the change (#57). `None` for a purely local event such as
+    /// a manual roster install.
+    pub fn trust(
+        ts: String,
+        event: String,
+        principal: Option<String>,
+        target: Option<String>,
+    ) -> Self {
         let mut r = Self::base(ts, AuditKind::Trust);
         r.event = Some(event);
+        r.principal = principal;
         r.target = target;
         r
     }
@@ -920,7 +967,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   new methods, or a strictness change like params validation — bumped in the same change that
 ///   makes it. A client can guard with `api_minor >= N` for a feature it needs, or refuse a daemon
 ///   older than a minor it requires. It never resets except on a MAJOR bump.
-pub const API_VERSION: &str = "1.11";
+pub const API_VERSION: &str = "1.12";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -938,12 +985,61 @@ pub const API_VERSION: &str = "1.11";
 /// `api_minor >= 10` before telling a user that revocation has taken effect; to 11 when
 /// `service_allow_grant`/`service_allow_revoke` gained EPHEMERAL-service support and became strict
 /// about an unknown service name — a name in neither the config nor the ephemeral registry now
-/// answers [`ERR_NO_SUCH_SERVICE`] instead of a silent `{}` (#55, #69).
-pub const API_MINOR: u32 = 11;
+/// answers [`ERR_NO_SUCH_SERVICE`] instead of a silent `{}` (#55, #69); to 12 with
+/// `AuditRecord.principal` — the caller's stable `eid:` device identity on every peer-attributed
+/// audit record and `subscribe` event, completing the #41/#42 stable-identity work on the one
+/// PUSHED surface that still keyed on a display nickname (#57).
+pub const API_MINOR: u32 = 12;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #57: `AuditRecord.principal` carries the caller's STABLE `eid:` device identity beside the
+    /// display `peer`, and is ELIDED (never `null`) when there is no resolved peer — so an older
+    /// consumer that ignores the field, and a record with no peer at all, both stay valid.
+    #[test]
+    fn audit_record_principal_is_additive_and_elided_when_absent() {
+        let r = AuditRecord::session_open(
+            "2026-07-03T14:02:11.480Z".into(),
+            Some("bob".into()),
+            Some("eid:beef".into()),
+            "notes".into(),
+        );
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["peer"], "bob", "the display rendering is retained");
+        assert_eq!(
+            v["principal"], "eid:beef",
+            "the stable principal rides alongside it: {v}"
+        );
+        // It round-trips.
+        let back: AuditRecord = serde_json::from_value(v).unwrap();
+        assert_eq!(back.principal.as_deref(), Some("eid:beef"));
+        assert_eq!(back, r);
+
+        // A local-only event (a manual roster install) has neither peer nor principal, and both
+        // keys are ABSENT rather than null.
+        let local = AuditRecord::trust(
+            "2026-07-03T14:02:11.480Z".into(),
+            "roster_install".into(),
+            None,
+            Some("acme/7".into()),
+        );
+        let v = serde_json::to_value(&local).unwrap();
+        assert!(
+            v.get("principal").is_none() && v.get("peer").is_none(),
+            "absent, not null: {v}"
+        );
+
+        // A record serialized by an OLDER daemon (no `principal` key) still deserializes.
+        let old = serde_json::json!({
+            "ts": "2026-07-03T14:02:11.480Z", "kind": "session_open",
+            "peer": "bob", "service": "notes"
+        });
+        let parsed: AuditRecord = serde_json::from_value(old).unwrap();
+        assert_eq!(parsed.principal, None);
+        assert_eq!(parsed.peer.as_deref(), Some("bob"));
+    }
 
     #[test]
     fn peer_reachability_serde_is_additive() {
@@ -1740,6 +1836,7 @@ mod tests {
             record: Box::new(AuditRecord::session_open(
                 "2026-07-03T14:02:11.480Z".into(),
                 Some("bob".into()),
+                Some("eid:beef".into()),
                 "notes".into(),
             )),
         };

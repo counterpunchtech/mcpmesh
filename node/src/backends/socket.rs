@@ -125,15 +125,26 @@ impl SocketBackend {
         let peer = identity
             .as_ref()
             .map(|id| id.user_id.clone().unwrap_or_else(|| id.name.clone()));
+        // The STABLE device principal from the SAME gate resolution (#57) — `eid:<hex>`, which no
+        // rename changes and no peer can spoof. `peer` above is the display rendering and cannot
+        // tell two devices of one person apart.
+        let principal = identity.as_ref().map(|id| id.endpoint.principal());
         // Session lifecycle via the RAII guard: it emits `session_open` now and, on drop (every exit
         // path — EOF, error, panic), emits `session_close` and removes the live-table row. Held for
         // the whole session scope, so it MUST outlive the pump below.
-        let _session = self
-            .audit
-            .session(peer.clone().unwrap_or_default(), self.service.clone());
+        let _session = self.audit.session(
+            peer.clone().unwrap_or_default(),
+            principal.clone(),
+            self.service.clone(),
+        );
         // The per-request-line auditor: hashes each caller request's args and correlates
         // the response. Threaded into the shared pump.
-        let auditor = RequestAuditor::new(self.audit.clone(), peer.clone(), self.service.clone());
+        let auditor = RequestAuditor::new(
+            self.audit.clone(),
+            peer.clone(),
+            principal.clone(),
+            self.service.clone(),
+        );
 
         // Split the endpoint: the read half is consumed by the pump's outbound direction
         // (its FrameReader), the write half by the inbound direction. Both are owned

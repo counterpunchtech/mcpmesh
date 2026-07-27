@@ -100,6 +100,7 @@ mod tests {
         let rec = AuditRecord::proxied_request(
             "2026-07-03T14:02:11.480Z".into(),
             Some("bob".into()),
+            Some("eid:beef".into()),
             "notes".into(),
             "tools/call".into(),
             Some("read_file".into()),
@@ -123,6 +124,7 @@ mod tests {
         let s = AuditRecord::session_open(
             "2026-07-03T14:02:11.480Z".into(),
             Some("bob".into()),
+            Some("eid:beef".into()),
             "notes".into(),
         );
         let sline = serde_json::to_string(&s).unwrap();
@@ -139,6 +141,7 @@ mod tests {
         let rec = AuditRecord::trust(
             "2026-07-03T14:02:11.480Z".into(),
             "pair".into(),
+            None,
             Some("bob".into()),
         );
         let line = serde_json::to_string(&rec).unwrap();

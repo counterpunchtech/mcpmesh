@@ -258,6 +258,7 @@ mod tests {
                         RequestAuditor::new(
                             AuditSink::disabled(),
                             Some("bob".into()),
+                            Some("eid:beef".into()),
                             "echo".into(),
                         ),
                         RateGate::new(RateLimiter::unlimited_shared(), None),
