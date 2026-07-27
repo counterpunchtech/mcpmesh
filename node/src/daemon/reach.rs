@@ -370,24 +370,18 @@ pub(crate) fn caller_admitted_services(
             .collect();
     let admits = |allow: &[String]| allow.iter().any(|a| principals.contains(a.as_str()));
 
-    let mut out: Vec<String> = Vec::new();
-    if let Ok(cfg) = crate::config::Config::load(&mesh.config_path) {
-        for (name, svc) in &cfg.services {
-            if admits(&svc.allow) {
-                out.push(name.clone());
-            }
-        }
-    }
-    for (name, eph) in mesh
-        .ephemeral_services
-        .lock()
-        .expect("ephemeral_services lock not poisoned")
+    // #100: answer from the LIVE registry — the same `Services` the accept path authorizes from.
+    // Reading `config.toml` + the ephemeral map instead meant a hand-added service that had not
+    // been reloaded was reported as usable and then refused, which a caller cannot distinguish
+    // from a network failure. The registry is already keyed by name with the overlay having won at
+    // build time, so no merge and no dedup is needed here.
+    let mut out: Vec<String> = mesh
+        .services
+        .get()
         .iter()
-    {
-        if admits(&eph.allow) && !out.contains(name) {
-            out.push(name.clone());
-        }
-    }
+        .filter(|(_, entry)| admits(&entry.allow))
+        .map(|(name, _)| name.clone())
+        .collect();
     out.sort();
     out
 }

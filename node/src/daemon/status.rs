@@ -8,7 +8,7 @@ use mcpmesh_local_api::{BackendKind, PeerInfo, PresencePeer, RosterStatus, Servi
 use mcpmesh_trust::roster::validate::RosterState;
 
 use crate::allowlist::PeerStore;
-use crate::config::{Backend, Config};
+use crate::config::Config;
 use crate::pairing;
 use crate::util::epoch_now_i64;
 
@@ -154,51 +154,60 @@ fn display_principal(principal: &str, peers: &[crate::allowlist::PeerEntry]) -> 
 }
 
 pub(crate) fn service_infos(
-    cfg: &Config,
-    ephemeral: &std::collections::HashMap<String, crate::daemon::EphemeralService>,
+    live: &mcpmesh_net::Services,
     peers: &[crate::allowlist::PeerEntry],
 ) -> Vec<ServiceInfo> {
-    let mut out: Vec<ServiceInfo> = cfg
-        .services
+    // #100: the LIVE registry decides which services exist and what each admits — it is what the
+    // accept path authorizes from. Reading config instead reported a hand-added service that had
+    // not been reloaded as though it were servable.
+    //
+    // `ServiceEntry` carries only `allow` and an opaque backend, so the `backend` KIND and the
+    // `ephemeral` flag are looked up from config / the ephemeral map as metadata for a name the
+    // registry has already admitted. Ephemeral is checked first: it wins for a duplicate name,
+    // matching `build_services_with_ephemeral`.
+    let mut out: Vec<ServiceInfo> = live
         .iter()
-        .filter_map(|(name, svc)| {
-            let backend = match svc.backend_result() {
-                Ok(Backend::Run(_)) => BackendKind::Run,
-                Ok(Backend::Socket(_)) => BackendKind::Socket,
-                Err(_) => return None,
-            };
-            Some(ServiceInfo {
-                name: name.clone(),
-                allow: svc.allow.clone(),
-                allow_display: svc
-                    .allow
-                    .iter()
-                    .map(|p| display_principal(p, peers))
-                    .collect(),
-                backend,
-                ephemeral: false,
-            })
-        })
-        .collect();
-    // Ephemeral registrations (#36): in-memory only, flagged so a consumer knows they vanish on
-    // disconnect/restart. Same surface discipline — kind only, never the command/path.
-    for (name, eph) in ephemeral {
-        let backend = match &eph.backend {
-            mcpmesh_local_api::BackendSpec::Run { .. } => BackendKind::Run,
-            mcpmesh_local_api::BackendSpec::Socket { .. } => BackendKind::Socket,
-        };
-        out.push(ServiceInfo {
+        .map(|(name, entry)| ServiceInfo {
             name: name.clone(),
-            allow: eph.allow.clone(),
-            allow_display: eph
+            allow: entry.allow.clone(),
+            allow_display: entry
                 .allow
                 .iter()
                 .map(|p| display_principal(p, peers))
                 .collect(),
-            backend,
-            ephemeral: true,
-        });
+            backend: match entry.kind {
+                mcpmesh_net::ServiceKind::Socket => BackendKind::Socket,
+                _ => BackendKind::Run,
+            },
+            ephemeral: entry.ephemeral,
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// The service names the daemon KNOWS, live or pending a reload — config plus ephemeral
+/// registrations (#100).
+///
+/// Deliberately NOT the live-registry view `service_infos` uses. `mint_invite` asks "is this a
+/// known service name", and an invite is redeemed later, after reloads — so an invite for a service
+/// the operator has just added to `config.toml` must still mint.
+pub(crate) fn known_service_names(
+    cfg: &Config,
+    ephemeral: &std::collections::HashMap<String, crate::daemon::EphemeralService>,
+) -> Vec<String> {
+    let mut out: Vec<String> = cfg
+        .services
+        .iter()
+        .filter(|(_, svc)| svc.backend_result().is_ok())
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in ephemeral.keys() {
+        if !out.contains(name) {
+            out.push(name.clone());
+        }
     }
+    out.sort();
     out
 }
 
@@ -226,15 +235,19 @@ pub(crate) fn peer_infos(store: &PeerStore) -> Vec<PeerInfo> {
 #[cfg(test)]
 mod tests {
     use crate::allowlist::PeerEntry;
-    use crate::daemon::config_write::append_allow_to_config;
     use crate::daemon::testutil::hermetic_mesh;
 
     /// `status` reflects the LIVE config + store on every call. A pairing grant
     /// (grant_service_access → allow-append) and a rendezvous PeerEntry write land durably
     /// WITHOUT touching `DaemonState`; `status` must still show the just-granted allow + the
     /// just-paired peer (the Jetson-proof "status says `allowed: no one yet` right after
-    /// pairing" confusion). Models the flows faithfully by mutating the config + store directly
-    /// (exactly what grant + rendezvous do to the durable state).
+    /// pairing" confusion).
+    ///
+    /// Drives the REAL `grant_service_access` rather than hand-writing the config. It used to do
+    /// the latter and claim it was "exactly what grant does" — it was not: the real verb writes
+    /// config AND reloads the live registry. #100 made that gap visible, because `status` now
+    /// answers from the registry, so a bare config append no longer shows up (correctly — that is
+    /// the state the accept path would refuse).
     #[tokio::test(flavor = "multi_thread")]
     async fn status_reads_the_live_config_and_store() {
         let dir = tempfile::tempdir().unwrap();
@@ -249,13 +262,9 @@ mod tests {
 
         // Durable mutations exactly as grant + rendezvous perform them: append the grant to the
         // config, and write the peer's PeerEntry straight to the store.
-        append_allow_to_config(
-            &config_path,
-            "alice",
-            &["kb".to_string()],
-            &std::collections::HashSet::new(),
-        )
-        .unwrap();
+        crate::daemon::grant_service_access(&mesh, "alice", "alice", &["kb".to_string()])
+            .await
+            .unwrap();
         mesh.store
             .add(PeerEntry {
                 endpoint_id: [9u8; 32],

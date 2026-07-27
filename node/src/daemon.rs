@@ -62,6 +62,33 @@ pub use handlers::{
     rename_peer, revoke_service_access, revoke_service_allow,
 };
 pub(crate) use reach::caller_admitted_services;
+/// The services this identity is admitted to, as the accept path computes them (#100). Test seam:
+/// it lets a test assert that the reported set matches what a session would actually be granted.
+/// The `status` service list, built from the live registry (#100). Test seam.
+#[doc(hidden)]
+pub fn service_infos_for_test(
+    mesh: &std::sync::Arc<MeshState>,
+) -> Vec<mcpmesh_local_api::ServiceInfo> {
+    let peers = mesh.store.list().unwrap_or_default();
+    service_infos(&mesh.live_services(), &peers)
+}
+
+/// Mint an invite (#100 test seam) — pins that `mint_invite` keeps the KNOWN-names view.
+#[doc(hidden)]
+pub async fn mint_invite_for_test(
+    mesh: &std::sync::Arc<MeshState>,
+    services: &[String],
+) -> anyhow::Result<mcpmesh_local_api::InviteResult> {
+    mint_invite(services.to_vec(), None, mesh).await
+}
+
+#[doc(hidden)]
+pub fn admitted_services_for_test(
+    mesh: &std::sync::Arc<MeshState>,
+    identity: &mcpmesh_net::PeerIdentity,
+) -> Vec<String> {
+    caller_admitted_services(mesh, identity)
+}
 pub use reach::{REACH_TTL_SECS, ReachEntry, probe_peer, reachability_of};
 pub use roster_install::{
     install_roster_view_and_sever, should_staleness_sever, staleness_sweep_once,
@@ -80,7 +107,9 @@ pub(crate) use handlers::{
 pub(crate) use roster_install::{
     install_roster, org_join, set_app_metadata, set_nickname, set_roster_url,
 };
-pub(crate) use status::{peer_infos, presence_peers, roster_status, service_infos};
+pub(crate) use status::{
+    known_service_names, peer_infos, presence_peers, roster_status, service_infos,
+};
 
 /// The lockstep stack version (workspace version) reported in `Hello`/`status`.
 pub const STACK_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -835,6 +864,11 @@ pub fn build_services_with_ephemeral(
             ServiceEntry {
                 backend,
                 allow: svc.allow.clone(),
+                kind: match svc.backend_result() {
+                    Ok(Backend::Socket(_)) => mcpmesh_net::ServiceKind::Socket,
+                    _ => mcpmesh_net::ServiceKind::Run,
+                },
+                ephemeral: false,
             },
         );
     }
@@ -854,6 +888,13 @@ pub fn build_services_with_ephemeral(
             ServiceEntry {
                 backend,
                 allow: eph.allow.clone(),
+                kind: match &eph.backend {
+                    mcpmesh_local_api::BackendSpec::Socket { .. } => {
+                        mcpmesh_net::ServiceKind::Socket
+                    }
+                    mcpmesh_local_api::BackendSpec::Run { .. } => mcpmesh_net::ServiceKind::Run,
+                },
+                ephemeral: true,
             },
         );
     }
@@ -993,7 +1034,7 @@ pub(crate) mod testutil {
         let endpoint = build_endpoint(iroh::SecretKey::from_bytes(&[7u8; 32]), &hermetic, false)
             .await
             .unwrap();
-        MeshState::new(
+        let mesh = MeshState::new(
             endpoint,
             gate,
             store,
@@ -1006,7 +1047,27 @@ pub(crate) mod testutil {
             None,
             None,
             None,
-        )
+        );
+        // Model a BOOTED daemon: `MeshState::new` installs an EMPTY registry, and boot then swaps
+        // in the built services before the control socket exists. #100 made that load-bearing —
+        // `status` and `peer_services` now answer from the registry, so a harness that left it
+        // empty was asserting against a state no live daemon is ever observable in.
+        let cfg = crate::config::Config::load(&mesh.config_path).unwrap_or_default();
+        let ephemeral = mesh
+            .ephemeral_services
+            .lock()
+            .expect("ephemeral_services lock not poisoned")
+            .clone();
+        crate::daemon::accept::swap_services(
+            &mesh,
+            crate::daemon::build_services_with_ephemeral(
+                &cfg,
+                &mesh.audit(),
+                &mesh.limits(),
+                &ephemeral,
+            ),
+        );
+        mesh
     }
 }
 
