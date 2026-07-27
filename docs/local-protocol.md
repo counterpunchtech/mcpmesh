@@ -168,6 +168,19 @@ Methods split into two groups by audience:
 | `blob_list` | *(none)* | `{scopes:[{name, hashes:[…], grants:[…]}]}` |
 | `blob_fetch` | `{ticket, dest_path}` | `{hash, bytes_len}` |
 
+> **`blob_fetch` blocks the control connection, and cannot be cancelled.**
+>
+> The fetch streams to disk, so peak memory does not scale with blob size (#82). Two limits remain:
+>
+> - **It is awaited inline on the control connection.** A multi-GB transfer stalls every other verb
+>   on *that* connection — status, reachability, grants. Use a separate control connection for a
+>   large fetch if you need the daemon responsive meanwhile.
+> - **There is no cancellation.** Dropping the client does not abort an in-flight transfer; the
+>   reader only errors at the next frame. A Cancel button cannot currently stop the work.
+>
+> Neither end reports progress, so a stalled transfer is indistinguishable from a slow one. Tracked
+> in [#82](https://github.com/counterpunchtech/mcpmesh/issues/82).
+
 > **`blob_unpublish` withdraws access, it does not delete data.** The bytes stay in the provider's
 > local store. The authorization effect applies to **new requests from that scope**: a subsequent
 > GET is refused at the request hook, even for a caller holding the ticket — a hash is not a

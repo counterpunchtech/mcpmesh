@@ -259,6 +259,24 @@ impl AppBlobs {
             .await
             .context("read fetched app blob")
     }
+
+    /// STREAM a blob from the store to `dest`, returning the bytes written (#82).
+    ///
+    /// Peak memory is independent of blob size. The `read_bytes` + `fs::write` path this replaces
+    /// materialized the whole blob as one `Bytes` first — and `get_bytes`' own iroh doc warns it
+    /// *"will run out of memory when called for very large blobs"*. On a small headless node a
+    /// multi-GB fetch was an OOM kill rather than a slow transfer.
+    ///
+    /// `ExportMode::Copy` (via `export`) writes an independent file, so the destination survives a
+    /// later store reclaim. `ExportMode::TryReference` would avoid the second copy but ties the
+    /// exported file's lifetime to the store — a separate decision, see #82's item 3.
+    pub async fn export_to(&self, hash: Hash, dest: &Path) -> Result<u64> {
+        self.store
+            .blobs()
+            .export(hash, dest)
+            .await
+            .with_context(|| format!("export app blob to {}", dest.display()))
+    }
 }
 
 /// The request-time scope Intercept drain loop (the security core). Single-consumer: this

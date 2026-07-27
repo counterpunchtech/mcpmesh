@@ -179,15 +179,12 @@ pub(crate) async fn blob_fetch(
         "app-blob provider not enabled (its store failed to build — check the daemon log)",
     )?;
     let hash = provider.fetch(&ticket).await.context("fetch blob")?;
-    let bytes = provider
-        .read_bytes(hash)
-        .await
-        .context("read fetched blob")?;
-    let bytes_len = bytes.len() as u64;
+    // STREAM to disk (#82). The previous `read_bytes` + `fs::write` held the entire blob in memory
+    // before a byte landed, so peak RSS was blob-sized and a large fetch OOM-killed the node rather
+    // than merely being slow. `export` writes incrementally and reports the size, so nothing here
+    // scales with the blob.
     let dest = PathBuf::from(dest_path);
-    tokio::fs::write(&dest, &bytes)
-        .await
-        .with_context(|| format!("write fetched blob to {}", dest.display()))?;
+    let bytes_len = provider.export_to(hash, &dest).await?;
     Ok(BlobFetchResult {
         hash: hash.to_hex().to_string(),
         bytes_len,
