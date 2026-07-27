@@ -14,8 +14,8 @@ use std::time::Duration;
 use mcpmesh::allowlist::{AllowlistGate, PeerEntry, PeerStore};
 use mcpmesh::config::Config;
 use mcpmesh::daemon::{
-    EphemeralService, MeshState, build_services, grant_service_access, revoke_service_allow,
-    spawn_accept_loop,
+    EphemeralService, MeshState, build_services, grant_service_access, grant_service_allow,
+    revoke_service_allow, spawn_accept_loop,
 };
 use mcpmesh::pairing::LiveInvites;
 use mcpmesh::roster::gate::RosterGate;
@@ -276,4 +276,112 @@ async fn an_ephemeral_registration_survives_an_unrelated_swap() {
     })
     .await
     .expect("overlay survival test timed out");
+}
+
+/// #94's central safety question. A name held by BOTH an ephemeral registration and `config.toml`
+/// must have the principal stripped from BOTH — the #55 review's finding, and the reason
+/// `revoke_service_allow` does NOT take an ephemeral fast path even though it has already computed
+/// `is_ephemeral`.
+///
+/// Stripping only the shadowing overlay leaves the config copy holding the principal: invisible
+/// while the overlay shadows it, then LIVE with the stale allow the instant the registering control
+/// connection drops the ephemeral entry. The revoke reported success; the peer walks back in.
+///
+/// This test fails if the config pass is skipped for an ephemeral name — the exact optimization
+/// #94 asked for.
+#[tokio::test]
+async fn a_revoke_strips_a_name_held_by_both_config_and_the_overlay() {
+    timeout(Duration::from_secs(30), async {
+        let (mesh, addr, peer, principal, dir) = mesh_with_ephemeral_room().await;
+
+        // `room` now exists in BOTH places, with the principal in each: the hand-edited config
+        // under the live ephemeral registration.
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[services.kept]\nrun = ['{STUB}']\nallow = [\"{principal}\"]\n\
+                 [services.room]\nrun = ['{STUB}']\nallow = [\"{principal}\"]\n"
+            ),
+        )
+        .unwrap();
+        grant_service_access(&mesh, &principal, "alice", &["room".to_string()])
+            .await
+            .expect("grant");
+
+        revoke_service_allow(&mesh, "room".to_string(), principal.clone())
+            .await
+            .expect("revoke");
+
+        // Drop the overlay. The config copy is now the live one — and must NOT admit the peer.
+        mcpmesh::daemon::unregister_ephemeral(&mesh, &["room".to_string()]).await;
+
+        let conn = dial(&peer, addr).await;
+        let mut t = open_session(&conn, "room").await;
+        assert!(
+            !session_served(t.as_mut()).await,
+            "the config copy of a both-held name must not survive the revoke — this is #55's \
+             defect: a revoke that reported success, then re-admitted the peer the moment the \
+             ephemeral registration dropped"
+        );
+    })
+    .await
+    .expect("both-held revoke test timed out");
+}
+
+/// #94 changes behaviour in one visible way, and this pins it: an allow edit that lands only in the
+/// ephemeral overlay no longer rebuilds the registry from disk, so it no longer picks up unrelated
+/// edits to `config.toml` as a side effect.
+///
+/// That side effect was incidental, not contractual — applying an operator's unrelated, possibly
+/// half-finished config edit because someone was granted access to a different service is
+/// surprising. `register_service` and the explicit reload remain the ways to pick config up.
+///
+/// Scoped to `service_allow_grant`/`service_allow_revoke`, the two verbs #94 names. The
+/// multi-service PAIRING grant (`grant_service_access`) still rebuilds from disk — see the
+/// regression test below, which pins that it was not changed by accident.
+#[tokio::test]
+async fn an_overlay_only_grant_does_not_apply_an_unrelated_config_edit() {
+    timeout(Duration::from_secs(30), async {
+        let (mesh, addr, peer, principal, dir) = mesh_with_ephemeral_room().await;
+
+        // First grant: `room` is not in the live registry yet (the harness boots config-only), so
+        // this one legitimately rebuilds — `with_allow_replaced` refuses to invent an entry.
+        grant_service_allow(&mesh, "room".to_string(), "b64u:carol".to_string())
+            .await
+            .expect("first grant");
+
+        // A new config service appears on disk AFTER that, unrelated to the grant below.
+        std::fs::write(
+            dir.path().join("config.toml"),
+            format!(
+                "[services.kept]\nrun = ['{STUB}']\nallow = [\"{principal}\"]\n\
+                 [services.late]\nrun = ['{STUB}']\nallow = [\"{principal}\"]\n"
+            ),
+        )
+        .unwrap();
+
+        // Second grant, on the SAME already-live ephemeral service. Nothing changes on disk, so
+        // this takes the targeted-swap path — and it grants the peer we then dial with, so the
+        // assertion below fails if the swap does not reach the live registry.
+        grant_service_allow(&mesh, "room".to_string(), principal.clone())
+            .await
+            .expect("second grant");
+
+        let conn = dial(&peer, addr).await;
+        let mut room = open_session(&conn, "room").await;
+        assert!(
+            session_served(room.as_mut()).await,
+            "the targeted swap must reach the live registry — this grant never touched disk"
+        );
+
+        let mut late = open_session(&conn, "late").await;
+        assert!(
+            !session_served(late.as_mut()).await,
+            "an overlay-only grant must NOT hot-load an unrelated config service — the disk \
+             reload is deliberately skipped (#94)"
+        );
+    })
+    .await
+    .expect("unrelated config edit test timed out");
 }

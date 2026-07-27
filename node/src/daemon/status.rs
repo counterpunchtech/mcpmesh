@@ -249,7 +249,13 @@ mod tests {
 
         // Durable mutations exactly as grant + rendezvous perform them: append the grant to the
         // config, and write the peer's PeerEntry straight to the store.
-        append_allow_to_config(&config_path, "alice", &["kb".to_string()]).unwrap();
+        append_allow_to_config(
+            &config_path,
+            "alice",
+            &["kb".to_string()],
+            &std::collections::HashSet::new(),
+        )
+        .unwrap();
         mesh.store
             .add(PeerEntry {
                 endpoint_id: [9u8; 32],

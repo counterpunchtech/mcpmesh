@@ -70,6 +70,11 @@ genuine mistake and must stay visible.
 A grant/revoke that changes only the ephemeral overlay **no longer picks up unrelated hand-edits to
 `config.toml`** as a side effect. Today it does, incidentally, because it reloads from disk.
 
+Scoped to `service_allow_grant` / `service_allow_revoke`, the two verbs #94 names. The
+multi-service PAIRING grant (`grant_service_access`) still rebuilds from disk — it grants into
+several services at once, so the single-entry swap does not fit it, and extending it is a separate
+change. A regression test pins that it was not altered by accident.
+
 This is a deliberate improvement: applying an operator's unrelated, possibly half-finished config
 edit as a side effect of granting one principal is surprising, and `register_service` / the explicit
 reload path remain the documented ways to pick config changes up. It is called out in

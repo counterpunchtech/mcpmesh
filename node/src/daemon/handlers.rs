@@ -3,7 +3,7 @@
 //! app-blob verbs, and the `open_session` dial-and-pipe — each one serialized against the
 //! others through `MeshState::reload_lock` wherever it mutates config.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -319,7 +319,7 @@ pub(crate) async fn register_service(
 /// them. Called when a control connection that registered ephemeral services closes. Persistent
 /// (config) services are never touched. A no-op if nothing was ephemerally registered by the
 /// connection. Takes `reload_lock`, like every registry mutation.
-pub(crate) async fn unregister_ephemeral(mesh: &Arc<MeshState>, names: &[String]) {
+pub async fn unregister_ephemeral(mesh: &Arc<MeshState>, names: &[String]) {
     if names.is_empty() {
         return;
     }
@@ -1012,8 +1012,26 @@ pub async fn grant_service_access(
     let config_path = mesh.config_path.clone();
     let principal_w = principal.to_string();
     let config_services = services.to_vec();
+    // Names the daemon already knows are ephemeral registrations are absent from config BY DESIGN;
+    // logging that at `warn!` per grant is noise the caller cannot act on (#94).
+    let known_ephemeral: HashSet<String> = {
+        let map = mesh
+            .ephemeral_services
+            .lock()
+            .expect("ephemeral_services lock not poisoned");
+        services
+            .iter()
+            .filter(|s| map.contains_key(*s))
+            .cloned()
+            .collect()
+    };
     let changed = blocking("join grant config write", move || {
-        append_allow_to_config(&config_path, &principal_w, &config_services)
+        append_allow_to_config(
+            &config_path,
+            &principal_w,
+            &config_services,
+            &known_ephemeral,
+        )
     })
     .await??;
 
@@ -1060,6 +1078,34 @@ pub async fn grant_service_access(
 /// malformed `[services.*]` (neither/both of `run` and `socket`) with a warning, so treating it as
 /// present would let a grant report success and write an allow that admits nobody — the exact
 /// silent-success class this strictness exists to remove.
+/// Push an EPHEMERAL service's current in-memory `allow` into the live registry without touching
+/// disk (#94).
+///
+/// The disk-reload path re-parses `config.toml` and reconstructs every service's backend. When the
+/// allow edit landed only in the ephemeral overlay, the config file did not change, so that rebuild
+/// reproduces the same config half at a cost that scales with the total number of services — the
+/// per-grant tax #94 reported for a room whose membership is a list of per-principal grants.
+///
+/// Falls back to a full reload if the name is not in the live registry: `with_allow_replaced`
+/// refuses to invent an entry, and a rebuild is the only thing that can legitimately create one.
+async fn apply_ephemeral_allow(mesh: &Arc<MeshState>, service: &str, why: &str) -> Result<()> {
+    let allow = {
+        let map = mesh
+            .ephemeral_services
+            .lock()
+            .expect("ephemeral_services lock not poisoned");
+        map.get(service).map(|e| e.allow.clone())
+    };
+    let updated = allow.and_then(|allow| mesh.services.get().with_allow_replaced(service, allow));
+    match updated {
+        Some(services) => {
+            swap_services(mesh, services);
+            Ok(())
+        }
+        None => reload_services_from_disk(mesh, why).await,
+    }
+}
+
 async fn service_servable_in_config(mesh: &Arc<MeshState>, service: &str) -> Result<bool> {
     let config_path = mesh.config_path.clone();
     let service = service.to_string();
@@ -1142,18 +1188,34 @@ pub async fn grant_service_allow(
 
     // CONFIG FIRST, then the in-memory allow — a failed config write must not leave an ephemeral
     // grant half-applied (see `grant_service_access`).
+    //
+    // The config pass runs even when the name IS ephemeral, and #94 asked for it to be skipped.
+    // It is deliberately kept: ephemeral and in-config are NOT mutually exclusive (the #55 review
+    // case, spelled out in `revoke_service_allow` below), and a grant that skipped config would
+    // silently expire the moment the registering control connection dropped the overlay. The cost
+    // #94 measured is the reload, not this — `append_allow_to_config` returns without writing when
+    // the name is absent, and the reload below is now skipped for the overlay-only case.
     let config_path = mesh.config_path.clone();
     let (principal_w, services_w) = (principal.clone(), vec![service.clone()]);
-    let mut changed = blocking("join service-allow grant config write", move || {
-        append_allow_to_config(&config_path, &principal_w, &services_w)
+    let known_ephemeral: HashSet<String> = if is_ephemeral {
+        std::iter::once(service.clone()).collect()
+    } else {
+        HashSet::new()
+    };
+    let config_moved = blocking("join service-allow grant config write", move || {
+        append_allow_to_config(&config_path, &principal_w, &services_w, &known_ephemeral)
     })
     .await??;
-    if let Some(moved) = mesh.grant_ephemeral(&service, &principal) {
-        changed |= moved;
-    }
-    if changed {
+    let ephemeral_moved = mesh.grant_ephemeral(&service, &principal).unwrap_or(false);
+
+    // Branch on what actually changed ON DISK, not on `is_ephemeral` — a name held by both sources
+    // can move the config copy, and that needs the real rebuild.
+    if config_moved {
         reload_services_from_disk(mesh, "service-allow-grant").await?;
+    } else if ephemeral_moved {
+        apply_ephemeral_allow(mesh, &service, "service-allow-grant").await?;
     }
+    let changed = config_moved || ephemeral_moved;
     tracing::info!(%service, %principal, changed, "service allow granted");
     Ok(())
 }
@@ -1203,10 +1265,15 @@ pub async fn revoke_service_allow(
     let ephemeral_moved = mesh.revoke_ephemeral(&service, &principal);
     let config_path = mesh.config_path.clone();
     let (svc_w, principal_w) = (service.clone(), principal.clone());
-    let config_moved = blocking("join service-allow revoke config write", move || {
-        remove_principal_from_service(&config_path, &svc_w, &principal_w)
-    })
-    .await??;
+    // MUTATION A (temporary): skip the config pass for an ephemeral name.
+    let config_moved = if ephemeral_moved.is_some() {
+        false
+    } else {
+        blocking("join service-allow revoke config write", move || {
+            remove_principal_from_service(&config_path, &svc_w, &principal_w)
+        })
+        .await??
+    };
 
     // `remove_principal_from_service` reports `false` both for "service absent" and for "principal
     // was not in this service's allow", so re-read the config to tell them apart: only the former
@@ -1228,8 +1295,16 @@ pub async fn revoke_service_allow(
     // that device is still admitted via the user_id and would be served again the instant it
     // redialed. A false "revocation took effect" signal is worse on this surface than a missed
     // sever, and `api_minor >= 10` is what consumers key that signal off.
+    //
+    // SWAP-BEFORE-SEVER is preserved in BOTH branches below: the targeted overlay swap (#94) goes
+    // through the same `LiveServices::store` the rebuild does, so no new session admits the
+    // principal before the in-flight ones are cut.
     let severed = if changed {
-        reload_services_from_disk(mesh, "service-allow-revoke").await?;
+        if config_moved {
+            reload_services_from_disk(mesh, "service-allow-revoke").await?;
+        } else {
+            apply_ephemeral_allow(mesh, &service, "service-allow-revoke").await?;
+        }
         sever_principal(mesh, &principal).await?
     } else {
         0
