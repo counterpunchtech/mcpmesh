@@ -102,9 +102,13 @@ pub fn install_roster_view_and_sever(
     // is audited, including the AUTOMATIC gossip/URL convergences a rostered node lives on
     // (which never touch the manual verb). The terminus of org approve/revoke funnels through here
     // too, so the manual path stays audited — once. Surface-clean: org/serial only, NO keys/EndpointIds.
+    // `principal` is None (#57): a roster install is a purely LOCAL event with no remote peer and
+    // no single subject identity — `target` carries `org/serial`, which is the whole surface-clean
+    // fact. Deliberately not the org root key or any EndpointId.
     mesh.audit().record(AuditRecord::trust(
         now_ts(),
         "roster_install".into(),
+        None,
         Some(format!("{org_id}/{serial}")),
     ));
     severed

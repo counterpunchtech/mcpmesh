@@ -406,9 +406,13 @@ pub async fn remove_peer(state: &DaemonState, params: PeerRemoveParams) -> Resul
     // Trust event: an unpair — reached only when something was ACTUALLY torn down (a
     // stripped allow OR a deleted PeerEntry; the all-no-op case errored above), so a refused
     // remove of a never-paired nickname writes NO phantom `unpair` record. Nickname only.
+    // `principal` is None: an unpair can tear down SEVERAL devices under one nickname, so there is
+    // no single stable identity for the record to name (#57). `target` carries the nickname, and
+    // the per-device detail is in the `revoke`/session records.
     mesh.audit().record(AuditRecord::trust(
         now_ts(),
         "unpair".into(),
+        None,
         Some(nickname.clone()),
     ));
     Ok(())
@@ -974,10 +978,15 @@ pub async fn grant_service_access(
 
     // Trust event: NO secret (the display nickname is the surface-clean handle).
     tracing::info!(peer = %display_nickname, ?services, changed, "granted service access");
-    // Trust event: a pairing grant. Display nickname only — NO secret.
+    // Trust event: a pairing grant. `principal` is None DELIBERATELY — `trust_mutations_emit_audit
+    // _events` enforces that the stable principal must not land in a trust record, and the surface
+    // discipline in `docs/local-protocol.md` says a record carries a nickname/user_id and never an
+    // endpoint-id. #57 is about attributing the SESSION/REQUEST stream; widening trust records is a
+    // separate decision. Display nickname only — NO secret.
     mesh.audit().record(AuditRecord::trust(
         now_ts(),
         "pair".into(),
+        None,
         Some(display_nickname.to_string()),
     ));
     Ok(())
@@ -1360,8 +1369,15 @@ where
             // stream shows the attempted-and-failed reach. `peer` is the caller's
             // nickname/user_id, never an endpoint-id.
             mesh.audit().record(
-                AuditRecord::session_open(now_ts(), Some(peer.to_string()), service.to_string())
-                    .with_status("error"),
+                // `principal` is None: this records OUR failed outbound dial, so there is no
+                // gate-resolved caller — `peer` carries the target spec the caller asked for.
+                AuditRecord::session_open(
+                    now_ts(),
+                    Some(peer.to_string()),
+                    None,
+                    service.to_string(),
+                )
+                .with_status("error"),
             );
             // Dial establishment failed: hand the proxy a well-formed -32055 (not a hang),
             // which it relays to the AI client. The error id is null — the AI

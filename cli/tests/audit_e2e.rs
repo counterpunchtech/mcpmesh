@@ -135,6 +135,33 @@ async fn real_session_audits_with_hashed_args_and_all_event_classes() {
         // Session lifecycle present.
         assert!(body.contains("\"kind\":\"session_open\""));
         assert!(body.contains("\"kind\":\"session_close\""));
+
+        // #57: every record attributed to this caller carries the STABLE `eid:` device principal
+        // beside the display `peer`. `peer` alone cannot tell two devices of one person apart, nor
+        // two contacts sharing a nickname — which is the whole point of the field.
+        let want_principal = format!("\"principal\":\"{caller_eid}\"");
+        assert!(
+            body.contains(&want_principal),
+            "audit records must carry the caller's stable principal {caller_eid}:\n{body}"
+        );
+        // It is on EVERY peer-attributed class, not just one: session lifecycle AND the proxied
+        // request. Parse the records rather than substring-matching so this cannot pass on a
+        // single stray occurrence.
+        let mut kinds_with_principal: Vec<String> = body
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["principal"] == serde_json::json!(caller_eid.clone()))
+            .map(|v| v["kind"].as_str().unwrap_or_default().to_string())
+            .collect();
+        kinds_with_principal.sort();
+        kinds_with_principal.dedup();
+        for kind in ["session_open", "session_close", "request"] {
+            assert!(
+                kinds_with_principal.iter().any(|k| k == kind),
+                "`{kind}` must carry the caller principal; got {kinds_with_principal:?}\n{body}"
+            );
+        }
     })
     .await
     .expect("audit E2E timed out");

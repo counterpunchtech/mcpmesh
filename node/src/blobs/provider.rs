@@ -281,9 +281,12 @@ fn spawn_gate_loop(
                     let peer = identity
                         .as_ref()
                         .map(|i| i.user_id.clone().unwrap_or_else(|| i.name.clone()));
+                    // The stable `eid:` device principal from the same resolution (#57).
+                    let principal = identity.as_ref().map(|i| i.endpoint.principal());
                     audit.record(AuditRecord::blob_fetch(
                         now_ts(),
                         peer,
+                        principal,
                         hash_hex,
                         if allow { "ok".into() } else { "denied".into() },
                     ));

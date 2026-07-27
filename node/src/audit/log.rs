@@ -66,7 +66,9 @@ pub struct AuditLog {
     bcast: broadcast::Sender<AuditRecord>,
     /// Currently-open sessions keyed by a monotonic id (so a guard removes exactly its own row).
     /// Behind a `Mutex`; the lock is never held across an `.await`.
-    live: Mutex<HashMap<u64, ActiveSession>>,
+    /// Live sessions: the public row plus the caller's stable `eid:` principal, which
+    /// `session_close` emits but `status` deliberately does not expose (#57).
+    live: Mutex<HashMap<u64, (ActiveSession, Option<String>)>>,
     /// Monotonic session-id source for the live table.
     seq: AtomicU64,
 }
@@ -127,7 +129,7 @@ impl AuditLog {
             .lock()
             .expect("audit live lock")
             .values()
-            .cloned()
+            .map(|(row, _principal)| row.clone())
             .collect();
         v.sort_by_key(|s| s.opened_at);
         v
@@ -136,20 +138,27 @@ impl AuditLog {
     /// Emit `session_open`, insert the session into the live table, and return its id (the RAII
     /// [`SessionGuard`] holds it to remove exactly this row on drop). The lock is released before
     /// return and never held across an `.await`.
-    fn open_tracked(&self, peer: String, service: String) -> u64 {
+    fn open_tracked(&self, peer: String, principal: Option<String>, service: String) -> u64 {
         let id = self.seq.fetch_add(1, Ordering::Relaxed);
         self.record(AuditRecord::session_open(
             now_ts(),
             Some(peer.clone()),
+            principal.clone(),
             service.clone(),
         ));
+        // The principal rides ALONGSIDE the public `ActiveSession` row rather than inside it (#57):
+        // `session_close` needs it, but `status`'s live-session view is a separate surface that this
+        // change deliberately does not widen.
         self.live.lock().expect("audit live lock").insert(
             id,
-            ActiveSession {
-                peer,
-                service,
-                opened_at: crate::util::epoch_now_i64(),
-            },
+            (
+                ActiveSession {
+                    peer,
+                    service,
+                    opened_at: crate::util::epoch_now_i64(),
+                },
+                principal,
+            ),
         );
         id
     }
@@ -158,10 +167,11 @@ impl AuditLog {
     /// present, so a double-drop or disabled path is a no-op).
     fn close_tracked(&self, id: u64) {
         let removed = self.live.lock().expect("audit live lock").remove(&id);
-        if let Some(s) = removed {
+        if let Some((s, principal)) = removed {
             self.record(AuditRecord::session_close(
                 now_ts(),
                 Some(s.peer),
+                principal,
                 s.service,
             ));
         }
@@ -196,10 +206,15 @@ impl AuditSink {
     /// Begin a tracked session: emits `session_open` and tracks it in the live table. Drop the
     /// returned [`SessionGuard`] to close it (emits `session_close` + table removal). A disabled sink
     /// returns a no-op guard that does nothing on drop.
-    pub fn session(&self, peer: String, service: String) -> SessionGuard {
+    pub fn session(
+        &self,
+        peer: String,
+        principal: Option<String>,
+        service: String,
+    ) -> SessionGuard {
         match &self.0 {
             Some(log) => SessionGuard {
-                id: log.open_tracked(peer, service),
+                id: log.open_tracked(peer, principal, service),
                 log: Some(log.clone()),
             },
             None => SessionGuard { log: None, id: 0 },
@@ -271,16 +286,23 @@ pub struct RequestAuditor {
 struct RequestAuditorInner {
     sink: AuditSink,
     peer: Option<String>,
+    principal: Option<String>,
     service: String,
     pending: Mutex<HashMap<String, Pending>>,
 }
 
 impl RequestAuditor {
-    pub fn new(sink: AuditSink, peer: Option<String>, service: String) -> Self {
+    pub fn new(
+        sink: AuditSink,
+        peer: Option<String>,
+        principal: Option<String>,
+        service: String,
+    ) -> Self {
         Self {
             inner: Some(Arc::new(RequestAuditorInner {
                 sink,
                 peer,
+                principal,
                 service,
                 pending: Mutex::new(HashMap::new()),
             })),
@@ -330,6 +352,7 @@ impl RequestAuditor {
                 inner.sink.record(AuditRecord::proxied_notification(
                     now_ts(),
                     inner.peer.clone(),
+                    inner.principal.clone(),
                     inner.service.clone(),
                     method.to_string(),
                     tool,
@@ -379,6 +402,7 @@ impl RequestAuditor {
         inner.sink.record(AuditRecord::proxied_request(
             now_ts(),
             inner.peer.clone(),
+            inner.principal.clone(),
             inner.service.clone(),
             p.method,
             p.tool,
@@ -404,6 +428,7 @@ mod tests {
         let rec = AuditRecord::proxied_request(
             "2026-07-03T14:02:11.480Z".into(),
             Some("bob".into()),
+            Some("eid:beef".into()),
             "notes".into(),
             "tools/call".into(),
             Some("read_file".into()),
@@ -427,8 +452,12 @@ mod tests {
         assert!(body.contains("blake3:"));
 
         // A second record in a DIFFERENT month lands in its own file (monthly rotation).
-        let rec2 =
-            AuditRecord::session_open("2026-08-01T00:00:00.000Z".into(), None, "notes".into());
+        let rec2 = AuditRecord::session_open(
+            "2026-08-01T00:00:00.000Z".into(),
+            None,
+            None,
+            "notes".into(),
+        );
         append_record(dir.path(), &rec2).unwrap();
         assert!(dir.path().join("2026-08.jsonl").exists());
         // The July file still has exactly one line (append, not overwrite).
@@ -445,6 +474,7 @@ mod tests {
             sink.record(AuditRecord::session_open(
                 format!("2026-07-03T14:02:1{i}.000Z"),
                 Some("bob".into()),
+                Some("eid:beef".into()),
                 "notes".into(),
             ));
         }
@@ -471,6 +501,7 @@ mod tests {
             "2026-07-03T14:02:11.480Z".into(),
             "pair".into(),
             None,
+            None,
         ));
         // Nothing observable to assert beyond "did not panic / no file created"; the call returns.
     }
@@ -480,7 +511,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let audit_dir = dir.path().to_path_buf();
         let sink = AuditSink::new(AuditLog::spawn(audit_dir.clone()));
-        let auditor = RequestAuditor::new(sink, Some("bob".into()), "notes".into());
+        let auditor = RequestAuditor::new(
+            sink,
+            Some("bob".into()),
+            Some("eid:beef".into()),
+            "notes".into(),
+        );
 
         let secret = "sensitive-search-query-xyzzy";
         // Direction A: a tools/call request with a sensitive argument. The auditor sees the raw args
@@ -533,7 +569,12 @@ mod tests {
     async fn server_initiated_request_does_not_corrupt_client_correlation() {
         let dir = tempfile::tempdir().unwrap();
         let sink = AuditSink::new(AuditLog::spawn(dir.path().to_path_buf()));
-        let auditor = RequestAuditor::new(sink, Some("bob".into()), "notes".into());
+        let auditor = RequestAuditor::new(
+            sink,
+            Some("bob".into()),
+            Some("eid:beef".into()),
+            "notes".into(),
+        );
         // Client sends request id=1 (tools/call).
         auditor.on_request(&json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -580,6 +621,7 @@ mod tests {
         log.record(AuditRecord::session_open(
             now_ts(),
             Some("bob".into()),
+            Some("eid:beef".into()),
             "notes".into(),
         ));
         let got = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
@@ -596,7 +638,7 @@ mod tests {
         let sink = AuditSink::new(AuditLog::spawn(dir.path().to_path_buf()));
         assert!(sink.active_sessions().is_empty());
         {
-            let _s = sink.session("bob".into(), "notes".into());
+            let _s = sink.session("bob".into(), Some("eid:beef".into()), "notes".into());
             let live = sink.active_sessions();
             assert_eq!(live.len(), 1);
             assert_eq!(live[0].peer, "bob");
@@ -612,8 +654,8 @@ mod tests {
         // leaving concurrent (overlapping-lifetime) sessions untouched.
         let dir = tempfile::tempdir().unwrap();
         let sink = AuditSink::new(AuditLog::spawn(dir.path().to_path_buf()));
-        let a = sink.session("alice".into(), "notes".into());
-        let b = sink.session("bob".into(), "notes".into());
+        let a = sink.session("alice".into(), Some("eid:beef".into()), "notes".into());
+        let b = sink.session("bob".into(), Some("eid:beef".into()), "notes".into());
         assert_eq!(sink.active_sessions().len(), 2);
         // Drop A → only B survives.
         drop(a);
@@ -628,7 +670,7 @@ mod tests {
     #[test]
     fn disabled_sink_session_is_a_noop() {
         let sink = AuditSink::disabled();
-        let _s = sink.session("bob".into(), "notes".into());
+        let _s = sink.session("bob".into(), Some("eid:beef".into()), "notes".into());
         assert!(sink.active_sessions().is_empty()); // no panic, no tracking
     }
 
@@ -636,7 +678,12 @@ mod tests {
     async fn request_auditor_marks_error_responses() {
         let dir = tempfile::tempdir().unwrap();
         let sink = AuditSink::new(AuditLog::spawn(dir.path().to_path_buf()));
-        let auditor = RequestAuditor::new(sink, Some("bob".into()), "notes".into());
+        let auditor = RequestAuditor::new(
+            sink,
+            Some("bob".into()),
+            Some("eid:beef".into()),
+            "notes".into(),
+        );
         auditor
             .on_request(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}));
         auditor.on_response(

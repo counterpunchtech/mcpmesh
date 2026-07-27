@@ -7,7 +7,7 @@ named pipe on Windows. Anything that can open the endpoint and parse JSON can sp
 language — [`local-api/examples/status.py`](../local-api/examples/status.py) is a complete client
 in ~60 lines of dependency-free Python.
 
-> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.11`, `api_minor` `11`) and evolves
+> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.12`, `api_minor` `12`) and evolves
 > **additively** (see [Versioning](#versioning)), but until a stable release this document — like the
 > wire format itself — may change without a migration path. Pin the mcpmesh version you build
 > against. Source of truth is the Rust in [`local-api/`](../local-api/src/protocol.rs); where this
@@ -400,6 +400,7 @@ shape.
     "ts": "2026-07-03T14:02:11.480Z",
     "kind": "request",
     "peer": "bob",
+    "principal": "eid:9f2k…",
     "service": "notes",
     "method": "tools/call",
     "tool": "read_file",
@@ -415,7 +416,15 @@ shape.
 an RFC3339-millis UTC timestamp. Every field beyond `ts` and `kind` is optional and present only
 when it applies:
 
-- `peer` — the caller's nickname/`user_id` (absent on a local-only event with no remote peer).
+- `peer` — the caller's nickname/`user_id`, a DISPLAY rendering (absent on a local-only event with
+  no remote peer). It is not guaranteed stable and never distinguishes two devices of one person.
+- `principal` — the caller's STABLE `eid:<hex>` device principal (`api_minor >= 12`, #57): the
+  authenticated endpoint id, which no rename changes and no peer can spoof. **Key per-peer
+  decisions on this, not on `peer`.** It is the same value `PeerInfo.principal` (#41) and
+  `PeerReachability.principal` (#42) carry, so a `snapshot` frame's peer half and an `event` frame
+  join directly instead of matching on nickname. Absent exactly when `peer` is — plus on the two
+  events with no single subject: an `unpair` (which can tear down several devices at once) and a
+  `roster_install` (a purely local event).
 - `service` — the mounted service name.
 - On a `request` (one proxied MCP line): `method` (the MCP method, e.g. `tools/call`), `tool` (the
   tool **name** only, for a `tools/call`), `args_hash` (a `"blake3:…"` digest of the arguments —
@@ -534,7 +543,8 @@ things:
   `service_allow_revoke` per-peer access verbs are `api_minor >= 8` (#44); `unregister_service` (#50), the `run`-backend `env`/`cwd` (#51), `peer_services` (#52), and the `set_relays` live relay-set verb (#53) are `api_minor >= 9`; IMMEDIATE revocation
   (`service_allow_revoke`/`peer_remove` refuse new sessions on already-open connections AND sever
   live ones, #54) is `api_minor >= 10`; ephemeral-service grant/revoke plus the `-32040`
-  no-such-service error (#55, #69) are `api_minor >= 11`; the `set_nickname` verb
+  no-such-service error (#55, #69) are `api_minor >= 11`; `AuditRecord.principal` (#57) is
+  `api_minor >= 12`; the `set_nickname` verb
   and `StatusResult.self_nickname` are `api_minor >= 2` (#37); STABLE-principal `allow`
   strings + `ServiceInfo.allow_display` are `api_minor >= 3` (#38). `api_minor` is itself
   additive: a pre-1.1 daemon omits it and it reads as `0`.
