@@ -41,7 +41,7 @@ n0-future = "0.3"
 # NOT install a CryptoProvider: reqwest resolves one at client-build time and panics if none is
 # installed, so the daemon installs a ring process-default first — see `daemon::serve_forever`.
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
-rmcp = { version = "=2.1.0", features = ["client", "server", "macros"] }  # official MCP Rust SDK
+rmcp = { version = "=3.0.0-beta.3", features = ["client", "server", "macros"] }  # official MCP Rust SDK
 url = "2"  # pkarr relay URLs (spec §10.3): iroh's Pkarr builders take `url::Url` directly
 # Internal crates: `path` drives the workspace build; `version` is REQUIRED for crates.io
 # (`cargo publish` rewrites path deps to registry deps and refuses version-less ones).
