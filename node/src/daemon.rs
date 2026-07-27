@@ -58,7 +58,8 @@ pub use accept::spawn_accept_loop;
 pub use boot::serve_forever;
 pub use dial::{dial_service, pipe_session, race_dial};
 pub use handlers::{
-    grant_service_access, remove_peer, rename_peer, revoke_service_access, revoke_service_allow,
+    NoSuchService, grant_service_access, grant_service_allow, remove_peer, rename_peer,
+    revoke_service_access, revoke_service_allow,
 };
 pub(crate) use reach::caller_admitted_services;
 pub use reach::{REACH_TTL_SECS, ReachEntry, probe_peer, reachability_of};
@@ -333,6 +334,71 @@ impl MeshState {
             reachability: std::sync::Mutex::new(std::collections::HashMap::new()),
             ephemeral_services: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
+    }
+
+    /// Install an EPHEMERAL service registration directly (#36's in-memory map).
+    ///
+    /// `pub` (like [`MeshState::new`] and [`spawn_accept_loop`]) so integration tests can stand up
+    /// an ephemeral service without driving a full control connection, and exercise the SAME
+    /// grant/revoke routing the verbs use. Returns the entry it replaced, if any.
+    ///
+    /// **`#[doc(hidden)]` — a TEST SEAM, not the registration API.** It deliberately bypasses
+    /// everything `register_service { ephemeral: true }` enforces: it takes no `reload_lock`,
+    /// triggers no reload (the live registry stays stale until something else swaps), and skips the
+    /// config-collision check that keeps a name from being held ephemerally AND persistently at
+    /// once. Use `register_service`.
+    #[doc(hidden)]
+    pub fn register_ephemeral(
+        &self,
+        name: String,
+        service: EphemeralService,
+    ) -> Option<EphemeralService> {
+        self.ephemeral_services
+            .lock()
+            .expect("ephemeral_services lock not poisoned")
+            .insert(name, service)
+    }
+
+    /// Add `principal` to an EPHEMERAL service's in-memory allow (#55).
+    ///
+    /// `None` when no ephemeral registration carries that name — the caller then falls through to
+    /// the config writers. `Some(changed)` when it exists, `changed` reporting whether the allow
+    /// actually moved, so an idempotent re-grant causes no reload (the same contract
+    /// [`append_allow_to_config`](crate::daemon::config_write::append_allow_to_config) has).
+    ///
+    /// An ephemeral registration's `allow` lives only here, so before this the grant verb edited
+    /// `config.toml`, found no entry, and reported success while admitting nobody.
+    ///
+    /// The std `Mutex` is held for the lookup + push only, never across an await; the CALLER holds
+    /// `reload_lock` around the whole mutate→reload→swap section, as every registry change does.
+    pub(crate) fn grant_ephemeral(&self, service: &str, principal: &str) -> Option<bool> {
+        let mut map = self
+            .ephemeral_services
+            .lock()
+            .expect("ephemeral_services lock not poisoned");
+        let entry = map.get_mut(service)?;
+        if entry.allow.iter().any(|a| a == principal) {
+            return Some(false);
+        }
+        entry.allow.push(principal.to_string());
+        Some(true)
+    }
+
+    /// Remove `principal` from an EPHEMERAL service's in-memory allow (#69) — the exact inverse of
+    /// [`grant_ephemeral`](Self::grant_ephemeral), with the same `None`/`Some(changed)` contract.
+    ///
+    /// Before this, revoking against an ephemeral service stripped `config.toml` (which never held
+    /// the entry) and the next hot-reload re-overlaid the untouched in-memory allow, so the peer
+    /// stayed admitted.
+    pub(crate) fn revoke_ephemeral(&self, service: &str, principal: &str) -> Option<bool> {
+        let mut map = self
+            .ephemeral_services
+            .lock()
+            .expect("ephemeral_services lock not poisoned");
+        let entry = map.get_mut(service)?;
+        let before = entry.allow.len();
+        entry.allow.retain(|a| a != principal);
+        Some(entry.allow.len() != before)
     }
 
     /// Record a completed inviter-side pairing for the `status` ceremony surface (display-only —

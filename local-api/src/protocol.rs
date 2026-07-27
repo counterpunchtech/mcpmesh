@@ -905,6 +905,12 @@ pub enum BackendSpec {
     },
 }
 
+/// Control-API error code: the named service exists in neither `config.toml` nor the ephemeral
+/// registry (#55). Distinct from the generic `-32000` so a caller can BRANCH on "no such service"
+/// instead of parsing a message — `service_allow_grant`/`service_allow_revoke` previously answered
+/// `{}` (success) for an unknown name, which silently included every ephemeral service.
+pub const ERR_NO_SUCH_SERVICE: i64 = -32040;
+
 pub const API_NAME: &str = "mcpmesh-local/1";
 /// The protocol-compatibility version as `"MAJOR.MINOR"`, distinct from the crate/stack version.
 ///
@@ -914,7 +920,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   new methods, or a strictness change like params validation — bumped in the same change that
 ///   makes it. A client can guard with `api_minor >= N` for a feature it needs, or refuse a daemon
 ///   older than a minor it requires. It never resets except on a MAJOR bump.
-pub const API_VERSION: &str = "1.10";
+pub const API_VERSION: &str = "1.11";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -929,8 +935,11 @@ pub const API_VERSION: &str = "1.10";
 /// observable contract did: a revoked principal's next session is refused even on a connection it
 /// already holds, and its live connections are severed. Previously both waited for the peer to
 /// disconnect on its own, which is unbounded (#54). A consumer can guard on
-/// `api_minor >= 10` before telling a user that revocation has taken effect.
-pub const API_MINOR: u32 = 10;
+/// `api_minor >= 10` before telling a user that revocation has taken effect; to 11 when
+/// `service_allow_grant`/`service_allow_revoke` gained EPHEMERAL-service support and became strict
+/// about an unknown service name — a name in neither the config nor the ephemeral registry now
+/// answers [`ERR_NO_SUCH_SERVICE`] instead of a silent `{}` (#55, #69).
+pub const API_MINOR: u32 = 11;
 
 #[cfg(test)]
 mod tests {

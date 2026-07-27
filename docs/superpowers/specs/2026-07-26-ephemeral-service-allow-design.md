@@ -35,22 +35,33 @@ pub(crate) fn grant_ephemeral(&self, service: &str, principal: &str) -> Option<b
 pub(crate) fn revoke_ephemeral(&self, service: &str, principal: &str) -> Option<bool>
 ```
 
-`None` = no ephemeral registration by that name (so the caller falls through to config).
+`None` = no ephemeral registration by that name (the config half still runs regardless).
 `Some(changed)` = the registration exists; `changed` reports whether the allow actually moved.
 Both take the `ephemeral_services` std `Mutex` for the mutation only — never across an await —
 under the caller's `reload_lock`, exactly like every other registry change.
 
-### 2. Routing: ephemeral first, then config, then error
+### 2. Routing: both sources, then error
 
 Both single-service verbs resolve the target in this order:
 
-1. an ephemeral registration by that name → mutate its in-memory allow;
-2. else a `[services.<name>]` config entry → the existing surgical RMW writer;
-3. else → **error** `NoSuchService`.
+1. the config entry, via the existing surgical RMW writer; **and**
+2. an ephemeral registration of that name, via the in-memory helpers;
+3. if NEITHER holds the name → **error** `NoSuchService`.
 
-A name cannot be both: `register_service` writes config, `register_service {ephemeral: true}` writes
-the map, and the overlay means an ephemeral name shadows a config name of the same name anyway —
-so "ephemeral first" matches what the running registry actually serves.
+Order matters within a grant: the **config write runs first**, and the in-memory allow is mutated
+only once it has succeeded. The reverse order left a failed grant half-applied — the verb returned
+`Err` while the in-memory grant stood, to be installed by the next unrelated reload.
+
+**Correction (adversarial review): a name CAN be both, so "ephemeral-first" is wrong.** The
+`ephemeral: true` branch of `register_service` refused a name already in config, but the persistent
+branch had no symmetric guard, and hand-editing `config.toml` bypasses both. With a shadow in play,
+mutating only the ephemeral copy left the config copy stale — invisible while the overlay shadows
+it, then LIVE with the wrong allow the moment the registering control connection drops the
+ephemeral entry. For a revoke that silently re-admits a principal the operator was told was cut.
+
+So the design is: **apply to BOTH sources**, and error only when neither holds the name.
+`register_service`'s persistent branch also gains the missing symmetric guard, making the collision
+rare rather than merely handled.
 
 Either path that reports `changed` triggers the same `reload_services_from_disk` swap, so the
 ephemeral mutation reaches already-open connections through the #54 live registry. Revoke then
@@ -67,6 +78,16 @@ pairing into an ephemeral service now actually grants.
 Only the single-service `service_allow_grant` / `service_allow_revoke` verbs are strict. That split
 is deliberate: the verb is a direct operator/embedder request about one named service, where a
 silent miss is the bug being fixed; the ceremony is a bulk best-effort.
+
+Both strict verbs resolve **and** mutate under `reload_lock`, via the symmetric pair
+`grant_service_allow` / `revoke_service_allow`. Resolving outside the lock left a race: an ephemeral
+registration whose control connection dropped between the check and the mutation fell through to a
+config append that warn-and-skipped, and the verb reported success having granted nobody.
+
+"Exists" means **servable**: the config entry must also name exactly one of `run`/`socket`, since
+the registry skips a malformed entry — otherwise a grant would report success and write an allow
+that admits nobody. A config-load failure propagates rather than being reported as
+`NoSuchService`.
 
 ### 4. Surface
 

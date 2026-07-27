@@ -214,6 +214,24 @@ pub(crate) async fn register_service(
         return Ok(());
     }
 
+    // Persistent: refuse a name an EPHEMERAL registration already holds — the symmetric half of
+    // the guard above (#55 review). Without it a config entry could be created UNDER a live
+    // ephemeral one; the overlay would shadow it, so the allow verbs would mutate the ephemeral
+    // copy while the config copy sat unreachable — and then went live, with a stale allow, the
+    // moment the registering control connection dropped the ephemeral entry.
+    {
+        let map = mesh
+            .ephemeral_services
+            .lock()
+            .expect("ephemeral_services lock not poisoned");
+        if map.contains_key(&name) {
+            anyhow::bail!(
+                "service '{name}' is currently registered ephemerally; \
+                 unregister it first, or use a different name for the persistent registration"
+            );
+        }
+    }
+
     // Persistent: atomic config write on a blocking thread, then hot-reload.
     let config_path = mesh.config_path.clone();
     let (name_w, backend_w, allow_w) = (name.clone(), backend.clone(), allow.clone());
@@ -918,13 +936,34 @@ pub async fn grant_service_access(
     // 1. Idempotent allow-append on a blocking thread (config IO blocks). `principal` is the
     //    redeemer's STABLE identity (#38: `b64u:` when bound, else `eid:`) — the display
     //    nickname below is audit/log color only and never lands in `allow`.
+    //    This path stays LENIENT about a name matching neither source (warn + skip, as before):
+    //    it is the pairing ceremony, and a stale service name in an invite must never abort a
+    //    pairing. The strict, single-service [`grant_service_allow`] is where an unknown name
+    //    errors.
+    //
+    //    ORDER MATTERS: the CONFIG write runs FIRST, and the in-memory ephemeral allow is only
+    //    mutated once it has succeeded (#55 review). The reverse order left a failed grant
+    //    half-applied — the verb returned `Err`, but the in-memory grant stood and was installed
+    //    by the next unrelated reload, admitting a principal the caller was told was not granted.
     let config_path = mesh.config_path.clone();
     let principal_w = principal.to_string();
-    let services_w = services.to_vec();
+    let config_services = services.to_vec();
     let changed = blocking("join grant config write", move || {
-        append_allow_to_config(&config_path, &principal_w, &services_w)
+        append_allow_to_config(&config_path, &principal_w, &config_services)
     })
     .await??;
+
+    //    EPHEMERAL registrations carry their allow in memory only (#55), so the config append
+    //    above cannot reach them. Apply to BOTH sources rather than ephemeral-first: a name can be
+    //    held by both (a hand-edited config under a live ephemeral registration), and granting only
+    //    the shadowing copy would leave the config copy stale — then live, with the wrong allow,
+    //    the moment the ephemeral entry is dropped.
+    let mut changed = changed;
+    for svc in services {
+        if let Some(moved) = mesh.grant_ephemeral(svc, principal) {
+            changed |= moved;
+        }
+    }
 
     // 2/3. Reload + hot-swap ONLY when the allow actually changed (else the running registry
     //      already admits the peer). The reload MUST happen for a real append to take effect,
@@ -944,18 +983,115 @@ pub async fn grant_service_access(
     Ok(())
 }
 
+/// Does `config.toml` carry a `[services.<name>]` entry the daemon can actually SERVE? Read fresh
+/// (not from the live registry) so a service added out-of-band since boot counts. Used only to
+/// distinguish "nothing to change" from "no such service" (#55) — the surgical RMW writers report
+/// `false` for both.
+///
+/// A config-load failure PROPAGATES rather than answering `false` (#55 review): a corrupt or
+/// unreadable config is not the same condition as a missing service, and reporting
+/// [`NoSuchService`] for it would tell the operator to register a service that already exists.
+///
+/// The entry must also have a well-formed backend. `build_services_with_ephemeral` skips a
+/// malformed `[services.*]` (neither/both of `run` and `socket`) with a warning, so treating it as
+/// present would let a grant report success and write an allow that admits nobody — the exact
+/// silent-success class this strictness exists to remove.
+async fn service_servable_in_config(mesh: &Arc<MeshState>, service: &str) -> Result<bool> {
+    let config_path = mesh.config_path.clone();
+    let service = service.to_string();
+    blocking("join service-exists config read", move || {
+        let cfg = Config::load(&config_path)
+            .map_err(|e| anyhow::anyhow!("config error in {}: {e}", config_path.display()))?;
+        Ok(cfg
+            .services
+            .get(&service)
+            .is_some_and(|svc| svc.backend_result().is_ok()))
+    })
+    .await?
+}
+
+/// The named service exists in neither the config nor the ephemeral registry (#55). A distinct
+/// error type so `respond` can map it to [`ERR_NO_SUCH_SERVICE`](mcpmesh_local_api::ERR_NO_SUCH_SERVICE)
+/// and a caller can branch — the same `downcast_ref` idiom `InvalidParams` uses for `-32602`.
+#[derive(Debug)]
+pub struct NoSuchService(pub String);
+
+impl std::fmt::Display for NoSuchService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "no service named '{}' that this daemon can serve — register it first \
+             ('mcpmesh serve', or register_service), or check the config entry names exactly one \
+             of `run` / `socket`",
+            self.0
+        )
+    }
+}
+impl std::error::Error for NoSuchService {}
+
 /// Grant a SINGLE stable `principal` access to a SINGLE `service` (#44, the
-/// `service_allow_grant` verb) — the per-peer "sharing on" toggle primitive. A thin wrapper
-/// over [`grant_service_access`] (one-element service list; the principal doubles as the
-/// audit display handle). Idempotent + serialized under `reload_lock`, exactly like a pairing
-/// grant; an unknown service logs + no-ops.
+/// `service_allow_grant` verb) — the per-peer "sharing on" toggle primitive. Idempotent +
+/// serialized under `reload_lock`, exactly like a pairing grant.
+///
+/// Unlike the pairing [`grant_service_access`] it wraps, this is STRICT (#55): a name that is
+/// neither an ephemeral registration nor a `[services.*]` config entry is a [`NoSuchService`]
+/// error, not a silent success. It used to answer `{}` for every unknown name — including EVERY
+/// ephemeral service, whose allow is in memory and so was never touched by the config append.
 pub(crate) async fn service_allow_grant(
     state: &DaemonState,
     service: String,
     principal: String,
 ) -> Result<()> {
-    let mesh = state.mesh_required()?;
-    grant_service_access(mesh, &principal, &principal, &[service]).await
+    grant_service_allow(state.mesh_required()?, service, principal).await
+}
+
+/// The mesh-level half of `service_allow_grant`, and the exact mirror of [`revoke_service_allow`]:
+/// resolve the service, append `principal` to its allow, hot-swap the live registry.
+///
+/// Resolution and mutation BOTH happen under `reload_lock` (#55 review). Resolving outside the
+/// lock left a race: an ephemeral registration whose control connection dropped between the check
+/// and the mutation fell through to the config append, which warn-and-skipped, and the verb
+/// reported success having granted nobody — the #55 symptom restored as a race.
+///
+/// STRICT, unlike the pairing [`grant_service_access`]: a name that is neither an ephemeral
+/// registration nor a servable `[services.*]` entry is a [`NoSuchService`] error rather than a
+/// silent success. It used to answer `{}` for every unknown name — silently including EVERY
+/// ephemeral service, whose allow the config append never touched.
+///
+/// `pub` (like [`revoke_service_allow`]) so integration tests drive the SAME pipeline the verb does.
+pub async fn grant_service_allow(
+    mesh: &Arc<MeshState>,
+    service: String,
+    principal: String,
+) -> Result<()> {
+    let _reload = mesh.reload_lock.lock().await;
+    let is_ephemeral = {
+        let map = mesh
+            .ephemeral_services
+            .lock()
+            .expect("ephemeral_services lock not poisoned");
+        map.contains_key(&service)
+    };
+    if !is_ephemeral && !service_servable_in_config(mesh, &service).await? {
+        anyhow::bail!(NoSuchService(service));
+    }
+
+    // CONFIG FIRST, then the in-memory allow — a failed config write must not leave an ephemeral
+    // grant half-applied (see `grant_service_access`).
+    let config_path = mesh.config_path.clone();
+    let (principal_w, services_w) = (principal.clone(), vec![service.clone()]);
+    let mut changed = blocking("join service-allow grant config write", move || {
+        append_allow_to_config(&config_path, &principal_w, &services_w)
+    })
+    .await??;
+    if let Some(moved) = mesh.grant_ephemeral(&service, &principal) {
+        changed |= moved;
+    }
+    if changed {
+        reload_services_from_disk(mesh, "service-allow-grant").await?;
+    }
+    tracing::info!(%service, %principal, changed, "service allow granted");
+    Ok(())
 }
 
 /// Revoke a SINGLE stable `principal` from a SINGLE `service`'s allow (#44, the
@@ -971,11 +1107,15 @@ pub(crate) async fn service_allow_revoke(
     revoke_service_allow(state.mesh_required()?, service, principal).await
 }
 
-/// The mesh-level half of `service_allow_revoke`: strip `principal` from `service`'s config
-/// `allow`, hot-swap the live registry, then SEVER the principal's live connections. Idempotent +
-/// serialized under `reload_lock`, mirroring [`grant_service_access`]. An absent principal /
-/// unknown service is a clean no-op for the config half — but the sever still runs, so a live
-/// connection is cut even when the allow was already clean.
+/// The mesh-level half of `service_allow_revoke`: strip `principal` from `service`'s allow,
+/// hot-swap the live registry, then SEVER the principal's live connections. Idempotent +
+/// serialized under `reload_lock`, mirroring [`grant_service_access`].
+///
+/// **Resolves the service EPHEMERAL-first, then config, then errors** (#69). An ephemeral
+/// registration's allow lives in memory only, so before this the strip edited `config.toml`, found
+/// nothing, and the next hot-reload re-overlaid the untouched in-memory allow — the peer stayed
+/// admitted while the verb reported success. A name that is neither is now a
+/// [`NoSuchService`] error rather than a silent no-op.
 ///
 /// Post-#54: revocation is IMMEDIATE. New sessions are refused (the live registry, read per
 /// bi-stream) and in-flight ones are cut (the sever). Previously both waited for the peer to
@@ -989,12 +1129,31 @@ pub async fn revoke_service_allow(
     principal: String,
 ) -> Result<()> {
     let _reload = mesh.reload_lock.lock().await;
+
+    // Strip from BOTH sources, not ephemeral-first (#55 review). A name can be held by both — a
+    // hand-edited `config.toml` under a live ephemeral registration — and stripping only the
+    // shadowing ephemeral copy left the config copy holding the principal. That copy is invisible
+    // while the overlay shadows it, then goes LIVE with the stale allow the moment the registering
+    // control connection drops the ephemeral entry, re-admitting a principal the operator was told
+    // was revoked. Revocation must be fail-closed across every allow the name owns.
+    let ephemeral_moved = mesh.revoke_ephemeral(&service, &principal);
     let config_path = mesh.config_path.clone();
     let (svc_w, principal_w) = (service.clone(), principal.clone());
-    let changed = blocking("join service-allow revoke config write", move || {
+    let config_moved = blocking("join service-allow revoke config write", move || {
         remove_principal_from_service(&config_path, &svc_w, &principal_w)
     })
     .await??;
+
+    // `remove_principal_from_service` reports `false` both for "service absent" and for "principal
+    // was not in this service's allow", so re-read the config to tell them apart: only the former
+    // is an error, and only when no ephemeral registration claims the name either.
+    if ephemeral_moved.is_none()
+        && !config_moved
+        && !service_servable_in_config(mesh, &service).await?
+    {
+        anyhow::bail!(NoSuchService(service));
+    }
+    let changed = config_moved || ephemeral_moved.unwrap_or(false);
     // SWAP-BEFORE-SEVER (#54): swap first so no NEW session admits the principal, THEN cut the
     // sessions already in flight.
     //
@@ -1300,13 +1459,216 @@ mod tests {
             .unwrap();
         assert!(allow().is_empty());
 
-        // Unknown service → clean no-op (both verbs), never an error.
-        service_allow_grant(&state, "ghost".into(), "eid:beef".into())
+        // #55: an unknown service is now an ERROR on both verbs, not a silent success. It used to
+        // answer `{}` — which silently included every ephemeral service, whose allow the config
+        // writers never touch.
+        let grant_err = service_allow_grant(&state, "ghost".into(), "eid:beef".into())
+            .await
+            .expect_err("an unknown service must not report success");
+        assert!(
+            grant_err.downcast_ref::<NoSuchService>().is_some(),
+            "the grant error must be branchable as NoSuchService, got: {grant_err}"
+        );
+        let revoke_err = service_allow_revoke(&state, "ghost".into(), "eid:beef".into())
+            .await
+            .expect_err("an unknown service must not report success");
+        assert!(
+            revoke_err.downcast_ref::<NoSuchService>().is_some(),
+            "the revoke error must be branchable as NoSuchService, got: {revoke_err}"
+        );
+    }
+
+    /// #55: the no-such-service condition reaches the WIRE as the branchable `-32040`, not the
+    /// generic `-32000`. The unit assertions above only prove the Rust-level downcast; a
+    /// misordered `respond` arm or a stray `.context()` would silently downgrade the code with
+    /// every other test still green.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unknown_service_answers_the_no_such_service_code_on_the_wire() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[services.kb]\nsocket = \"/run/kb.sock\"\nallow = []\n",
+        )
+        .unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        let state = crate::control::DaemonState::with_mesh("test", mesh);
+        let req = |method: &str| {
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": method,
+                "params": {"service": "ghost", "principal": "eid:beef"}
+            })
+        };
+
+        for method in ["service_allow_grant", "service_allow_revoke"] {
+            let r = crate::control::handle_request(&req(method), &state).await;
+            assert_eq!(
+                r["error"]["code"],
+                mcpmesh_local_api::ERR_NO_SUCH_SERVICE,
+                "{method} must answer -32040 for an unknown service, got: {r}"
+            );
+        }
+    }
+
+    /// #55 review: a name held BOTH ephemerally and in config must be revoked from BOTH. The
+    /// ephemeral entry shadows the config one in the registry, so stripping only the shadow left
+    /// the config allow holding the principal — invisible until the ephemeral registration was
+    /// dropped, at which point it went live and re-admitted them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn revoking_a_shadowed_name_strips_the_config_allow_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[services.room]\nsocket = \"/run/room.sock\"\nallow = [\"eid:beef\"]\n",
+        )
+        .unwrap();
+        let mesh = hermetic_mesh(config_path.clone()).await;
+        // A hand-edited config under a live ephemeral registration of the same name.
+        mesh.register_ephemeral(
+            "room".to_string(),
+            crate::daemon::EphemeralService {
+                backend: mcpmesh_local_api::BackendSpec::Socket {
+                    path: "/run/room.sock".into(),
+                },
+                allow: vec!["eid:beef".to_string()],
+            },
+        );
+
+        revoke_service_allow(&mesh, "room".into(), "eid:beef".into())
             .await
             .unwrap();
-        service_allow_revoke(&state, "ghost".into(), "eid:beef".into())
+
+        assert!(
+            mesh.ephemeral_services
+                .lock()
+                .unwrap()
+                .get("room")
+                .unwrap()
+                .allow
+                .is_empty(),
+            "the ephemeral allow is stripped"
+        );
+        assert!(
+            crate::config::Config::load(&config_path)
+                .unwrap()
+                .services
+                .get("room")
+                .unwrap()
+                .allow
+                .is_empty(),
+            "the SHADOWED config allow must be stripped too — otherwise it goes live with a \
+             revoked principal the moment the ephemeral registration is dropped"
+        );
+    }
+
+    /// #55 review: a FAILED grant must not leave the in-memory ephemeral allow mutated. The config
+    /// write runs first; if it fails the whole grant fails, and a later unrelated reload must not
+    /// install a principal the caller was told was not granted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_config_write_leaves_the_ephemeral_allow_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        // `allow` as a scalar makes `append_allow_to_config` bail.
+        std::fs::write(
+            &config_path,
+            "[services.kb]\nsocket = \"/run/kb.sock\"\nallow = \"not-an-array\"\n",
+        )
+        .unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        mesh.register_ephemeral(
+            "room".to_string(),
+            crate::daemon::EphemeralService {
+                backend: mcpmesh_local_api::BackendSpec::Socket {
+                    path: "/run/room.sock".into(),
+                },
+                allow: vec![],
+            },
+        );
+
+        let r = grant_service_access(
+            &mesh,
+            "eid:beef",
+            "eid:beef",
+            &["room".to_string(), "kb".to_string()],
+        )
+        .await;
+        assert!(r.is_err(), "the malformed config must fail the grant");
+        assert!(
+            mesh.ephemeral_services
+                .lock()
+                .unwrap()
+                .get("room")
+                .unwrap()
+                .allow
+                .is_empty(),
+            "a FAILED grant must not have applied the in-memory half"
+        );
+    }
+
+    /// #55/#69: both verbs route to an EPHEMERAL registration's in-memory allow, which the config
+    /// writers cannot reach. The unit-level complement to `cli/tests/ephemeral_allow.rs` (which
+    /// proves a real peer is admitted/refused end to end).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn allow_verbs_mutate_an_ephemeral_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[services.kb]\nsocket = \"/run/kb.sock\"\nallow = []\n",
+        )
+        .unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+
+        mesh.register_ephemeral(
+            "room".to_string(),
+            crate::daemon::EphemeralService {
+                backend: mcpmesh_local_api::BackendSpec::Socket {
+                    path: "/run/room.sock".into(),
+                },
+                allow: vec![],
+            },
+        );
+        let allow = || {
+            mesh.ephemeral_services
+                .lock()
+                .unwrap()
+                .get("room")
+                .unwrap()
+                .allow
+                .clone()
+        };
+
+        service_allow_grant(&state, "room".into(), "eid:beef".into())
             .await
             .unwrap();
+        assert_eq!(allow(), vec!["eid:beef".to_string()], "granted in memory");
+        service_allow_grant(&state, "room".into(), "eid:beef".into())
+            .await
+            .unwrap();
+        assert_eq!(allow(), vec!["eid:beef".to_string()], "grant is idempotent");
+
+        service_allow_revoke(&state, "room".into(), "eid:beef".into())
+            .await
+            .unwrap();
+        assert!(allow().is_empty(), "revoked in memory");
+        service_allow_revoke(&state, "room".into(), "eid:beef".into())
+            .await
+            .unwrap();
+        assert!(allow().is_empty(), "revoke is idempotent");
+
+        // The config service is untouched by the ephemeral routing.
+        assert!(
+            crate::config::Config::load(&mesh.config_path)
+                .unwrap()
+                .services
+                .get("kb")
+                .unwrap()
+                .allow
+                .is_empty(),
+            "an ephemeral grant must not write the config"
+        );
     }
 
     /// The invite registration-check message shapes: silent on all-registered, names the missing

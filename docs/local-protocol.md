@@ -7,7 +7,7 @@ named pipe on Windows. Anything that can open the endpoint and parse JSON can sp
 language — [`local-api/examples/status.py`](../local-api/examples/status.py) is a complete client
 in ~60 lines of dependency-free Python.
 
-> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.10`, `api_minor` `10`) and evolves
+> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.11`, `api_minor` `11`) and evolves
 > **additively** (see [Versioning](#versioning)), but until a stable release this document — like the
 > wire format itself — may change without a migration path. Pin the mcpmesh version you build
 > against. Source of truth is the Rust in [`local-api/`](../local-api/src/protocol.rs); where this
@@ -150,8 +150,8 @@ Methods split into two groups by audience:
 | `peer_remove` | `{nickname}` | `{}` (ack) |
 | `peer_rename` | `{to, user_id?, nickname?}` — rename a person by `user_id`, else a provisional contact by `nickname` | `{}` (ack) |
 | `set_nickname` | `{nickname}` — rename **this node** live (#37, `api_minor >= 2`): validated (trimmed non-empty, no `/`), persisted to `[identity].nickname` under the daemon's own config lock (no lost-update window against a concurrent grant/registration), and effective for FUTURE invites/presentations immediately — no restart. Display-only: peers keep the nickname they stored at pairing time until a re-invite | `{}` (ack) |
-| `service_allow_grant` | `{service, principal}` — grant a stable principal (`b64u:`/`eid:`) access to ONE service's allow WITHOUT (re)pairing (#44), under the daemon's config lock + hot-reload. The per-peer "sharing on" toggle. Idempotent; unknown service → clean no-op. | `{}` (ack) |
-| `service_allow_revoke` | `{service, principal}` — remove a stable principal from ONE service's allow WITHOUT unpairing (#44): the peer's `PeerEntry` identity is untouched. **Immediate at `api_minor >= 10`** — see "Revocation is immediate" below. Idempotent; absent principal / unknown service → clean no-op for the config, but a live connection is still severed. | `{}` (ack) |
+| `service_allow_grant` | `{service, principal}` — grant a stable principal (`b64u:`/`eid:`) access to ONE service's allow WITHOUT (re)pairing (#44), under the daemon's config lock + hot-reload. The per-peer "sharing on" toggle. Works on EPHEMERAL registrations too, mutating their in-memory allow (#55, `api_minor >= 11`). Idempotent; a name in neither the config nor the ephemeral registry → `-32040`. | `{}` (ack) |
+| `service_allow_revoke` | `{service, principal}` — remove a stable principal from ONE service's allow WITHOUT unpairing (#44): the peer's `PeerEntry` identity is untouched. **Immediate at `api_minor >= 10`** — see "Revocation is immediate" below. Works on EPHEMERAL registrations too (#69, `api_minor >= 11`). Idempotent; an absent principal is a clean no-op, a name in neither the config nor the ephemeral registry → `-32040`. | `{}` (ack) |
 | `unregister_service` | `{name}` — remove a service registration (#50), the mirror of `register_service`: drops the whole `[services.<name>]` entry (allow included) + any ephemeral registration, then hot-reloads. Idempotent; unknown name → clean no-op. In-flight sessions finish; no new ones admitted. | `{}` (ack) |
 | `peer_services` | `{peer}` — discover which services a paired `peer` (nickname / `eid:` / `b64u:`) CURRENTLY grants you (#52): dials the peer over `mcpmesh/ping/1` and returns `{services:[…]}` — the names whose allow admits YOUR principal (only yours, never the peer's full registry). Authoritative + current. | `{services:[…]}` |
 | `set_relays` | `{relay_urls}` — set this node's CUSTOM relay set LIVE (#53, `api_minor >= 9`): each URL must parse as an iroh relay URL (empty list → error; disable relays via a `relay_mode="disabled"` restart). When the node is already `relay_mode="custom"`, the daemon diffs against the running endpoint and applies the delta with iroh's live `insert_relay`/`remove_relay` — **no restart, no dropped peer sessions** — then persists `[network] relay_mode="custom" relay_urls=[…]` under the config lock. Idempotent (an unchanged set → `changed:false`, no writes). When the node is currently `default`/`disabled`, iroh cannot live-transition the relay MODE: the config is persisted but `restart_required:true` is returned (apply on next start). | `{changed, restart_required}` |
@@ -194,10 +194,10 @@ well-behaved peer one reconnect.
   connections by endpoint id with no protocol discriminator, so a revoke closes that peer's live
   gossip and blob connections too. Each of those carries its own gate, so this costs availability
   (a presence blip, an aborted blob transfer), never authorization; the peer reconnects.
-- **Ephemeral services are excluded.** `service_allow_revoke` edits `config.toml`, and an ephemeral
-  registration's `allow` lives only in memory — so revoking against an ephemeral service strips
-  nothing, returns success, and severs nothing (the verb reports `changed = false` internally). Use
-  `unregister_service` to withdraw an ephemeral service. This mirrors the grant-side gap in #55.
+- **Ephemeral services are covered as of `api_minor >= 11`** (#55/#69). Both verbs resolve the
+  service ephemeral-first, then config, so a grant or revoke against an ephemeral registration
+  mutates its in-memory allow and takes effect immediately, like any other service. Before that
+  they edited only `config.toml` and silently changed nothing.
 
 Roster principals ARE covered: a bare roster `user_id` or a GROUP name in an `allow` resolves
 through the installed roster view to that user's or group's devices. Roster-mode revocation by
@@ -506,6 +506,7 @@ Reference: [`cli/src/backends/spawn.rs`](../cli/src/backends/spawn.rs) (`run`),
 | `-32601` | unknown method |
 | `-32602` | invalid params (a required field missing or the wrong type) |
 | `-32603` | internal error |
+| `-32040` | no such service — the name is in neither `config.toml` nor the ephemeral registry (`service_allow_grant` / `service_allow_revoke`, `api_minor >= 11`) |
 | `-32000` | operation failed — `message` carries the detail. One common instance: the daemon is in control-only mode with no mesh (e.g. `invite`/`pair` before a mesh exists) |
 | `-32055` | *(session only)* peer unreachable |
 | `-32054` | *(session only)* session refused |
@@ -532,7 +533,8 @@ things:
   the same on reachability rows — is `api_minor >= 7` (#42); the `service_allow_grant`/
   `service_allow_revoke` per-peer access verbs are `api_minor >= 8` (#44); `unregister_service` (#50), the `run`-backend `env`/`cwd` (#51), `peer_services` (#52), and the `set_relays` live relay-set verb (#53) are `api_minor >= 9`; IMMEDIATE revocation
   (`service_allow_revoke`/`peer_remove` refuse new sessions on already-open connections AND sever
-  live ones, #54) is `api_minor >= 10`; the `set_nickname` verb
+  live ones, #54) is `api_minor >= 10`; ephemeral-service grant/revoke plus the `-32040`
+  no-such-service error (#55, #69) are `api_minor >= 11`; the `set_nickname` verb
   and `StatusResult.self_nickname` are `api_minor >= 2` (#37); STABLE-principal `allow`
   strings + `ServiceInfo.allow_display` are `api_minor >= 3` (#38). `api_minor` is itself
   additive: a pre-1.1 daemon omits it and it reads as `0`.

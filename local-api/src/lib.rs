@@ -58,13 +58,13 @@ pub use principals::principal_set;
 pub use protocol::{
     API_MINOR, API_NAME, API_VERSION, ActiveSession, AuditKind, AuditRecord, AuditSummaryResult,
     BackendKind, BackendSpec, BlobFetchParams, BlobFetchResult, BlobGrantParams, BlobPublishParams,
-    BlobPublishResult, BlobScopeList, Hello, InviteParams, InviteResult, OpenSessionParams,
-    OrgJoinParams, OrgJoinResult, PairParams, PairResult, PeerAddParams, PeerInfo,
-    PeerReachability, PeerRemoveParams, PeerRenameParams, PeerServicesParams, PeerServicesResult,
-    PresencePeer, RecentPairing, RegisterServiceParams, Request, RosterInstallParams,
-    RosterInstallResult, RosterStatus, ScopeInfo, ServiceAllowParams, ServiceInfo,
-    SetAppMetadataParams, SetNicknameParams, SetRelaysParams, SetRelaysResult, SetRosterUrlParams,
-    StatusResult, StreamFrame, UnregisterServiceParams, method_of,
+    BlobPublishResult, BlobScopeList, ERR_NO_SUCH_SERVICE, Hello, InviteParams, InviteResult,
+    OpenSessionParams, OrgJoinParams, OrgJoinResult, PairParams, PairResult, PeerAddParams,
+    PeerInfo, PeerReachability, PeerRemoveParams, PeerRenameParams, PeerServicesParams,
+    PeerServicesResult, PresencePeer, RecentPairing, RegisterServiceParams, Request,
+    RosterInstallParams, RosterInstallResult, RosterStatus, ScopeInfo, ServiceAllowParams,
+    ServiceInfo, SetAppMetadataParams, SetNicknameParams, SetRelaysParams, SetRelaysResult,
+    SetRosterUrlParams, StatusResult, StreamFrame, UnregisterServiceParams, method_of,
 };
 
 #[cfg(feature = "client")]
