@@ -58,8 +58,8 @@ pub use accept::spawn_accept_loop;
 pub use boot::serve_forever;
 pub use dial::{dial_service, pipe_session, race_dial};
 pub use handlers::{
-    NoSuchService, grant_service_access, grant_service_allow, remove_peer, rename_peer,
-    revoke_service_access, revoke_service_allow,
+    NoSuchBlobScope, NoSuchService, grant_service_access, grant_service_allow, remove_peer,
+    rename_peer, revoke_service_access, revoke_service_allow,
 };
 pub(crate) use reach::caller_admitted_services;
 pub use reach::{REACH_TTL_SECS, ReachEntry, probe_peer, reachability_of};
@@ -69,9 +69,9 @@ pub use roster_install::{
 
 pub use boot::{NetPlan, net_plan};
 pub(crate) use handlers::{
-    add_peer, blob_fetch, blob_grant, blob_list, blob_publish, mint_invite, open_session,
-    peer_services, redeem, register_service, service_allow_grant, service_allow_revoke, set_relays,
-    unregister_ephemeral, unregister_service,
+    add_peer, blob_fetch, blob_grant, blob_list, blob_publish, blob_revoke, blob_unpublish,
+    mint_invite, open_session, peer_services, redeem, register_service, service_allow_grant,
+    service_allow_revoke, set_relays, unregister_ephemeral, unregister_service,
 };
 pub(crate) use roster_install::{
     install_roster, org_join, set_app_metadata, set_nickname, set_roster_url,

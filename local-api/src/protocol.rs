@@ -442,6 +442,30 @@ pub struct BlobGrantParams {
     pub principal: String,
 }
 
+/// Params of [`Request::BlobRevoke`] (#62): the scope and the principals to withdraw from it.
+///
+/// SCOPED, unlike unpair hygiene: only the named scope's grants change. A principal that also holds
+/// grants on other scopes keeps them — withdrawing access to one thing must not silently withdraw
+/// access to everything else.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobRevokeParams {
+    pub scope: String,
+    pub principals: Vec<String>,
+}
+
+/// Params of [`Request::BlobUnpublish`] (#62): the scope and the blake3 hex to remove from it.
+///
+/// Removes REACHABILITY, not bytes. The scope gate requires a hash to be listed in some scope, so
+/// this takes effect immediately for authorization — but the bytes stay in the local store, and
+/// there is no reclaim verb yet. Do not surface this to a user as deletion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobUnpublishParams {
+    pub scope: String,
+    pub hash: String,
+}
+
 /// Params of [`Request::BlobFetch`]: the `mcpmesh/blob/1` ticket and the LOCAL export path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -570,6 +594,11 @@ pub enum Request {
     /// nickname (the shared `principal_set` expansion). Tag
     /// `"blob_grant"`.
     BlobGrant(BlobGrantParams),
+    /// Tag `"blob_revoke"`: withdraw principals from ONE scope's grants (#62).
+    BlobRevoke(BlobRevokeParams),
+    /// Tag `"blob_unpublish"`: remove a hash from ONE scope (#62). Withdraws reachability, not
+    /// bytes.
+    BlobUnpublish(BlobUnpublishParams),
     /// List the daemon's blob scopes (name → hashes + grants). Tag `"blob_list"`.
     BlobList,
     /// Fetch a `mcpmesh/blob/1` ticket THROUGH the daemon (BLAKE3-verified streaming) and export the
@@ -980,7 +1009,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   new methods, or a strictness change like params validation — bumped in the same change that
 ///   makes it. A client can guard with `api_minor >= N` for a feature it needs, or refuse a daemon
 ///   older than a minor it requires. It never resets except on a MAJOR bump.
-pub const API_VERSION: &str = "1.14";
+pub const API_VERSION: &str = "1.15";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -1003,8 +1032,9 @@ pub const API_VERSION: &str = "1.14";
 /// [`PeerReachability::path`] — direct-vs-relay attribution on every reachability row (#64); to 14
 /// with the `run`-backend `MCPMESH_PEER_EID` identity var — the caller's stable device principal,
 /// unconditionally present, so a `run` server can scope per caller without keying on a nickname
-/// (#60).
-pub const API_MINOR: u32 = 14;
+/// (#60); to 15 with the `blob_revoke` / `blob_unpublish` verbs — per-scope withdrawal of a grant
+/// and of a published hash, so un-sharing a file no longer requires unpairing the person (#62).
+pub const API_MINOR: u32 = 15;
 
 #[cfg(test)]
 mod tests {
@@ -1789,6 +1819,27 @@ mod tests {
         assert_eq!(serde_json::from_value::<Request>(v).unwrap(), r);
 
         // BlobGrant → { method, params: { scope, principal } }.
+        // #62: the two withdrawal verbs' wire tags. A wrong dispatch string or a swapped param
+        // would otherwise ship undetected — the e2e test calls the provider directly and never
+        // crosses JSON-RPC.
+        let rev = Request::BlobRevoke(BlobRevokeParams {
+            scope: "photos".into(),
+            principals: vec!["alice".into()],
+        });
+        let v = serde_json::to_value(&rev).unwrap();
+        assert_eq!(v["method"], "blob_revoke");
+        assert_eq!(v["params"]["principals"][0], "alice");
+        assert_eq!(serde_json::from_value::<Request>(v).unwrap(), rev);
+
+        let unp = Request::BlobUnpublish(BlobUnpublishParams {
+            scope: "photos".into(),
+            hash: "abc123".into(),
+        });
+        let v = serde_json::to_value(&unp).unwrap();
+        assert_eq!(v["method"], "blob_unpublish");
+        assert_eq!(v["params"]["hash"], "abc123");
+        assert_eq!(serde_json::from_value::<Request>(v).unwrap(), unp);
+
         let r = Request::BlobGrant(BlobGrantParams {
             scope: "docs".into(),
             principal: "alice".into(),

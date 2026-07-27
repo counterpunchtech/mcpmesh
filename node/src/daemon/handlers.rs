@@ -80,6 +80,78 @@ pub(crate) async fn blob_grant(
     provider.grant(&scope, &principal)
 }
 
+/// Handle a `blob_revoke` control request (#62): withdraw principals from ONE scope's grants.
+///
+/// The blob analogue of #44 — un-sharing a file must not require unpairing the person. SCOPED, so
+/// a principal's grants on other scopes are untouched; the global sweep is unpair hygiene and stays
+/// reachable only through `peer_remove`.
+pub(crate) async fn blob_revoke(
+    state: &DaemonState,
+    scope: String,
+    principals: Vec<String>,
+) -> Result<()> {
+    let mesh = state.mesh_required()?;
+    let provider = mesh
+        .app_blobs()
+        .await
+        .context("app-blob provider not enabled (roster mode only)")?;
+    // An UNKNOWN scope is an error, not a silent ack (#62 review). Answering `{}` to a typo'd
+    // scope tells an operator that access was withdrawn when nothing was touched — the exact defect
+    // #55/#69 was filed about and fixed with `-32040`. "The principal was not granted" IS
+    // idempotent and stays a clean success; "there is no such scope" is not.
+    if !provider.has_scope(&scope) {
+        anyhow::bail!(NoSuchBlobScope(scope));
+    }
+    let changed = provider.revoke_from_scope(&scope, &principals)?;
+    tracing::info!(%scope, count = principals.len(), changed, "blob grants revoked");
+    Ok(())
+}
+
+/// Handle a `blob_unpublish` control request (#62): remove a hash from ONE scope.
+///
+/// Takes effect IMMEDIATELY for authorization — the scope gate requires the hash to be listed in
+/// some scope — but does NOT delete bytes: the local store keeps them and there is no reclaim verb
+/// (`iroh_blobs` exposes no on-demand GC; see the issue). A hash published into several scopes stays
+/// reachable through the others.
+pub(crate) async fn blob_unpublish(state: &DaemonState, scope: String, hash: String) -> Result<()> {
+    let mesh = state.mesh_required()?;
+    let provider = mesh
+        .app_blobs()
+        .await
+        .context("app-blob provider not enabled (roster mode only)")?;
+    // Parse the hash before touching anything (#62 review). Stored hashes are lowercase hex; an
+    // UPPERCASE rendering of the same blake3 hash is valid, common, and would silently miss the
+    // set removal — returning success while the blob stayed fetchable. Parsing normalizes it and
+    // rejects garbage outright rather than acking a no-op.
+    let parsed: iroh_blobs::Hash = hash
+        .parse()
+        .map_err(|_| anyhow::anyhow!("not a blake3 hash: {hash}"))?;
+    let hash_hex = parsed.to_hex().to_string();
+    if !provider.has_scope(&scope) {
+        anyhow::bail!(NoSuchBlobScope(scope));
+    }
+    let changed = provider.unpublish(&scope, &hash_hex)?;
+    tracing::info!(%scope, changed, "blob unpublished from scope");
+    Ok(())
+}
+
+/// The named blob scope does not exist (#62). A distinct error type so `respond` maps it to
+/// [`ERR_NO_SUCH_SERVICE`](mcpmesh_local_api::ERR_NO_SUCH_SERVICE) — the same "you named something
+/// that is not there" contract `service_allow_grant`/`_revoke` use — rather than acking a no-op.
+#[derive(Debug)]
+pub struct NoSuchBlobScope(pub String);
+
+impl std::fmt::Display for NoSuchBlobScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "no blob scope named '{}' — 'blob_list' shows the scopes this daemon has",
+            self.0
+        )
+    }
+}
+impl std::error::Error for NoSuchBlobScope {}
+
 /// Handle a `blob_list` control request: the daemon's scopes (name → hashes + grants).
 pub(crate) async fn blob_list(state: &DaemonState) -> Result<BlobScopeList> {
     let mesh = state.mesh_required()?;
