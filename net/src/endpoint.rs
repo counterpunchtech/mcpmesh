@@ -129,6 +129,43 @@ impl Services {
     pub fn iter(&self) -> impl Iterator<Item = (&String, &ServiceEntry)> {
         self.0.iter()
     }
+
+    /// A copy of this registry with ONE service's `allow` replaced, or `None` if the name is not
+    /// registered.
+    ///
+    /// This is the cheap half of a hot-reload (#94). Rebuilding from disk re-reads and re-parses
+    /// `config.toml` and reconstructs EVERY service's backend, which is per-grant work that scales
+    /// with the number of services rather than with the one being changed. When the config file
+    /// did not change — an allow edit that lives purely in the ephemeral overlay (#36/#69) — the
+    /// rebuilt registry would be identical apart from this one list.
+    ///
+    /// Backends are `Arc`s and are cloned by handle, never reconstructed: no process is respawned
+    /// and no socket path is re-resolved. The result is swapped in through
+    /// [`LiveServices::store`], so it inherits #54's per-bi-stream visibility unchanged.
+    pub fn with_allow_replaced(&self, name: &str, allow: Vec<String>) -> Option<Services> {
+        if !self.0.contains_key(name) {
+            return None;
+        }
+        Some(Services(
+            self.0
+                .iter()
+                .map(|(svc, entry)| {
+                    let allow = if svc == name {
+                        allow.clone()
+                    } else {
+                        entry.allow.clone()
+                    };
+                    (
+                        svc.clone(),
+                        ServiceEntry {
+                            backend: Arc::clone(&entry.backend),
+                            allow,
+                        },
+                    )
+                })
+                .collect(),
+        ))
+    }
 }
 
 /// A hot-swappable handle to the live [`Services`] registry.
@@ -457,6 +494,80 @@ mod tests {
 
     use super::*;
     use crate::framing::{FrameReader, Inbound};
+
+    /// A backend that is never run — these tests only care about registry identity, and
+    /// `Arc::ptr_eq` on this is how they prove nothing was reconstructed.
+    struct InertBackend;
+
+    #[async_trait::async_trait]
+    impl SessionBackend for InertBackend {
+        async fn run(
+            &self,
+            _identity: Option<PeerIdentity>,
+            _initialize: Value,
+            _transport: SessionTransport,
+        ) -> anyhow::Result<()> {
+            unreachable!("InertBackend is never run")
+        }
+    }
+
+    fn registry(entries: &[(&str, &[&str])]) -> Services {
+        Services::new(
+            entries
+                .iter()
+                .map(|(name, allow)| {
+                    (
+                        (*name).to_string(),
+                        ServiceEntry {
+                            backend: Arc::new(InertBackend),
+                            allow: allow.iter().map(|a| (*a).to_string()).collect(),
+                        },
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// #94: replacing ONE service's allow leaves every other entry untouched — and reuses the
+    /// same backend allocations. `Arc::ptr_eq` is the assertion that carries the point: the
+    /// whole reason this exists instead of `reload_services_from_disk` is that no backend is
+    /// reconstructed. A rewrite that rebuilt backends would still pass an allow-only assertion.
+    #[test]
+    fn with_allow_replaced_swaps_one_allow_and_reuses_every_backend() {
+        let before = registry(&[("room", &["b64u:alice"]), ("notes", &["b64u:bob"])]);
+        let after = before
+            .with_allow_replaced("room", vec!["b64u:alice".into(), "b64u:carol".into()])
+            .expect("room is present");
+
+        assert_eq!(
+            after.get("room").expect("room survives").allow,
+            vec!["b64u:alice".to_string(), "b64u:carol".to_string()],
+            "the named service takes the new allow"
+        );
+        assert_eq!(
+            after.get("notes").expect("notes survives").allow,
+            vec!["b64u:bob".to_string()],
+            "an unrelated service's allow is untouched"
+        );
+        for name in ["room", "notes"] {
+            assert!(
+                Arc::ptr_eq(
+                    &before.get(name).expect("present before").backend,
+                    &after.get(name).expect("present after").backend,
+                ),
+                "{name}: the backend must be the SAME allocation — reconstructing backends is \
+                 exactly the cost this method exists to avoid"
+            );
+        }
+    }
+
+    /// An unknown name yields `None` rather than inserting a backendless entry — the caller
+    /// (an ephemeral grant) must fall back to a real rebuild rather than invent a service.
+    #[test]
+    fn with_allow_replaced_returns_none_for_an_unknown_service() {
+        let before = registry(&[("room", &["b64u:alice"])]);
+        assert!(before.with_allow_replaced("nope", vec![]).is_none());
+    }
 
     /// #54: a swap is visible to the NEXT read, while a handle already taken keeps the
     /// snapshot it was given — the exact split the accept path relies on (next session honors a

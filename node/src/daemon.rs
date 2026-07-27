@@ -68,10 +68,14 @@ pub use roster_install::{
 };
 
 pub use boot::{NetPlan, net_plan};
+/// Symmetric with the already-public [`MeshState::register_ephemeral`]: drops in-memory
+/// registrations and reloads. Public so tests can exercise what happens to a name held by BOTH an
+/// ephemeral registration and `config.toml` once the overlay goes away (#55/#94).
+pub use handlers::unregister_ephemeral;
 pub(crate) use handlers::{
     add_peer, blob_fetch, blob_grant, blob_list, blob_publish, blob_revoke, blob_unpublish,
     mint_invite, open_session, peer_services, redeem, register_service, service_allow_grant,
-    service_allow_revoke, set_relays, unregister_ephemeral, unregister_service,
+    service_allow_revoke, set_relays, unregister_service,
 };
 pub(crate) use roster_install::{
     install_roster, org_join, set_app_metadata, set_nickname, set_roster_url,
@@ -379,6 +383,14 @@ impl MeshState {
     /// config-collision check that keeps a name from being held ephemerally AND persistently at
     /// once. Use `register_service`.
     #[doc(hidden)]
+    /// The LIVE service registry as of now — the same handle the accept path reads per accepted
+    /// bi-stream. A test seam: it lets a test assert what the registry admits at a precise instant
+    /// (e.g. that a revoke's swap is installed before it severs) without racing the wire.
+    #[doc(hidden)]
+    pub fn live_services(&self) -> Arc<mcpmesh_net::Services> {
+        self.services.get()
+    }
+
     pub fn register_ephemeral(
         &self,
         name: String,

@@ -12,6 +12,7 @@
 //! call sites (`install_roster` / `org_join` / `set_roster_url` / `register_service` /
 //! `grant_service_access` / `revoke_service_access` / `rename_peer`), never here.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -249,27 +250,40 @@ pub(crate) fn write_service_to_config(
 /// A service NOT present in config is logged + skipped: a pairing grant authorizes into an
 /// existing service, it never creates one. An already-present principal is a no-op for that
 /// service (idempotent re-pair). Returns `Ok(false)` with no write when nothing changed.
+///
+/// `known_ephemeral` names services the caller has already resolved as ephemeral registrations
+/// (#36). Their absence from config is the expected path, not a mistake, so they are logged at
+/// `debug!` — #94 reported the `warn!` as a per-grant line "describing a condition that is correct
+/// and expected". A name in NEITHER config nor this set still warns: that one is a real mistake
+/// (a typo'd service in a pairing grant) and must stay visible.
 pub(crate) fn append_allow_to_config(
     path: &Path,
     principal: &str,
     services: &[String],
+    known_ephemeral: &HashSet<String>,
 ) -> Result<bool> {
+    // Absent from config: expected for an ephemeral name, a mistake otherwise.
+    let note_absent = |svc: &String| {
+        if known_ephemeral.contains(svc) {
+            tracing::debug!(service = %svc, "grant: ephemeral service, no config allow to append");
+        } else {
+            tracing::warn!(service = %svc, "grant: service not in config; skipping allow-append");
+        }
+    };
     let existing = read_config_for_rmw(path)?;
     let mut doc: toml::Table = toml::from_str(&existing)
         .with_context(|| format!("parse existing config {}", path.display()))?;
 
     // No `[services]` table at all → nothing to grant into (log each, change nothing).
     let Some(toml::Value::Table(services_tbl)) = doc.get_mut("services") else {
-        for svc in services {
-            tracing::warn!(service = %svc, "grant: service not in config; skipping allow-append");
-        }
+        services.iter().for_each(note_absent);
         return Ok(false);
     };
 
     let mut changed = false;
     for svc in services {
         let Some(entry) = services_tbl.get_mut(svc) else {
-            tracing::warn!(service = %svc, "grant: service not in config; skipping allow-append");
+            note_absent(svc);
             continue;
         };
         let toml::Value::Table(entry) = entry else {
@@ -398,7 +412,9 @@ mod tests {
             "the generated config opens with the reference header: {text}"
         );
         // A second managed write re-adds the header exactly once, and the file still parses.
-        assert!(append_allow_to_config(&path, "bob", &["kb".to_string()]).unwrap());
+        assert!(
+            append_allow_to_config(&path, "bob", &["kb".to_string()], &HashSet::new()).unwrap()
+        );
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
             text.matches("# mcpmesh config").count(),
@@ -519,14 +535,21 @@ mod tests {
         std::fs::write(&path, "[services.kb]\nsocket = \"/run/kb.sock\"\n").unwrap();
 
         // Grant bob → true, and bob is in the allow list.
-        assert!(append_allow_to_config(&path, "bob", &["kb".to_string()]).unwrap());
+        assert!(
+            append_allow_to_config(&path, "bob", &["kb".to_string()], &HashSet::new()).unwrap()
+        );
         let doc: toml::Table = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let allow = doc["services"]["kb"]["allow"].as_array().unwrap();
         assert!(allow.iter().any(|v| v.as_str() == Some("bob")));
         // Idempotent: re-granting bob is a no-op (false).
-        assert!(!append_allow_to_config(&path, "bob", &["kb".to_string()]).unwrap());
+        assert!(
+            !append_allow_to_config(&path, "bob", &["kb".to_string()], &HashSet::new()).unwrap()
+        );
         // Granting into a service NOT in config → skipped, no change.
-        assert!(!append_allow_to_config(&path, "carol", &["ghost".to_string()]).unwrap());
+        assert!(
+            !append_allow_to_config(&path, "carol", &["ghost".to_string()], &HashSet::new())
+                .unwrap()
+        );
 
         // Revoke bob's principals → true, allow becomes empty. (Principals-slice form, #38:
         // one atomic RMW strips every listed principal.)
@@ -544,7 +567,9 @@ mod tests {
         // No [services] table at all → both grant + revoke are false (nothing to touch).
         let empty = dir.path().join("empty.toml");
         std::fs::write(&empty, "[identity]\nnickname = \"x\"\n").unwrap();
-        assert!(!append_allow_to_config(&empty, "bob", &["kb".to_string()]).unwrap());
+        assert!(
+            !append_allow_to_config(&empty, "bob", &["kb".to_string()], &HashSet::new()).unwrap()
+        );
         assert!(!remove_allow_from_config(&empty, &["bob".to_string()]).unwrap());
     }
 
@@ -563,7 +588,7 @@ mod tests {
         // 1. kb registers itself with an empty allow (reachability is a separate user grant).
         write_service_to_config(&path, "kb", &socket, &[]).unwrap();
         // 2. Pairing grants "alice" access (appends to [services.kb].allow).
-        append_allow_to_config(&path, "alice", &["kb".to_string()]).unwrap();
+        append_allow_to_config(&path, "alice", &["kb".to_string()], &HashSet::new()).unwrap();
         // 3. The kb daemon RESTARTS → re-registers idempotently, again with an empty allow.
         write_service_to_config(&path, "kb", &socket, &[]).unwrap();
 
