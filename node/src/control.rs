@@ -323,16 +323,27 @@ pub async fn serve_control_io(
 /// Drive a live event stream over a subscribed control connection. Mirrors
 /// [`open_session`](crate::daemon::open_session)'s upgrade: it consumes the write half for the
 /// subscription's lifetime. Sends the initial [`Snapshot`](crate::stream::StreamFrame::Snapshot)
-/// FIRST, then forwards every broadcast [`AuditRecord`](crate::audit::AuditRecord) as an
-/// [`Event`](crate::stream::StreamFrame::Event) frame until the client disconnects.
+/// FIRST, then forwards TWO independent taps until the client disconnects:
+/// every broadcast [`AuditRecord`](crate::audit::AuditRecord) as an
+/// [`Event`](crate::stream::StreamFrame::Event), and every reachability transition as a
+/// [`Reachability`](crate::stream::StreamFrame::Reachability) frame (#58).
 ///
-/// Backpressure (spec): a subscriber that falls behind the broadcast ring surfaces as
+/// They are merged HERE rather than at the source: the audit broadcast is the same call that
+/// appends to the on-disk log, so routing probe results through it would either write them into the
+/// audit file or force splitting record-from-broadcast.
+///
+/// Backpressure (spec): a subscriber that falls behind EITHER ring surfaces as
 /// `RecvError::Lagged(n)` → one [`Lagged`](crate::stream::StreamFrame::Lagged) frame, then the loop
-/// CONTINUES (the subscriber is never dropped on lag). A closed broadcast → clean return. A failed
-/// `write_frame` (the client is gone) → clean return. No lock is held across the `recv().await`.
+/// CONTINUES (the subscriber is never dropped on lag). NOTE the consequence for liveness: a
+/// dropped reachability transition is never re-asserted, so a consumer that ignores `Lagged` can
+/// hold a stale online/offline indicator indefinitely — the documented advice is to reconnect for a
+/// fresh snapshot. A failed `write_frame` (the client is gone) → clean return. No lock is held
+/// across either `recv().await`.
 ///
-/// When auditing is disabled (control-only daemon, or a mesh with no audit sink), `subscribe()`
-/// yields `None`: the snapshot is sent and the stream ends (no events will ever flow).
+/// The stream lives as long as EITHER tap does. A closed tap is dropped and the other continues;
+/// only when both are gone does the loop return. So a mesh daemon with auditing DISABLED still
+/// pushes reachability — auditing and liveness are independent signals (#58). A control-only
+/// daemon has neither tap, and gets the snapshot alone, exactly as before.
 async fn run_subscription(
     state: &Arc<DaemonState>,
     mut w: impl tokio::io::AsyncWrite + Unpin,
@@ -350,26 +361,83 @@ async fn run_subscription(
     // that race into an at-most-idempotent DOUBLE (a session may appear both in `active_sessions`
     // and as a live `session_open`), which a state-projecting consumer absorbs harmlessly.
     let rx = audit.subscribe();
+    // The reachability ring (#58) is registered BEFORE the snapshot for the same reason the audit
+    // one is: a transition landing in the gap would otherwise be absent from both.
+    let mut reach_rx = mesh.map(|m| m.reach_bcast.subscribe());
     let snapshot = StreamFrame::Snapshot {
         active_sessions: audit.active_sessions(),
         reachability: mesh.map(crate::daemon::reachability_of).unwrap_or_default(),
     };
     write_frame(&mut w, &serde_json::to_value(&snapshot)?).await?;
 
-    // Disabled sink → no live tap: the snapshot stands alone, then the stream ends.
-    let Some(mut rx) = rx else {
+    // The stream lives as long as EITHER tap does. A disabled audit sink used to end the stream
+    // outright; since #58 a mesh still pushes reachability transitions, so auditing being off must
+    // not also switch liveness off — they are independent signals. Only when NEITHER tap exists
+    // (a control-only daemon with no mesh) does the snapshot stand alone.
+    let mut rx = rx;
+    if rx.is_none() && reach_rx.is_none() {
         return Ok(());
-    };
+    }
     use tokio::sync::broadcast::error::RecvError;
-    loop {
-        let frame = match rx.recv().await {
-            Ok(record) => StreamFrame::Event {
+
+    /// Map an audit-ring result to a frame; `None` (with `closed` set) means this tap is finished.
+    fn audit_frame(
+        r: Result<crate::audit::AuditRecord, RecvError>,
+        closed: &mut bool,
+    ) -> Option<StreamFrame> {
+        match r {
+            Ok(record) => Some(StreamFrame::Event {
                 record: Box::new(record),
+            }),
+            Err(RecvError::Lagged(n)) => Some(StreamFrame::Lagged { dropped: n }),
+            Err(RecvError::Closed) => {
+                *closed = true;
+                None
+            }
+        }
+    }
+
+    /// The reachability-ring equivalent (#58).
+    fn reach_frame(
+        r: Result<mcpmesh_local_api::PeerReachability, RecvError>,
+        closed: &mut bool,
+    ) -> Option<StreamFrame> {
+        match r {
+            Ok(peer) => Some(StreamFrame::Reachability { peer }),
+            Err(RecvError::Lagged(n)) => Some(StreamFrame::Lagged { dropped: n }),
+            Err(RecvError::Closed) => {
+                *closed = true;
+                None
+            }
+        }
+    }
+
+    let (mut closed_audit, mut closed_reach) = (false, false);
+    loop {
+        // Two independent rings — audit records and reachability transitions (#58) — merged here
+        // rather than at the source, so the audit broadcast (which is the same call that appends to
+        // the on-disk log) keeps its schema untouched. Lag on EITHER ring reports the same `Lagged`
+        // frame and never drops the subscriber.
+        let frame = match (&mut rx, &mut reach_rx) {
+            (Some(audit_rx), Some(reach)) => tokio::select! {
+                r = audit_rx.recv() => audit_frame(r, &mut closed_audit),
+                r = reach.recv() => reach_frame(r, &mut closed_reach),
             },
-            // Fell behind the ring: tell the subscriber, then KEEP streaming (never drop it).
-            Err(RecvError::Lagged(n)) => StreamFrame::Lagged { dropped: n },
-            Err(RecvError::Closed) => return Ok(()),
+            (Some(audit_rx), None) => audit_frame(audit_rx.recv().await, &mut closed_audit),
+            (None, Some(reach)) => reach_frame(reach.recv().await, &mut closed_reach),
+            (None, None) => return Ok(()),
         };
+        // A tap whose sender is gone is dropped rather than ending the stream — the OTHER tap may
+        // still be healthy. When both are gone the match arm above returns.
+        if closed_audit {
+            rx = None;
+            closed_audit = false;
+        }
+        if closed_reach {
+            reach_rx = None;
+            closed_reach = false;
+        }
+        let Some(frame) = frame else { continue };
         if write_frame(&mut w, &serde_json::to_value(&frame)?)
             .await
             .is_err()

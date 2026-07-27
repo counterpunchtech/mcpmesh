@@ -7,7 +7,7 @@ named pipe on Windows. Anything that can open the endpoint and parse JSON can sp
 language — [`local-api/examples/status.py`](../local-api/examples/status.py) is a complete client
 in ~60 lines of dependency-free Python.
 
-> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.11`, `api_minor` `11`) and evolves
+> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.12`, `api_minor` `12`) and evolves
 > **additively** (see [Versioning](#versioning)), but until a stable release this document — like the
 > wire format itself — may change without a migration path. Pin the mcpmesh version you build
 > against. Source of truth is the Rust in [`local-api/`](../local-api/src/protocol.rs); where this
@@ -432,9 +432,44 @@ Upholding the surface discipline: a record carries names, counts, and a status �
 a service name, a method/tool name, an argument **digest**, and byte/latency **numbers** — never raw
 arguments, response content, endpoint-ids, or keys.
 
-**`lagged`** — the subscriber fell behind the daemon's bounded event ring and `dropped` records were
-skipped. The stream is **not** dropped and continues; **reconnect** to get a fresh `snapshot` and
-resume in sync.
+**`reachability`** — a peer went online or offline (`api_minor >= 12`, #58). Pushed so you do not
+have to poll `status` for a liveness indicator, and so work queued for an unreachable peer can flush
+the instant it returns rather than on the next poll tick.
+
+```json
+{
+  "type": "reachability",
+  "peer": {
+    "name": "bob",
+    "reachable": true,
+    "rtt_ms": 12,
+    "age_secs": 0,
+    "meta": "",
+    "principal": "eid:9f2k…"
+  }
+}
+```
+
+`peer` is a whole `PeerReachability` row — the same shape the opening `snapshot`'s `reachability`
+list carries, so both project through one code path.
+
+Emitted on a **transition** only: the `reachable` verdict changed, or this is the first probe of
+that peer. A refreshed probe that re-confirms the same verdict emits nothing, so a peer that stays
+up does not produce a frame per cache refresh; `rtt_ms`/`meta` drift is advisory detail, not a
+transition. `age_secs` is `0` — the probe just completed.
+
+This is the **pairing-mode probe**. Roster-mode presence travels on the gossip topic and surfaces
+through `status`; it is not (yet) an event here.
+
+**`lagged`** — the subscriber fell behind one of the daemon's bounded rings and `dropped` messages
+were skipped. The stream is **not** dropped and continues; **reconnect** to get a fresh `snapshot`
+and resume in sync.
+
+A `lagged` frame may account for skipped **audit events or reachability transitions** — it does not
+say which. That matters for liveness: a missed `reachability` transition is **never re-asserted**
+(the next frame comes only on the next flip), so a consumer that shrugs off `lagged` can hold a
+stale online/offline indicator indefinitely. If you render liveness, treat `lagged` as "resync":
+reconnect, or fall back to a `status` read.
 
 ```json
 {"type": "lagged", "dropped": 12}
@@ -534,7 +569,8 @@ things:
   `service_allow_revoke` per-peer access verbs are `api_minor >= 8` (#44); `unregister_service` (#50), the `run`-backend `env`/`cwd` (#51), `peer_services` (#52), and the `set_relays` live relay-set verb (#53) are `api_minor >= 9`; IMMEDIATE revocation
   (`service_allow_revoke`/`peer_remove` refuse new sessions on already-open connections AND sever
   live ones, #54) is `api_minor >= 10`; ephemeral-service grant/revoke plus the `-32040`
-  no-such-service error (#55, #69) are `api_minor >= 11`; the `set_nickname` verb
+  no-such-service error (#55, #69) are `api_minor >= 11`; the pushed `reachability` stream frame (#58)
+  is `api_minor >= 12`; the `set_nickname` verb
   and `StatusResult.self_nickname` are `api_minor >= 2` (#37); STABLE-principal `allow`
   strings + `ServiceInfo.allow_display` are `api_minor >= 3` (#38). `api_minor` is itself
   additive: a pre-1.1 daemon omits it and it reads as `0`.

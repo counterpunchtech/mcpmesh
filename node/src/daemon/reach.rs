@@ -26,6 +26,13 @@ pub struct ReachEntry {
     /// The services this peer currently grants US (#52), read from its pong — the discovery
     /// answer. Only services whose allow admits our principal; empty if it shares nothing.
     pub services: Vec<String>,
+    /// Monotonic ticket taken when this probe STARTED (#58 review). Probes of one peer overlap
+    /// routinely — `reachability_of` spawns a refresh per stale peer, and BOTH `status` and
+    /// `subscribe` call it — and they complete out of order, so a slow probe that started earlier
+    /// must not overwrite a fast one that started later. Without this the older (timed-out) result
+    /// wins on arrival, poisoning the cache for a full TTL and, since #58, PUSHING a false "went
+    /// offline" for a peer that is up.
+    pub seq: u64,
 }
 
 /// Advisory reachability TTL: a cache entry older than this is refreshed by a NON-BLOCKING
@@ -44,6 +51,10 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 /// `MeshState::reachability` cache and returns it. Reachable ⇔ a pong arrived within
 /// `PROBE_TIMEOUT`; a gate refusal (no pong) or any dial/IO failure is a clean `reachable:false`.
 pub async fn probe_peer(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> ReachEntry {
+    // Ticket FIRST, before any await: ordering is by probe START, not completion.
+    let seq = mesh
+        .probe_seq
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let started = std::time::Instant::now();
     let outcome = tokio::time::timeout(PROBE_TIMEOUT, probe_once(mesh, endpoint_id)).await;
     // `probe_once` returns the peer's (already length-capped) metadata on a reachable pong.
@@ -57,12 +68,118 @@ pub async fn probe_peer(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> ReachEn
         probed_at: epoch_now_i64(),
         meta,
         services,
+        seq,
     };
-    mesh.reachability
-        .lock()
-        .expect("reachability lock not poisoned")
-        .insert(endpoint_id, entry.clone());
+    // Commit under ONE lock acquisition, DISCARDING a result a newer probe has already superseded
+    // (#58 review): probes of one peer overlap and complete out of order.
+    let outcome = {
+        let mut cache = mesh
+            .reachability
+            .lock()
+            .expect("reachability lock not poisoned");
+        match cache.get(&endpoint_id) {
+            // A newer probe already landed. Drop ours and report THEIRS, so a caller never acts on
+            // a value the cache disagrees with.
+            Some(newer) if !supersedes(seq, newer) => Outcome::Superseded(newer.clone()),
+            other => {
+                let previous = other.cloned();
+                cache.insert(endpoint_id, entry.clone());
+                Outcome::Committed(previous)
+            }
+        }
+    };
+    let previous = match outcome {
+        Outcome::Superseded(newer) => return newer,
+        Outcome::Committed(previous) => previous,
+    };
+
+    if is_transition(previous.as_ref(), &entry) {
+        // Only for a peer the STORE knows: `probe_peer` is also reachable via `peer_services`,
+        // which accepts a bare `eid:` with no stored row. Emitting for one of those would push a
+        // NAMELESS frame for an endpoint the snapshot's store-driven list can never contain — the
+        // stream asserting state `status` contradicts (#58 review).
+        if let Some(row) = stored_row(mesh, endpoint_id, &entry) {
+            // Best-effort: `send` errors only when there are no subscribers, the common case.
+            let _ = mesh.reach_bcast.send(row);
+        }
+    }
     entry
+}
+
+/// Should a probe holding ticket `seq` overwrite `existing` (#58 review)?
+///
+/// Tickets are taken at probe START, so a LOWER ticket is an OLDER probe: it may complete later
+/// (a 3s timeout losing to a 50ms pong) but must not win. Equal is impossible — tickets are unique
+/// — and is treated as "write" so the guard can never wedge.
+fn supersedes(seq: u64, existing: &ReachEntry) -> bool {
+    seq >= existing.seq
+}
+
+/// What [`probe_peer`]'s commit step decided.
+enum Outcome {
+    /// Our result was written; carries the entry it replaced, if any.
+    Committed(Option<ReachEntry>),
+    /// A newer probe had already landed; carries THAT result.
+    Superseded(ReachEntry),
+}
+
+/// Did this probe CHANGE what a subscriber already believes (#58)?
+///
+/// The baseline is the SNAPSHOT, not the cache: a peer with no cache entry is reported
+/// `reachable: false` there (see [`reachability_of`]'s `None` arm). So first knowledge is news only
+/// when the peer turns out to be UP — a first probe confirming "down" merely restates the snapshot,
+/// and emitting it produced a burst of spurious "is now offline" frames on every daemon restart,
+/// immediately after a snapshot that had just said exactly that (#58 review).
+///
+/// Deliberately NOT sensitive to `rtt_ms`/`meta`/`services`: those drift on every refresh and are
+/// advisory detail, so treating them as transitions would emit a frame per TTL refresh for a peer
+/// that is simply staying up — chatty, and not a decision point for any consumer.
+fn is_transition(previous: Option<&ReachEntry>, current: &ReachEntry) -> bool {
+    match previous {
+        None => current.reachable,
+        Some(prev) => prev.reachable != current.reachable,
+    }
+}
+
+/// Build the wire row for ONE peer. THE single constructor of `PeerReachability` — both the
+/// `status`/snapshot list and the #58 transition event go through it, so the two genuinely cannot
+/// drift (an earlier version merely CLAIMED this while `reachability_of` built its rows inline).
+///
+/// `entry == None` is a peer never probed: `reachable: false` with no age, which a consumer renders
+/// as "checking…". `age_secs` is the caller's, since the snapshot computes it from `probed_at`
+/// while a transition event is fresh by construction.
+fn reachability_row(
+    nickname: String,
+    endpoint_id: [u8; 32],
+    entry: Option<&ReachEntry>,
+    age_secs: Option<u64>,
+) -> mcpmesh_local_api::PeerReachability {
+    mcpmesh_local_api::PeerReachability {
+        name: nickname,
+        reachable: entry.is_some_and(|e| e.reachable),
+        rtt_ms: entry.and_then(|e| e.rtt_ms),
+        age_secs,
+        meta: entry.map(|e| e.meta.clone()).unwrap_or_default(),
+        // #42: the eid: device principal, so a row joins to the authenticated endpoint rather
+        // than the non-unique nickname.
+        principal: Some(mcpmesh_net::EndpointId::from_bytes(endpoint_id).principal()),
+    }
+}
+
+/// The transition event's row, or `None` when the peer has no stored entry — see the call site.
+/// A point read, not the O(n) scan an earlier version used.
+fn stored_row(
+    mesh: &Arc<MeshState>,
+    endpoint_id: [u8; 32],
+    entry: &ReachEntry,
+) -> Option<mcpmesh_local_api::PeerReachability> {
+    let nickname = mesh.store.resolve(&endpoint_id).ok().flatten()?.nickname;
+    Some(reachability_row(
+        nickname,
+        endpoint_id,
+        Some(entry),
+        Some(0),
+    ))
 }
 
 /// The dial → ping → pong half of [`probe_peer`], separated so the whole exchange is one timeout
@@ -204,27 +321,12 @@ pub fn reachability_of(mesh: &Arc<MeshState>) -> Vec<mcpmesh_local_api::PeerReac
                 if age > REACH_TTL_SECS {
                     stale.push(eid);
                 }
-                out.push(mcpmesh_local_api::PeerReachability {
-                    name: nickname,
-                    reachable: e.reachable,
-                    rtt_ms: e.rtt_ms,
-                    age_secs: Some(age as u64),
-                    meta: e.meta.clone(),
-                    // #42: the eid: device principal, so a row joins to the authenticated
-                    // endpoint rather than the non-unique nickname.
-                    principal: Some(mcpmesh_net::EndpointId::from_bytes(eid).principal()),
-                });
+                out.push(reachability_row(nickname, eid, Some(e), Some(age as u64)));
             }
             None => {
                 stale.push(eid);
-                out.push(mcpmesh_local_api::PeerReachability {
-                    name: nickname,
-                    reachable: false,
-                    rtt_ms: None,
-                    age_secs: None, // never probed → consumer shows "checking…"
-                    meta: String::new(),
-                    principal: Some(mcpmesh_net::EndpointId::from_bytes(eid).principal()),
-                });
+                // Never probed → `age_secs: None`, which a consumer renders as "checking…".
+                out.push(reachability_row(nickname, eid, None, None));
             }
         }
     }
@@ -247,7 +349,94 @@ pub fn reachability_of(mesh: &Arc<MeshState>) -> Vec<mcpmesh_local_api::PeerReac
 #[cfg(test)]
 mod tests {
     use super::pong_meta;
+    use super::{ReachEntry, is_transition, supersedes};
     use crate::roster::presence::APP_METADATA_MAX_BYTES;
+
+    fn entry(reachable: bool, rtt_ms: Option<u64>) -> ReachEntry {
+        ReachEntry {
+            reachable,
+            rtt_ms,
+            probed_at: 1_700_000_000,
+            meta: String::new(),
+            services: Vec::new(),
+            seq: 0,
+        }
+    }
+
+    /// #58 review: a SLOW probe that started earlier must not overwrite a FAST one that started
+    /// later. Probes of one peer overlap routinely — `reachability_of` spawns a refresh per stale
+    /// peer and both `status` and `subscribe` call it — and they complete out of order. Without
+    /// this the timed-out older result wins on arrival, poisoning the cache for a full TTL AND
+    /// pushing a false "went offline" for a peer that is up.
+    #[test]
+    fn a_probe_never_overwrites_a_newer_one() {
+        let mut newer = entry(true, Some(50));
+        newer.seq = 7;
+
+        assert!(
+            !supersedes(3, &newer),
+            "an older probe (ticket 3) must not overwrite ticket 7's result"
+        );
+        assert!(
+            supersedes(9, &newer),
+            "a newer probe (ticket 9) must overwrite"
+        );
+        assert!(
+            supersedes(7, &newer),
+            "equal tickets cannot happen, but must not wedge the guard"
+        );
+    }
+
+    /// #58: the emit rule, exhaustively. A transition is a CHANGE in the `reachable` verdict (or
+    /// first knowledge of the peer) — never a refresh that merely re-confirms it, which would emit
+    /// a frame per TTL refresh for a peer that is simply staying up.
+    #[test]
+    fn only_a_change_in_the_reachable_verdict_is_a_transition() {
+        // First knowledge is news ONLY when the peer is UP. The snapshot already reports an
+        // unprobed peer as `reachable: false`, so a first probe confirming "down" restates it —
+        // emitting that produced a spurious offline burst on every daemon restart (#58 review).
+        assert!(
+            is_transition(None, &entry(true, Some(9))),
+            "first probe finds the peer UP — news"
+        );
+        assert!(
+            !is_transition(None, &entry(false, None)),
+            "first probe confirms DOWN — the snapshot already said so"
+        );
+
+        // The two real flips.
+        assert!(
+            is_transition(Some(&entry(false, None)), &entry(true, Some(9))),
+            "came back online"
+        );
+        assert!(
+            is_transition(Some(&entry(true, Some(9))), &entry(false, None)),
+            "went offline"
+        );
+
+        // A refresh confirming the same verdict is NOT a transition, even when the advisory
+        // detail moved — this is what keeps a healthy peer from emitting once per TTL.
+        assert!(
+            !is_transition(Some(&entry(true, Some(9))), &entry(true, Some(9))),
+            "unchanged refresh"
+        );
+        assert!(
+            !is_transition(Some(&entry(true, Some(9))), &entry(true, Some(120))),
+            "rtt drift alone is not a transition"
+        );
+        assert!(
+            !is_transition(Some(&entry(false, None)), &entry(false, None)),
+            "still offline"
+        );
+
+        // Metadata drift alone is likewise not a transition.
+        let mut with_meta = entry(true, Some(9));
+        with_meta.meta = "status: away".into();
+        assert!(
+            !is_transition(Some(&entry(true, Some(9))), &with_meta),
+            "meta drift alone is not a transition"
+        );
+    }
 
     /// The probe RECEIVE cap (#40): a pong's `meta` is surfaced only when it is a string within
     /// the ≤256B cap — a missing, non-string, or OVERSIZED value (a compromised paired peer

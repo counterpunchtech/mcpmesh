@@ -858,8 +858,13 @@ pub struct ActiveSession {
 /// `{"type":"lagged",...}`. `Event.record` is the [`AuditRecord`] verbatim, so the stream and the
 /// on-disk log carry ONE schema. The daemon serializes these; an embedding consumer deserializes
 /// them (see `docs/local-protocol.md` "Live event stream").
+/// **`#[non_exhaustive]`**: a future frame kind must not break a downstream `match`. Adding
+/// `Reachability` in 0.13.0 DID break exhaustive matches — which is why that release is a MINOR,
+/// per `RELEASING.md`'s pre-1.0 rule that breaking changes bump the minor. Consumers now write a
+/// `_ =>` arm and later additions are additive for Rust as well as for JSON.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum StreamFrame {
     /// The FIRST frame: a point-in-time picture of the mesh (open sessions + paired-peer
     /// reachability) so a fresh subscriber renders immediately without replaying history.
@@ -871,6 +876,16 @@ pub enum StreamFrame {
     /// Boxed so this (much larger) variant does not bloat every frame; serde delegates through the
     /// `Box`, so the wire shape is the record's fields verbatim.
     Event { record: Box<AuditRecord> },
+    /// A peer's reachability TRANSITIONED (#58): it became reachable, became unreachable, or was
+    /// probed for the first time. Pushed so an embedder does not have to poll `status` for a live
+    /// online/offline indicator — and so work queued for an unreachable peer can flush the moment
+    /// it returns, rather than on the next poll tick.
+    ///
+    /// Emitted on a CHANGE of `reachable` only. A refreshed probe with the same verdict emits
+    /// nothing, so a peer that stays up does not produce a frame per TTL refresh; `rtt_ms`/`meta`/
+    /// `services` drift is advisory detail and is not a transition. `age_secs` is `0` — the probe
+    /// just completed.
+    Reachability { peer: PeerReachability },
     /// The subscriber fell `dropped` records behind the broadcast ring; the stream continues (a
     /// fresh reconnect would re-`Snapshot`). Never drops the subscriber — lag is reported, never fatal.
     Lagged { dropped: u64 },
@@ -920,7 +935,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   new methods, or a strictness change like params validation — bumped in the same change that
 ///   makes it. A client can guard with `api_minor >= N` for a feature it needs, or refuse a daemon
 ///   older than a minor it requires. It never resets except on a MAJOR bump.
-pub const API_VERSION: &str = "1.11";
+pub const API_VERSION: &str = "1.12";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -938,12 +953,40 @@ pub const API_VERSION: &str = "1.11";
 /// `api_minor >= 10` before telling a user that revocation has taken effect; to 11 when
 /// `service_allow_grant`/`service_allow_revoke` gained EPHEMERAL-service support and became strict
 /// about an unknown service name — a name in neither the config nor the ephemeral registry now
-/// answers [`ERR_NO_SUCH_SERVICE`] instead of a silent `{}` (#55, #69).
-pub const API_MINOR: u32 = 11;
+/// answers [`ERR_NO_SUCH_SERVICE`] instead of a silent `{}` (#55, #69); to 12 with the pushed
+/// [`StreamFrame::Reachability`] liveness transition frame (#58).
+pub const API_MINOR: u32 = 12;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #58: the pushed liveness frame tags as `{"type":"reachability","peer":{…}}` and carries a
+    /// whole `PeerReachability` row — the SAME shape the opening snapshot's list holds, so a
+    /// consumer projects both through one code path.
+    #[test]
+    fn reachability_frame_tags_and_round_trips() {
+        let frame = StreamFrame::Reachability {
+            peer: PeerReachability {
+                name: "bob".into(),
+                reachable: true,
+                rtt_ms: Some(12),
+                age_secs: Some(0),
+                meta: String::new(),
+                principal: Some("eid:beef".into()),
+            },
+        };
+        let v = serde_json::to_value(&frame).unwrap();
+        assert_eq!(v["type"], "reachability");
+        assert_eq!(v["peer"]["name"], "bob");
+        assert_eq!(v["peer"]["reachable"], true);
+        assert_eq!(
+            v["peer"]["age_secs"], 0,
+            "a transition frame is fresh by construction: {v}"
+        );
+        let back: StreamFrame = serde_json::from_value(v).unwrap();
+        assert_eq!(back, frame);
+    }
 
     #[test]
     fn peer_reachability_serde_is_additive() {
