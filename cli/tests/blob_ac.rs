@@ -306,7 +306,7 @@ async fn unpublish_and_revoke_withdraw_access_per_scope() {
         assert!(matches!(fetch(kept_ticket.clone(), "b").await, Ok(Ok(_))));
 
         // UNPUBLISH the first: its hash leaves "docs", so the gate denies it.
-        provider.unpublish("docs", &doomed_hash).unwrap();
+        provider.unpublish("docs", &doomed_hash).await.unwrap();
         let after = fetch(doomed_ticket.clone(), "c").await;
         assert!(
             matches!(after, Ok(Err(_))),
