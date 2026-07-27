@@ -19,11 +19,11 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use mcpmesh_local_api::transport::{LocalListener, LocalStream};
 use mcpmesh_local_api::{
-    API_NAME, API_VERSION, BlobFetchParams, BlobGrantParams, BlobPublishParams, BlobRevokeParams,
-    BlobUnpublishParams, Hello, InviteParams, OpenSessionParams, OrgJoinParams, PairParams,
-    PeerServicesParams, RosterInstallParams, ServiceAllowParams, SetAppMetadataParams,
-    SetNicknameParams, SetRelaysParams, SetRosterUrlParams, StatusResult, UnregisterServiceParams,
-    method_of,
+    API_NAME, API_VERSION, BlobFetchParams, BlobGrantParams, BlobPublishParams,
+    BlobRepublishParams, BlobRevokeParams, BlobUnpublishParams, Hello, InviteParams,
+    OpenSessionParams, OrgJoinParams, PairParams, PeerServicesParams, RosterInstallParams,
+    ServiceAllowParams, SetAppMetadataParams, SetNicknameParams, SetRelaysParams,
+    SetRosterUrlParams, StatusResult, UnregisterServiceParams, method_of,
 };
 use mcpmesh_net::framing::{FrameReader, Inbound, write_frame};
 use serde_json::{Value, json};
@@ -666,6 +666,14 @@ pub(crate) async fn handle_request(req: &Value, state: &DaemonState) -> Value {
             .await
             .map(unit),
         ),
+        Some("blob_republish") => respond(
+            id,
+            "blob_republish",
+            with_params(&params, |p: BlobRepublishParams| {
+                crate::daemon::blob_republish(state, p.scope, p.hash)
+            })
+            .await,
+        ),
         Some("blob_list") => respond(id, "blob_list", crate::daemon::blob_list(state).await),
         Some("blob_fetch") => respond(
             id,
@@ -733,6 +741,14 @@ fn respond<T: serde::Serialize>(id: Value, method: &str, r: anyhow::Result<T>) -
         }
         // #55: "no such service" is BRANCHABLE, not a generic failure — a caller distinguishing
         // "register it first" from "the daemon broke" cannot parse `-32000` messages reliably.
+        // #83: a missing BLOB gets its own code — "fetch it first" is a different remedy from
+        // "that scope does not exist", and a client should not have to parse messages to tell them
+        // apart. Checked BEFORE the shared arm below.
+        Err(e) if e.downcast_ref::<crate::daemon::NoSuchBlob>().is_some() => error(
+            id,
+            mcpmesh_local_api::ERR_NO_SUCH_BLOB,
+            format!("{method} failed: {e}"),
+        ),
         Err(e)
             if e.downcast_ref::<crate::daemon::NoSuchService>().is_some()
                 || e.downcast_ref::<crate::daemon::NoSuchBlobScope>().is_some() =>

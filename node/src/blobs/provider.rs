@@ -17,6 +17,7 @@ use mcpmesh_net::TrustGate;
 use crate::audit::{AuditRecord, AuditSink, now_ts};
 use crate::blobs::APP_BLOB_ALPN;
 use crate::blobs::scope::ScopeStore;
+use crate::daemon::RELAY_READY_TIMEOUT;
 
 /// The request-time scope-gate `EventMask` for the serving app-blob provider.
 ///
@@ -74,6 +75,14 @@ pub struct AppBlobs {
     /// Unreachable while the provider was roster-only — an embedded `NodeBuilder` node never built
     /// one — and it broke `shutdown_frees_the_root_*` the moment app blobs reached pairing mode.
     gate_loop: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Wait (bounded) for the relay handshake before minting a ticket (#83 ask 3).
+    ///
+    /// OFF by default, switched ON by boot alone. The wait exists so a ticket carries the
+    /// home-relay URL a fetcher needs across NAT; on a relay-disabled endpoint `online()` never
+    /// completes, so it is a guaranteed [`RELAY_READY_TIMEOUT`] of dead time per mint. Defaulting
+    /// off keeps that cost out of every test fixture (relay-disabled by construction) while
+    /// production — the only place the relay URL matters — opts in explicitly.
+    relay_wait: std::sync::atomic::AtomicBool,
 }
 
 impl AppBlobs {
@@ -107,6 +116,7 @@ impl AppBlobs {
             store,
             endpoint,
             events: None,
+            relay_wait: std::sync::atomic::AtomicBool::new(false),
             scopes: Arc::new(ScopeStore::new(blobs_dir.join("scopes.json"))),
             gate_loop: tokio::sync::Mutex::new(None),
         }))
@@ -142,6 +152,7 @@ impl AppBlobs {
             events: Some(events),
             scopes,
             gate_loop: tokio::sync::Mutex::new(Some(gate_loop)),
+            relay_wait: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
@@ -182,7 +193,7 @@ impl AppBlobs {
             .add_path(path)
             .await
             .with_context(|| format!("add blob from {}", path.display()))?;
-        let ticket = BlobTicket::new(self.endpoint.addr(), tag.hash, BlobFormat::Raw);
+        let ticket = self.ticket_for(tag.hash).await;
         Ok((ticket.to_string(), tag.hash.to_hex().to_string()))
     }
 
@@ -192,6 +203,71 @@ impl AppBlobs {
         let (ticket, hash_hex) = self.publish_path(path).await?;
         self.scopes.publish_hash(scope, &hash_hex)?;
         Ok((ticket, hash_hex))
+    }
+
+    /// Add a hash ALREADY COMPLETE in the local store to a scope (#83) — the "every recipient is a
+    /// source" primitive. Returns a ticket addressed to THIS node.
+    ///
+    /// No filesystem round-trip: `blob_publish { scope, path }` was the only way back in, and it
+    /// re-imported bytes the store already held, producing a third copy with nothing to reclaim it
+    /// (#80).
+    ///
+    /// **Completeness is checked first, and it is load-bearing.** Recording a hash in a scope
+    /// ADVERTISES it: the gate authorizes GETs for it and the returned ticket names us as the
+    /// source. `Blobs::has` is true only for `BlobStatus::Complete`, so an interrupted fetch's
+    /// partial bytes are refused exactly like absent ones — advertising what we cannot serve would
+    /// convert the publisher going offline into a hang at every fetcher.
+    ///
+    /// Idempotent (the scope's hash set is a set).
+    ///
+    /// **Do NOT call this unconditionally after every fetch.** Republishing into a scope
+    /// re-exposes the hash to every principal that scope ALREADY grants — including a hash an
+    /// operator deliberately withdrew with `blob_unpublish`, which removes reachability but not
+    /// the bytes, so `has()` stays true forever and a later republish silently restores access with
+    /// no grant call and no warning. Republish when the user asks to share, not as fetch hygiene.
+    ///
+    /// **Grants nobody.** The republisher chooses a scope they already control; inheriting the
+    /// original publisher's grant list would be a silent authorization transfer. Sharing is
+    /// `blob_grant`'s job.
+    pub async fn republish(&self, scope: &str, hash_hex: &str) -> Result<(String, String)> {
+        // Scope first: a typo'd scope must not report as a missing blob.
+        if !self.scopes.has_scope(scope) {
+            anyhow::bail!(crate::daemon::NoSuchBlobScope(scope.to_string()));
+        }
+        // Parse (panic-safe) AND NORMALIZE before touching the scope. The gate compares against
+        // the canonical lowercase hex (`msg.request.hash.to_hex()`), so inserting the caller's raw
+        // string would record an entry that authorizes nothing: `blob_list` would show the file as
+        // shared, every fetcher would be denied, and `blob_unpublish` — which normalizes — could
+        // never remove it. That is #62's silent-no-op defect re-entered from the other side.
+        // `blob_publish` is safe only because it stores `tag.hash.to_hex()`.
+        let hash = crate::blobs::parse_blob_hash(hash_hex)?;
+        let canonical = hash.to_hex().to_string();
+        if !self.store.blobs().has(hash).await.unwrap_or(false) {
+            anyhow::bail!(crate::daemon::NoSuchBlob(canonical));
+        }
+        self.scopes.publish_hash(scope, &canonical)?;
+        Ok((self.ticket_for(hash).await.to_string(), canonical))
+    }
+
+    /// Mint a ticket for a hash this node holds, addressed to this node.
+    ///
+    /// Waits (bounded by [`RELAY_READY_TIMEOUT`]) for the endpoint to come online first, so the
+    /// address carries the home-relay URL a fetcher needs across NAT (#83 ask 3). `mint_invite` has
+    /// done this since #4; the blob path minted immediately, so a file published shortly after boot
+    /// or after a network change could yield a direct-addresses-only ticket: LAN-dialable and
+    /// NAT-dead. A CAP, not a fixed wait — production returns the instant the relay handshake
+    /// completes, and the relay-disabled test preset simply falls through to direct addresses.
+    async fn ticket_for(&self, hash: Hash) -> BlobTicket {
+        if self.relay_wait.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = tokio::time::timeout(RELAY_READY_TIMEOUT, self.endpoint.online()).await;
+        }
+        BlobTicket::new(self.endpoint.addr(), hash, BlobFormat::Raw)
+    }
+
+    /// Turn the relay-ready wait ON. Boot calls this; nothing else should.
+    pub(crate) fn enable_relay_wait(&self) {
+        self.relay_wait
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Grant a scope to a STABLE principal — a group name, a user_id, or an `eid:` device
@@ -388,6 +464,291 @@ mod tests {
     use crate::blobs::scope::ScopeStore;
     use mcpmesh_net::{EndpointId, PeerIdentity, StaticGate};
     use std::sync::Arc;
+
+    /// #83: republishing a hash the store does NOT hold COMPLETE must fail, and must leave the
+    /// scope untouched.
+    ///
+    /// Putting a hash in a scope ADVERTISES it — the gate will authorize GETs for it and the
+    /// returned ticket names us as the source. Advertising bytes we cannot serve converts the
+    /// original sender going offline into a hang at every fetcher, which is strictly worse than the
+    /// failure #83 reports. Partial bytes (an interrupted fetch leaves them) must fail the same way
+    /// as absent ones, which is why the predicate is `Blobs::has` (true only for
+    /// `BlobStatus::Complete`) rather than "do we know this hash".
+    #[tokio::test]
+    async fn republishing_a_blob_we_do_not_hold_fails_and_leaves_the_scope_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = AppBlobs::open_fetcher(dir.path().join("blobs"), ep().await)
+            .await
+            .unwrap();
+        provider.grant("room", "b64u:alice").unwrap();
+
+        // A well-formed hash the store has never seen.
+        let absent = blake3::hash(b"never fetched").to_hex().to_string();
+        let err = provider
+            .republish("room", &absent)
+            .await
+            .expect_err("republishing a blob we do not hold must fail");
+        assert!(
+            err.downcast_ref::<crate::daemon::NoSuchBlob>().is_some(),
+            "must be NoSuchBlob so the client can tell it apart from a bad scope, got: {err}"
+        );
+        let hashes: Vec<String> = provider
+            .list()
+            .into_iter()
+            .flat_map(|(_, hashes, _)| hashes)
+            .collect();
+        assert!(
+            !hashes.contains(&absent),
+            "a FAILED republish must not half-advertise the hash, got {hashes:?}"
+        );
+    }
+
+    /// The check ORDER: an unknown scope reports `NoSuchBlobScope`, even when the hash is also
+    /// absent. A typo'd scope must not be reported as a missing blob — the client's remedy differs.
+    #[tokio::test]
+    async fn an_unknown_scope_outranks_a_missing_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = AppBlobs::open_fetcher(dir.path().join("blobs"), ep().await)
+            .await
+            .unwrap();
+        let absent = blake3::hash(b"nope").to_hex().to_string();
+        let err = provider
+            .republish("no-such-scope", &absent)
+            .await
+            .expect_err("unknown scope must fail");
+        assert!(
+            err.downcast_ref::<crate::daemon::NoSuchBlobScope>()
+                .is_some(),
+            "an unknown scope outranks a missing blob, got: {err}"
+        );
+    }
+
+    /// #83's exact scenario, end to end: a fetched blob becomes servable FROM THE FETCHER, and a
+    /// third peer gets it while the ORIGINAL PUBLISHER IS OFFLINE.
+    ///
+    /// "Someone posts a file to a room of eight and closes their laptop." Before republish, the
+    /// only address anyone held pointed at the sleeping publisher, so the remaining peers failed
+    /// even though complete, byte-identical bytes sat on three machines.
+    ///
+    /// B is a GATED provider (`AppBlobs::load`), which is what makes this test mean anything. An
+    /// ungated fetcher serves every hash it holds, so the scope insert republish performs is never
+    /// exercised and the test passes with republish recording nothing — verified by mutation.
+    #[tokio::test]
+    async fn a_fetched_blob_is_servable_from_the_fetcher_after_the_publisher_goes_away() {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let c_ep = ep().await;
+            let c_eid = EndpointId::from_bytes(*c_ep.id().as_bytes());
+            let mut entries = HashMap::new();
+            entries.insert(
+                c_eid,
+                PeerIdentity {
+                    endpoint: c_eid,
+                    name: "carol".into(),
+                    user_id: Some("carol".into()),
+                    groups: vec![],
+                },
+            );
+            let b_gate: Arc<dyn mcpmesh_net::TrustGate> = Arc::new(StaticGate::new(entries));
+
+            // A publishes (ungated — A's gate is not what is under test).
+            let adir = tempfile::tempdir().unwrap();
+            let a_ep = ep().await;
+            let a = AppBlobs::open_fetcher(adir.path().join("blobs"), a_ep.clone())
+                .await
+                .unwrap();
+            a.spawn_accept(&a_ep);
+            let src = adir.path().join("shared.bin");
+            std::fs::write(&src, b"the file everyone wants").unwrap();
+            let (a_ticket, hash_hex) = a.publish_path(&src).await.unwrap();
+
+            // B fetches it, and is GATED when it serves.
+            let bdir = tempfile::tempdir().unwrap();
+            let b_ep = ep().await;
+            let b = AppBlobs::load(
+                bdir.path().join("blobs"),
+                Arc::new(ScopeStore::new(bdir.path().join("scopes.json"))),
+                b_gate,
+                b_ep.clone(),
+                crate::audit::AuditSink::disabled(),
+            )
+            .await
+            .unwrap();
+            b.spawn_accept(&b_ep);
+            b.fetch(&a_ticket).await.unwrap();
+
+            // B republishes into a scope IT controls and grants C.
+            b.grant("b-room", "carol").unwrap();
+            let (b_ticket, _canon) = b.republish("b-room", &hash_hex).await.unwrap();
+            assert_ne!(b_ticket, a_ticket, "the ticket must name B, not A");
+
+            // A goes away — the laptop closes.
+            a_ep.close().await;
+
+            // C fetches from B regardless.
+            let cdir = tempfile::tempdir().unwrap();
+            let c = AppBlobs::open_fetcher(cdir.path().join("blobs"), c_ep)
+                .await
+                .unwrap();
+            let got = c
+                .fetch(&b_ticket)
+                .await
+                .expect("C must fetch from B with A offline — the whole point of #83");
+            assert_eq!(
+                &c.read_bytes(got).await.unwrap()[..],
+                b"the file everyone wants"
+            );
+        })
+        .await
+        .expect("republish round-trip timed out");
+    }
+
+    /// Republish must NOT inherit the original publisher's grants. A principal A shared with, but
+    /// B did not, is refused by B — otherwise republishing would silently widen access to everyone
+    /// the previous holder had shared with, which no one asked for and no one would see.
+    #[tokio::test]
+    async fn republish_does_not_inherit_the_publishers_grants() {
+        tokio::time::timeout(std::time::Duration::from_secs(90), async {
+            let m_ep = ep().await;
+            let m_eid = EndpointId::from_bytes(*m_ep.id().as_bytes());
+            let mut entries = HashMap::new();
+            entries.insert(
+                m_eid,
+                PeerIdentity {
+                    endpoint: m_eid,
+                    name: "mallory".into(),
+                    user_id: Some("mallory".into()),
+                    groups: vec![],
+                },
+            );
+            let b_gate: Arc<dyn mcpmesh_net::TrustGate> = Arc::new(StaticGate::new(entries));
+
+            // A publishes and grants mallory.
+            let adir = tempfile::tempdir().unwrap();
+            let a_ep = ep().await;
+            let a = AppBlobs::open_fetcher(adir.path().join("blobs"), a_ep.clone())
+                .await
+                .unwrap();
+            a.spawn_accept(&a_ep);
+            let src = adir.path().join("f.bin");
+            std::fs::write(&src, b"a's file").unwrap();
+            let (a_ticket, hash_hex) = a.publish_path(&src).await.unwrap();
+            a.grant("a-room", "mallory").unwrap();
+
+            // B fetches and republishes into ITS scope, granting nobody.
+            let bdir = tempfile::tempdir().unwrap();
+            let b_ep = ep().await;
+            let b = AppBlobs::load(
+                bdir.path().join("blobs"),
+                Arc::new(ScopeStore::new(bdir.path().join("scopes.json"))),
+                b_gate,
+                b_ep.clone(),
+                crate::audit::AuditSink::disabled(),
+            )
+            .await
+            .unwrap();
+            b.spawn_accept(&b_ep);
+            b.fetch(&a_ticket).await.unwrap();
+            b.grant("b-room", "someone-else").unwrap();
+            let (b_ticket, _canon) = b.republish("b-room", &hash_hex).await.unwrap();
+
+            // mallory — granted by A, never by B — is refused by B.
+            let mdir = tempfile::tempdir().unwrap();
+            let mallory = AppBlobs::open_fetcher(mdir.path().join("blobs"), m_ep)
+                .await
+                .unwrap();
+            // A DENIED fetch does not fail fast (the gate refuses at accept and the fetcher
+            // retries), so bound it: both "errored" and "never completed" are denials — only
+            // SUCCESS is a failure of this property.
+            let res =
+                tokio::time::timeout(std::time::Duration::from_secs(10), mallory.fetch(&b_ticket))
+                    .await;
+            assert!(
+                !matches!(res, Ok(Ok(_))),
+                "republishing must not transfer A's grants to B's copy — that would silently widen \
+                 access to everyone the previous holder shared with (got {res:?})"
+            );
+        })
+        .await
+        .expect("grant-isolation test timed out");
+    }
+
+    /// #83 review: a NON-CANONICAL rendering of a hash must not create an entry that authorizes
+    /// nothing. The gate compares against canonical lowercase hex, so recording the caller's raw
+    /// string (a valid 52-char base32 form, or uppercase hex) would put a row in `blob_list` that
+    /// looks shared, denies every fetcher, and cannot be removed — `blob_unpublish` normalizes and
+    /// would find nothing to delete, acking a no-op. That is #62's defect from the other side.
+    #[tokio::test]
+    async fn a_non_canonical_hash_is_normalized_before_it_is_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = AppBlobs::open_fetcher(dir.path().join("blobs"), ep().await)
+            .await
+            .unwrap();
+        provider.grant("room", "b64u:alice").unwrap();
+        let src = dir.path().join("f.bin");
+        std::fs::write(&src, b"canonical me").unwrap();
+        let (_t, canonical) = provider.publish_path(&src).await.unwrap();
+
+        // The SAME hash in its base32 rendering — what `Hash`'s Display produces, and a form a
+        // client can legitimately hold. (Uppercase HEX is not an alternative spelling: iroh's
+        // parser rejects it outright, which the review's own probe confirmed.)
+        let parsed = crate::blobs::parse_blob_hash(&canonical).unwrap();
+        let base32 = data_encoding::BASE32_NOPAD
+            .encode(parsed.as_bytes())
+            .to_ascii_lowercase();
+        assert_ne!(base32, canonical, "the fixture must actually differ");
+        let (_ticket, returned) = provider
+            .republish("room", &base32)
+            .await
+            .expect("an alternative rendering of a held hash must republish");
+
+        assert_eq!(
+            returned, canonical,
+            "the RESULT must carry canonical hex — blob_publish does, and the docs promise the two \
+             are interchangeable"
+        );
+        let recorded: Vec<String> = provider
+            .list()
+            .into_iter()
+            .filter(|(name, _, _)| name == "room")
+            .flat_map(|(_, hashes, _)| hashes)
+            .collect();
+        assert_eq!(
+            recorded,
+            vec![canonical],
+            "the SCOPE must record canonical hex — the gate compares against it, so a raw-string \
+             entry would authorize nobody and be unremovable"
+        );
+    }
+
+    /// Republish is idempotent (the scope hash set is a set), so a client may call it
+    /// unconditionally after every fetch without special-casing the second time.
+    #[tokio::test]
+    async fn republishing_twice_is_not_an_error_and_records_one_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = AppBlobs::open_fetcher(dir.path().join("blobs"), ep().await)
+            .await
+            .unwrap();
+        provider.grant("room", "b64u:alice").unwrap();
+        let src = dir.path().join("f.bin");
+        std::fs::write(&src, b"dupe").unwrap();
+        let (_t, hash_hex) = provider.publish_path(&src).await.unwrap();
+
+        provider.republish("room", &hash_hex).await.unwrap();
+        provider.republish("room", &hash_hex).await.unwrap();
+
+        // Constrain the SCOPE NAME too: without it, a mutation inserting into a hardcoded scope,
+        // or into every scope, passes.
+        let rooms: Vec<(String, Vec<String>)> = provider
+            .list()
+            .into_iter()
+            .map(|(name, hashes, _)| (name, hashes))
+            .collect();
+        assert_eq!(
+            rooms,
+            vec![("room".to_string(), vec![hash_hex.clone()])],
+            "exactly one entry, in the NAMED scope, not two and not elsewhere"
+        );
+    }
 
     /// Lock the exact serving mask: single-blob GET is scope-checked (`Intercept`); every other
     /// request type is pinned to deny-by-default so the refusal does NOT rely on 0.103.0's

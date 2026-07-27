@@ -41,7 +41,7 @@ const INVITE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// fixed wait: production returns the instant the relay handshake completes (~1s). On the
 /// relay-disabled localhost preset `online()` never completes, so this fires and we mint
 /// with the direct-address-only addr (dialable on localhost/LAN — sufficient for tests).
-const RELAY_READY_TIMEOUT: Duration = Duration::from_secs(3);
+pub(crate) const RELAY_READY_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Handle a `blob_publish` control request: add a LOCAL file into a scope on the gated
 /// app-blob store, returning the ticket + hash. Requires roster mode (the provider is built only
@@ -118,9 +118,7 @@ pub(crate) async fn blob_unpublish(state: &DaemonState, scope: String, hash: Str
     // UPPERCASE rendering of the same blake3 hash is valid, common, and would silently miss the
     // set removal — returning success while the blob stayed fetchable. Parsing normalizes it and
     // rejects garbage outright rather than acking a no-op.
-    let parsed: iroh_blobs::Hash = hash
-        .parse()
-        .map_err(|_| anyhow::anyhow!("not a blake3 hash: {hash}"))?;
+    let parsed = crate::blobs::parse_blob_hash(&hash)?;
     let hash_hex = parsed.to_hex().to_string();
     if !provider.has_scope(&scope) {
         anyhow::bail!(NoSuchBlobScope(scope));
@@ -146,6 +144,46 @@ impl std::fmt::Display for NoSuchBlobScope {
     }
 }
 impl std::error::Error for NoSuchBlobScope {}
+
+/// The blob is not present COMPLETE in this daemon's local store (#83, `blob_republish`).
+///
+/// Distinct from [`NoSuchBlobScope`] because the remedy differs: a missing scope is a typo or an
+/// unshared name, a missing blob means "fetch it first". Partial bytes report as missing too — an
+/// interrupted fetch leaves them, and advertising a hash we cannot fully serve would turn the
+/// original sender going offline into a hang at every fetcher.
+#[derive(Debug)]
+pub struct NoSuchBlob(pub String);
+
+impl std::fmt::Display for NoSuchBlob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "blob '{}' is not held complete by this daemon — fetch it before republishing",
+            self.0
+        )
+    }
+}
+impl std::error::Error for NoSuchBlob {}
+
+/// Handle a `blob_republish` control request (#83): make a blob this daemon ALREADY holds servable
+/// from here, in a scope it controls. No filesystem round-trip and no third copy of the bytes.
+pub(crate) async fn blob_republish(
+    state: &DaemonState,
+    scope: String,
+    hash: String,
+) -> Result<mcpmesh_local_api::BlobPublishResult> {
+    let mesh = state.mesh_required()?;
+    let provider = mesh.app_blobs().await.ok_or_else(|| {
+        anyhow::anyhow!(
+            "app-blob provider not enabled (its store failed to build — check the daemon log)"
+        )
+    })?;
+    // Return the CANONICAL hash, not the caller's rendering — `blob_publish` returns canonical
+    // hex, and the docs promise the two are interchangeable.
+    let (ticket, hash) = provider.republish(&scope, &hash).await?;
+    tracing::info!(%scope, %hash, "blob republished");
+    Ok(mcpmesh_local_api::BlobPublishResult { ticket, hash })
+}
 
 /// Handle a `blob_list` control request: the daemon's scopes (name → hashes + grants).
 pub(crate) async fn blob_list(state: &DaemonState) -> Result<BlobScopeList> {

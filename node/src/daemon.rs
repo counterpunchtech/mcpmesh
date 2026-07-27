@@ -58,8 +58,8 @@ pub use accept::spawn_accept_loop;
 pub use boot::serve_forever;
 pub use dial::{dial_service, pipe_session, race_dial};
 pub use handlers::{
-    NoSuchBlobScope, NoSuchService, grant_service_access, grant_service_allow, remove_peer,
-    rename_peer, revoke_service_access, revoke_service_allow,
+    NoSuchBlob, NoSuchBlobScope, NoSuchService, grant_service_access, grant_service_allow,
+    remove_peer, rename_peer, revoke_service_access, revoke_service_allow,
 };
 pub(crate) use reach::caller_admitted_services;
 /// The services this identity is admitted to, as the accept path computes them (#100). Test seam:
@@ -95,14 +95,15 @@ pub use roster_install::{
 };
 
 pub use boot::{NetPlan, net_plan};
+pub(crate) use handlers::RELAY_READY_TIMEOUT;
 /// Symmetric with the already-public [`MeshState::register_ephemeral`]: drops in-memory
 /// registrations and reloads. Public so tests can exercise what happens to a name held by BOTH an
 /// ephemeral registration and `config.toml` once the overlay goes away (#55/#94).
 pub use handlers::unregister_ephemeral;
 pub(crate) use handlers::{
-    add_peer, blob_fetch, blob_grant, blob_list, blob_publish, blob_revoke, blob_unpublish,
-    mint_invite, open_session, peer_services, redeem, register_service, service_allow_grant,
-    service_allow_revoke, set_relays, unregister_service,
+    add_peer, blob_fetch, blob_grant, blob_list, blob_publish, blob_republish, blob_revoke,
+    blob_unpublish, mint_invite, open_session, peer_services, redeem, register_service,
+    service_allow_grant, service_allow_revoke, set_relays, unregister_service,
 };
 pub(crate) use roster_install::{
     install_roster, org_join, set_app_metadata, set_nickname, set_roster_url,

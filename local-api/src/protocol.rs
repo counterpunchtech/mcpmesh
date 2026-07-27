@@ -466,6 +466,22 @@ pub struct BlobUnpublishParams {
     pub hash: String,
 }
 
+/// Params of [`Request::BlobRepublish`] (#83): the scope and the blake3 hex to add to it.
+///
+/// The blob must already be held COMPLETE by this daemon — republish makes a fetched blob servable
+/// FROM this node, it does not fetch. A hash that is absent, or only partially present from an
+/// interrupted fetch, is refused with [`ERR_NO_SUCH_BLOB`]: advertising bytes we cannot serve would
+/// turn the original publisher going offline into a hang at every fetcher.
+///
+/// It grants NOBODY. The republisher names a scope they already control; inheriting the original
+/// publisher's grants would be a silent authorization transfer. Share with `blob_grant`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobRepublishParams {
+    pub scope: String,
+    pub hash: String,
+}
+
 /// Params of [`Request::BlobFetch`]: the `mcpmesh/blob/1` ticket and the LOCAL export path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -599,6 +615,10 @@ pub enum Request {
     /// Tag `"blob_unpublish"`: remove a hash from ONE scope (#62). Withdraws reachability, not
     /// bytes.
     BlobUnpublish(BlobUnpublishParams),
+    /// #83: make a blob this daemon already holds servable from HERE, in a scope it controls.
+    /// Answers a [`BlobPublishResult`] — same shape as `blob_publish`, so a client can treat the
+    /// two interchangeably after a fetch.
+    BlobRepublish(BlobRepublishParams),
     /// List the daemon's blob scopes (name → hashes + grants). Tag `"blob_list"`.
     BlobList,
     /// Fetch a `mcpmesh/blob/1` ticket THROUGH the daemon (BLAKE3-verified streaming) and export the
@@ -999,6 +1019,9 @@ pub enum BackendSpec {
 /// instead of parsing a message — `service_allow_grant`/`service_allow_revoke` previously answered
 /// `{}` (success) for an unknown name, which silently included every ephemeral service.
 pub const ERR_NO_SUCH_SERVICE: i64 = -32040;
+/// The named blob is not held COMPLETE by this daemon (#83, `blob_republish`). Distinct from
+/// [`ERR_NO_SUCH_SERVICE`] because the remedy differs: fetch the blob first.
+pub const ERR_NO_SUCH_BLOB: i64 = -32041;
 
 pub const API_NAME: &str = "mcpmesh-local/1";
 /// The protocol-compatibility version as `"MAJOR.MINOR"`, distinct from the crate/stack version.
@@ -1009,7 +1032,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   new methods, or a strictness change like params validation — bumped in the same change that
 ///   makes it. A client can guard with `api_minor >= N` for a feature it needs, or refuse a daemon
 ///   older than a minor it requires. It never resets except on a MAJOR bump.
-pub const API_VERSION: &str = "1.17";
+pub const API_VERSION: &str = "1.18";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -1036,7 +1059,7 @@ pub const API_VERSION: &str = "1.17";
 /// and of a published hash, so un-sharing a file no longer requires unpairing the person (#62); to
 /// 16 when the app-blob provider became available in PAIRING mode — the blob verbs previously
 /// errored on any daemon without an org root key, though their scope gate never needed one (#61).
-pub const API_MINOR: u32 = 17;
+pub const API_MINOR: u32 = 18;
 
 #[cfg(test)]
 mod tests {

@@ -323,7 +323,13 @@ async fn boot_node(paths: NodePaths, config: Option<Config>) -> Result<BootedNod
                 )
                 .await
                 {
-                    Ok(provider) => mesh.set_app_blobs(provider).await,
+                    Ok(provider) => {
+                        // #83 ask 3: production tickets must carry the home-relay URL, so wait
+                        // (bounded) for the relay handshake before minting. Only here — see
+                        // `enable_relay_wait`.
+                        provider.enable_relay_wait();
+                        mesh.set_app_blobs(provider).await
+                    }
                     Err(e) => tracing::warn!(%e, "app-blob provider disabled (build failed)"),
                 }
             }
