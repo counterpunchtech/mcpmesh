@@ -336,6 +336,13 @@ impl AppBlobs {
     }
 
     /// Turn the relay-ready wait ON. Boot calls this; nothing else should.
+    /// Is the relay-ready wait on? Test-only — production sets it and never asks (#105).
+    #[cfg(test)]
+    pub(crate) fn relay_wait_enabled(&self) -> bool {
+        self.relay_wait.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Turn the relay-ready wait ON. Boot calls this; nothing else should.
     pub(crate) fn enable_relay_wait(&self) {
         self.relay_wait
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -910,6 +917,70 @@ mod tests {
         })
         .await
         .expect("publish/unpublish race test timed out");
+    }
+
+    /// #105: the relay-ready wait is a CAP, and it actually RUNS.
+    ///
+    /// The first version of this test asserted neither. On a relay-disabled endpoint the minted
+    /// ticket is byte-identical with and without the wait — no relay URL appears either way — so
+    /// the ONLY observable difference is elapsed time. Deleting the wait from `ticket_for`
+    /// entirely left both #105 tests passing (in 0.65s instead of 9.3s). Guarding the flag is not
+    /// guarding the behaviour the flag exists to produce.
+    ///
+    /// Because `online()` never completes with relays disabled, an enabled wait MUST consume the
+    /// full cap. So the elapsed time is a two-sided assertion: the lower bound fails if the wait
+    /// is removed or skipped, the upper bound fails if it becomes unbounded or is lengthened.
+    #[tokio::test]
+    async fn the_relay_wait_actually_runs_and_is_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider_ep = ep().await;
+        let provider = AppBlobs::open_fetcher(dir.path().join("blobs"), provider_ep.clone())
+            .await
+            .unwrap();
+        // F3: pin the DEFAULT too. Without this, flipping `relay_wait`'s initial value to `true`
+        // would make the boot guard in `boot.rs` stop failing when its one call is deleted — the
+        // whole point of #105 would evaporate silently.
+        assert!(
+            !provider.relay_wait_enabled(),
+            "the wait must default OFF — every hand-built fixture would otherwise pay the full cap \
+             per mint, and the boot guard would stop guarding anything"
+        );
+        provider.enable_relay_wait();
+        provider.spawn_accept(&provider_ep);
+
+        let src = dir.path().join("capped.bin");
+        std::fs::write(&src, b"capped").unwrap();
+
+        let started = std::time::Instant::now();
+        let published = provider.publish_path(&src).await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= crate::daemon::RELAY_READY_TIMEOUT,
+            "the wait must actually RUN — `online()` never completes on a relay-disabled endpoint, \
+             so an enabled wait consumes the full cap. Minting in {elapsed:?} means the wait was \
+             skipped or removed"
+        );
+        assert!(
+            elapsed < crate::daemon::RELAY_READY_TIMEOUT + std::time::Duration::from_secs(2),
+            "and it must be CAPPED — minting took {elapsed:?}, so the bound is longer than \
+             RELAY_READY_TIMEOUT or the wait is unbounded"
+        );
+
+        // F5: the fetch is bounded too — an unbounded one hangs the whole test binary with no
+        // failing test name, since libtest has no per-test timeout.
+        let cdir = tempfile::tempdir().unwrap();
+        let caller = AppBlobs::open_fetcher(cdir.path().join("blobs"), ep().await)
+            .await
+            .unwrap();
+        let hash = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            caller.fetch(&published.0),
+        )
+        .await
+        .expect("fetch timed out")
+        .expect("the fallback direct-address ticket must still round-trip");
+        assert_eq!(&caller.read_bytes(hash).await.unwrap()[..], b"capped");
     }
 
     /// Republish is idempotent (the scope hash set is a set), so a client may call it

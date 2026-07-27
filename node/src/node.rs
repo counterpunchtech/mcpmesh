@@ -146,34 +146,8 @@ impl Node {
     /// requests get a dropped connection — acceptable, shutdown means shutdown), and close the
     /// endpoint (a graceful QUIC close — live sessions end cleanly).
     pub async fn shutdown(self) {
-        let state = &self.booted.state;
-        state.request_shutdown();
-        state.abort_control_tasks();
-        let mesh = self
-            .booted
-            .state
-            .mesh()
-            .expect("a started Node always owns a mesh")
-            .clone();
-        if let Some(task) = mesh.accept_task.lock().await.take() {
-            task.abort();
-        }
-        if let Some(task) = mesh.poll_loop.lock().await.take() {
-            task.abort();
-        }
-        for task in self.booted.background {
-            task.abort();
-        }
-        // End the app-blob request gate loop and WAIT for it (#61). That task owns the
-        // `Arc<dyn TrustGate>`, which on a pairing daemon holds the `PeerStore` — and therefore the
-        // redb data-dir lock. Aborting without awaiting only schedules the drop, so a fresh node on
-        // the same root could still hit `DataDirInUse`. Was unreachable while the provider was
-        // roster-only (an embedded node never built one) and became reachable the moment app blobs
-        // were enabled in pairing mode.
-        if let Some(blobs) = mesh.app_blobs.lock().await.take() {
-            blobs.shutdown().await;
-        }
-        mesh.endpoint.close().await;
+        // One teardown path, shared with the boot tests (#105) so neither can drift from the other.
+        crate::daemon::boot::shutdown_booted(self.booted).await;
     }
 
     fn mesh(&self) -> &Arc<crate::daemon::MeshState> {
