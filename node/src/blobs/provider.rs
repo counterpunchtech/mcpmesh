@@ -83,6 +83,21 @@ pub struct AppBlobs {
     /// off keeps that cost out of every test fixture (relay-disabled by construction) while
     /// production — the only place the relay URL matters — opts in explicitly.
     relay_wait: std::sync::atomic::AtomicBool,
+    /// Serializes the HASH-MEMBERSHIP mutations (#104).
+    ///
+    /// `ScopeStore` makes each individual mutation atomic, but `republish` is a read-check-write:
+    /// it verifies the blob is complete (an `.await` on the store) and only then inserts. A
+    /// concurrent `blob_unpublish` landing in that gap is silently undone — both verbs return
+    /// success and the operator's revocation disappears. An async lock is required because the
+    /// completeness check awaits, so `ScopeStore`'s `std::sync::Mutex` cannot be held across it.
+    ///
+    /// Held by every verb that adds or removes a hash from a scope; grant/revoke of PRINCIPALS do
+    /// not contend, since they cannot race a membership decision.
+    hash_membership: tokio::sync::Mutex<()>,
+    /// TEST-ONLY: pause between `republish`'s completeness check and its scope insert, so the
+    /// interleaving #104 describes is deterministic rather than timing-dependent.
+    #[cfg(test)]
+    republish_delay: std::sync::Mutex<Option<std::time::Duration>>,
 }
 
 impl AppBlobs {
@@ -117,6 +132,9 @@ impl AppBlobs {
             endpoint,
             events: None,
             relay_wait: std::sync::atomic::AtomicBool::new(false),
+            hash_membership: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            republish_delay: std::sync::Mutex::new(None),
             scopes: Arc::new(ScopeStore::new(blobs_dir.join("scopes.json"))),
             gate_loop: tokio::sync::Mutex::new(None),
         }))
@@ -153,6 +171,9 @@ impl AppBlobs {
             scopes,
             gate_loop: tokio::sync::Mutex::new(Some(gate_loop)),
             relay_wait: std::sync::atomic::AtomicBool::new(false),
+            hash_membership: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            republish_delay: std::sync::Mutex::new(None),
         }))
     }
 
@@ -201,6 +222,9 @@ impl AppBlobs {
     /// named scope (single-writer via `ScopeStore`). Returns `(ticket_string, blake3_hex)`.
     pub async fn publish_scope(&self, scope: &str, path: &Path) -> Result<(String, String)> {
         let (ticket, hash_hex) = self.publish_path(path).await?;
+        // #104: membership mutations are serialized as a family, so an import that finishes while
+        // an unpublish is in flight cannot interleave with it either.
+        let _membership = self.hash_membership.lock().await;
         self.scopes.publish_hash(scope, &hash_hex)?;
         Ok((ticket, hash_hex))
     }
@@ -230,6 +254,11 @@ impl AppBlobs {
     /// original publisher's grant list would be a silent authorization transfer. Sharing is
     /// `blob_grant`'s job.
     pub async fn republish(&self, scope: &str, hash_hex: &str) -> Result<(String, String)> {
+        // #104: hold the membership lock across the completeness CHECK and the scope INSERT. They
+        // are a read-check-write with an `.await` between them, so a concurrent `blob_unpublish`
+        // landing in the gap was silently undone — both verbs returned success and the operator's
+        // revocation vanished.
+        let _membership = self.hash_membership.lock().await;
         // Scope first: a typo'd scope must not report as a missing blob.
         if !self.scopes.has_scope(scope) {
             anyhow::bail!(crate::daemon::NoSuchBlobScope(scope.to_string()));
@@ -244,6 +273,16 @@ impl AppBlobs {
         let canonical = hash.to_hex().to_string();
         if !self.store.blobs().has(hash).await.unwrap_or(false) {
             anyhow::bail!(crate::daemon::NoSuchBlob(canonical));
+        }
+        #[cfg(test)]
+        {
+            let d = *self
+                .republish_delay
+                .lock()
+                .expect("republish delay lock not poisoned");
+            if let Some(d) = d {
+                tokio::time::sleep(d).await;
+            }
         }
         self.scopes.publish_hash(scope, &canonical)?;
         Ok((self.ticket_for(hash).await.to_string(), canonical))
@@ -300,8 +339,20 @@ impl AppBlobs {
     /// requires the hash to be listed in some scope, so a subsequent GET is refused at the request
     /// hook. The BYTES remain in the store — there is no reclaim (#80) — so do not describe this to
     /// a user as deletion. A transfer already streaming is not interrupted.
-    pub fn unpublish(&self, scope: &str, hash_hex: &str) -> Result<bool> {
+    pub async fn unpublish(&self, scope: &str, hash_hex: &str) -> Result<bool> {
+        // #104: same lock as `republish`, so a revocation cannot land inside a republish's
+        // check-then-insert window and be overwritten by it.
+        let _membership = self.hash_membership.lock().await;
         self.scopes.unpublish_hash(scope, hash_hex)
+    }
+
+    /// TEST-ONLY: pause between the completeness check and the scope insert (#104).
+    #[cfg(test)]
+    pub(crate) fn set_republish_delay(&self, d: std::time::Duration) {
+        *self
+            .republish_delay
+            .lock()
+            .expect("republish delay lock not poisoned") = Some(d);
     }
 
     /// The current scope table (name, hashes, grants) for `list`.
@@ -718,6 +769,58 @@ mod tests {
             "the SCOPE must record canonical hex — the gate compares against it, so a raw-string \
              entry would authorize nobody and be unremovable"
         );
+    }
+
+    /// #104: a `blob_unpublish` concurrent with a `blob_republish` must not be silently undone.
+    ///
+    /// `republish` is a read-check-write — it verifies completeness (an `.await`) and only then
+    /// inserts. Without a lock spanning both, an unpublish landing in that gap removes the hash,
+    /// republish then re-inserts it, and BOTH verbs report success: the operator was told the file
+    /// was withdrawn while it is being served.
+    ///
+    /// Driven deterministically via the test-only delay seam rather than hoping for the
+    /// interleaving. With the lock, unpublish blocks until republish finishes and therefore
+    /// serializes AFTER it — the revocation is the last word, which is the outcome an operator
+    /// expects. Without it, unpublish slips into the gap and is overwritten.
+    #[tokio::test]
+    async fn a_concurrent_unpublish_is_not_lost_to_a_republish() {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let dir = tempfile::tempdir().unwrap();
+            let provider = AppBlobs::open_fetcher(dir.path().join("blobs"), ep().await)
+                .await
+                .unwrap();
+            provider.grant("room", "b64u:alice").unwrap();
+            let src = dir.path().join("f.bin");
+            std::fs::write(&src, b"contested").unwrap();
+            // Already published into the scope, so the unpublish below has something to remove.
+            let (_t, hash_hex) = provider.publish_scope("room", &src).await.unwrap();
+
+            provider.set_republish_delay(std::time::Duration::from_millis(600));
+            let p2 = provider.clone();
+            let h2 = hash_hex.clone();
+            let republish =
+                tokio::spawn(async move { p2.republish("room", &h2).await.map(|_| ()) });
+
+            // Let republish get past its completeness check and into the gap.
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            let removed = provider.unpublish("room", &hash_hex).await.unwrap();
+            republish.await.unwrap().unwrap();
+
+            assert!(removed, "the unpublish must actually have removed the hash");
+            let hashes: Vec<String> = provider
+                .list()
+                .into_iter()
+                .flat_map(|(_, hashes, _)| hashes)
+                .collect();
+            assert!(
+                !hashes.contains(&hash_hex),
+                "the revocation must survive — a republish that overwrites a concurrent unpublish \
+                 tells the operator the file was withdrawn while it is still being served (scope \
+                 now holds {hashes:?})"
+            );
+        })
+        .await
+        .expect("republish/unpublish race test timed out");
     }
 
     /// Republish is idempotent (the scope hash set is a set), so a client may call it

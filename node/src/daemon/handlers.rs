@@ -123,7 +123,7 @@ pub(crate) async fn blob_unpublish(state: &DaemonState, scope: String, hash: Str
     if !provider.has_scope(&scope) {
         anyhow::bail!(NoSuchBlobScope(scope));
     }
-    let changed = provider.unpublish(&scope, &hash_hex)?;
+    let changed = provider.unpublish(&scope, &hash_hex).await?;
     tracing::info!(%scope, changed, "blob unpublished from scope");
     Ok(())
 }
