@@ -280,6 +280,10 @@ pub struct MeshState {
 pub struct EphemeralService {
     pub backend: mcpmesh_local_api::BackendSpec,
     pub allow: Vec<String>,
+    /// This service's proxied-request rate per authenticated peer (#63), or `None` to inherit
+    /// `[limits].rate_limit_per_min`. Carried here so an EPHEMERAL registration can set it too —
+    /// #55 was filed because a per-service feature skipped ephemeral registrations.
+    pub rate_limit_per_min: Option<u32>,
 }
 
 /// Ring depth of the reachability transition fan-out (#58). Transitions are rare relative to audit
@@ -784,8 +788,11 @@ pub fn build_services_with_ephemeral(
                 cfg,
                 audit,
                 limiters,
+                svc.rate_limit_per_min,
             ),
-            Ok(Backend::Socket(path)) => session_backend_socket(path, name, audit, limiters),
+            Ok(Backend::Socket(path)) => {
+                session_backend_socket(path, name, cfg, audit, limiters, svc.rate_limit_per_min)
+            }
             Err(e) => {
                 tracing::warn!(service = %name, %e, "skipping malformed service");
                 continue;
@@ -803,11 +810,18 @@ pub fn build_services_with_ephemeral(
     // shape; map it to the same SpawnBackend/SocketBackend the config path builds.
     for (name, eph) in ephemeral {
         let backend = match &eph.backend {
-            mcpmesh_local_api::BackendSpec::Run { cmd, env, cwd } => {
-                session_backend_run(cmd, env, cwd.as_deref(), name, cfg, audit, limiters)
-            }
+            mcpmesh_local_api::BackendSpec::Run { cmd, env, cwd } => session_backend_run(
+                cmd,
+                env,
+                cwd.as_deref(),
+                name,
+                cfg,
+                audit,
+                limiters,
+                eph.rate_limit_per_min,
+            ),
             mcpmesh_local_api::BackendSpec::Socket { path } => {
-                session_backend_socket(path, name, audit, limiters)
+                session_backend_socket(path, name, cfg, audit, limiters, eph.rate_limit_per_min)
             }
         };
         map.insert(
@@ -830,6 +844,7 @@ fn session_backend_run(
     cfg: &Config,
     audit: &AuditSink,
     limiters: &Arc<crate::limits::MeshLimiters>,
+    rate_limit_per_min: Option<u32>,
 ) -> Arc<dyn SessionBackend> {
     Arc::new(SpawnBackend {
         cmd: cmd.to_vec(),
@@ -838,21 +853,31 @@ fn session_backend_run(
         concurrency: Arc::new(Semaphore::new(spawn_concurrency(cfg))),
         service: name.to_string(),
         audit: audit.clone(),
-        limiter: limiters.requests.clone(),
+        // #63: this service's OWN bucket set, so a noisy service cannot exhaust the budget a quiet
+        // one needs. Falls back to the global rate when the service sets none.
+        limiter: limiters.service_requests(
+            name,
+            rate_limit_per_min.unwrap_or(cfg.limits.rate_limit_per_min),
+        ),
     })
 }
 
 fn session_backend_socket(
     path: &str,
     name: &str,
+    cfg: &Config,
     audit: &AuditSink,
     limiters: &Arc<crate::limits::MeshLimiters>,
+    rate_limit_per_min: Option<u32>,
 ) -> Arc<dyn SessionBackend> {
     Arc::new(SocketBackend {
         path: path.to_string(),
         service: name.to_string(),
         audit: audit.clone(),
-        limiter: limiters.requests.clone(),
+        limiter: limiters.service_requests(
+            name,
+            rate_limit_per_min.unwrap_or(cfg.limits.rate_limit_per_min),
+        ),
     })
 }
 

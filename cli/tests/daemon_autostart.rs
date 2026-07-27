@@ -124,6 +124,7 @@ async fn ephemeral_service_is_connection_scoped_and_never_persisted() {
             },
             allow: vec!["x".into()],
             ephemeral: true,
+            rate_limit_per_min: None,
         }))
         .await
         .expect("ephemeral register acked");
@@ -326,6 +327,7 @@ async fn register_service_and_peer_add_reflect_in_status() {
                 },
                 allow: vec!["tester".into()],
                 ephemeral: false,
+                rate_limit_per_min: None,
             }))
             .await
             .expect("register_service");
@@ -401,6 +403,7 @@ async fn concurrent_register_service_calls_all_persist() {
             },
             allow: vec!["x".into()],
             ephemeral: false,
+            rate_limit_per_min: None,
         }));
         let reg_b = b.request(Request::RegisterService(RegisterServiceParams {
             name: "beta".into(),
@@ -411,6 +414,7 @@ async fn concurrent_register_service_calls_all_persist() {
             },
             allow: vec!["y".into()],
             ephemeral: false,
+            rate_limit_per_min: None,
         }));
         let (ra, rb) = tokio::join!(reg_a, reg_b);
         ra.expect("register alpha");
@@ -661,6 +665,7 @@ async fn status_output_leaks_no_transport_vocabulary() {
                 },
                 allow: vec!["bob".into()],
                 ephemeral: false,
+                rate_limit_per_min: None,
             }))
             .await
             .expect("register_service");

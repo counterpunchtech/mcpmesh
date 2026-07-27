@@ -68,7 +68,7 @@ refuses to run rather than silently falling back to public infrastructure.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `rate_limit_per_min` | `120` | Per-peer request rate (token bucket; this value is also the burst allowance). An over-limit request is refused with a retry hint — never served. |
+| `rate_limit_per_min` | `120` | Per-peer request rate (token bucket; this value is also the burst allowance). An over-limit request is refused with a retry hint — never served. The DEFAULT for every service; override one with `[services.<name>].rate_limit_per_min` (#63). |
 | `max_sessions` | `4` | Per-service cap on concurrently spawned sessions for a `run` service (a `socket` service is one warm process that manages its own concurrency). `0` is floored to `1`. |
 | `max_inflight` | `16` | Reserved: parsed and accepted, not yet enforced at this release. |
 
@@ -99,6 +99,7 @@ the service's public name (`mcpmesh serve notes …` writes `[services.notes]`).
 | `env` | `{}` | (`run` only, #51) Per-service environment variables for the spawned child, overlaid on the daemon's inherited env. The injected `MCPMESH_PEER_*` identity vars always win; a service `env` cannot set them. Literal values (owner-only config file, same posture as every MCP client). |
 | `cwd` | — | (`run` only, #51) Working directory to spawn the child in. Default: inherit the daemon's cwd. |
 | `allow` | `[]` | The STABLE principals admitted to this service (#38): `b64u:<user_id>`, `eid:<device id>`, or roster group/user_id names — never display nicknames (they cannot admit). Pairing appends the peer's principal; `mcpmesh pair --remove` prunes it; a bare nickname typed at `serve --allow`/`register_service` time is resolved to the peer's principal on write. Removing a principal here (via `service_allow_revoke` / `peer_remove`) takes effect IMMEDIATELY on peers that are already connected — their next session is refused and their live connections are severed (#54, 0.11.0). |
+| `rate_limit_per_min` | *(inherits `[limits]`)* | Proxied-request rate for THIS service, per authenticated peer (#63). Each service has its OWN bucket set, so a noisy service can no longer exhaust the budget a quiet one needs — set this to tune a known-noisy service down, or an interactive one up. Note the consequence: a peer's total budget across N services is now N × the per-service rate, so an operator who relied on the aggregate cap should set explicit per-service values. |
 
 Exactly **one** of `run` / `socket` per service — both or neither makes that one service error
 (surfaced when it is dialed; the rest of the config still loads). Peers themselves are *not* in the

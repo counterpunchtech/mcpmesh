@@ -169,11 +169,27 @@ const PAIR_ACCEPT_PER_MIN: u32 = 30;
 /// that churn per endpoint.
 const BLOB_CONN_PER_MIN: u32 = 60;
 
+/// Cap on the per-service limiter map (#63). Bounded like every other map here: EPHEMERAL
+/// registrations (#36) can churn service names, so an unbounded map would be a slow leak driven by
+/// a local caller. Past the cap a service shares the global limiter — degraded isolation, never
+/// degraded enforcement.
+const MAX_TRACKED_SERVICES: usize = 256;
+
 /// The daemon's rate/concurrency limiter bundle, built ONCE from config and carried
 /// on `MeshState`. Bundled so `MeshState` gains ONE handle. Every map is bounded.
 pub struct MeshLimiters {
-    /// Per-authenticated-endpoint proxied-request buckets (`[limits].rate_limit_per_min`).
+    /// The GLOBAL per-authenticated-endpoint proxied-request buckets
+    /// (`[limits].rate_limit_per_min`) — the fallback when a service has no limiter of its own.
     pub requests: Arc<RateLimiter>,
+    /// PER-SERVICE proxied-request limiters (#63), keyed by service name → (configured rate, its
+    /// limiter). Each `RateLimiter` is still keyed by endpoint internally, so the effective bucket
+    /// is (service, endpoint) and one noisy service can no longer starve a quiet one.
+    ///
+    /// Held HERE rather than built in `build_services` because this struct survives hot-reloads
+    /// while `build_services` runs on every one of them (grant, revoke, register, roster install).
+    /// Rebuilding the limiters per reload would reset every peer's bucket, letting a local caller
+    /// clear its own rate limit by spamming grants.
+    per_service: Mutex<HashMap<String, (u32, Arc<RateLimiter>)>>,
     /// A GLOBAL pair-ALPN accept bucket (bounds a distinct-id stranger flood).
     pair_accept: Mutex<TokenBucket>,
     /// Per-authenticated-endpoint app-blob connection buckets.
@@ -190,6 +206,7 @@ impl MeshLimiters {
                 limits.rate_limit_per_min,
                 limits.rate_limit_per_min,
             )),
+            per_service: Mutex::new(HashMap::new()),
             pair_accept: Mutex::new(TokenBucket::new(
                 f64::from(PAIR_ACCEPT_PER_MIN),
                 f64::from(PAIR_ACCEPT_PER_MIN) / 60.0,
@@ -202,11 +219,39 @@ impl MeshLimiters {
         })
     }
 
+    /// The proxied-request limiter for ONE service (#63).
+    ///
+    /// `per_min` is the service's configured rate (`[services.<name>].rate_limit_per_min`, or the
+    /// `register_service` field for an ephemeral registration), already defaulted to the global
+    /// `[limits].rate_limit_per_min` by the caller.
+    ///
+    /// Reuses the existing limiter when the rate is UNCHANGED, so a hot-reload preserves bucket
+    /// state; a changed rate installs a fresh limiter, which necessarily resets that service's
+    /// buckets — the operator asked for a different limit.
+    ///
+    /// Past [`MAX_TRACKED_SERVICES`] a service shares the global limiter instead of growing the
+    /// map. Isolation degrades; enforcement does not.
+    pub fn service_requests(&self, service: &str, per_min: u32) -> Arc<RateLimiter> {
+        let mut map = self.per_service.lock().expect("per-service limiter lock");
+        if let Some((rate, limiter)) = map.get(service)
+            && *rate == per_min
+        {
+            return limiter.clone();
+        }
+        if !map.contains_key(service) && map.len() >= MAX_TRACKED_SERVICES {
+            return self.requests.clone();
+        }
+        let limiter = Arc::new(RateLimiter::per_minute(per_min, per_min));
+        map.insert(service.to_string(), (per_min, limiter.clone()));
+        limiter
+    }
+
     /// An effectively-unlimited bundle (control-only test daemon / `build_services` default).
     pub fn unlimited() -> Arc<Self> {
         let now = Instant::now();
         Arc::new(Self {
             requests: RateLimiter::unlimited_shared(),
+            per_service: Mutex::new(HashMap::new()),
             pair_accept: Mutex::new(TokenBucket::new(
                 f64::from(u32::MAX),
                 f64::from(u32::MAX),
@@ -240,6 +285,114 @@ impl MeshLimiters {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #63: one service exhausting its bucket must NOT starve another on the same node for the
+    /// same peer. Before this, every service drew from ONE endpoint-keyed bucket, so an agent
+    /// hammering a browser service could break the embedder's own low-rate control traffic to a
+    /// different service.
+    #[test]
+    fn a_noisy_service_does_not_starve_a_quiet_one() {
+        let cfg = crate::config::LimitsCfg {
+            rate_limit_per_min: 2,
+            ..Default::default()
+        };
+        let ml = MeshLimiters::from_config(&cfg);
+        let eid = EndpointId::from_bytes([7u8; 32]);
+        let t = Instant::now();
+
+        let noisy = ml.service_requests("browser", 2);
+        let quiet = ml.service_requests("kb", 2);
+
+        // Drain the noisy service for this peer.
+        assert!(noisy.check(&eid, t).is_ok());
+        assert!(noisy.check(&eid, t).is_ok());
+        assert!(
+            noisy.check(&eid, t).is_err(),
+            "noisy service is now limited"
+        );
+
+        // The quiet service is untouched — THE assertion.
+        assert!(
+            quiet.check(&eid, t).is_ok(),
+            "a different service must have its own budget for the same peer"
+        );
+        assert!(quiet.check(&eid, t).is_ok());
+    }
+
+    /// #63: a per-service override applies instead of the global rate.
+    #[test]
+    fn a_service_override_replaces_the_global_rate() {
+        let cfg = crate::config::LimitsCfg {
+            rate_limit_per_min: 100,
+            ..Default::default()
+        };
+        let ml = MeshLimiters::from_config(&cfg);
+        let eid = EndpointId::from_bytes([9u8; 32]);
+        let t = Instant::now();
+
+        let tight = ml.service_requests("bulk", 1); // overridden down
+        let normal = ml.service_requests("kb", 100); // inherits the global
+
+        assert!(tight.check(&eid, t).is_ok());
+        assert!(
+            tight.check(&eid, t).is_err(),
+            "the override caps this service at 1/min"
+        );
+        for _ in 0..50 {
+            assert!(
+                normal.check(&eid, t).is_ok(),
+                "the un-overridden service still runs at the global rate"
+            );
+        }
+    }
+
+    /// #63: a hot-reload must not reset buckets. `build_services` runs on EVERY reload (grant,
+    /// revoke, register, roster install), so limiters rebuilt there would let a local caller clear
+    /// its own rate limit by spamming grants. An unchanged (name, rate) returns the SAME limiter.
+    #[test]
+    fn an_unchanged_reload_preserves_bucket_state() {
+        let ml = MeshLimiters::from_config(&crate::config::LimitsCfg {
+            rate_limit_per_min: 1,
+            ..Default::default()
+        });
+        let eid = EndpointId::from_bytes([3u8; 32]);
+        let t = Instant::now();
+
+        let first = ml.service_requests("kb", 1);
+        assert!(first.check(&eid, t).is_ok());
+        assert!(first.check(&eid, t).is_err(), "budget spent");
+
+        // Same name, same rate → same limiter, so the spent budget stays spent.
+        let after_reload = ml.service_requests("kb", 1);
+        assert!(Arc::ptr_eq(&first, &after_reload), "reused across reload");
+        assert!(
+            after_reload.check(&eid, t).is_err(),
+            "a reload must not hand back a fresh budget"
+        );
+
+        // A CHANGED rate is a deliberate operator action and does install a fresh limiter.
+        let retuned = ml.service_requests("kb", 500);
+        assert!(!Arc::ptr_eq(&first, &retuned));
+        assert!(retuned.check(&eid, t).is_ok());
+    }
+
+    /// #63: the map is bounded. Ephemeral registrations (#36) can churn names, so past the cap a
+    /// service shares the global limiter rather than growing the map without limit.
+    #[test]
+    fn the_per_service_map_is_bounded() {
+        let ml = MeshLimiters::from_config(&crate::config::LimitsCfg {
+            rate_limit_per_min: 10,
+            ..Default::default()
+        });
+        for i in 0..MAX_TRACKED_SERVICES {
+            ml.service_requests(&format!("svc-{i}"), 10);
+        }
+        let overflow = ml.service_requests("one-too-many", 10);
+        assert!(
+            Arc::ptr_eq(&overflow, &ml.requests),
+            "past the cap a service falls back to the shared global limiter"
+        );
+    }
     use std::time::{Duration, Instant};
 
     #[test]

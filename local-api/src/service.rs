@@ -139,6 +139,7 @@ pub async fn register_service(
                 // Ephemeral (#36) is for embedders that hold a ControlClient open for the
                 // service's lifetime (see ControlClient::register_service_with).
                 ephemeral: false,
+                rate_limit_per_min: None,
             }))
             .await?;
         Ok(())

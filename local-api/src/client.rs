@@ -196,6 +196,7 @@ impl ControlClient {
             backend,
             allow,
             ephemeral,
+            rate_limit_per_min: None,
         }))
         .await
     }
