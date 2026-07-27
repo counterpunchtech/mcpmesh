@@ -65,6 +65,32 @@ pub struct AppBlobs {
     endpoint: Endpoint,
     events: Option<EventSender>,
     scopes: Arc<ScopeStore>,
+    /// The request-time gate loop's handle, so shutdown can END it deterministically (#61).
+    ///
+    /// That task owns an `Arc<dyn TrustGate>`, which on a pairing daemon holds the `PeerStore` and
+    /// therefore the redb data-dir lock. It used to be a fire-and-forget `tokio::spawn` whose handle
+    /// was discarded: the loop exits when the last `EventSender` drops, but only once the task is
+    /// next polled, so nothing guaranteed the lock was released by the time `shutdown` returned.
+    /// Unreachable while the provider was roster-only — an embedded `NodeBuilder` node never built
+    /// one — and it broke `shutdown_frees_the_root_*` the moment app blobs reached pairing mode.
+    gate_loop: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl AppBlobs {
+    /// End the request-time gate loop, releasing the `TrustGate` (and with it the redb handle).
+    /// Idempotent; a fetcher has no loop and is a no-op.
+    ///
+    /// The `await` after `abort` is deliberate but NOT load-bearing for the current test: dropping
+    /// the provider already closes the event channel, and abort-without-await passes today. It is
+    /// here so the release is deterministic rather than dependent on when the runtime reaps the
+    /// task — the racy version is the kind that fails under load, not in CI.
+    pub async fn shutdown(&self) {
+        let handle = self.gate_loop.lock().await.take();
+        if let Some(h) = handle {
+            h.abort();
+            let _ = h.await;
+        }
+    }
 }
 
 impl AppBlobs {
@@ -82,6 +108,7 @@ impl AppBlobs {
             endpoint,
             events: None,
             scopes: Arc::new(ScopeStore::new(blobs_dir.join("scopes.json"))),
+            gate_loop: tokio::sync::Mutex::new(None),
         }))
     }
 
@@ -108,12 +135,13 @@ impl AppBlobs {
         // get_many/observe/push to the drain loop today; the pinned fields keep them refused even if
         // a future iroh-blobs honors the per-type fields directly.
         let (events, rx) = EventSender::channel(64, APP_BLOB_EVENT_MASK);
-        spawn_gate_loop(rx, gate, scopes.clone(), audit);
+        let gate_loop = spawn_gate_loop(rx, gate, scopes.clone(), audit);
         Ok(Arc::new(Self {
             store,
             endpoint,
             events: Some(events),
             scopes,
+            gate_loop: tokio::sync::Mutex::new(Some(gate_loop)),
         }))
     }
 
@@ -254,7 +282,7 @@ fn spawn_gate_loop(
     gate: Arc<dyn TrustGate>,
     scopes: Arc<ScopeStore>,
     audit: AuditSink,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut conns: HashMap<u64, mcpmesh_net::EndpointId> = HashMap::new();
         while let Some(msg) = rx.recv().await {
@@ -332,7 +360,7 @@ fn spawn_gate_loop(
                 _ => {}
             }
         }
-    });
+    })
 }
 
 #[cfg(test)]

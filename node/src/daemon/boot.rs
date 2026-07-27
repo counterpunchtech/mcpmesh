@@ -297,11 +297,16 @@ async fn boot_node(paths: NodePaths, config: Option<Config>) -> Result<BootedNod
     };
     mesh.set_self_binding(self_binding);
     // Build the gated per-scope app-blob provider in roster mode and install it on the
-    // mesh BEFORE the accept loop starts. Uses the SAME composed trust gate the mesh resolves inbound
-    // MCP with, so the request-time scope check keys on the exact authenticated identity. A build
-    // failure disables app blobs with a warning (pairing + mesh keep working); a pure-pairing daemon
-    // never builds it.
-    if roster_mode {
+    // mesh BEFORE the accept loop starts. Uses the SAME trust gate the mesh resolves inbound MCP
+    // with, so the request-time scope check keys on the exact authenticated identity. A build
+    // failure disables app blobs with a warning (pairing + mesh keep working).
+    //
+    // Built in BOTH modes (#61). The scope gate is identity-generic — a grant is a flat principal
+    // (`eid:` device, `b64u:` user, or a roster group/user name), and the `eid:` arm is exercised
+    // against a non-roster gate by `pairing_mode_eid_grant_admits_and_nickname_grant_stays_denied`.
+    // Gating construction on an org root key kept content-addressed transfer out of the mode the
+    // quickstart teaches, for no authorization reason.
+    {
         let scopes_path = paths.blob_scopes_path.clone();
         match blocking("join app-blob scopes load", move || {
             crate::blobs::scope::ScopeStore::load(scopes_path)
@@ -522,21 +527,42 @@ pub(crate) async fn build_endpoint(
             b
         }
     };
-    // Roster mode advertises the gossip + blob ALPNs; every daemon (pairing or roster) also
-    // advertises ping/1, the trust-gated reachability probe (pairing-mode liveness) — it leaks
-    // nothing to a stranger (the accept arm gate-refuses an unresolved peer with no pong).
-    let mut alpns = vec![ALPN_MCP.to_vec(), ALPN_PAIR.to_vec(), ALPN_PING.to_vec()];
-    if roster_mode {
-        alpns.push(crate::roster::transport::GOSSIP_ALPN.to_vec());
-        alpns.push(crate::roster::transport::BLOB_ALPN.to_vec());
-        alpns.push(crate::blobs::APP_BLOB_ALPN.to_vec());
-    }
+    let alpns = alpns_for(roster_mode);
     builder
         .secret_key(secret)
         .alpns(alpns)
         .bind()
         .await
         .context("bind iroh endpoint")
+}
+
+/// The ALPNs a daemon advertises, by trust mode (#61).
+///
+/// Every daemon advertises mcp/1 + pair/1 + ping/1 (the trust-gated reachability probe) AND
+/// `mcpmesh/blob/1`, the gated app-blob provider.
+///
+/// **The app-blob ALPN is deliberately NOT roster-gated.** Its authorization is per-scope grants
+/// over the flat principal namespace, which an `eid:` device principal satisfies exactly as a roster
+/// group name does; the accept arm resolves through `Arc<dyn TrustGate>`, so a pairing
+/// `AllowlistGate` gates it identically. Advertising it leaks nothing to a stranger — the arm
+/// refuses an unresolved peer with a 401 before any request, then rate-limits per endpoint.
+/// Gating it on an org root key kept content-addressed transfer out of the mode the quickstart
+/// teaches, for no authorization reason.
+///
+/// `GOSSIP_ALPN` and the roster `BLOB_ALPN` stay roster-only: both key on `org_id`, which a
+/// pairing-mode node does not have.
+pub(crate) fn alpns_for(roster_mode: bool) -> Vec<Vec<u8>> {
+    let mut alpns = vec![
+        ALPN_MCP.to_vec(),
+        ALPN_PAIR.to_vec(),
+        ALPN_PING.to_vec(),
+        crate::blobs::APP_BLOB_ALPN.to_vec(),
+    ];
+    if roster_mode {
+        alpns.push(crate::roster::transport::GOSSIP_ALPN.to_vec());
+        alpns.push(crate::roster::transport::BLOB_ALPN.to_vec());
+    }
+    alpns
 }
 
 /// Compose the roster-mode gossip/blob transport on the daemon's ONE endpoint.
@@ -620,6 +646,44 @@ async fn compose_roster_transport(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #61: a PAIRING-mode daemon must advertise the app-blob ALPN. This is the load-bearing half
+    /// of the change — the provider is useless if the endpoint never negotiates the protocol, and
+    /// the existing blob AC tests build the provider by hand, so they pass either way and cannot
+    /// catch a regression here.
+    ///
+    /// Gossip and the ROSTER blob ALPN must stay roster-only: both key on `org_id`.
+    #[test]
+    fn pairing_mode_advertises_app_blobs_but_not_gossip_or_roster_blobs() {
+        let pairing = super::alpns_for(false);
+        let roster = super::alpns_for(true);
+        let has = |v: &[Vec<u8>], a: &[u8]| v.iter().any(|x| x.as_slice() == a);
+
+        for alpn in [ALPN_MCP, ALPN_PAIR, ALPN_PING] {
+            assert!(
+                has(&pairing, alpn),
+                "every daemon advertises the base ALPNs"
+            );
+        }
+        assert!(
+            has(&pairing, crate::blobs::APP_BLOB_ALPN),
+            "a pairing-mode daemon MUST advertise mcpmesh/blob/1 — its scope gate is \
+             identity-generic and an eid: grant authorizes it (#61)"
+        );
+
+        // The two that legitimately need an org.
+        assert!(
+            !has(&pairing, crate::roster::transport::GOSSIP_ALPN),
+            "gossip keys on org_id — never advertised without a roster"
+        );
+        assert!(
+            !has(&pairing, crate::roster::transport::BLOB_ALPN),
+            "the ROSTER blob transport is distinct from app blobs and stays roster-only"
+        );
+        assert!(has(&roster, crate::roster::transport::GOSSIP_ALPN));
+        assert!(has(&roster, crate::roster::transport::BLOB_ALPN));
+        assert!(has(&roster, crate::blobs::APP_BLOB_ALPN));
+    }
     /// `net_plan` implements EXACTLY the shipped `[network]` surface — the privacy knobs are
     /// real, validated, and never silently fall back to public infrastructure.
     #[test]

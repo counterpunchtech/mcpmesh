@@ -53,10 +53,9 @@ pub(crate) async fn blob_publish(
     path: String,
 ) -> Result<BlobPublishResult> {
     let mesh = state.mesh_required()?;
-    let provider = mesh
-        .app_blobs()
-        .await
-        .context("app-blob provider not enabled (roster mode only)")?;
+    let provider = mesh.app_blobs().await.context(
+        "app-blob provider not enabled (its store failed to build — check the daemon log)",
+    )?;
     let (ticket, hash) = provider
         .publish_scope(&scope, Path::new(&path))
         .await
@@ -73,10 +72,9 @@ pub(crate) async fn blob_grant(
     let mesh = state.mesh_required()?;
     // Stored VERBATIM (#38), like service `allow`: a `b64u:`/`eid:` principal or a roster
     // group/user_id name grants; a bare display nickname does not authorize anyone.
-    let provider = mesh
-        .app_blobs()
-        .await
-        .context("app-blob provider not enabled (roster mode only)")?;
+    let provider = mesh.app_blobs().await.context(
+        "app-blob provider not enabled (its store failed to build — check the daemon log)",
+    )?;
     provider.grant(&scope, &principal)
 }
 
@@ -91,10 +89,9 @@ pub(crate) async fn blob_revoke(
     principals: Vec<String>,
 ) -> Result<()> {
     let mesh = state.mesh_required()?;
-    let provider = mesh
-        .app_blobs()
-        .await
-        .context("app-blob provider not enabled (roster mode only)")?;
+    let provider = mesh.app_blobs().await.context(
+        "app-blob provider not enabled (its store failed to build — check the daemon log)",
+    )?;
     // An UNKNOWN scope is an error, not a silent ack (#62 review). Answering `{}` to a typo'd
     // scope tells an operator that access was withdrawn when nothing was touched — the exact defect
     // #55/#69 was filed about and fixed with `-32040`. "The principal was not granted" IS
@@ -115,10 +112,9 @@ pub(crate) async fn blob_revoke(
 /// reachable through the others.
 pub(crate) async fn blob_unpublish(state: &DaemonState, scope: String, hash: String) -> Result<()> {
     let mesh = state.mesh_required()?;
-    let provider = mesh
-        .app_blobs()
-        .await
-        .context("app-blob provider not enabled (roster mode only)")?;
+    let provider = mesh.app_blobs().await.context(
+        "app-blob provider not enabled (its store failed to build — check the daemon log)",
+    )?;
     // Parse the hash before touching anything (#62 review). Stored hashes are lowercase hex; an
     // UPPERCASE rendering of the same blake3 hash is valid, common, and would silently miss the
     // set removal — returning success while the blob stayed fetchable. Parsing normalizes it and
@@ -179,10 +175,9 @@ pub(crate) async fn blob_fetch(
     dest_path: String,
 ) -> Result<BlobFetchResult> {
     let mesh = state.mesh_required()?;
-    let provider = mesh
-        .app_blobs()
-        .await
-        .context("app-blob provider not enabled (roster mode only)")?;
+    let provider = mesh.app_blobs().await.context(
+        "app-blob provider not enabled (its store failed to build — check the daemon log)",
+    )?;
     let hash = provider.fetch(&ticket).await.context("fetch blob")?;
     let bytes = provider
         .read_bytes(hash)
