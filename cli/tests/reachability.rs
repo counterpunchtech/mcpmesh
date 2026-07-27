@@ -449,12 +449,14 @@ async fn probe_surfaces_the_services_the_peer_grants_the_caller() {
         .unwrap();
         let a_store = Arc::new(PeerStore::open(&dir.path().join("a.redb")).unwrap());
         seed_peer(&a_store, b_id, "beacon-b");
+        let a_cfg = Config::load(&config).expect("A's config parses");
         let a_mesh = assemble_mesh(a_ep, a_store, config);
         let b_mesh = assemble_mesh(b_ep, b_store, dir.path().join("b-config.toml"));
-        let accept = spawn_accept_loop(
-            a_mesh.clone(),
-            Arc::new(build_services(&Config::from_toml_str("").unwrap())),
-        );
+        // A's LIVE registry is built from A's OWN config, as a real daemon's boot does. #100 made
+        // this load-bearing: the probe answer now comes from the live registry, so a harness that
+        // booted an EMPTY registry while claiming config-granted services was asserting a state
+        // the daemon reports — deliberately — as not servable.
+        let accept = spawn_accept_loop(a_mesh.clone(), Arc::new(build_services(&a_cfg)));
 
         // B probes A → the pong reports the services A grants B: only `shared`.
         let entry = probe_peer(&b_mesh, a_id).await;

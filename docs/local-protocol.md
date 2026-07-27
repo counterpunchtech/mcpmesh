@@ -685,7 +685,7 @@ things:
   `api_minor >= 13`, and the `run`-backend `MCPMESH_PEER_EID` identity var (#60) is
   `api_minor >= 14`; ephemeral-service grant/revoke plus the `-32040`
   no-such-service error (#55, #69) are `api_minor >= 11`; app blobs in PAIRING mode (#61) are
-  `api_minor >= 16`; `status` + `peer_services` answering from the live registry rather than `config.toml` (#100) is `api_minor >= 17`; the `blob_revoke` / `blob_unpublish` verbs
+  `api_minor >= 16`; `status` + `peer_services` — and the `mcpmesh/ping/1` probe's `services` field, which shares the same resolver — answering from the live registry rather than `config.toml` (#100) is `api_minor >= 17`; the `blob_revoke` / `blob_unpublish` verbs
   (#62) are `api_minor >= 15`; the pushed `reachability` stream frame (#58)
   is `api_minor >= 12`; the `set_nickname` verb
   and `StatusResult.self_nickname` are `api_minor >= 2` (#37); STABLE-principal `allow`
