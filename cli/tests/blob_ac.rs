@@ -445,3 +445,66 @@ async fn a_pairing_mode_daemon_serves_app_blobs() {
     .await
     .expect("pairing-mode app-blob test timed out");
 }
+
+/// #82: the daemon's fetch path STREAMS a blob to disk instead of materializing it in memory.
+///
+/// The `read_bytes` + `fs::write` path this replaces held the whole blob as one `Bytes` before a
+/// byte landed — `get_bytes`' own iroh doc warns it "will run out of memory when called for very
+/// large blobs" — so a multi-GB fetch OOM-killed a small node rather than being slow.
+///
+/// **What this proves and what it does not.** It proves the export path is correct at a non-trivial
+/// size: the returned length and the on-disk bytes both match the source. It does NOT prove peak
+/// memory is size-independent — that property comes from `Blobs::export` streaming incrementally,
+/// and a regression to `read_bytes` would still pass this. Asserting RSS would be platform-specific
+/// and flaky; the guarantee rests on the API contract.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_daemon_fetch_path_exports_to_disk_without_buffering() {
+    timeout(Duration::from_secs(120), async {
+        let root = SigningKey::from_bytes(&[23u8; 32]);
+        let provider_ep = provider_endpoint().await;
+        let alice_ep = caller_endpoint().await;
+        let alice_id = *alice_ep.id().as_bytes();
+
+        let roster = Arc::new(RosterGate::empty());
+        let view = mint_view(&root, 1, &[(alice_id, "alice")], &[]);
+        let (mesh, dir) = serving_provider(provider_ep.clone(), roster, view).await;
+        seed_addr(&alice_ep, &provider_ep);
+
+        // Well past any plausible frame or chunk buffer, but deliberately NOT the 32 MiB the
+        // large-transfer AC uses: this test is about export CORRECTNESS at size, and a third
+        // 32 MiB blob in a parallel suite starved `blob_gate`'s timeouts into failing. Size the
+        // fixture to what it proves.
+        const EXPORT_TEST_BYTES: usize = 4 * 1024 * 1024;
+        let payload: Vec<u8> = (0..EXPORT_TEST_BYTES).map(|i| (i % 251) as u8).collect();
+        let src = dir.path().join("large.bin");
+        std::fs::write(&src, &payload).unwrap();
+        let provider = mesh.app_blobs().await.unwrap();
+        let (ticket, _hash) = provider.publish_scope("media", &src).await.unwrap();
+        provider.grant("media", "alice").unwrap();
+
+        // Caller pulls it into its own store, then exports to a destination path — the same two
+        // steps `blob_fetch` performs, with the export replacing read_bytes + fs::write.
+        let cdir = tempfile::tempdir().unwrap();
+        let alice = AppBlobs::open_fetcher(cdir.path().join("c"), alice_ep.clone())
+            .await
+            .unwrap();
+        let hash = alice.fetch(&ticket).await.expect("granted caller fetches");
+
+        let dest = cdir.path().join("exported.bin");
+        let written = alice
+            .export_to(hash, &dest)
+            .await
+            .expect("export streams the blob to disk");
+
+        assert_eq!(
+            written,
+            payload.len() as u64,
+            "export reports the full byte count"
+        );
+        let on_disk = std::fs::read(&dest).unwrap();
+        assert_eq!(on_disk.len(), payload.len(), "whole blob landed");
+        assert_eq!(on_disk, payload, "and byte-for-byte intact");
+    })
+    .await
+    .expect("streaming fetch test timed out");
+}
