@@ -313,8 +313,34 @@ async fn a_revoke_strips_a_name_held_by_both_config_and_the_overlay() {
             .await
             .expect("revoke");
 
+        // Locate a failure rather than just observing one: the config strip is the step this test
+        // exists to protect, so assert it directly before going over the wire. If THIS fires, the
+        // config pass regressed; if only the wire assertion below fires, the registry did.
+        let on_disk = std::fs::read_to_string(&config_path).expect("read config back");
+        let room_section = on_disk
+            .split("[services.room]")
+            .nth(1)
+            .expect("room section present");
+        assert!(
+            !room_section.contains(&principal),
+            "the revoke must strip the principal from the CONFIG copy too — config after \
+             revoke:\n{on_disk}"
+        );
+
         // Drop the overlay. The config copy is now the live one — and must NOT admit the peer.
         mcpmesh::daemon::unregister_ephemeral(&mesh, &["room".to_string()]).await;
+
+        // The reload inside `unregister_ephemeral` only WARNS on failure, so assert the live
+        // registry really reflects the strip — otherwise a silently-failed reload would look
+        // identical to a correct denial.
+        let live = mesh.live_services();
+        let room_allow = live.get("room").map(|e| e.allow.clone());
+        assert_eq!(
+            room_allow,
+            Some(Vec::<String>::new()),
+            "after dropping the overlay, the live `room` must be the CONFIG entry with an empty \
+             allow (got {room_allow:?})"
+        );
 
         let conn = dial(&peer, addr).await;
         let mut t = open_session(&conn, "room").await;
@@ -384,4 +410,48 @@ async fn an_overlay_only_grant_does_not_apply_an_unrelated_config_edit() {
     })
     .await
     .expect("unrelated config edit test timed out");
+}
+
+/// A revoke leaves the LIVE registry denying by the time it returns — on the #94 fast path, where
+/// the deny comes from the targeted swap rather than a rebuild.
+///
+/// **What this does NOT prove, stated because the obvious reading is wrong:** it does not pin
+/// #54's SWAP-BEFORE-SEVER *ordering*. Moving the swap after `sever_principal` still passes this
+/// test — verified by mutation, not assumed — because by the time the verb returns both have
+/// happened either way. Ordering is only observable from inside the verb, and pinning it needs a
+/// test seam this change does not add. Tracked separately; the ordering itself is still correct in
+/// the code (`handlers.rs`), just not test-enforced.
+///
+/// What it does catch: a fast path that severs but never installs the new registry, which would
+/// leave the principal admitted on the next dial.
+#[tokio::test]
+async fn a_revoke_leaves_the_live_registry_denying_when_it_returns() {
+    timeout(Duration::from_secs(60), async {
+        let (mesh, addr, peer, principal, _dir) = mesh_with_ephemeral_room().await;
+        grant_service_access(&mesh, &principal, &principal, &["room".to_string()])
+            .await
+            .expect("grant");
+
+        let conn = dial(&peer, addr).await;
+        let mut session = open_session(&conn, "room").await;
+        assert!(session_served(session.as_mut()).await, "served after grant");
+
+        revoke_service_allow(&mesh, "room".into(), principal.clone())
+            .await
+            .expect("revoke");
+
+        // The verb has returned, so the sever has run. The registry it severed against must
+        // already have been the post-revoke one: a session opened right now — on the connection
+        // that was live throughout — must be refused by the LIVE registry, not by the sever.
+        let live = mesh.live_services();
+        let room_allow = live.get("room").map(|e| e.allow.clone());
+        assert_eq!(
+            room_allow,
+            Some(Vec::<String>::new()),
+            "the revoke must leave the live registry denying — a fast path that severed without \
+             installing the new registry would re-admit on the next dial (got {room_allow:?})"
+        );
+    })
+    .await
+    .expect("registry-denies-on-return test timed out");
 }

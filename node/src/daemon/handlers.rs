@@ -319,6 +319,7 @@ pub(crate) async fn register_service(
 /// them. Called when a control connection that registered ephemeral services closes. Persistent
 /// (config) services are never touched. A no-op if nothing was ephemerally registered by the
 /// connection. Takes `reload_lock`, like every registry mutation.
+#[doc(hidden)]
 pub async fn unregister_ephemeral(mesh: &Arc<MeshState>, names: &[String]) {
     if names.is_empty() {
         return;
@@ -1265,15 +1266,10 @@ pub async fn revoke_service_allow(
     let ephemeral_moved = mesh.revoke_ephemeral(&service, &principal);
     let config_path = mesh.config_path.clone();
     let (svc_w, principal_w) = (service.clone(), principal.clone());
-    // MUTATION A (temporary): skip the config pass for an ephemeral name.
-    let config_moved = if ephemeral_moved.is_some() {
-        false
-    } else {
-        blocking("join service-allow revoke config write", move || {
-            remove_principal_from_service(&config_path, &svc_w, &principal_w)
-        })
-        .await??
-    };
+    let config_moved = blocking("join service-allow revoke config write", move || {
+        remove_principal_from_service(&config_path, &svc_w, &principal_w)
+    })
+    .await??;
 
     // `remove_principal_from_service` reports `false` both for "service absent" and for "principal
     // was not in this service's allow", so re-read the config to tell them apart: only the former
@@ -1299,6 +1295,9 @@ pub async fn revoke_service_allow(
     // SWAP-BEFORE-SEVER is preserved in BOTH branches below: the targeted overlay swap (#94) goes
     // through the same `LiveServices::store` the rebuild does, so no new session admits the
     // principal before the in-flight ones are cut.
+    //
+    // NOTE: this ORDER is not enforced by any test — reversing it passes the whole suite, since
+    // both have happened by the time the verb returns. Keep the order when editing here.
     let severed = if changed {
         if config_moved {
             reload_services_from_disk(mesh, "service-allow-revoke").await?;

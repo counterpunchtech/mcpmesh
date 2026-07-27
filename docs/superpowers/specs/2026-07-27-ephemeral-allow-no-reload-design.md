@@ -80,6 +80,17 @@ edit as a side effect of granting one principal is surprising, and `register_ser
 reload path remain the documented ways to pick config changes up. It is called out in
 `docs/local-protocol.md` because someone is relying on the accident.
 
+### Two incidental effects, recorded rather than left to be found
+
+- **The per-service spawn semaphore is no longer reset on every grant.** `session_backend_run`
+  builds a fresh `Semaphore::new(spawn_concurrency(cfg))` per rebuild, so every reload previously
+  reset each run-service's concurrency cap and dropped accounting for in-flight spawns. Reusing the
+  backend `Arc` keeps one semaphore for the service's life — strictly safer, and adjacent to
+  #63/#77.
+- **A corrupt `config.toml` no longer aborts an overlay-only revoke.** It used to strip the
+  in-memory allow, then fail `Config::load` and return `Err` without swapping or severing. The fast
+  path now completes the revoke. Fail-closed improvement.
+
 ## Surface + versioning
 
 No control-API surface change — same verbs, same params, same results. **No `API_MINOR` bump.**

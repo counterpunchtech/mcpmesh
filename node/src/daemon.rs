@@ -383,6 +383,14 @@ impl MeshState {
     /// config-collision check that keeps a name from being held ephemerally AND persistently at
     /// once. Use `register_service`.
     #[doc(hidden)]
+    /// The LIVE service registry as of now — the same handle the accept path reads per accepted
+    /// bi-stream. A test seam: it lets a test assert what the registry admits at a precise instant
+    /// (e.g. that a revoke's swap is installed before it severs) without racing the wire.
+    #[doc(hidden)]
+    pub fn live_services(&self) -> Arc<mcpmesh_net::Services> {
+        self.services.get()
+    }
+
     pub fn register_ephemeral(
         &self,
         name: String,
