@@ -74,6 +74,38 @@ pub(crate) struct BootedNode {
     pub(crate) background: Vec<tokio::task::JoinHandle<()>>,
 }
 
+/// Tear a booted node down: stop accepting, end the background loops, END THE APP-BLOB GATE LOOP
+/// (and wait for it), then close the endpoint.
+///
+/// Shared by `Node::shutdown` and by tests that boot a real node (#105). Factored out rather than
+/// duplicated because a test teardown that drifts from the production one silently stops testing
+/// the thing it models — and because `BootedNode::background` is EMPTY in pairing mode, so the
+/// obvious `for h in booted.background { h.abort() }` is a no-op that LOOKS like cleanup while the
+/// accept loop, the gate loop (holding the redb data-dir lock) and the endpoint all leak.
+pub(crate) async fn shutdown_booted(booted: BootedNode) {
+    let state = &booted.state;
+    state.request_shutdown();
+    state.abort_control_tasks();
+    let Some(mesh) = state.mesh().cloned() else {
+        return;
+    };
+    if let Some(task) = mesh.accept_task.lock().await.take() {
+        task.abort();
+    }
+    if let Some(task) = mesh.poll_loop.lock().await.take() {
+        task.abort();
+    }
+    for task in booted.background {
+        task.abort();
+    }
+    // Wait for the gate loop: it owns the `Arc<dyn TrustGate>` -> `PeerStore` -> redb lock, and
+    // aborting without awaiting only SCHEDULES the drop (#61).
+    if let Some(blobs) = mesh.app_blobs.lock().await.take() {
+        blobs.shutdown().await;
+    }
+    mesh.endpoint.close().await;
+}
+
 /// Boot the node core — everything `serve_forever` does EXCEPT the control endpoint:
 /// crypto-provider install, audit sink, config + device key, the iroh endpoint, stores,
 /// gates, limiters, service registry, the mesh accept loop, and roster mode's loops.
@@ -652,6 +684,46 @@ async fn compose_roster_transport(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #105: a BOOTED daemon must have the relay-ready ticket wait ON.
+    ///
+    /// The wait is opt-in and `boot_node` is the ONLY caller of `enable_relay_wait`, so deleting
+    /// that one line silently reverts #83 ask 3 — and the symptom is invisible on any developer
+    /// machine: it appears only across a real NAT, shortly after boot, and the SENDER sees nothing
+    /// wrong because the file looks fine to them. Nothing else in the suite touches the production
+    /// path, since every other fixture builds `AppBlobs` by hand (where the flag defaults off, on
+    /// purpose — a relay-disabled endpoint would otherwise pay a guaranteed 3s per mint).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_booted_daemon_waits_for_the_relay_before_minting_tickets() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::paths::NodePaths::under_root(dir.path());
+        std::fs::create_dir_all(paths.config_path.parent().unwrap()).unwrap();
+        // Relay-disabled so the test never reaches the network; the FLAG is what is under test.
+        std::fs::write(&paths.config_path, "[network]\nrelay_mode = \"disabled\"\n").unwrap();
+
+        let booted = super::boot_node(paths, None)
+            .await
+            .expect("the node boots in pairing mode");
+        let provider = booted
+            .state
+            .mesh_required()
+            .expect("mesh is up")
+            .app_blobs()
+            .await
+            .expect("the app-blob provider must build in pairing mode (#61) — if THIS fails it is a provider-build regression, not a relay-wait one");
+
+        assert!(
+            provider.relay_wait_enabled(),
+            "boot must enable the relay-ready wait — without it a ticket minted before the relay \
+             handshake carries direct addresses only: LAN-dialable and NAT-dead, and the sender \
+             cannot tell (#83 ask 3)"
+        );
+
+        // Real teardown — `booted.background` is EMPTY in pairing mode, so aborting it cleans up
+        // NOTHING: the accept loop, the app-blob gate loop (holding the redb data-dir lock) and
+        // the endpoint would all outlive this test for the life of the binary.
+        super::shutdown_booted(booted).await;
+    }
 
     /// #61: a PAIRING-mode daemon must advertise the app-blob ALPN. This is the load-bearing half
     /// of the change — the provider is useless if the endpoint never negotiates the protocol, and
