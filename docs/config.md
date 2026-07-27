@@ -68,7 +68,7 @@ refuses to run rather than silently falling back to public infrastructure.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `rate_limit_per_min` | `120` | Per-peer request rate (token bucket; this value is also the burst allowance). An over-limit request is refused with a retry hint — never served. |
+| `rate_limit_per_min` | `120` | Per-peer request rate (token bucket; this value is also the burst allowance). An over-limit **request** is refused with a `-32053` retry hint — never served. An over-limit **notification** is dropped **silently**, since JSON-RPC gives it no reply channel: notification delivery is not guaranteed under load and the loss is undetectable by the sender (see `docs/local-protocol.md`). |
 | `max_sessions` | `4` | Per-service cap on concurrently spawned sessions for a `run` service (a `socket` service is one warm process that manages its own concurrency). `0` is floored to `1`. |
 | `max_inflight` | `16` | Reserved: parsed and accepted, not yet enforced at this release. |
 
