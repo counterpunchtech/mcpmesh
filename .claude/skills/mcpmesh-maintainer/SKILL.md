@@ -34,7 +34,7 @@ enter → ensure watch cron → TRIAGE ─(no work)→ idle (cron re-fires TRIAG
                                │      (every TRIAGE runs the iroh watch first)
                           (work found)
                                ▼
-              pause watch cron → WORK → SHIP → recreate watch cron → TRIAGE (immediately)
+       pause watch cron → WORK → GATE (adversarial review) → SHIP → recreate cron → TRIAGE
 ```
 
 ### 0. Enter maintainer mode
@@ -136,14 +136,60 @@ Follow the superpowers process skills in order (invoke each via the Skill tool �
    cargo clippy --workspace --all-targets      # zero warnings (CI runs -D warnings)
    cargo test --workspace --locked             # zero failures
    ```
-6. **Adversarial review of the diff** (a subagent): stage the diff, dispatch a `general-purpose`
-   agent to hunt correctness + security defects against the spec. Fix every real finding and add a
-   **regression test per finding**. Re-run the suite. This step is mandatory for anything touching
-   trust/authz, config writes, the network/iroh layer, or identity.
+   **NEVER pipe the suite through `head`/`tail`.** A truncated pass is not a pass — it hid a real
+   regression twice. Report counts + EVERY failure, unbounded:
+   ```
+   cargo test --workspace --locked 2>&1 | tee /tmp/suite.log \
+     | grep -E "^test result|FAILED|panicked at" > /tmp/summary.log
+   grep -c 'test result: ok' /tmp/summary.log     # suites ok
+   grep -E "^test .* FAILED" /tmp/summary.log     # ALL failures
+   ```
+   Also note `cargo test` STOPS after the first failing binary, so "N suites ok" is never the whole
+   workspace when anything failed. Re-run after fixing.
+6. **Mutation-test every property you claim.** A test that passes is not evidence; a test that
+   FAILS when you break the thing it names is. Break the behavior, watch the test fail, restore.
+   This has caught a vacuous test on essentially every issue — tests that passed because a fixture
+   was ungated, because an assertion read state after both operations completed, or because a sink
+   recorded only the last of two observations.
+
+### 2b. GATE — adversarial review BEFORE the PR exists
+
+**Run this before `git push`, not alongside CI.** Racing them produces a green, mergeable-looking PR
+on defects CI cannot see: on three consecutive issues the review found a reachable panic, an
+inverse-defect that hid live services from `status`, a 3s block on the revocation path, and two
+FALSE CLAIMS in commit messages — every time after CI was fully green. CI is necessary and nowhere
+near sufficient.
+
+1. **Commit first.** Never `git add -A` while a review subagent is running — one left a mutation in
+   the tree and it shipped into a commit, putting an authorization hole on a PR.
+2. Dispatch a `general-purpose` agent at the committed diff. Tell it to restore any file it mutates
+   and to state whether `git status --porcelain` is empty.
+3. Point it at the specific classes that keep recurring, not just "find bugs":
+   - **Panics on caller-supplied input** — parsers that `assert!` internally (`Hash::from_str`).
+   - **Normalization mismatch** — storing one rendering and comparing another, so an entry
+     authorizes nobody and cannot be deleted.
+   - **Locks held across an `.await`**, especially where the SECURITY path pays another path's
+     latency.
+   - **Test vacuity** — which single-side mutations does each new test actually catch?
+   - **Overclaimed guarantees** — does the code deliver what the doc/commit asserts?
+4. Fix every real finding, add a **regression test per finding**, re-run the suite.
+
+Mandatory for anything touching trust/authz, config writes, the network/iroh layer, or identity.
 
 ### 3. SHIP — PR + full release train
 
 Follow `RELEASING.md`. Full auto (no human gate):
+
+0. **Verify the CLAIMS, not just the code.** Two review findings were not code defects at all —
+   they were false statements written in a commit message. Both were seconds to catch. Before
+   committing, answer these mechanically:
+
+   | Question | If yes |
+   |---|---|
+   | Did any `pub` signature change in a PUBLISHED crate (`codec`, `local-api`, `trust`, `net`, `node`, `cli`)? | It is BREAKING → **MINOR**, per `RELEASING.md`. `mcpmesh-node` exists to be embedded — `pub fn` → `pub async fn` breaks embedders on a routine `cargo update`. Do not write "no API surface change" without checking. |
+   | Does the message/doc assert something CANNOT happen? | Name the mechanism that prevents it, or downgrade the claim. "A revocation cannot be lost" was false — a mutex orders by lock ACQUISITION, not request arrival. |
+   | Does it claim a test proves a property? | Say which mutation that test fails on. If you have not run it, do not claim it. |
+   | Does it claim a full-suite pass? | Was the output truncated? See WORK step 5. |
 
 1. **Version bump** (if not already done in WORK): `Cargo.toml` version + 5 pins → `X.Y.Z`, then
    `cargo update -w` and `cargo test --workspace --locked`.
@@ -193,6 +239,17 @@ on a real network. The loopback e2e suite gates CI in the meantime.
 - **Never**: publish on red tests/clippy/fmt; force-push; start implementation on `main`; take on a
   blocked/gated issue; run two issues at once; file an iroh-bump issue without the dedup search
   first; start an iroh bump just because you filed it (filing ≠ working — it goes through triage).
+- **Never**: merge on CI-green alone when the change touches trust/authz, config writes, the
+  network/iroh layer, or identity — the adversarial gate (step 2b) must have reported first. Green
+  CI has coexisted with a reachable panic, a live-service-hiding regression, and a mis-versioned
+  breaking change.
+- **Never**: `git add -A` (or `git commit -a`) while a review subagent is running. It captured a
+  reviewer's mutation once and shipped an authorization hole into a commit.
+- **Never**: truncate verification output with `head`/`tail`, and never report "N suites green"
+  from a run that stopped at the first failing binary.
+- **Never**: attribute a failure to "machine load" or "environmental" from a SINGLE timing sample.
+  Compare whole-suite runs, or run the same test on `main` in a worktree. Single-sample timings on
+  this machine have produced two confident-and-wrong diagnoses in both directions.
 
 ## Memory
 
@@ -209,6 +266,7 @@ recurring gotcha, write a memory (one fact per file) and add its one-line pointe
 | iroh watch | `curl -s -H "$UA" https://crates.io/api/v1/crates/iroh` · `grep '^iroh = ' Cargo.toml` · dedup `gh issue list --state all --search "iroh <V> in:title"` · `gh issue create` |
 | Triage | `gh issue list --state open`, `gh issue view <n>` |
 | Verify | `cargo fmt --all` · `cargo clippy --workspace --all-targets` · `cargo test --workspace --locked` |
+| Gate | commit FIRST, then dispatch the review subagent — before `git push` |
 | PR | `gh pr create` · `gh run watch <id> --exit-status` · `gh pr merge --squash` |
 | Release | `git tag vX.Y.Z` · `cargo xtask publish` · `gh release create` · bump `Formula/mcpmesh.rb` |
 | Loop | `CronCreate "*/10 * * * *"` / `CronDelete` / `CronList` |
