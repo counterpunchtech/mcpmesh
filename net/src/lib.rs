@@ -16,7 +16,24 @@
 //! [`SessionTransport`]). Use the re-export — `mcpmesh_net::iroh::…` — and never
 //! add your own `iroh` dependency: any other version is a different crate to the
 //! type system, and the first floating requirement breaks the build.
+//!
+//! # The rmcp pin — and why it is currently a PRERELEASE
+//!
+//! [`NdjsonTransport`] implements `rmcp::transport::Transport`, so rmcp is in this crate's PUBLIC
+//! API exactly as iroh is. The same rule applies, and right now it applies harder: the pin is an
+//! exact **prerelease** (`=3.0.0-beta.3`), and Cargo does not match a caret requirement against a
+//! prerelease. A downstream writing `rmcp = "3"` — or `rmcp = "2"`, which worked before — gets TWO
+//! rmcp crates in the graph, and our `Transport` impl is on a different trait than theirs. It
+//! compiles, then fails at the use site with `expected Transport, found Transport`, no version in
+//! the message.
+//!
+//! Use the re-export — `mcpmesh_net::rmcp::…` — and never add your own `rmcp` dependency.
+//!
+//! Tracking a prerelease is deliberate: we want the SDK ahead of the coming MCP spec change (it
+//! already knows `ProtocolVersion::V_2026_07_28` while still defaulting to `V_2025_11_25`). This
+//! re-export is what keeps that choice from being a hard break for embedders.
 pub use iroh;
+pub use rmcp;
 
 pub mod endpoint;
 pub mod errors;

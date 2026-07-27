@@ -64,6 +64,17 @@ the daemon's own handlers.
 - **iroh version:** `mcpmesh-node` exact-pins iroh (via `mcpmesh-net`). Never add your
   own `iroh` dependency — use the `mcpmesh_net::iroh` re-export; a floating requirement
   is a different crate to the type system and breaks the build.
+- **rmcp version — currently a PRERELEASE:** `mcpmesh-net` exact-pins
+  `rmcp = "=3.0.0-beta.3"` and implements `rmcp::transport::Transport` on its public
+  `NdjsonTransport`, so rmcp is in the public API just as iroh is. Use the
+  `mcpmesh_net::rmcp` re-export and never add your own `rmcp` dependency.
+  This matters more than the iroh case: Cargo does **not** match a caret requirement
+  against a prerelease, so `rmcp = "3"` (or `rmcp = "2"`, which worked before 0.16.0)
+  resolves a SECOND rmcp crate. The build then fails at your use site with
+  `expected Transport, found Transport` and no version in the message.
+  The prerelease is deliberate — it tracks the SDK ahead of the coming MCP spec change,
+  and already knows `ProtocolVersion::V_2026_07_28` while still defaulting to the
+  `V_2025_11_25` mcpmesh speaks today.
 - **Crypto provider:** `start()` installs a process-default rustls `CryptoProvider`
   (ring) only if none is installed — idempotent; a host that installed its own first wins.
 - **Tracing:** the node emits `tracing` events and never installs a subscriber — the
