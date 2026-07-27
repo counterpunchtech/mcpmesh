@@ -172,6 +172,70 @@ async fn concurrency_cap_is_enforced() {
 }
 
 /// #51: a `run` backend applies per-service `env` (a normal var reaches the child) while the
+/// #60 review: the `MCPMESH_*` strip is the ONLY defense for MCPMESH_ vars the identity injector
+/// never sets — above all `MCPMESH_HOME`, which sandboxes all daemon state (keys, config, data,
+/// socket). The identity vars are protected by injection-overwrite regardless, so a test that only
+/// asserts those passes even with the strip deleted; this one does not.
+///
+/// The `Mcpmesh_Home` iteration is effectively a WINDOWS-ONLY assertion: Windows environment keys
+/// compare case-insensitively, so that key would arrive as `MCPMESH_HOME` under an exact-case
+/// filter. On Unix the keys are distinct and the child never reads it, so this iteration passes
+/// there whether or not the filter folds case — CI's `windows-latest` job is what actually
+/// enforces it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_service_env_cannot_set_mcpmesh_home() {
+    let _ = timeout(Duration::from_secs(30), async {}).await;
+    for key in ["MCPMESH_HOME", "Mcpmesh_Home"] {
+        let (server_io, client_io) = duplex(64 * 1024);
+        let (sr, sw) = split(server_io);
+        let backend_transport = NdjsonTransport::new(sr, sw, MAX_FRAME);
+        let (cr, cw) = split(client_io);
+        let mut client = NdjsonTransport::new(cr, cw, MAX_FRAME);
+        let mut env = std::collections::BTreeMap::new();
+        env.insert(key.to_string(), "/tmp/attacker-controlled".to_string());
+        let backend = SpawnBackend {
+            cmd: vec![STUB.to_string()],
+            concurrency: Arc::new(Semaphore::new(4)),
+            service: "test".into(),
+            audit: mcpmesh::audit::AuditSink::disabled(),
+            limiter: mcpmesh::limits::RateLimiter::unlimited_shared(),
+            env,
+            cwd: None,
+        };
+        let identity = Some(PeerIdentity {
+            endpoint: [0u8; 32].into(),
+            name: "bob".into(),
+            user_id: None,
+            groups: vec![],
+        });
+        let initialize = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-11-25", "capabilities": {}}
+        });
+        let session = tokio::spawn(async move {
+            backend
+                .run_over(identity, initialize, backend_transport)
+                .await
+        });
+        let _init = client.recv_value().await.unwrap().unwrap();
+        client
+            .send_value(json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"arguments": {"text": "hi"}}
+            }))
+            .await
+            .unwrap();
+        let call = client.recv_value().await.unwrap().unwrap();
+        assert_eq!(
+            call["result"]["mesh_home"], "",
+            "a service env must not be able to set MCPMESH_HOME via `{key}` — it sandboxes all \
+             daemon state, and the identity injector never overwrites it"
+        );
+        drop(client);
+        let _ = session.await.unwrap();
+    }
+}
+
 /// injected `MCPMESH_PEER_*` identity is AUTHORITATIVE — a service env cannot spoof it, even
 /// `MCPMESH_PEER_USER` for an UNBOUND caller (identity.user_id = None).
 #[tokio::test]
@@ -191,6 +255,10 @@ async fn run_backend_env_reaches_child_but_identity_is_not_spoofable() {
         // A malicious service definition trying to forge the caller's user_id (the caller is
         // UNBOUND, so the injector would otherwise not overwrite this).
         env.insert("MCPMESH_PEER_USER".to_string(), "b64u:FORGED".to_string());
+        // #60: the same spoof attempt against the new STABLE device principal. This one matters
+        // more than the others — it is the var a `run` server is now told to key per-caller
+        // scoping on, so a forgeable value would be an authz bypass by config.
+        env.insert("MCPMESH_PEER_EID".to_string(), "eid:FORGED".to_string());
         let backend = SpawnBackend {
             cmd: vec![STUB.to_string()],
             concurrency: Arc::new(Semaphore::new(4)),
@@ -236,6 +304,18 @@ async fn run_backend_env_reaches_child_but_identity_is_not_spoofable() {
             "a service env must never spoof MCPMESH_PEER_USER (#51 security)"
         );
         assert_eq!(call["result"]["peer_name"], "bob", "real identity injected");
+        // #60: the forged eid loses to the real authenticated principal.
+        //
+        // NOTE what this does and does not prove. For the vars the injector ALWAYS sets, the
+        // guarantee is injection-order (the authoritative `env()` overwrites whatever the service
+        // env put there) — this assertion passes even with the `MCPMESH_*` filter deleted. The
+        // filter is the ONLY defense for `MCPMESH_*` keys the injector never touches; that case is
+        // covered separately by `a_service_env_cannot_set_mcpmesh_home`.
+        assert_eq!(
+            call["result"]["peer_eid"],
+            mcpmesh_net::EndpointId::from_bytes([0u8; 32]).principal(),
+            "a service env must never spoof MCPMESH_PEER_EID — it is the authz key"
+        );
         drop(client);
         let _ = session.await.unwrap();
     })

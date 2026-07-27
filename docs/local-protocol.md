@@ -7,7 +7,7 @@ named pipe on Windows. Anything that can open the endpoint and parse JSON can sp
 language — [`local-api/examples/status.py`](../local-api/examples/status.py) is a complete client
 in ~60 lines of dependency-free Python.
 
-> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.13`, `api_minor` `13`) and evolves
+> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.14`, `api_minor` `14`) and evolves
 > **additively** (see [Versioning](#versioning)), but until a stable release this document — like the
 > wire format itself — may change without a migration path. Pin the mcpmesh version you build
 > against. Source of truth is the Rust in [`local-api/`](../local-api/src/protocol.rs); where this
@@ -530,15 +530,35 @@ process reads at startup:
 
 | Variable | Meaning |
 |---|---|
-| `MCPMESH_PEER_NAME` | the caller's nickname (your local name for them) |
-| `MCPMESH_PEER_USER` | the caller's verified self-sovereign `user_id` (`b64u:…`), spanning all their devices. **Absent** when a pairing peer presented no device→user binding |
+| `MCPMESH_PEER_EID` | the caller's **stable device principal**, `eid:<hex>` — the authenticated endpoint id (#60, `api_minor >= 14`). **Always present** for a resolved caller. Scope per-caller state on this. |
+| `MCPMESH_PEER_NAME` | the caller's nickname (your local name for them) — **display only**; it collides and changes under a rename |
+| `MCPMESH_PEER_USER` | the caller's verified `user_id`, spanning all their devices — a **bare handle** in roster mode (`alice`), a `b64u:…` principal in pairing mode. **Absent** when a pairing peer presented no device→user binding, and see the warning below: it is *not* stable for a fixed device |
 | `MCPMESH_PEER_GROUPS` | comma-joined roster groups (may be empty) |
 
 ```python
 import os
-caller = os.environ.get("MCPMESH_PEER_USER") or os.environ["MCPMESH_PEER_NAME"]
-# authorize / scope your answer to `caller`
+# KEY PERSISTENT STATE ON THE DEVICE PRINCIPAL. It is the only identifier that is always
+# present and never changes for a given caller. `[...]` not `.get(...)`: failing loudly beats
+# silently sharing one bucket between callers.
+storage_key = os.environ["MCPMESH_PEER_EID"]
+
+# Use the user_id for cross-device POLICY ("is this the same person?"), not as a storage key.
+person = os.environ.get("MCPMESH_PEER_USER")  # may be absent, and may change — see below
 ```
+
+> **`MCPMESH_PEER_USER` is not stable for a fixed device.** It can appear, disappear, or change for
+> the same physical caller, so keying stored state on it loses that state:
+>
+> - An unbound pairing peer that later proves a device→user binding flips `eid:…` → `b64u:…`.
+> - If the org roster goes stale or expires past its grace window, a rostered peer falls back to its
+>   pairing identity and the value flips `alice` → `eid:…` — with no operator action, and back again
+>   when a fresh roster installs.
+> - One person on two unbound devices has no shared value at all.
+>
+> It also spans three namespaces (a bare roster handle, `b64u:…`, `eid:…`), so a bare handle can
+> collide with a group name or an attacker-chosen literal in a `caller`-keyed store. Key on
+> `MCPMESH_PEER_EID`; consult `MCPMESH_PEER_USER` for policy.
+
 
 ### `socket` backend — MCP `initialize` `_meta`
 
@@ -603,7 +623,10 @@ things:
   the same on reachability rows — is `api_minor >= 7` (#42); the `service_allow_grant`/
   `service_allow_revoke` per-peer access verbs are `api_minor >= 8` (#44); `unregister_service` (#50), the `run`-backend `env`/`cwd` (#51), `peer_services` (#52), and the `set_relays` live relay-set verb (#53) are `api_minor >= 9`; IMMEDIATE revocation
   (`service_allow_revoke`/`peer_remove` refuse new sessions on already-open connections AND sever
-  live ones, #54) is `api_minor >= 10`; ephemeral-service grant/revoke plus the `-32040`
+  live ones, #54) is `api_minor >= 10`; `AuditRecord`-adjacent surfaces aside, the pushed
+  `reachability` frame (#58) is `api_minor >= 12`, `PeerReachability.path` (#64) is
+  `api_minor >= 13`, and the `run`-backend `MCPMESH_PEER_EID` identity var (#60) is
+  `api_minor >= 14`; ephemeral-service grant/revoke plus the `-32040`
   no-such-service error (#55, #69) are `api_minor >= 11`; the pushed `reachability` stream frame (#58)
   is `api_minor >= 12`; the `set_nickname` verb
   and `StatusResult.self_nickname` are `api_minor >= 2` (#37); STABLE-principal `allow`
