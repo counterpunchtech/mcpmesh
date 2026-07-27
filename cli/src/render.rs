@@ -633,6 +633,7 @@ mod tests {
                 age_secs: Some(0),
                 meta: String::new(),
                 principal: Some("eid:beef".into()),
+                path: Default::default(),
             },
         };
         let up = super::render_frame(&frame(true));
@@ -920,6 +921,7 @@ mod tests {
                 age_secs: Some(4),
                 meta: String::new(),
                 principal: None,
+                path: Default::default(),
             },
             PeerReachability {
                 name: "bob".into(),
@@ -928,6 +930,7 @@ mod tests {
                 age_secs: Some(90),
                 meta: String::new(),
                 principal: None,
+                path: Default::default(),
             },
             PeerReachability {
                 name: "carol".into(),
@@ -936,6 +939,7 @@ mod tests {
                 age_secs: None, // never probed
                 meta: String::new(),
                 principal: None,
+                path: Default::default(),
             },
         ]);
         assert_eq!(lines[0], "  alice · online · 23ms");
@@ -1168,6 +1172,7 @@ mod tests {
             age_secs: Some(2),
             meta: meta.into(),
             principal: None,
+            path: Default::default(),
         };
         let l = reachability_lines(&[peer("v=2.0.0")]);
         assert!(l[0].contains("· app: v=2.0.0"), "benign meta shown: {l:?}");
@@ -1185,6 +1190,7 @@ mod tests {
             age_secs: Some(30),
             meta: String::new(),
             principal: None,
+            path: Default::default(),
         }]);
         assert!(!l[0].contains("app:"), "no app segment without meta: {l:?}");
     }

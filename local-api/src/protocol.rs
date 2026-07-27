@@ -80,8 +80,48 @@ pub struct PeerInfo {
     pub principal: Option<String>,
 }
 
-/// Advisory reachability of a paired peer (pairing-mode liveness). Surface-clean:
-/// a nickname + a bool + latency/age NUMBERS — never an endpoint-id, key, or transport path.
+/// HOW a peer is reached (#64): a direct/hole-punched QUIC path, or through a relay.
+///
+/// `rtt_ms` is NOT a proxy for this — a fast relay beats a slow direct path — and iroh's own
+/// distinction was being dropped at the mcpmesh boundary. Three things depend on it: a truthful
+/// locality claim ("this traffic never left the building"), honest disclosure that a relayed path
+/// depends on third-party infrastructure, and diagnostics, since "slow" has a different cause and
+/// fix in each case.
+///
+/// **Only `Direct` supports a locality claim.** `Unknown` means "we do not know", NOT "private" —
+/// rendering it as private is the one misuse that turns this field into a false privacy statement.
+/// The daemon errs the same way: when a relay path is active it reports [`Relay`](Self::Relay) even
+/// if a direct path is live too, because overstating privacy is worse than understating it.
+///
+/// `#[non_exhaustive]`: iroh already has a third address kind (a custom transport) that could
+/// warrant a variant, and adding one to a public enum later breaks every downstream exhaustive
+/// `match` — the lesson #58 paid for.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum PeerPath {
+    /// A direct or hole-punched QUIC path: the bytes did not transit a relay.
+    Direct,
+    /// Through a relay server. `url` is the relay in use when known.
+    Relay {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+    },
+    /// Not known: never probed, no selected path, or a transport mcpmesh does not model.
+    ///
+    /// `#[serde(other)]` makes this the landing spot for a `kind` a client has never heard of. That
+    /// is what actually buys wire-additivity: `#[non_exhaustive]` only protects the Rust `match`,
+    /// and without this an older client hits `unknown variant` and fails to deserialize the WHOLE
+    /// `PeerReachability` — one new path kind would break every `status` response it reads.
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+/// Advisory reachability of a paired peer (pairing-mode liveness). Surface-clean: a nickname, a
+/// bool, latency/age NUMBERS, the stable `eid:` principal (#42), and since #64 the PATH KIND —
+/// direct vs relay, plus the relay URL when relayed. Never a socket address, an IP, or a key: the
+/// path field says WHICH KIND of route is in use, never where the peer is.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerReachability {
     pub name: String,    // the peer's nickname
@@ -105,6 +145,11 @@ pub struct PeerReachability {
     /// `#[serde(default, skip_serializing_if = "Option::is_none")]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub principal: Option<String>,
+    /// HOW this peer is reached (#64) — see [`PeerPath`]. Captured by the same probe that sets
+    /// `reachable`/`rtt_ms`, so it shares their freshness: one TTL, one `age_secs`. `Unknown` for a
+    /// peer never probed. Additive (`#[serde(default)]`), so older rows and clients are unaffected.
+    #[serde(default)]
+    pub path: PeerPath,
 }
 
 /// Roster-mode status. Surface-clean roster VOCABULARY only: org_id, serial, a plain
@@ -935,7 +980,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   new methods, or a strictness change like params validation — bumped in the same change that
 ///   makes it. A client can guard with `api_minor >= N` for a feature it needs, or refuse a daemon
 ///   older than a minor it requires. It never resets except on a MAJOR bump.
-pub const API_VERSION: &str = "1.12";
+pub const API_VERSION: &str = "1.13";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -954,12 +999,55 @@ pub const API_VERSION: &str = "1.12";
 /// `service_allow_grant`/`service_allow_revoke` gained EPHEMERAL-service support and became strict
 /// about an unknown service name — a name in neither the config nor the ephemeral registry now
 /// answers [`ERR_NO_SUCH_SERVICE`] instead of a silent `{}` (#55, #69); to 12 with the pushed
-/// [`StreamFrame::Reachability`] liveness transition frame (#58).
-pub const API_MINOR: u32 = 12;
+/// [`StreamFrame::Reachability`] liveness transition frame (#58); to 13 with
+/// [`PeerReachability::path`] — direct-vs-relay attribution on every reachability row (#64).
+pub const API_MINOR: u32 = 13;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #64: the path field's wire shape, and its ADDITIVE default. A row from an older daemon has
+    /// no `path` key at all and must land on `Unknown` — never on `Direct`, which would invent a
+    /// privacy guarantee that daemon never made.
+    #[test]
+    fn peer_path_tags_and_defaults_to_unknown() {
+        let tagged = |p: PeerPath| serde_json::to_value(p).unwrap();
+        assert_eq!(tagged(PeerPath::Direct)["kind"], "direct");
+        assert_eq!(tagged(PeerPath::Unknown)["kind"], "unknown");
+        let relay = tagged(PeerPath::Relay {
+            url: Some("https://relay.example/".into()),
+        });
+        assert_eq!(relay["kind"], "relay");
+        assert_eq!(relay["url"], "https://relay.example/");
+        // A relay whose URL we do not know still tags as relay, with the key elided.
+        let bare = tagged(PeerPath::Relay { url: None });
+        assert_eq!(bare["kind"], "relay");
+        assert!(bare.get("url").is_none(), "elided, not null: {bare}");
+
+        // #64 review: a path kind from a NEWER daemon must degrade to Unknown, not fail the whole
+        // row. Without `#[serde(other)]` an unknown `kind` errors out of
+        // `PeerReachability` entirely, so one new variant would break every `status` read an
+        // older pinned client does.
+        let future: PeerPath =
+            serde_json::from_value(serde_json::json!({"kind": "quantum", "id": "x"})).unwrap();
+        assert_eq!(future, PeerPath::Unknown);
+        let row: PeerReachability = serde_json::from_value(serde_json::json!({
+            "name": "bob", "reachable": true, "path": {"kind": "quantum"}
+        }))
+        .expect("an unknown path kind must not fail the whole row");
+        assert_eq!(row.path, PeerPath::Unknown);
+        assert!(row.reachable, "the rest of the row survives");
+
+        // A pre-#64 row: no `path` key.
+        let old = serde_json::json!({"name": "bob", "reachable": true});
+        let parsed: PeerReachability = serde_json::from_value(old).unwrap();
+        assert_eq!(
+            parsed.path,
+            PeerPath::Unknown,
+            "an older daemon's row must never imply a direct path"
+        );
+    }
 
     /// #58: the pushed liveness frame tags as `{"type":"reachability","peer":{…}}` and carries a
     /// whole `PeerReachability` row — the SAME shape the opening snapshot's list holds, so a
@@ -974,6 +1062,7 @@ mod tests {
                 age_secs: Some(0),
                 meta: String::new(),
                 principal: Some("eid:beef".into()),
+                path: Default::default(),
             },
         };
         let v = serde_json::to_value(&frame).unwrap();
@@ -997,6 +1086,7 @@ mod tests {
             age_secs: Some(3),
             meta: String::new(),
             principal: None,
+            path: Default::default(),
         };
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["name"], "bob");
@@ -1011,6 +1101,7 @@ mod tests {
             age_secs: None,
             meta: String::new(),
             principal: None,
+            path: Default::default(),
         };
         let uv = serde_json::to_value(&unknown).unwrap();
         assert!(uv.get("rtt_ms").is_none() && uv.get("age_secs").is_none());
@@ -1107,6 +1198,7 @@ mod tests {
             age_secs: Some(3),
             meta: "v=1.2.3".into(),
             principal: Some("eid:0707".into()),
+            path: Default::default(),
         };
         let back: PeerReachability =
             serde_json::from_value(serde_json::to_value(&full).unwrap()).unwrap();
@@ -1129,6 +1221,7 @@ mod tests {
             age_secs: Some(3),
             meta: "v=1.2.3".into(),
             principal: None,
+            path: Default::default(),
         };
         let back: PeerReachability =
             serde_json::from_value(serde_json::to_value(&with).unwrap()).unwrap();
@@ -1770,6 +1863,7 @@ mod tests {
                 age_secs: Some(3),
                 meta: String::new(),
                 principal: None,
+                path: Default::default(),
             }],
         };
         let v = serde_json::to_value(&snap).unwrap();
