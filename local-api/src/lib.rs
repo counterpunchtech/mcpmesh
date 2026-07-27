@@ -60,7 +60,7 @@ pub use protocol::{
     BackendKind, BackendSpec, BlobFetchParams, BlobFetchResult, BlobGrantParams, BlobPublishParams,
     BlobPublishResult, BlobScopeList, ERR_NO_SUCH_SERVICE, Hello, InviteParams, InviteResult,
     OpenSessionParams, OrgJoinParams, OrgJoinResult, PairParams, PairResult, PeerAddParams,
-    PeerInfo, PeerReachability, PeerRemoveParams, PeerRenameParams, PeerServicesParams,
+    PeerInfo, PeerPath, PeerReachability, PeerRemoveParams, PeerRenameParams, PeerServicesParams,
     PeerServicesResult, PresencePeer, RecentPairing, RegisterServiceParams, Request,
     RosterInstallParams, RosterInstallResult, RosterStatus, ScopeInfo, ServiceAllowParams,
     ServiceInfo, SetAppMetadataParams, SetNicknameParams, SetRelaysParams, SetRelaysResult,

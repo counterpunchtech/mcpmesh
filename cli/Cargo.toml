@@ -63,7 +63,13 @@ serde_json.workspace = true
 # Test-side only: the integration suites assemble hermetic meshes (endpoints, address
 # lookups) and forge roster signatures directly. The SHIPPED binary reaches iroh through
 # mcpmesh-net's pinned re-export and dalek through mcpmesh-trust's — no runtime dep here.
-iroh.workspace = true
+# `test-utils` (dev-only) brings `iroh::test_utils::run_relay_server`, which lets the #64 path
+# test drive a REAL relay in-process. Without it the suite can only ever produce a direct path —
+# and it was exactly that blind spot that let a wrong direct-vs-relay derivation pass review-free.
+iroh = { workspace = true, features = ["test-utils"] }
+# The in-process relay serves a self-signed cert; the #64 path test trusts it explicitly.
+# Dev-only, and already in the lock via iroh.
+iroh-relay = { version = "1", features = ["test-utils"] }
 ed25519-dalek.workspace = true
 # The distribute tests install the ring provider themselves (they build reqwest clients
 # without booting a daemon). Same ring-only posture as mcpmesh-node's runtime dep.

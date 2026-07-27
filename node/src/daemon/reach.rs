@@ -33,6 +33,10 @@ pub struct ReachEntry {
     /// wins on arrival, poisoning the cache for a full TTL and, since #58, PUSHING a false "went
     /// offline" for a peer that is up.
     pub seq: u64,
+    /// HOW the peer was reached on this probe (#64) — direct/hole-punched vs through a relay.
+    /// Captured alongside `reachable`/`rtt_ms` so it shares ONE TTL and one `age_secs`, rather
+    /// than inventing a second staleness rule; `Unknown` covers "never probed" for free.
+    pub path: mcpmesh_local_api::PeerPath,
 }
 
 /// Advisory reachability TTL: a cache entry older than this is refreshed by a NON-BLOCKING
@@ -58,9 +62,18 @@ pub async fn probe_peer(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> ReachEn
     let started = std::time::Instant::now();
     let outcome = tokio::time::timeout(PROBE_TIMEOUT, probe_once(mesh, endpoint_id)).await;
     // `probe_once` returns the peer's (already length-capped) metadata on a reachable pong.
-    let (reachable, meta, services) = match outcome {
-        Ok(Ok((meta, services))) => (true, meta, services),
-        _ => (false, String::new(), Vec::new()),
+    // `path` rides the probe OUTCOME, so it is exactly as fresh as `reachable`/`rtt_ms` and an
+    // unreachable peer reports `Unknown` rather than a stale route (#64 review). Reading it from
+    // the endpoint's address map after the fact reported `Direct` for a peer that had just gone
+    // away, because iroh leaves those entries Active for up to a minute after the connection dies.
+    let (reachable, meta, services, path) = match outcome {
+        Ok(Ok((meta, services, path))) => (true, meta, services, path),
+        _ => (
+            false,
+            String::new(),
+            Vec::new(),
+            mcpmesh_local_api::PeerPath::Unknown,
+        ),
     };
     let entry = ReachEntry {
         reachable,
@@ -69,6 +82,7 @@ pub async fn probe_peer(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> ReachEn
         meta,
         services,
         seq,
+        path,
     };
     // Commit under ONE lock acquisition, DISCARDING a result a newer probe has already superseded
     // (#58 review): probes of one peer overlap and complete out of order.
@@ -123,6 +137,74 @@ enum Outcome {
     Superseded(ReachEntry),
 }
 
+/// How long to let a fresh connection settle before classifying its path (#64).
+///
+/// A dial starts on the relay and hole-punches in the background; measured on loopback the direct
+/// path is SELECTED about 300 ms in. Classifying immediately after the pong therefore reported
+/// `Relay` for every peer on a relay-enabled node — useless for the locality claim, and wrong in
+/// the same direction as the address-map version this replaced. This window is well inside the
+/// probe's existing `PROBE_TIMEOUT` budget and is only ever spent on a connection that has NOT yet
+/// selected a direct path.
+const PATH_SETTLE: Duration = Duration::from_millis(600);
+
+/// [`selected_path`] with a bounded wait for hole-punching to finish (#64).
+///
+/// Returns as soon as a DIRECT path is selected; otherwise polls until [`PATH_SETTLE`] elapses and
+/// reports whatever is selected then — a genuinely relayed peer costs the full window once per
+/// probe, and reports `Relay`, which is the truthful answer for it.
+async fn settled_path(conn: &iroh::endpoint::Connection) -> mcpmesh_local_api::PeerPath {
+    let deadline = tokio::time::Instant::now() + PATH_SETTLE;
+    loop {
+        let path = selected_path(conn);
+        if path == mcpmesh_local_api::PeerPath::Direct || tokio::time::Instant::now() >= deadline {
+            return path;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Which path is this connection actually using (#64)?
+///
+/// `Path::is_selected()` is iroh's own answer to "selected for application data transmission" —
+/// the only signal that means traffic. Every other view (the endpoint's remote-address map,
+/// `TransportAddrUsage::Active`) reports *open* paths, and iroh deliberately keeps a relay path
+/// open as a standby for the life of the connection, so those views call a hole-punched connection
+/// relayed forever.
+///
+/// No selected path (a snapshot taken as the connection tears down) → `Unknown`, never a guess.
+fn selected_path(conn: &iroh::endpoint::Connection) -> mcpmesh_local_api::PeerPath {
+    let paths = conn.paths();
+    for path in &paths {
+        if !path.is_selected() {
+            continue;
+        }
+        return match path.remote_addr() {
+            iroh::TransportAddr::Relay(url) => mcpmesh_local_api::PeerPath::Relay {
+                url: Some(sanitize_relay_url(url)),
+            },
+            iroh::TransportAddr::Ip(_) => mcpmesh_local_api::PeerPath::Direct,
+            // A transport mcpmesh does not model: say so rather than guess.
+            _ => mcpmesh_local_api::PeerPath::Unknown,
+        };
+    }
+    mcpmesh_local_api::PeerPath::Unknown
+}
+
+/// Render a relay URL for the wire WITHOUT its userinfo (#64 review).
+///
+/// Relay URLs are operator-supplied (`[network].relay_urls`, `set_relays`), so a
+/// `https://user:token@relay.internal/` would otherwise ship that token to every local-API client.
+/// Scheme + host + port only: enough to name which relay is in use, carrying no credential and no
+/// path/query.
+fn sanitize_relay_url(url: &iroh::RelayUrl) -> String {
+    let u: &url::Url = url; // RelayUrl derefs to Url
+    match (u.host_str(), u.port()) {
+        (Some(host), Some(port)) => format!("{}://{host}:{port}", u.scheme()),
+        (Some(host), None) => format!("{}://{host}", u.scheme()),
+        (None, _) => u.scheme().to_string(),
+    }
+}
+
 /// Did this probe CHANGE what a subscriber already believes (#58)?
 ///
 /// The baseline is the SNAPSHOT, not the cache: a peer with no cache entry is reported
@@ -155,6 +237,7 @@ fn reachability_row(
     age_secs: Option<u64>,
 ) -> mcpmesh_local_api::PeerReachability {
     mcpmesh_local_api::PeerReachability {
+        path: entry.map(|e| e.path.clone()).unwrap_or_default(),
         name: nickname,
         reachable: entry.is_some_and(|e| e.reachable),
         rtt_ms: entry.and_then(|e| e.rtt_ms),
@@ -185,7 +268,10 @@ fn stored_row(
 /// The dial → ping → pong half of [`probe_peer`], separated so the whole exchange is one timeout
 /// unit. Reuses the real iroh 1.0.1 call shapes from `dial.rs`/`pairing::rendezvous`
 /// (`endpoint.connect`, `open_bi`, `write_frame`, `finish`, a framed read).
-async fn probe_once(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> Result<(String, Vec<String>)> {
+async fn probe_once(
+    mesh: &Arc<MeshState>,
+    endpoint_id: [u8; 32],
+) -> Result<(String, Vec<String>, mcpmesh_local_api::PeerPath)> {
     let id = iroh::EndpointId::from_bytes(&endpoint_id)
         .map_err(|e| anyhow::anyhow!("invalid endpoint id: {e}"))?;
     // Attach the pairing-persisted `last_addr` hint, exactly as `dial::dial_service` does
@@ -219,7 +305,17 @@ async fn probe_once(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> Result<(Str
         // SAME ≤256B cap the sender applies (an oversized/absent/non-string value ⇒ empty).
         // The channel is authenticated (this is a trust-gated paired peer), so no signature is
         // needed; the cap is the only receive-side hardening required.
-        Some(Inbound::Frame(v)) => Ok((pong_meta(&v), pong_services(&v))),
+        // Classify the path from THIS connection, while it is still open (#64). It must come
+        // from `Connection::paths()` + `Path::is_selected()` — the path actually carrying
+        // application data — and NOT from the endpoint's remote-address map: iroh deliberately
+        // keeps a relay path OPEN as a standby after hole-punching succeeds ("Relay and custom
+        // paths are kept open", `remote_state.rs`), so an address-usage view reports a relay for
+        // a connection whose data provably flows direct. That version made `Direct` unreachable
+        // on any relay-enabled node — i.e. every real deployment — which is the opposite of the
+        // truthful-locality-claim this field exists to support.
+        Some(Inbound::Frame(v)) => {
+            Ok((pong_meta(&v), pong_services(&v), settled_path(&conn).await))
+        }
         _ => anyhow::bail!("no pong from peer"),
     }
 }
@@ -349,7 +445,7 @@ pub fn reachability_of(mesh: &Arc<MeshState>) -> Vec<mcpmesh_local_api::PeerReac
 #[cfg(test)]
 mod tests {
     use super::pong_meta;
-    use super::{ReachEntry, is_transition, supersedes};
+    use super::{ReachEntry, is_transition, sanitize_relay_url, supersedes};
     use crate::roster::presence::APP_METADATA_MAX_BYTES;
 
     fn entry(reachable: bool, rtt_ms: Option<u64>) -> ReachEntry {
@@ -360,7 +456,37 @@ mod tests {
             meta: String::new(),
             services: Vec::new(),
             seq: 0,
+            path: mcpmesh_local_api::PeerPath::Unknown,
         }
+    }
+
+    /// #64 review: a relay URL reaching the wire must carry NO credential. Relay URLs are
+    /// operator-supplied (`[network].relay_urls`, `set_relays`), so a `https://user:token@host/`
+    /// would otherwise ship that token to every local-API client on every reachability row.
+    #[test]
+    fn sanitize_relay_url_drops_credentials_and_path() {
+        let u = |s: &str| -> iroh::RelayUrl { s.parse().expect("relay url") };
+
+        assert_eq!(
+            sanitize_relay_url(&u("https://user:token@relay.internal/")),
+            "https://relay.internal",
+            "userinfo must never reach the wire"
+        );
+        assert_eq!(
+            sanitize_relay_url(&u("https://relay.example:4433/some/path?x=1")),
+            "https://relay.example:4433",
+            "port is kept (it names the relay); path/query are not"
+        );
+        assert_eq!(
+            sanitize_relay_url(&u("https://relay.example/")),
+            "https://relay.example"
+        );
+        // A self-hosted relay on a LAN address still renders — the field names WHICH relay is in
+        // use, and an operator who points at an IP has already chosen to expose it.
+        assert_eq!(
+            sanitize_relay_url(&u("http://192.168.1.5:4433/")),
+            "http://192.168.1.5:4433"
+        );
     }
 
     /// #58 review: a SLOW probe that started earlier must not overwrite a FAST one that started

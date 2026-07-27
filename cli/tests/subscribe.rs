@@ -416,10 +416,37 @@ async fn reachability_flips_are_pushed_to_subscribers() {
         //     unprobed peer as offline), so it must be pushed. ---
         let up = daemon::probe_peer(&mesh, peer_id).await;
         assert!(up.reachable, "the live peer must probe reachable");
+        // #64: relays are DISABLED in this harness, so a reachable peer here is genuinely direct.
+        // But the FIRST probe of a brand-new connection may still report `Unknown` — a path is not
+        // selected the instant the pong lands, and under parallel test load it can exceed the
+        // probe's settle window. That is honest (`Unknown` means "we do not know", and it is the
+        // fail-safe answer), so the contract is "eventually Direct", not "Direct immediately".
+        // Asserting the latter made this test flaky under full-suite load.
+        let mut path = up.path.clone();
+        for _ in 0..10 {
+            if path == mcpmesh_local_api::PeerPath::Direct {
+                break;
+            }
+            assert_ne!(
+                path,
+                mcpmesh_local_api::PeerPath::Relay { url: None },
+                "no relay is configured, so a relay verdict would be wrong"
+            );
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            path = daemon::probe_peer(&mesh, peer_id).await.path;
+        }
+        assert_eq!(
+            path,
+            mcpmesh_local_api::PeerPath::Direct,
+            "a loopback peer with relays disabled must settle on Direct"
+        );
         let frame = sub.next().await;
         assert_eq!(frame["type"], "reachability", "got {frame}");
         assert_eq!(frame["peer"]["reachable"], true, "came online: {frame}");
         assert_eq!(frame["peer"]["name"], "bob", "got {frame}");
+        // The frame's path is whatever was known at transition time — `direct` or, if the path
+        // had not settled yet, `unknown`. Never `relay`: none is configured.
+        assert_ne!(frame["peer"]["path"]["kind"], "relay", "got {frame}");
         // The row carries the peer's authenticated endpoint id, rendered independently of the
         // implementation's own helper so this pins the VALUE, not just the call.
         assert_eq!(

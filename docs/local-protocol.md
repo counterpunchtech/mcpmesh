@@ -7,7 +7,7 @@ named pipe on Windows. Anything that can open the endpoint and parse JSON can sp
 language — [`local-api/examples/status.py`](../local-api/examples/status.py) is a complete client
 in ~60 lines of dependency-free Python.
 
-> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.12`, `api_minor` `12`) and evolves
+> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.13`, `api_minor` `13`) and evolves
 > **additively** (see [Versioning](#versioning)), but until a stable release this document — like the
 > wire format itself — may change without a migration path. Pin the mcpmesh version you build
 > against. Source of truth is the Rust in [`local-api/`](../local-api/src/protocol.rs); where this
@@ -452,6 +452,41 @@ the instant it returns rather than on the next poll tick.
 
 `peer` is a whole `PeerReachability` row — the same shape the opening `snapshot`'s `reachability`
 list carries, so both project through one code path.
+
+### `path` — direct or relayed (`api_minor >= 13`, #64)
+
+Every `PeerReachability` row carries how the peer is reached:
+
+```json
+"path": {"kind": "direct"}
+"path": {"kind": "relay", "url": "https://relay.example/"}
+"path": {"kind": "unknown"}
+```
+
+- `direct` — a direct or hole-punched QUIC path. The bytes did not transit a relay.
+- `relay` — through a relay server, so the path depends on third-party infrastructure. `url` is the
+  relay when known.
+- `unknown` — never probed, no active transport address, or a transport mcpmesh does not model.
+
+**Only `direct` supports a locality claim.** `unknown` means "we do not know" — rendering it as
+"private" is the one misuse that turns this field into a false privacy statement, and a row from a
+pre-`api_minor`-13 daemon defaults to `unknown` precisely so it cannot be mistaken for a guarantee
+that daemon never made.
+
+The daemon errs the same way: while hole-punching, a relay and a direct path can BOTH be active, and
+it reports `relay` in that case. Overstating privacy is worse than understating it.
+
+`path` is captured by the same probe that sets `reachable`/`rtt_ms`, so it shares their freshness —
+one TTL, one `age_secs`. `rtt_ms` is not a proxy for it: a fast relay beats a slow direct path.
+
+**A first probe may report `unknown`.** A fresh connection starts on the relay and hole-punches in
+the background; the daemon waits briefly for the path to settle, but under load that can time out.
+The next probe reports the settled answer. So treat `unknown` as "not yet known" and re-read, rather
+than as a stable property of the peer — and never as "private".
+
+A path change alone does **not** emit a `reachability` frame — only the `reachable` verdict flipping
+does. Hole-punching flaps by nature, and the stream stays quiet through it; read `status` if you
+need the current path.
 
 Emitted on a **transition** only: the `reachable` verdict changed, or this is the first probe of
 that peer. A refreshed probe that re-confirms the same verdict emits nothing, so a peer that stays

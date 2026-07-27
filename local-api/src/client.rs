@@ -986,6 +986,7 @@ mod tests {
                         age_secs: Some(3),
                         meta: String::new(),
                         principal: None,
+                        path: Default::default(),
                     }],
                 },
                 StreamFrame::Event {

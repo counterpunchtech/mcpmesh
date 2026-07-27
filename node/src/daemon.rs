@@ -356,6 +356,16 @@ impl MeshState {
         })
     }
 
+    /// The mesh's iroh endpoint.
+    ///
+    /// `#[doc(hidden)]` — a TEST SEAM. The #64 path test dials a peer itself to inspect the path
+    /// set the daemon's own probe sees, which is the only way to assert that a `Direct` verdict
+    /// came from the SELECTED path rather than from an open relay standby.
+    #[doc(hidden)]
+    pub fn endpoint_for_test(&self) -> &iroh::Endpoint {
+        &self.endpoint
+    }
+
     /// Install an EPHEMERAL service registration directly (#36's in-memory map).
     ///
     /// `pub` (like [`MeshState::new`] and [`spawn_accept_loop`]) so integration tests can stand up
