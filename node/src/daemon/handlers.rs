@@ -1342,6 +1342,16 @@ async fn sever_principal(mesh: &Arc<MeshState>, principal: &str) -> Result<usize
 ///
 /// A principal naming no device (or no live connection) severs nothing.
 async fn sever_principals(mesh: &Arc<MeshState>, principals: &[String]) -> Result<usize> {
+    // #99: hand the observer the registry AS OF NOW — before any connection is cut. A caller that
+    // severed before swapping would show a registry here that still admits the principal.
+    let observer = mesh
+        .sever_observer
+        .lock()
+        .expect("sever observer lock not poisoned")
+        .clone();
+    if let Some(observe) = observer {
+        observe(&mesh.services.get());
+    }
     let store = mesh.store.clone();
     let roster = mesh.roster.view();
     let principals_w = principals.to_vec();

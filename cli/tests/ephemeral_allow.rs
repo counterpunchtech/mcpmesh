@@ -455,3 +455,61 @@ async fn a_revoke_leaves_the_live_registry_denying_when_it_returns() {
     .await
     .expect("registry-denies-on-return test timed out");
 }
+
+/// #99: #54's SWAP-BEFORE-SEVER ordering, pinned deterministically.
+///
+/// `revoke_service_allow` must install the new registry BEFORE cutting live connections. Swap
+/// first and no NEW session can be admitted under the pre-revoke allow while the in-flight ones
+/// are being cut; sever first and there is a window where the peer just cut can redial into a
+/// registry that still admits it.
+///
+/// The ordering is invisible from outside the verb — by the time it returns, both have happened
+/// (see `a_revoke_leaves_the_live_registry_denying_when_it_returns`, which does NOT catch a
+/// reversal). So observe from INSIDE: the sever observer fires at the top of the sever, and
+/// records what the live registry admitted at that instant.
+#[tokio::test]
+async fn the_registry_already_denies_at_the_moment_of_the_sever() {
+    timeout(Duration::from_secs(60), async {
+        let (mesh, addr, peer, principal, _dir) = mesh_with_ephemeral_room().await;
+        grant_service_access(&mesh, &principal, &principal, &["room".to_string()])
+            .await
+            .expect("grant");
+
+        let conn = dial(&peer, addr).await;
+        let mut session = open_session(&conn, "room").await;
+        assert!(session_served(session.as_mut()).await, "served after grant");
+
+        // Capture the live `room` allow at the exact instant EVERY sever begins — not just the
+        // last. A reversal that severs twice would otherwise hide the stale first observation
+        // behind a fresh second one, which is how the first version of this test went vacuous.
+        let seen: Arc<std::sync::Mutex<Vec<Vec<String>>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let sink = seen.clone();
+        mesh.set_sever_observer(move |live| {
+            sink.lock().expect("observer sink not poisoned").push(
+                live.get("room")
+                    .map(|e| e.allow.clone())
+                    .unwrap_or_default(),
+            );
+        });
+
+        revoke_service_allow(&mesh, "room".into(), principal.clone())
+            .await
+            .expect("revoke");
+
+        let observed = seen.lock().expect("observer sink not poisoned").clone();
+        assert!(
+            !observed.is_empty(),
+            "the revoke must have severed, firing the observer"
+        );
+        for at_sever in &observed {
+            assert!(
+                at_sever.is_empty(),
+                "the new registry must be installed BEFORE every sever — at one sever `room` \
+                 still admitted {at_sever:?}, so a peer cut by that sever could have redialled \
+                 straight back in (all observations: {observed:?})"
+            );
+        }
+    })
+    .await
+    .expect("swap-before-sever test timed out");
+}

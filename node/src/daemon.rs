@@ -187,6 +187,19 @@ pub struct MeshState {
     /// the old abort-and-respawn of the accept loop never did (#54). Swapping in place also
     /// removes the window in which the accept loop was down.
     pub(crate) services: Arc<mcpmesh_net::LiveServices>,
+    /// Test-only hook fired at the START of a sever, with the LIVE registry as of that instant
+    /// (#99).
+    ///
+    /// #54's SWAP-BEFORE-SEVER ordering — install the new registry, THEN cut live connections —
+    /// is a security property: swap first and no NEW session is admitted under the pre-revoke
+    /// allow while the in-flight ones are being cut. Reversing the two statements is invisible
+    /// from outside the verb, because by the time it returns both have happened. This seam is the
+    /// only way to observe the order without racing the wire.
+    ///
+    /// `None` in every production path; nothing installs it but tests.
+    #[allow(clippy::type_complexity)]
+    pub(crate) sever_observer:
+        std::sync::Mutex<Option<Arc<dyn Fn(&mcpmesh_net::Services) + Send + Sync>>>,
     /// The roster/presence gossip handle + roster-blob transport, spawned on the
     /// daemon's ONE endpoint (#54). `None` in a pure-pairing daemon (no org root
     /// pinned) — no gossip is spawned, exactly the pairing-only behavior. [`spawn_accept_loop`]'s gossip/blob
@@ -339,6 +352,7 @@ impl MeshState {
             conn_registry,
             // Empty until `spawn_accept_loop` installs the built registry; nothing serves before
             // then, so an empty live handle is never read.
+            sever_observer: std::sync::Mutex::new(None),
             services: Arc::new(mcpmesh_net::LiveServices::new(Arc::new(
                 mcpmesh_net::Services::new(std::collections::HashMap::new()),
             ))),
@@ -383,6 +397,18 @@ impl MeshState {
     /// config-collision check that keeps a name from being held ephemerally AND persistently at
     /// once. Use `register_service`.
     #[doc(hidden)]
+    /// Install the sever observer (#99). Test seam; see the field docs.
+    #[doc(hidden)]
+    pub fn set_sever_observer<F>(&self, f: F)
+    where
+        F: Fn(&mcpmesh_net::Services) + Send + Sync + 'static,
+    {
+        *self
+            .sever_observer
+            .lock()
+            .expect("sever observer lock not poisoned") = Some(Arc::new(f));
+    }
+
     /// The LIVE service registry as of now — the same handle the accept path reads per accepted
     /// bi-stream. A test seam: it lets a test assert what the registry admits at a precise instant
     /// (e.g. that a revoke's swap is installed before it severs) without racing the wire.
