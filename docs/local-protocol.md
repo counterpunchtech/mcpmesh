@@ -347,8 +347,31 @@ consumer always gets a well-formed answer rather than a hang:
 - `-32055` — peer unreachable.
 - `-32054` — session refused (e.g. not authorized).
 
-Both carry `"data":{"source":"mcpmesh"}` to distinguish a mesh-synthesized error from one the remote
+- `-32053` — rate-limited, carrying `retry_after_ms`. See the warning below.
+
+All carry `"data":{"source":"mcpmesh"}` to distinguish a mesh-synthesized error from one the remote
 server produced. A session severed mid-stream instead surfaces as a clean EOF.
+
+> **Rate-limited notifications are dropped silently — design for it.**
+>
+> The per-peer rate limiter is consulted before forwarding any method-bearing frame. Over the limit:
+>
+> - a **request** (an `id` present and non-null) is answered `-32053` with `retry_after_ms`, so the
+>   caller learns it was throttled and can back off;
+> - a **notification** (no `id`) is dropped with **no signal at all**.
+>
+> JSON-RPC gives a notification no reply channel, so there is nowhere to put the refusal. The
+> consequence is that notification delivery is **not guaranteed under load**, and the loss is
+> *undetectable from the sending side* — a dropped notification is indistinguishable from a
+> delivered one.
+>
+> If you rely on server-initiated pushes, a reconciliation path is **mandatory, not an
+> optimization**: reconcile periodically, or carry a sequence number your peer can notice a gap in.
+> Do not treat notifications as an at-least-once channel.
+>
+> Whether the daemon should surface dropped-notification counts (a `status` counter, an audit
+> record, or a `subscribe` frame) is tracked in
+> [#76](https://github.com/counterpunchtech/mcpmesh/issues/76).
 
 This is exactly what `mcpmesh connect <peer>/<service>` does; an embedding client that wants to mount
 a remote service itself reproduces this upgrade. Reference:
@@ -600,6 +623,7 @@ Reference: [`cli/src/backends/spawn.rs`](../cli/src/backends/spawn.rs) (`run`),
 | `-32000` | operation failed — `message` carries the detail. One common instance: the daemon is in control-only mode with no mesh (e.g. `invite`/`pair` before a mesh exists) |
 | `-32055` | *(session only)* peer unreachable |
 | `-32054` | *(session only)* session refused |
+| `-32053` | *(session only)* rate-limited; carries `retry_after_ms`. **Requests only** — a rate-limited *notification* is dropped silently, see below |
 
 `-32600` through `-32603` follow their JSON-RPC 2.0 meanings. Session errors (`-3205x`) appear
 inside a [session](#sessions), not as control-method responses, and carry `data.source = "mcpmesh"`.
