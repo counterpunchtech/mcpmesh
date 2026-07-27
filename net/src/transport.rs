@@ -147,7 +147,8 @@ pub enum RecvError {
     Violation(Violation),
 }
 
-/// rmcp 2.1.0 reality (reconciled): `Transport<R: ServiceRole>` with
+/// rmcp reality (reconciled, and re-verified byte-for-byte across the 2.1.0 -> 3.0.0-beta.3
+/// major — the `Transport` trait did not change): `Transport<R: ServiceRole>` with
 /// `type Error`, `send() -> impl Future + Send + 'static`,
 /// `receive() -> impl Future<Output = Option<RxJsonRpcMessage<R>>>` (no error
 /// channel), and `close()`. One `NdjsonTransport` serves either role — unlike
