@@ -114,6 +114,7 @@ async fn mesh_with_ephemeral_room() -> (
                 cwd: None,
             },
             allow: vec![],
+            rate_limit_per_min: None,
         },
     );
 

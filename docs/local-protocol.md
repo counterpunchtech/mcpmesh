@@ -7,7 +7,7 @@ named pipe on Windows. Anything that can open the endpoint and parse JSON can sp
 language — [`local-api/examples/status.py`](../local-api/examples/status.py) is a complete client
 in ~60 lines of dependency-free Python.
 
-> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.13`, `api_minor` `13`) and evolves
+> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.14`, `api_minor` `14`) and evolves
 > **additively** (see [Versioning](#versioning)), but until a stable release this document — like the
 > wire format itself — may change without a migration path. Pin the mcpmesh version you build
 > against. Source of truth is the Rust in [`local-api/`](../local-api/src/protocol.rs); where this
@@ -142,7 +142,7 @@ Methods split into two groups by audience:
 
 | `method` | `params` | `result` |
 |---|---|---|
-| `register_service` | `{name, backend, allow, ephemeral?}` — `backend` is `{"run":{"cmd":[…], "env"?:{…}, "cwd"?:"…"}}` (#51 — per-service env + working dir; `MCPMESH_PEER_*` identity vars always win over `env`, and a service `env` cannot set them) or `{"socket":{"path":"…"}}`; `allow` is a list of STABLE principals — `b64u:<user_id>`, `eid:<device id>`, or roster group/user_id names; a bare input naming a paired peer's nickname is RESOLVED to that peer's stable principal at write time (#38); `ephemeral:true` (#36) keeps the registration in memory only and unregisters it when THIS connection closes (see [Ephemeral registration](#ephemeral-registration)) | `{}` (ack) |
+| `register_service` | `{name, backend, allow, ephemeral?, rate_limit_per_min?}` — `backend` is `{"run":{"cmd":[…], "env"?:{…}, "cwd"?:"…"}}` (#51 — per-service env + working dir; `MCPMESH_PEER_*` identity vars always win over `env`, and a service `env` cannot set them) or `{"socket":{"path":"…"}}`; `allow` is a list of STABLE principals — `b64u:<user_id>`, `eid:<device id>`, or roster group/user_id names; a bare input naming a paired peer's nickname is RESOLVED to that peer's stable principal at write time (#38); `ephemeral:true` (#36) keeps the registration in memory only and unregisters it when THIS connection closes (see [Ephemeral registration](#ephemeral-registration)) | `{}` (ack) |
 | `status` | *(none)* | [`StatusResult`](#statusresult) |
 | `audit_summary` | *(none)* | `{per_peer:[[name,count],…], per_service:[[name,count],…], total_sessions}` — this node's **local** session tallies; nothing is transmitted |
 | `invite` | `{services:[…]}` | `{invite_line:"mcpmesh-invite:…", expires_at_epoch}` |
@@ -604,7 +604,8 @@ things:
   `service_allow_revoke` per-peer access verbs are `api_minor >= 8` (#44); `unregister_service` (#50), the `run`-backend `env`/`cwd` (#51), `peer_services` (#52), and the `set_relays` live relay-set verb (#53) are `api_minor >= 9`; IMMEDIATE revocation
   (`service_allow_revoke`/`peer_remove` refuse new sessions on already-open connections AND sever
   live ones, #54) is `api_minor >= 10`; ephemeral-service grant/revoke plus the `-32040`
-  no-such-service error (#55, #69) are `api_minor >= 11`; the pushed `reachability` stream frame (#58)
+  no-such-service error (#55, #69) are `api_minor >= 11`; per-service `rate_limit_per_min` (#63) is
+  `api_minor >= 14`; the pushed `reachability` stream frame (#58)
   is `api_minor >= 12`; the `set_nickname` verb
   and `StatusResult.self_nickname` are `api_minor >= 2` (#37); STABLE-principal `allow`
   strings + `ServiceInfo.allow_display` are `api_minor >= 3` (#38). `api_minor` is itself

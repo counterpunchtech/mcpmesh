@@ -43,6 +43,12 @@ pub struct ServiceCfg {
     /// Working directory for a `run` backend (#51). Default: inherit the daemon's cwd.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// Proxied-request rate for THIS service, per authenticated peer (#63). Falls back to
+    /// `[limits].rate_limit_per_min`. Each service gets its own bucket set, so a noisy service can
+    /// no longer exhaust the budget a quiet one needs; set this to tune a known-noisy one down (or
+    /// an interactive one up) independently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_per_min: Option<u32>,
 }
 
 /// The resolved backend kind of a [`ServiceCfg`], borrowing the config as slices (no

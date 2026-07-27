@@ -179,6 +179,7 @@ pub(crate) fn write_service_to_config(
     name: &str,
     backend: &BackendSpec,
     allow: &[String],
+    rate_limit_per_min: Option<u32>,
 ) -> Result<()> {
     let existing = read_config_for_rmw(path)?;
     let mut doc: toml::Table = toml::from_str(&existing)
@@ -236,6 +237,15 @@ pub(crate) fn write_service_to_config(
         "allow".into(),
         toml::Value::Array(merged_allow.into_iter().map(toml::Value::String).collect()),
     );
+    // #63: persist the per-service rate when the registration sets one. Omitted (not written as a
+    // default) so the entry keeps inheriting `[limits].rate_limit_per_min` when unset — writing a
+    // materialized default would silently pin the service to today's global value.
+    if let Some(rate) = rate_limit_per_min {
+        entry.insert(
+            "rate_limit_per_min".into(),
+            toml::Value::Integer(rate.into()),
+        );
+    }
     services.insert(name.to_string(), toml::Value::Table(entry));
 
     write_config_doc(path, &doc)
@@ -390,6 +400,7 @@ mod tests {
                 path: "/run/kb.sock".into(),
             },
             &[],
+            None,
         )
         .unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
@@ -561,11 +572,11 @@ mod tests {
         };
 
         // 1. kb registers itself with an empty allow (reachability is a separate user grant).
-        write_service_to_config(&path, "kb", &socket, &[]).unwrap();
+        write_service_to_config(&path, "kb", &socket, &[], None).unwrap();
         // 2. Pairing grants "alice" access (appends to [services.kb].allow).
         append_allow_to_config(&path, "alice", &["kb".to_string()]).unwrap();
         // 3. The kb daemon RESTARTS → re-registers idempotently, again with an empty allow.
-        write_service_to_config(&path, "kb", &socket, &[]).unwrap();
+        write_service_to_config(&path, "kb", &socket, &[], None).unwrap();
 
         // The grant must survive the re-registration.
         let cfg = Config::load(&path).unwrap();
@@ -590,6 +601,7 @@ mod tests {
                 path: "/a.sock".into(),
             },
             &["alice".to_string()],
+            None,
         )
         .unwrap();
         // Re-register: a new socket path + a new allow entry "bob".
@@ -600,6 +612,7 @@ mod tests {
                 path: "/b.sock".into(),
             },
             &["bob".to_string()],
+            None,
         )
         .unwrap();
 
@@ -626,7 +639,7 @@ mod tests {
             env,
             cwd: Some("/home/me/code".into()),
         };
-        write_service_to_config(&path, "gh", &spec, &["eid:beef".to_string()]).unwrap();
+        write_service_to_config(&path, "gh", &spec, &["eid:beef".to_string()], None).unwrap();
         let cfg = Config::load(&path).unwrap();
         let svc = cfg.services.get("gh").unwrap();
         assert_eq!(svc.cwd.as_deref(), Some("/home/me/code"));

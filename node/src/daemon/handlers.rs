@@ -178,6 +178,7 @@ pub(crate) async fn register_service(
         backend,
         allow,
         ephemeral,
+        rate_limit_per_min,
     } = params;
     // `allow` entries are stored VERBATIM (#38): a `b64u:`/`eid:` principal or a roster
     // group/user_id name admits; a bare display nickname does NOT (nicknames never authorize
@@ -207,6 +208,7 @@ pub(crate) async fn register_service(
                 crate::daemon::EphemeralService {
                     backend,
                     allow: allow.clone(),
+                    rate_limit_per_min,
                 },
             );
         reload_services_from_disk(mesh, "register-ephemeral").await?;
@@ -236,7 +238,13 @@ pub(crate) async fn register_service(
     let config_path = mesh.config_path.clone();
     let (name_w, backend_w, allow_w) = (name.clone(), backend.clone(), allow.clone());
     blocking("join config write", move || {
-        write_service_to_config(&config_path, &name_w, &backend_w, &allow_w)
+        write_service_to_config(
+            &config_path,
+            &name_w,
+            &backend_w,
+            &allow_w,
+            rate_limit_per_min,
+        )
     })
     .await??;
 
@@ -1532,6 +1540,7 @@ mod tests {
                     path: "/run/room.sock".into(),
                 },
                 allow: vec!["eid:beef".to_string()],
+                rate_limit_per_min: None,
             },
         );
 
@@ -1583,6 +1592,7 @@ mod tests {
                     path: "/run/room.sock".into(),
                 },
                 allow: vec![],
+                rate_limit_per_min: None,
             },
         );
 
@@ -1628,6 +1638,7 @@ mod tests {
                     path: "/run/room.sock".into(),
                 },
                 allow: vec![],
+                rate_limit_per_min: None,
             },
         );
         let allow = || {
