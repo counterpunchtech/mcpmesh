@@ -131,6 +131,43 @@ impl Services {
     }
 }
 
+/// A hot-swappable handle to the live [`Services`] registry.
+///
+/// The accept path reads this ONCE PER accepted bi-stream, so a config reload (a grant, a revoke,
+/// a roster install) is visible to the very next session on an ALREADY-OPEN connection. The
+/// previous design handed each connection an `Arc<Services>` captured when the accept loop was
+/// spawned, so a revoked peer kept opening admitted sessions for the whole lifetime of its
+/// connection — the verb reported success and did nothing (#54).
+///
+/// In-flight sessions deliberately keep the snapshot they were admitted under: a session's service
+/// resolution is fixed at admit. Cutting those is the revoke path's
+/// [`sever_matching`](crate::registry::ConnRegistry::sever_matching) job.
+///
+/// `std::sync::RwLock` (not `arc-swap`) matches the surrounding idiom and is never held across an
+/// await — [`get`](Self::get) clones the `Arc` and drops the guard before returning.
+pub struct LiveServices(std::sync::RwLock<Arc<Services>>);
+
+impl LiveServices {
+    /// Wrap an initial registry.
+    pub fn new(services: Arc<Services>) -> Self {
+        Self(std::sync::RwLock::new(services))
+    }
+
+    /// The registry as of now. Cheap: one `Arc` clone under a read lock.
+    pub fn get(&self) -> Arc<Services> {
+        self.0
+            .read()
+            .expect("live services lock not poisoned")
+            .clone()
+    }
+
+    /// Hot-swap the registry. Visible to every subsequent [`get`](Self::get); handles already
+    /// taken are unaffected (that is what keeps an in-flight session on its admit-time snapshot).
+    pub fn store(&self, services: Arc<Services>) {
+        *self.0.write().expect("live services lock not poisoned") = services;
+    }
+}
+
 /// Handle to a running [`serve`] accept loop.
 ///
 /// Dropping this handle does NOT stop the accept loop: the spawned task keeps
@@ -165,7 +202,7 @@ pub fn serve(
     services: Services,
     registry: Arc<crate::registry::ConnRegistry>,
 ) -> ServeHandle {
-    let services = Arc::new(services);
+    let services = Arc::new(LiveServices::new(Arc::new(services)));
     let task = tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
             let gate = gate.clone();
@@ -198,7 +235,7 @@ pub fn serve(
 pub async fn run_mesh_connection(
     conn: iroh::endpoint::Connection,
     gate: Arc<dyn TrustGate>,
-    services: Arc<Services>,
+    services: Arc<LiveServices>,
     registry: Arc<crate::registry::ConnRegistry>,
 ) {
     // 1. Accept-time trust gate — before any MCP traffic. `remote_id()` on a
@@ -235,7 +272,11 @@ pub async fn run_mesh_connection(
     // 2. Sessions: one bi-stream each; a connection may carry several.
     //    `accept_bi()` yields `(send, recv)`.
     while let Ok((send, recv)) = conn.accept_bi().await {
-        let services = services.clone();
+        // Read the LIVE registry PER SESSION (#54): a revoke landing between two sessions on
+        // this same connection is honored by the second one. Before this, each connection carried
+        // an `Arc<Services>` captured when the accept loop was spawned, so a revoked peer kept
+        // opening admitted sessions until it happened to disconnect.
+        let services = services.get();
         let identity = identity.clone();
         tokio::spawn(async move {
             if let Err(e) = run_session(recv, send, &identity, &services).await {
@@ -416,6 +457,30 @@ mod tests {
 
     use super::*;
     use crate::framing::{FrameReader, Inbound};
+
+    /// #54: a swap is visible to the NEXT read, while a handle already taken keeps the
+    /// snapshot it was given — the exact split the accept path relies on (next session honors a
+    /// revoke; the in-flight session it was admitted under is not rewritten under it).
+    #[test]
+    fn live_services_swap_is_visible_to_the_next_get_only() {
+        let (before, after) = (
+            Arc::new(Services::new(HashMap::new())),
+            Arc::new(Services::new(HashMap::new())),
+        );
+        let live = LiveServices::new(before.clone());
+        let taken = live.get();
+        assert!(Arc::ptr_eq(&taken, &before));
+
+        live.store(after.clone());
+        assert!(
+            Arc::ptr_eq(&taken, &before),
+            "an already-taken handle keeps its admit-time snapshot"
+        );
+        assert!(
+            Arc::ptr_eq(&live.get(), &after),
+            "the next read resolves against the swapped-in registry"
+        );
+    }
 
     /// One error frame off the probe side; panics if the stream is EOF or a
     /// (non-existent) violation instead of a frame.

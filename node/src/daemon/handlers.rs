@@ -25,7 +25,7 @@ use crate::control::DaemonState;
 use crate::pairing::Invite;
 use crate::util::{blocking, epoch_now_u64};
 
-use super::accept::reload_accept_loop;
+use super::accept::swap_services;
 use super::config_write::{
     append_allow_to_config, remove_allow_from_config, remove_principal_from_service,
     remove_service_from_config, write_relays, write_service_to_config,
@@ -127,12 +127,15 @@ pub(crate) async fn blob_fetch(
     })
 }
 
-/// Reload the config from disk and hot-swap the accept loop with services rebuilt from it — the
-/// shared read→rebuild→swap tail of every config-mutating control verb ([`register_service`],
-/// [`rename_peer`], [`grant_service_access`], [`revoke_service_access`]). `why` names the mutation
-/// for the reload error (`"reload config after {why}: …"`). The CALLER holds `mesh.reload_lock`
-/// around its whole critical section; this helper takes no lock beyond [`reload_accept_loop`]'s
-/// short-lived `accept_task` swap.
+/// Reload the config from disk and hot-swap the LIVE service registry with services rebuilt from
+/// it — the shared read→rebuild→swap tail of every config-mutating control verb
+/// ([`register_service`], [`rename_peer`], [`grant_service_access`], [`revoke_service_access`]).
+/// `why` names the mutation for the reload error (`"reload config after {why}: …"`). The CALLER
+/// holds `mesh.reload_lock` around its whole critical section; [`swap_services`] itself takes only
+/// the live handle's short write lock.
+///
+/// Post-#54: the swap is visible to connections that are ALREADY open (their next session
+/// reads the new registry), not merely to connections accepted afterwards.
 async fn reload_services_from_disk(mesh: &Arc<MeshState>, why: &str) -> Result<()> {
     let cfg = Config::load(&mesh.config_path)
         .map_err(|e| anyhow::anyhow!("reload config after {why}: {e}"))?;
@@ -144,7 +147,7 @@ async fn reload_services_from_disk(mesh: &Arc<MeshState>, why: &str) -> Result<(
         .lock()
         .expect("ephemeral_services lock not poisoned")
         .clone();
-    reload_accept_loop(
+    swap_services(
         mesh,
         crate::daemon::build_services_with_ephemeral(
             &cfg,
@@ -152,8 +155,7 @@ async fn reload_services_from_disk(mesh: &Arc<MeshState>, why: &str) -> Result<(
             &mesh.limits(),
             &ephemeral,
         ),
-    )
-    .await;
+    );
     Ok(())
 }
 
@@ -316,9 +318,10 @@ pub(crate) async fn add_peer(state: &DaemonState, params: PeerAddParams) -> Resu
 /// as a completed cut-off. Each half stays individually idempotent, so retrying a
 /// partially-failed removal (allow stripped, identity row still present) still finishes clean.
 ///
-/// **Live sessions.** This severs only the ability to establish NEW authorized sessions;
-/// an in-flight mesh session runs to completion (an unpair does not cut live sessions —
-/// roster revocation is the surface that does).
+/// **Live sessions.** Cut immediately, as of #54. The authorization half
+/// ([`revoke_service_access`]) resolves the peer's devices and closes their live connections, so
+/// an unpair no longer leaves in-flight mesh sessions running until the peer happens to
+/// disconnect. Severing is connection-granular (see [`sever_principals`]).
 ///
 /// **Status snapshot.** Not refreshed here — and it no longer needs to be: `status` reads the
 /// config + store LIVE (control.rs `status_result`), so a revoke is reflected immediately even
@@ -895,8 +898,8 @@ pub(crate) async fn set_relays(
 ///
 /// Serialized against `register_service` via `mesh.reload_lock` (SAME lock — a concurrent
 /// register and a pairing-grant must not read the same base config and clobber each other's
-/// write). Reuses `append_allow_to_config`'s atomic write and `reload_accept_loop`'s
-/// abort/respawn (DRY). A service not present in config is logged + skipped (a pairing grant
+/// write). Reuses `append_allow_to_config`'s atomic write and `swap_services`'s
+/// in-place registry swap (DRY). A service not present in config is logged + skipped (a pairing grant
 /// never CREATES a service). Reloads ONLY when the append actually changed the config — an
 /// idempotent re-pair or an all-missing grant is a no-op with no serving blip. (The cached
 /// `status` snapshot is not refreshed here — this runs inside the accept loop's detached pair
@@ -957,15 +960,34 @@ pub(crate) async fn service_allow_grant(
 
 /// Revoke a SINGLE stable `principal` from a SINGLE `service`'s allow (#44, the
 /// `service_allow_revoke` verb) — the per-peer "sharing off" toggle, WITHOUT unpairing (the
-/// peer's `PeerEntry` identity is untouched; only NEW sessions are refused, in-flight ones run
-/// to completion, mirroring [`remove_peer`]). Idempotent + serialized under `reload_lock`,
-/// mirroring [`grant_service_access`]. An absent principal / unknown service is a clean no-op.
+/// peer's `PeerEntry` identity is untouched). A thin `DaemonState` wrapper over
+/// [`revoke_service_allow`], mirroring how [`service_allow_grant`] wraps
+/// [`grant_service_access`].
 pub(crate) async fn service_allow_revoke(
     state: &DaemonState,
     service: String,
     principal: String,
 ) -> Result<()> {
-    let mesh = state.mesh_required()?;
+    revoke_service_allow(state.mesh_required()?, service, principal).await
+}
+
+/// The mesh-level half of `service_allow_revoke`: strip `principal` from `service`'s config
+/// `allow`, hot-swap the live registry, then SEVER the principal's live connections. Idempotent +
+/// serialized under `reload_lock`, mirroring [`grant_service_access`]. An absent principal /
+/// unknown service is a clean no-op for the config half — but the sever still runs, so a live
+/// connection is cut even when the allow was already clean.
+///
+/// Post-#54: revocation is IMMEDIATE. New sessions are refused (the live registry, read per
+/// bi-stream) and in-flight ones are cut (the sever). Previously both waited for the peer to
+/// disconnect on its own.
+///
+/// `pub` (like [`grant_service_access`]) so the integration tests drive the SAME
+/// strip→swap→sever pipeline the control verb drives.
+pub async fn revoke_service_allow(
+    mesh: &Arc<MeshState>,
+    service: String,
+    principal: String,
+) -> Result<()> {
     let _reload = mesh.reload_lock.lock().await;
     let config_path = mesh.config_path.clone();
     let (svc_w, principal_w) = (service.clone(), principal.clone());
@@ -973,11 +995,79 @@ pub(crate) async fn service_allow_revoke(
         remove_principal_from_service(&config_path, &svc_w, &principal_w)
     })
     .await??;
-    if changed {
+    // SWAP-BEFORE-SEVER (#54): swap first so no NEW session admits the principal, THEN cut the
+    // sessions already in flight.
+    //
+    // Gated on `changed` DELIBERATELY. A strip that removed nothing means this principal was not
+    // in that allow, so nothing was revoked — and severing anyway would hand the operator a
+    // visible disconnect that LOOKS like the revoke landed while access is unchanged. Concretely:
+    // `allow = ["b64u:alice"]` and a caller revoking `eid:<alice's device>` strips nothing, but
+    // that device is still admitted via the user_id and would be served again the instant it
+    // redialed. A false "revocation took effect" signal is worse on this surface than a missed
+    // sever, and `api_minor >= 10` is what consumers key that signal off.
+    let severed = if changed {
         reload_services_from_disk(mesh, "service-allow-revoke").await?;
-    }
-    tracing::info!(%service, %principal, changed, "service allow revoked");
+        sever_principal(mesh, &principal).await?
+    } else {
+        0
+    };
+    tracing::info!(%service, %principal, changed, severed, "service allow revoked");
     Ok(())
+}
+
+/// Close every live mesh connection held by one `principal`'s devices. Thin wrapper over
+/// [`sever_principals`] for the single-principal call sites.
+async fn sever_principal(mesh: &Arc<MeshState>, principal: &str) -> Result<usize> {
+    sever_principals(mesh, std::slice::from_ref(&principal.to_string())).await
+}
+
+/// Close every live connection held by ANY of `principals`' devices, returning the number severed.
+///
+/// The liveness half of a revoke (#54): stripping the config `allow` and swapping the live
+/// registry stop NEW sessions, but an in-flight session on an already-open connection keeps running
+/// until the peer disconnects — unbounded for an embedder holding a warm session.
+///
+/// Resolves the WHOLE set in ONE pass (one `store.list()` + one roster-view walk) rather than once
+/// per principal, since `revoke_service_access` routinely passes a device `eid:` and its owner's
+/// `b64u:` together.
+///
+/// **Granularity is the CONNECTION, not the session.** `sever_matching` closes the whole QUIC
+/// connection, so a peer revoked from ONE service also loses in-flight sessions to services it
+/// still holds; it redials and is re-evaluated against the live registry. Per-session cancellation
+/// would need the registry to track sessions by service, and would still not protect the revoked
+/// service's own in-flight stream — the actual hazard. Revocation is an explicit operator action,
+/// so the bluntness is the accepted cost of the verb taking effect NOW.
+///
+/// **It also reaches non-mesh ALPNs.** The registry tracks gossip and blob connections on the same
+/// endpoint id with no ALPN discriminator, so a revoke cuts those too. Availability only (each of
+/// those arms keeps its own gate), and the peer reconnects; documented in `docs/local-protocol.md`
+/// so it is not a surprise.
+///
+/// A principal naming no device (or no live connection) severs nothing.
+async fn sever_principals(mesh: &Arc<MeshState>, principals: &[String]) -> Result<usize> {
+    let store = mesh.store.clone();
+    let roster = mesh.roster.view();
+    let principals_w = principals.to_vec();
+    let targets = blocking("join sever principal resolution", move || {
+        let mut all = std::collections::HashSet::new();
+        for principal in &principals_w {
+            all.extend(crate::daemon::sever::endpoints_for_principal(
+                &store,
+                roster.as_deref(),
+                principal,
+            )?);
+        }
+        anyhow::Ok(all)
+    })
+    .await??;
+    if targets.is_empty() {
+        return Ok(0);
+    }
+    Ok(mesh.conn_registry.sever_matching(
+        mcpmesh_net::CLOSE_UNAUTHORIZED, // 401 — "no longer authorized"
+        b"access revoked",
+        |eid, _| targets.contains(eid),
+    ))
 }
 
 /// Revoke a peer's AUTHORIZATION: resolve the nickname to its devices' STABLE principals
@@ -997,15 +1087,15 @@ pub(crate) async fn service_allow_revoke(
 ///
 /// Serialized against [`register_service`] / [`grant_service_access`] via `mesh.reload_lock` (the
 /// SAME lock — a concurrent config mutation must not read the same base config and clobber this
-/// removal). Reuses [`remove_allow_from_config`]'s atomic write and [`reload_accept_loop`]'s
-/// abort/respawn (DRY — the same helper the grant uses). Reloads ONLY when the removal actually
+/// removal). Reuses [`remove_allow_from_config`]'s atomic write and [`swap_services`]'s
+/// in-place registry swap (DRY — the same helper the grant uses). Reloads ONLY when the removal actually
 /// changed the config (an absent nickname is a no-op with no serving blip). Idempotent: revoking a
 /// nickname not present in any allow returns `Ok(())` with `changed == false` and no reload.
 ///
 /// (Like [`grant_service_access`], the cached `status` snapshot is not refreshed here — but
 /// `status` reads the config + store LIVE (control.rs `status_result`), so the removal shows up
 /// immediately. The durable allow-removal + the live rebuilt `Services` are the functional truth.)
-pub(crate) async fn revoke_service_access(mesh: &Arc<MeshState>, nickname: &str) -> Result<bool> {
+pub async fn revoke_service_access(mesh: &Arc<MeshState>, nickname: &str) -> Result<bool> {
     // SAME serialization as register_service / grant: hold the whole remove→reload→swap section.
     let _reload = mesh.reload_lock.lock().await;
 
@@ -1041,8 +1131,9 @@ pub(crate) async fn revoke_service_access(mesh: &Arc<MeshState>, nickname: &str)
     // 1. Idempotent allow-removal on a blocking thread (config IO blocks) — ONE atomic RMW
     //    over all of the peer's principals.
     let config_path = mesh.config_path.clone();
+    let principals_w = principals.clone(); // the sever below needs them after the write consumes its copy
     let changed = blocking("join revoke config write", move || {
-        remove_allow_from_config(&config_path, &principals)
+        remove_allow_from_config(&config_path, &principals_w)
     })
     .await??;
 
@@ -1053,9 +1144,22 @@ pub(crate) async fn revoke_service_access(mesh: &Arc<MeshState>, nickname: &str)
         reload_services_from_disk(mesh, "revoke").await?;
     }
 
+    // 4. SEVER the peer's live connections (#54). The strip + swap above stop NEW sessions;
+    //    without this, sessions already in flight run to completion on a connection whose peer we
+    //    just de-authorized. Runs AFTER the swap (swap-before-sever, the ordering
+    //    `install_roster_view_and_sever` uses) so a peer racing a redial across the sever meets
+    //    the NEW registry.
+    //
+    //    UNCONDITIONAL of `changed` here — unlike `revoke_service_allow`, which gates on it. The
+    //    caller (`remove_peer`) DELETES the `PeerEntry` right after this returns, so the peer
+    //    loses gate resolve entirely and cannot be re-admitted on redial. There is therefore no
+    //    false "it took effect" signal to worry about: the unpair really did take effect, whether
+    //    or not any allow line happened to name it.
+    let severed = sever_principals(mesh, &principals).await?;
+
     // Return whether an allow was actually stripped so `remove_peer` audits an `unpair` only
     // on a real tear-down (nickname only — NO secret, NO endpoint id).
-    tracing::info!(peer = %nickname, changed, "revoked service access");
+    tracing::info!(peer = %nickname, changed, severed, "revoked service access");
     Ok(changed)
 }
 
