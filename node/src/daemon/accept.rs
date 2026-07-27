@@ -1,7 +1,7 @@
 //! The daemon's ALPN-dispatch accept loop: one loop routing each inbound
 //! connection to the mesh / pairing / ping / gossip / blob handlers, the shared
-//! gate-and-register discipline for the roster-mode arms, and the hot-reload abort/respawn
-//! that swaps the loop with a rebuilt service registry.
+//! gate-and-register discipline for the roster-mode arms, and the hot-reload that swaps the LIVE
+//! service registry the loop serves from.
 
 use std::sync::Arc;
 
@@ -65,23 +65,29 @@ fn gate_and_register(
 /// gate (that is precisely why the mesh-only `serve` is not enough). An unknown ALPN is closed
 /// cleanly.
 ///
-/// Both the initial start (`serve_forever`) and the hot-reload swap (`reload_accept_loop`,
-/// shared by `register_service` and the pairing `grant_service_access`) call this ONE function,
-/// so the loop is defined in exactly one place; the reload path aborts the returned handle and
-/// spawns a fresh loop carrying the rebuilt `services`.
+/// The loop is started ONCE (`serve_forever`) and then runs for the process lifetime. A
+/// hot-reload no longer restarts it: `swap_services` (shared by `register_service` and the pairing
+/// `grant_service_access`) swaps `mesh.services` in place, which the loop and every connection it
+/// has already accepted read live ().
 ///
 /// Takes `Arc<MeshState>` (not the individual parts): the arms read the gate/limits/handles off
 /// it, and the `mcpmesh/pair/1` branch hands the rendezvous the narrow per-connection
 /// [`InviterCtx`](crate::pairing::rendezvous::InviterCtx) the mesh composes (`inviter_ctx` —
-/// store + invites + the grant hook into the reload machinery). Only `services` is passed
-/// alongside because a hot-reload swaps the registry without rebuilding the rest of the mesh.
+/// store + invites + the grant hook into the reload machinery). `services` is passed alongside
+/// only to seed the live handle at startup.
 ///
 /// `pub` (like [`build_services`](crate::daemon::build_services)) so integration tests can drive the SAME accept loop the daemon
 /// runs against in-process endpoints, proving mesh vs. pair ALPN routing.
 pub fn spawn_accept_loop(mesh: Arc<MeshState>, services: Arc<Services>) -> JoinHandle<()> {
+    // INSTALL `services` as the live handle, then serve from that handle forever. The loop
+    // captures only `mesh`: a reload swaps `mesh.services` IN PLACE, so connections this loop has
+    // already accepted resolve their next session against the new registry (). The old
+    // shape captured an `Arc<Services>` here, which is why aborting + respawning the loop could
+    // never reach an open connection.
+    mesh.services.store(services);
     tokio::spawn(async move {
         while let Some(incoming) = mesh.endpoint.accept().await {
-            let (mesh, services) = (mesh.clone(), services.clone());
+            let mesh = mesh.clone();
             tokio::spawn(async move {
                 // Inbound-handshake discipline (preserved from net's `serve`): a failed
                 // handshake drops the connection. The handshake ERROR is logged at debug (a
@@ -105,7 +111,7 @@ pub fn spawn_accept_loop(mesh: Arc<MeshState>, services: Arc<Services>) -> JoinH
                         run_mesh_connection(
                             conn,
                             mesh.gate.clone(),
-                            services,
+                            mesh.services.clone(),
                             mesh.conn_registry.clone(),
                         )
                         .await;
@@ -262,15 +268,16 @@ pub fn spawn_accept_loop(mesh: Arc<MeshState>, services: Arc<Services>) -> JoinH
     })
 }
 
-/// Abort the running accept loop and spawn a fresh one on the same endpoint carrying the
-/// rebuilt `services`. Shared by [`register_service`] and [`grant_service_access`] so the
-/// abort/respawn discipline lives in exactly ONE place (DRY). The CALLER holds
-/// `mesh.reload_lock` for the whole config→reload→swap section; this helper only takes the
-/// short-lived `accept_task` lock for the swap itself.
-pub(crate) async fn reload_accept_loop(mesh: &Arc<MeshState>, services: Services) {
-    let mut guard = mesh.accept_task.lock().await;
-    if let Some(old) = guard.take() {
-        old.abort();
-    }
-    *guard = Some(spawn_accept_loop(mesh.clone(), Arc::new(services)));
+/// Hot-swap the live service registry every accepted connection reads.
+///
+/// Replaces the former abort-and-respawn of the accept loop (): the loop reads
+/// `mesh.services` per connection and `run_mesh_connection` reads it per session, so a swap
+/// reaches connections that are ALREADY open — which respawning could not, because the
+/// per-connection tasks are independent `tokio::spawn`s that aborting the loop never touched.
+/// It also removes the brief window in which no accept loop was running.
+///
+/// Shared by [`register_service`] and [`grant_service_access`] so the discipline lives in exactly
+/// ONE place (DRY). The CALLER holds `mesh.reload_lock` for the whole config→reload→swap section.
+pub(crate) fn swap_services(mesh: &Arc<MeshState>, services: Services) {
+    mesh.services.store(Arc::new(services));
 }

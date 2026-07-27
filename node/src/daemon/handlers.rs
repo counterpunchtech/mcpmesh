@@ -25,7 +25,7 @@ use crate::control::DaemonState;
 use crate::pairing::Invite;
 use crate::util::{blocking, epoch_now_u64};
 
-use super::accept::reload_accept_loop;
+use super::accept::swap_services;
 use super::config_write::{
     append_allow_to_config, remove_allow_from_config, remove_principal_from_service,
     remove_service_from_config, write_relays, write_service_to_config,
@@ -127,12 +127,15 @@ pub(crate) async fn blob_fetch(
     })
 }
 
-/// Reload the config from disk and hot-swap the accept loop with services rebuilt from it — the
-/// shared read→rebuild→swap tail of every config-mutating control verb ([`register_service`],
-/// [`rename_peer`], [`grant_service_access`], [`revoke_service_access`]). `why` names the mutation
-/// for the reload error (`"reload config after {why}: …"`). The CALLER holds `mesh.reload_lock`
-/// around its whole critical section; this helper takes no lock beyond [`reload_accept_loop`]'s
-/// short-lived `accept_task` swap.
+/// Reload the config from disk and hot-swap the LIVE service registry with services rebuilt from
+/// it — the shared read→rebuild→swap tail of every config-mutating control verb
+/// ([`register_service`], [`rename_peer`], [`grant_service_access`], [`revoke_service_access`]).
+/// `why` names the mutation for the reload error (`"reload config after {why}: …"`). The CALLER
+/// holds `mesh.reload_lock` around its whole critical section; [`swap_services`] itself takes only
+/// the live handle's short write lock.
+///
+/// Post-: the swap is visible to connections that are ALREADY open (their next session
+/// reads the new registry), not merely to connections accepted afterwards.
 async fn reload_services_from_disk(mesh: &Arc<MeshState>, why: &str) -> Result<()> {
     let cfg = Config::load(&mesh.config_path)
         .map_err(|e| anyhow::anyhow!("reload config after {why}: {e}"))?;
@@ -144,7 +147,7 @@ async fn reload_services_from_disk(mesh: &Arc<MeshState>, why: &str) -> Result<(
         .lock()
         .expect("ephemeral_services lock not poisoned")
         .clone();
-    reload_accept_loop(
+    swap_services(
         mesh,
         crate::daemon::build_services_with_ephemeral(
             &cfg,
@@ -152,8 +155,7 @@ async fn reload_services_from_disk(mesh: &Arc<MeshState>, why: &str) -> Result<(
             &mesh.limits(),
             &ephemeral,
         ),
-    )
-    .await;
+    );
     Ok(())
 }
 
@@ -895,7 +897,7 @@ pub(crate) async fn set_relays(
 ///
 /// Serialized against `register_service` via `mesh.reload_lock` (SAME lock — a concurrent
 /// register and a pairing-grant must not read the same base config and clobber each other's
-/// write). Reuses `append_allow_to_config`'s atomic write and `reload_accept_loop`'s
+/// write). Reuses `append_allow_to_config`'s atomic write and `swap_services`'s
 /// abort/respawn (DRY). A service not present in config is logged + skipped (a pairing grant
 /// never CREATES a service). Reloads ONLY when the append actually changed the config — an
 /// idempotent re-pair or an all-missing grant is a no-op with no serving blip. (The cached
@@ -997,7 +999,7 @@ pub(crate) async fn service_allow_revoke(
 ///
 /// Serialized against [`register_service`] / [`grant_service_access`] via `mesh.reload_lock` (the
 /// SAME lock — a concurrent config mutation must not read the same base config and clobber this
-/// removal). Reuses [`remove_allow_from_config`]'s atomic write and [`reload_accept_loop`]'s
+/// removal). Reuses [`remove_allow_from_config`]'s atomic write and [`swap_services`]'s
 /// abort/respawn (DRY — the same helper the grant uses). Reloads ONLY when the removal actually
 /// changed the config (an absent nickname is a no-op with no serving blip). Idempotent: revoking a
 /// nickname not present in any allow returns `Ok(())` with `changed == false` and no reload.

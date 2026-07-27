@@ -132,9 +132,10 @@ pub struct MeshState {
     /// `RwLock` (std, never held across await; read-clone via [`self_nickname`](Self::self_nickname)).
     /// The redeemer stores it as its local name for us.
     pub(crate) self_nickname: std::sync::RwLock<String>,
-    /// The daemon's own ALPN-dispatch accept loop (see [`spawn_accept_loop`]). Hot-reload
-    /// takes it, `.abort()`s it, and installs a fresh loop with the rebuilt registry — a brief
-    /// serving blip is acceptable.
+    /// The daemon's own ALPN-dispatch accept loop (see [`spawn_accept_loop`]). Started once and
+    /// held for the process lifetime: since  a hot-reload swaps [`services`](Self::services)
+    /// in place rather than aborting and respawning this loop, so there is no serving blip and a
+    /// reload reaches connections that are already open.
     pub(crate) accept_task: tokio::sync::Mutex<Option<JoinHandle<()>>>,
     /// The running HTTPS roster-poll loop, if `[roster].url` is set. `None` until a URL is
     /// pinned. Held so [`respawn_poll_loop`] can ABORT+REPLACE it — a runtime `set_roster_url`
@@ -171,6 +172,13 @@ pub struct MeshState {
     /// [`spawn_accept_loop`] threads it into [`run_mesh_connection`] (CHECK-register on accept); the
     /// install path calls [`ConnRegistry::sever_matching`] against it.
     pub(crate) conn_registry: Arc<ConnRegistry>,
+    /// The LIVE service registry every accepted connection resolves its sessions against.
+    /// Installed by [`spawn_accept_loop`] and hot-swapped by
+    /// [`swap_services`](crate::daemon::accept::swap_services) on every reload (grant, revoke,
+    /// register, roster install) — so a reload reaches connections that are ALREADY open, which
+    /// the old abort-and-respawn of the accept loop never did (). Swapping in place also
+    /// removes the window in which the accept loop was down.
+    pub(crate) services: Arc<mcpmesh_net::LiveServices>,
     /// The roster/presence gossip handle + roster-blob transport, spawned on the
     /// daemon's ONE endpoint (). `None` in a pure-pairing daemon (no org root
     /// pinned) — no gossip is spawned, exactly the pairing-only behavior. [`spawn_accept_loop`]'s gossip/blob
@@ -302,6 +310,11 @@ impl MeshState {
             applied_relays: std::sync::Mutex::new(RelayPosture::default()),
             roster,
             conn_registry,
+            // Empty until `spawn_accept_loop` installs the built registry; nothing serves before
+            // then, so an empty live handle is never read.
+            services: Arc::new(mcpmesh_net::LiveServices::new(Arc::new(
+                mcpmesh_net::Services::new(std::collections::HashMap::new()),
+            ))),
             gossip,
             blobs,
             roster_topic: tokio::sync::Mutex::new(roster_topic),
@@ -550,7 +563,7 @@ impl MeshState {
     /// (completes the construction chicken-egg). Also used to seed the handle a later
     /// hot-reload aborts.
     ///
-    /// Take-and-abort any prior handle first (mirroring `reload_accept_loop`): a stray second
+    /// Take-and-abort any prior handle first (mirroring the accept-loop start): a stray second
     /// call would otherwise DROP the previous `JoinHandle` — detaching, not stopping, its loop —
     /// leaving two loops accepting on one endpoint. Latent today (each caller invokes once), but
     /// this keeps the invariant self-healing rather than silently doubling the accept loop.

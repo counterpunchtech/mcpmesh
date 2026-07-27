@@ -26,8 +26,8 @@ pub mod registry;
 pub mod service;
 pub mod transport;
 pub use endpoint::{
-    ALPN_MCP, ALPN_PAIR, ALPN_PING, CLOSE_UNAUTHORIZED, ConnectError, ServeHandle, ServiceEntry,
-    Services, SessionBackend, SessionTransport, connect, run_mesh_connection, serve,
+    ALPN_MCP, ALPN_PAIR, ALPN_PING, CLOSE_UNAUTHORIZED, ConnectError, LiveServices, ServeHandle,
+    ServiceEntry, Services, SessionBackend, SessionTransport, connect, run_mesh_connection, serve,
 };
 pub use framing::{
     FrameReader, Inbound, MAX_FRAME_BYTES, StrikeOutcome, Strikes, Violation, write_frame,
