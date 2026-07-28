@@ -482,20 +482,33 @@ where
 }
 
 /// Caller side: dial `peer`, open one session bi-stream, and return the framed
-/// transport. The caller writes the `initialize` frame naming the service in the
-/// params `_meta["mcpmesh/service"]`; the server strips the reserved key before
-/// any backend sees it. `service` is accepted here only to name the dial in
+/// transport ALONGSIDE the connection it rides. The caller writes the
+/// `initialize` frame naming the service in the params
+/// `_meta["mcpmesh/service"]`; the server strips the reserved key before any
+/// backend sees it. `service` is accepted here only to name the dial in
 /// errors/traces — the caller already holds it. `open_bi()` yields
 /// `(send, recv)`.
+///
+/// **The `Connection` is returned as of #92 item 2, and that is a BREAKING
+/// change.** It previously returned `SessionTransport` alone — an alias for
+/// `NdjsonTransport<RecvStream, SendStream>`, i.e. the QUIC *streams* — and
+/// dropped the connection here. Sessions still worked, because quinn's streams
+/// keep the connection alive internally, but nothing upstream could observe it:
+/// no `path_events()`, no `paths()`, no per-session path signal of any kind.
+///
+/// A caller that only wants the transport can `.0` it. The connection is
+/// returned rather than a watcher being spawned here on purpose: `net` has no
+/// knowledge of the reachability cache, and pushing the watcher down would mean
+/// plumbing a callback through a lower layer for one caller's benefit.
 pub async fn connect(
     endpoint: &iroh::Endpoint,
     peer: iroh::EndpointAddr,
     service: &str,
-) -> Result<SessionTransport, ConnectError> {
+) -> Result<(SessionTransport, iroh::endpoint::Connection), ConnectError> {
     tracing::debug!(service, "dialing mesh service");
     let conn = endpoint.connect(peer, ALPN_MCP).await?;
     let (send, recv) = conn.open_bi().await?;
-    Ok(SessionTransport::new(recv, send, MAX_FRAME_BYTES))
+    Ok((SessionTransport::new(recv, send, MAX_FRAME_BYTES), conn))
 }
 
 #[cfg(test)]

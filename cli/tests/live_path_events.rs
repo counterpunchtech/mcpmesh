@@ -10,8 +10,10 @@
 //! drops the connection, so the transition happens on a connection nobody is watching. That is the
 //! whole reason this suite is separate from `peer_path.rs`.
 //!
-//! The assertion that makes this about LIVE signal rather than probing: `probe_seq` must not have
-//! advanced. If a probe ran, the frame proves nothing new — item (1) already covers that path.
+//! The assertion that makes this about LIVE signal rather than probing: `rtt_ms` must be `None`. A
+//! probe measures a round trip and reports `Some(rtt)`; the watcher observes a path and never
+//! fabricates a measurement. `probe_seq` is NOT the discriminator — the watcher shares that counter
+//! with `probe_peer` on purpose, so a correct implementation advances it.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -148,12 +150,25 @@ async fn a_live_relay_to_direct_transition_pushes_a_frame() {
             "the frame must report the path the session ACTUALLY moved to"
         );
 
-        // The point of the suite: this came from the LIVE session, not a probe. If a probe ran,
-        // item (1) already emits and this test proves nothing about item (2).
+        // The point of the suite: this came from the LIVE session, not a probe. If a probe drove
+        // it, item (1) already emits and this test proves nothing about item (2).
+        //
+        // `rtt_ms` is the discriminator, NOT the probe ticket. An earlier draft asserted
+        // `probe_seq` was unchanged; that was wrong, because the watcher deliberately SHARES the
+        // ticket counter with `probe_peer` — that shared ordering is what stops an in-flight probe
+        // overwriting a fresher live observation. A correct implementation therefore advances it.
+        //
+        // A probe measures a round trip and reports `Some(rtt)`. The watcher observes a path and
+        // never fabricates a measurement, so a watcher-seeded entry carries `None`.
         assert_eq!(
-            mesh.probe_seq_for_test(),
-            seq_before,
-            "no probe may have run — a probe-driven frame is item (1), already shipped in 0.19.0"
+            frame.rtt_ms, None,
+            "the frame must be watcher-seeded: a probe-driven row carries a measured rtt_ms, and \
+             a probe-driven path frame is item (1), already shipped in 0.19.0"
+        );
+        assert!(
+            mesh.probe_seq_for_test() > seq_before,
+            "the watcher must TAKE a ticket — sharing probe_peer's counter is what keeps an \
+             in-flight probe from overwriting this observation"
         );
     })
     .await
