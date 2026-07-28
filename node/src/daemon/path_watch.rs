@@ -26,9 +26,6 @@ use mcpmesh_local_api::PeerPath;
 /// relay→direct transition of a healthy dial, so it needs its own damping. Same 600ms as
 /// `reach::PATH_SETTLE` and for the same reason: it is the measured time for a loopback punch to
 /// settle, and it is well inside any session's lifetime.
-// Consumed by the watcher loop in the next commit (Task 3); CI runs clippy -D warnings, so the
-// gap between the pure rule landing and its caller landing must not leave the branch red.
-#[allow(dead_code)]
 pub(crate) const PATH_CHANGE_SETTLE: Duration = Duration::from_millis(600);
 
 /// Should an observation be committed and emitted?
@@ -40,7 +37,6 @@ pub(crate) const PATH_CHANGE_SETTLE: Duration = Duration::from_millis(600);
 /// only when the observation DIFFERS from what a consumer already believes. A watcher that emits
 /// on every event turns a flapping connection into a frame storm, which is the noise #64 avoided
 /// by excluding `path` entirely.
-#[allow(dead_code)]
 pub(crate) fn decide(observed: &PeerPath, cached: Option<&PeerPath>) -> Option<PeerPath> {
     // `Unknown` is never worth emitting: it means "we do not know", and pushing it would replace a
     // consumer's correct belief with an absence of one. A connection tearing down reports Unknown
@@ -54,6 +50,62 @@ pub(crate) fn decide(observed: &PeerPath, cached: Option<&PeerPath>) -> Option<P
     }
 }
 
+/// Watch ONE session's selected path and emit when it settles on something new (#92 item 2).
+///
+/// Ends when the connection does — `path_events()` is documented to end on close — so the task is
+/// bounded by the session and needs no separate shutdown path. #61 cost a release to a detached
+/// task holding a lock; this one holds no lock and no strong connection handle.
+///
+/// **It must NOT hold a `Connection`.** Re-reading the path after the settle window needs a
+/// `&Connection`, but a clone kept for the task's life would keep the session open until the task
+/// exits — and the task exits when the session closes. That is a deadlock, and it would make the
+/// "dies with its connection" property untestable. A [`WeakConnectionHandle`] is upgraded per read
+/// instead: if the upgrade fails the connection is gone and the watcher stops, which is correct.
+///
+/// [`WeakConnectionHandle`]: iroh::endpoint::WeakConnectionHandle
+pub(crate) fn spawn(
+    mesh: std::sync::Arc<super::MeshState>,
+    endpoint_id: [u8; 32],
+    conn: &iroh::endpoint::Connection,
+) {
+    let mut events = conn.path_events();
+    let weak = conn.weak_handle();
+    tokio::spawn(async move {
+        use n0_future::StreamExt as _;
+        while let Some(event) = events.next().await {
+            match event {
+                // The only event that means "application data moved" — the same semantics #64
+                // settled on via `is_selected()`.
+                iroh::endpoint::PathEvent::Selected { .. } => {}
+                // The consumer fell behind. iroh documents the CURRENT selected path as still
+                // recoverable from `Connection::paths()`, so re-read rather than skip: on a stable
+                // session the event we dropped may be the only one there will ever be, and
+                // skipping it is how the indicator stays wrong.
+                iroh::endpoint::PathEvent::Lagged { missed, .. } => {
+                    tracing::debug!(missed, "path events lagged; re-reading current path");
+                }
+                // Opened/Closed alone do not move application data; the Selected event that
+                // follows a meaningful change is what we act on.
+                _ => continue,
+            }
+            // Ticket FIRST, before observing — ordering is by observation START, exactly as
+            // `probe_peer` does it. See `commit_observation`.
+            let seq = mesh
+                .probe_seq
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Let the change HOLD before believing it. `settle` returns early on `Direct`, so a
+            // relay→direct recovery reports promptly, while a flap that returns to Direct inside
+            // the window reports Direct and `decide` then finds nothing changed — no frame.
+            let Some(strong) = weak.upgrade() else { break };
+            let observed =
+                super::reach::settle(PATH_CHANGE_SETTLE, || super::reach::selected_path(&strong))
+                    .await;
+            drop(strong);
+            commit_observation(&mesh, endpoint_id, seq, &observed);
+        }
+    });
+}
+
 /// Commit a settled observation for `endpoint_id` and emit if it changed anything.
 ///
 /// **The watcher is a SECOND writer to the reachability cache**, alongside `probe_peer`. That is
@@ -65,7 +117,6 @@ pub(crate) fn decide(observed: &PeerPath, cached: Option<&PeerPath>) -> Option<P
 /// Only `path` is the watcher's to set. `reachable`/`rtt_ms`/`meta`/`services` come from a probe's
 /// pong; a live connection carrying data IS reachability evidence, but inventing an `rtt_ms` from a
 /// path event would be a fabricated measurement, so a seeded entry carries `rtt_ms: None`.
-#[allow(dead_code)]
 pub(crate) fn commit_observation(
     mesh: &std::sync::Arc<super::MeshState>,
     endpoint_id: [u8; 32],
