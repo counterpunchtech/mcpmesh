@@ -15,18 +15,25 @@
 //! connection, so a punch that misses the window leaves nothing cached and the next probe restarts.
 //! Twelve probes are twelve independent attempts, not one cumulative wait.
 //!
-//! **Known coverage limit.** This suite pins that a relayed peer eventually reports `Direct` once
-//! hole-punching completes, which catches the address-map derivation bug. It NO LONGER catches the
-//! other #64 bug, classifying before the path settles: holding the connection open means a probe's
-//! fresh dial finds an already-validated direct address, so a zeroed `PATH_SETTLE` passes here.
-//! That property moved to `reach.rs`'s
-//! `the_probe_waits_for_the_direct_path_instead_of_classifying_immediately`, which drives it on
-//! tokio's test clock instead of a real hole-punch. Verified by mutation, in both directions.
-//! It also does NOT distinguish a classifier that reads the
-//! SELECTED path from one that reads open paths in iteration order: mutating `is_selected()` away
-//! still passes, because the probe connection surfaces the direct path first. That guarantee rests
-//! on iroh's documented semantics for `Path::is_selected()` and on reading its source, not on a
-//! test. Worth revisiting if iroh exposes a way to force path ordering.
+//! **Known coverage limits — measured by mutation, not estimated.** What this suite still catches
+//! is exactly one thing: deriving the path from the endpoint's ADDRESS MAP rather than from the
+//! connection. Mutating `probe_once` to classify from `remote_info()` — where the relay entry stays
+//! alongside the direct one — fails it with an all-`Relay` sample set. That is the bug #64 shipped,
+//! and it stays pinned.
+//!
+//! It does NOT catch, and must not be claimed to:
+//!
+//! - **Classifying before the path settles.** Holding the connection open means a probe's fresh
+//!   dial inherits an already-selected direct path, so a zeroed `PATH_SETTLE` passes here. The
+//!   window's LOGIC moved to `reach.rs`'s
+//!   `the_probe_waits_for_the_direct_path_instead_of_classifying_immediately` (tokio test clock,
+//!   deterministic); the window's USE at the `settled_path` call site is pinned by nothing — see
+//!   that function's doc comment.
+//! - **Reading the SELECTED path rather than any open one.** Once the punch has landed the probe's
+//!   connection carries a single direct path and no relay path at all, so `is_selected()` has
+//!   nothing to discriminate: removing the guard passes, and so does returning `Relay` whenever any
+//!   relay path is open. That guarantee rests on iroh's documented semantics and on reading its
+//!   source, not on this test. Worth revisiting if iroh exposes a way to force path ordering.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -136,15 +143,20 @@ async fn the_path_reports_the_route_data_actually_takes() {
         // SETUP FIRST, and HOLD the connection open for the rest of the test (#110).
         //
         // This ordering is the whole point. `probe_peer` dials a FRESH connection, waits at most
-        // `PATH_SETTLE` (600ms) for hole-punching, then DROPS it. When the punch does not land
-        // inside that window — routine on a loaded CI runner — the connection dies before the
-        // direct path is validated, so nothing is cached and the next probe starts over. Probing in
-        // a loop therefore does not converge: it is twelve independent 600ms attempts, not one
-        // cumulative 6s wait, and it reported Relay twelve times on both Windows and Linux.
+        // `PATH_SETTLE` (600ms) for hole-punching, then DROPS it. Closing the last connection
+        // clears the remote's SELECTED path (`remote_state.rs`), so the next probe must re-select
+        // inside its own 600ms window — twelve probes are twelve chances at that, not one
+        // cumulative 6s wait. It reported Relay twelve times on both Windows and Linux.
         //
-        // Holding ONE connection lets the punch complete once. The endpoint then has a validated
-        // direct address for this peer, so every later dial selects it promptly. That is also what
-        // production does — real sessions are long-lived, not 600ms probes.
+        // (Address knowledge itself is NOT lost: iroh retains previously-established paths as
+        // Inactive for ACTOR_MAX_IDLE_TIMEOUT = 60s, explicitly "to keep data about previous path
+        // around for subsequent connections". An earlier draft of this comment claimed nothing was
+        // cached; that was wrong. What is lost per connection is the selection, not the address.)
+        //
+        // Holding ONE connection lets the punch land once and STAY selected: a remote-global
+        // selected path is applied to every later connection at registration, so subsequent dials
+        // come up direct by construction rather than by re-punching. That also models production,
+        // where sessions are long-lived rather than 600ms probes.
         let probe_conn = mesh_endpoint_dial(&mesh, peer_id, &relay_url).await;
         let (mut relay_open, mut direct_selected) = (false, false);
         // Generous: this is waiting for the NETWORK, not asserting a latency budget. A tight bound
@@ -181,9 +193,14 @@ async fn the_path_reports_the_route_data_actually_takes() {
 
         // Now the behavioural assertion, with the punch already landed. A probe still opens its own
         // connection, so it must still classify correctly — but it is no longer racing the network.
+        //
+        // Four attempts, not twelve: with a selected path already established the FIRST probe is
+        // expected to report Direct, and the extra samples exist only to absorb a scheduling hiccup.
+        // Twelve was sized for the old structure, where each attempt was an independent punch — and
+        // at 3.5s worst case apiece it pushed the in-block worst case past this test's own timeout.
         let mut seen = Vec::new();
         let mut got_direct = false;
-        for _ in 0..12 {
+        for _ in 0..4 {
             let entry = daemon::probe_peer(&mesh, peer_id).await;
             assert!(entry.reachable, "the peer must be reachable over the relay");
             seen.push(entry.path.clone());
@@ -198,8 +215,10 @@ async fn the_path_reports_the_route_data_actually_takes() {
             "with a direct path available, the field must eventually report Direct — reporting \
              Relay forever is the bug this suite exists to catch. Saw: {seen:?}"
         );
-        // Keep the connection alive to here: dropping it earlier would let the endpoint discard the
-        // validated direct path mid-test and reintroduce exactly the race this fix removes.
+        // Hold the connection to here so the remote keeps a SELECTED path for the probes above to
+        // inherit. (Dropping it earlier does not lose the ADDRESS — iroh retains that for 60s — only
+        // the selection, which is the part the probes rely on. Measured: the test passes either way
+        // on a fast machine, so this is insurance for a loaded runner, not a load-bearing assertion.)
         drop(probe_conn);
 
         // Whatever it reported along the way, it must never have been a value we do not model.

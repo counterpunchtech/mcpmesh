@@ -152,6 +152,15 @@ const PATH_SETTLE: Duration = Duration::from_millis(600);
 /// Returns as soon as a DIRECT path is selected; otherwise polls until [`PATH_SETTLE`] elapses and
 /// reports whatever is selected then — a genuinely relayed peer costs the full window once per
 /// probe, and reports `Relay`, which is the truthful answer for it.
+///
+/// **This one line is NOT covered by any test (#110 review).** [`settle`]'s logic is pinned below,
+/// but nothing catches this call site passing `Duration::ZERO` instead of [`PATH_SETTLE`] — that
+/// mutation reintroduces the exact #64 regression (every peer reports `Relay` on a relay-enabled
+/// node) with the whole suite green. Verified by mutation, not assumed. Pinning it needs a probe
+/// against a real connection whose punch has not yet landed, which is precisely the timing race
+/// that made this suite flaky; a latency assertion is not an option either, since timing
+/// assertions on a loaded machine have lied to this repo before. Kept as a deliberate, stated gap
+/// rather than a claim of coverage.
 async fn settled_path(conn: &iroh::endpoint::Connection) -> mcpmesh_local_api::PeerPath {
     settle(PATH_SETTLE, || selected_path(conn)).await
 }
@@ -163,6 +172,8 @@ async fn settled_path(conn: &iroh::endpoint::Connection) -> mcpmesh_local_api::P
 /// depend on CI network luck. The e2e test proves we read the SELECTED path; this proves we WAIT
 /// for it. Neither test can cover both without one of them going vacuous — reordering the e2e test
 /// to be non-flaky silently stopped it catching a zeroed `PATH_SETTLE`.
+///
+/// Note the seam covers the WINDOW's behaviour, not the window's USE — see [`settled_path`].
 async fn settle<F>(window: Duration, mut probe: F) -> mcpmesh_local_api::PeerPath
 where
     F: FnMut() -> mcpmesh_local_api::PeerPath,
