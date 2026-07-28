@@ -219,7 +219,18 @@ fn sanitize_relay_url(url: &iroh::RelayUrl) -> String {
 fn is_transition(previous: Option<&ReachEntry>, current: &ReachEntry) -> bool {
     match previous {
         None => current.reachable,
-        Some(prev) => prev.reachable != current.reachable,
+        // #92: `path` counts, `rtt_ms`/`meta` do not. #64 grouped path with the advisory drift
+        // fields, which was wrong — and the same release's own docs are what prove it. `Direct` is
+        // the only value that supports a locality claim, and rendering `Unknown` as private is
+        // documented as "the one misuse that turns this field into a false privacy statement". A
+        // field carrying a truth claim about WHERE USER DATA WENT cannot be advisory: without this,
+        // a session that degrades Direct -> Relay stays silently mislabelled as private for its
+        // whole duration, and the only fallback is polling a 20s-TTL cache.
+        //
+        // Flapping was #64's stated reason for excluding it. `settled_path` already applies the
+        // 600ms PATH_SETTLE window, so the cached value is post-hole-punch, and probes are TTL-gated
+        // — a peer cannot emit more than once per refresh regardless.
+        Some(prev) => prev.reachable != current.reachable || prev.path != current.path,
     }
 }
 
@@ -547,6 +558,26 @@ mod tests {
         assert!(
             !is_transition(Some(&entry(false, None)), &entry(false, None)),
             "still offline"
+        );
+
+        // #92: a PATH change IS a transition, even with the verdict unchanged — unlike rtt/meta
+        // drift above. `Direct` is a truth claim about where the traffic went, so a silent
+        // Direct -> Relay leaves an embedder rendering "private" about a relayed session.
+        let mut relayed = entry(true, Some(9));
+        relayed.path = mcpmesh_local_api::PeerPath::Relay { url: None };
+        let mut direct = entry(true, Some(9));
+        direct.path = mcpmesh_local_api::PeerPath::Direct;
+        assert!(
+            is_transition(Some(&direct), &relayed),
+            "Direct -> Relay must emit: the privacy indicator just became wrong"
+        );
+        assert!(
+            is_transition(Some(&relayed), &direct),
+            "and Relay -> Direct, so a recovered session can be relabelled"
+        );
+        assert!(
+            !is_transition(Some(&direct), &direct.clone()),
+            "but an unchanged path still does not emit once per TTL"
         );
 
         // Metadata drift alone is likewise not a transition.
