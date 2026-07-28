@@ -82,3 +82,10 @@ tempfile.workspace = true
 # EndpointId leaks into a refusal's logs.
 tracing-subscriber = "0.3"
 serde_json.workspace = true
+
+# #116: `iroh::test_utils::run_relay_server` + the self-signed CA config, so the relay-only
+# selector can be proven END TO END against a real in-process relay rather than argued about.
+# Dev-only: under resolver "3" these features do not leak into `cargo build`, so the production
+# feature gate is unaffected.
+iroh = { workspace = true, features = ["test-utils"] }
+iroh-relay = { version = "1", features = ["test-utils"] }

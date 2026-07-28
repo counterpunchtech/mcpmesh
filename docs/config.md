@@ -65,34 +65,26 @@ are in the [operator runbook §5](operator.md#5-self-hosting-relay--discovery-10
 An unknown mode, or a `"custom"` mode without its URL list, is a **startup error** — the daemon
 refuses to run rather than silently falling back to public infrastructure.
 
-### `relay_only` — what it does and does not do
+### `relay_only` — CURRENTLY NON-FUNCTIONAL (#116)
 
-Relay behaviour is otherwise only testable by physically breaking direct connectivity (#116 was
-filed after moving a machine onto a phone hotspot, twice). The trap: **two machines on a LAN with
-IPv6 hole-punch direct**, so a "WAN" test on different subnets can silently still be direct.
+> **Do not rely on this flag.** Measured end to end (`relay_only_keeps_data_on_the_relay_while_a_direct_path_exists`,
+> `#[ignore]`d in `node/src/daemon/boot.rs`): on loopback with a real relay, the client's connection
+> has exactly **one** path — direct IP — from the first sample onward. **No relay path is ever
+> present**, so the selector has nothing to select and traffic goes direct.
 
-**It selects the relay path when one is OPEN; it does not prevent hole-punching, and it is not a
-guarantee.** A direct path may still form — it simply never carries application data while a relay
-path exists. But if **no** relay path is open (hermetic mode, an unreachable relay, or the window
-before the relay connects), the selector selects nothing and traffic takes whatever iroh already
-chose — usually **direct**, with no error. `doctor` warns for the configurations it can detect;
-check `status`, which reports `direct`/`relay` honestly because the field is derived from which path
-iroh actually selected.
+The mechanism is the problem, not the wiring. A `PathSelector` chooses among paths iroh has
+**already opened**. When a direct path wins, there is no relay path open to choose — so precisely in
+the situation the flag exists for (a direct path is available, force the relay anyway) it does
+nothing. iroh's own `RelayOnly` works at the socket layer and also suppresses hole-punching; that is
+not reachable through the public `path_selector` API.
 
-**It is behind a cargo feature on purpose.** It compiles against `iroh`'s `path_selector`, which
-iroh gates behind `unstable-custom-transports` and documents as *"not covered by semantic versioning
-guarantees and may change in any release without a major version bump"*. mcpmesh exact-pins iroh to
-control that risk, so a production build must never depend on it:
+`mcpmesh doctor` warns when the flag is set on a binary without the `unstable-relay-only` feature,
+and when it is set alongside a hermetic `relay_mode`. It cannot warn about the case above, because
+nothing is detectably wrong at config time.
 
-```bash
-cargo build -p mcpmesh-node --features unstable-relay-only
-```
+**To actually verify relayed behaviour today, break direct connectivity** — which is the situation
+#116 was filed to escape. The issue remains open.
 
-**Not yet covered end to end.** The selector's `select()` cannot be *unit*-tested — iroh exposes no
-public constructor for a path-selection context. An end-to-end test IS possible and is not yet
-written: `iroh::test_utils::run_relay_server()` gives a hermetic harness with a real relay (the
-`peer_path` suite already uses it), so a two-endpoint test asserting `PeerPath::Relay` with the
-feature on is achievable. Until it exists, validate on real hardware before trusting this flag.
 
 ## `[limits]`
 
