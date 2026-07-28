@@ -780,20 +780,117 @@ mod tests {
         assert!(!plain.relay_only, "default must be off");
     }
 
-    // #116: the SELECTOR'S LOGIC IS NOT UNIT-TESTED, and that is a limitation of iroh's API rather
-    // than an omission here. `PathSelectionContext` has no public constructor — iroh's own
-    // `for_test` helpers are `pub(crate)` — so there is no way to hand the selector a candidate set
-    // from outside the crate.
+    // #116: `select()` itself cannot be UNIT-tested — iroh's `PathSelectionContext` has no public
+    // constructor (`for_test` is `pub(crate)`), so there is no way to hand the selector a candidate
+    // set from outside the crate. But the property that matters is end-to-end, and THAT is
+    // testable: `iroh::test_utils::run_relay_server()` gives a hermetic harness with a real relay.
     //
-    // A test asserting `format!("{selector:?}")` was written and DELETED: it exercised nothing and
-    // would have read as coverage for the one property that matters ("picks relay over direct").
-    //
-    // What IS covered here: the config field parses on any build, defaults off, and the
-    // feature-off path warns rather than ignoring silently. What is NOT: that traffic actually
-    // takes the relay. That needs a real relay and two hosts, which the hermetic harness cannot
-    // provide (relays are disabled there, so there would be no relay path to select) — and it is
-    // precisely what the issue's filer offered to run on their two-machine Mac<->Jetson setup.
-    // Validate there before trusting this flag.
+    // An earlier version of this comment claimed a hermetic harness could not cover it "because
+    // relays are disabled there". That was wrong — `cli/tests/peer_path.rs` had been using
+    // `run_relay_server()` since #64. The test below is what that claim should have been.
+
+    /// #116: with the relay-only selector installed, application data takes the RELAY even though
+    /// a direct path is available and iroh would otherwise select it.
+    ///
+    /// Both endpoints are on loopback with a real in-process relay, so a direct path IS reachable
+    /// and hole-punching succeeds — `peer_path.rs` asserts exactly that for the default selector.
+    /// Here the selected path must be the relay regardless, which is the whole feature.
+    /// **THIS TEST CURRENTLY FAILS, AND THAT IS THE POINT.** It documents that `relay_only` does
+    /// NOT deliver what it claims, measured rather than argued.
+    ///
+    /// Observed on loopback with a real in-process relay: the client's connection has exactly ONE
+    /// path — direct IP, never `is_selected()` — at every sample from the first. **No relay path
+    /// is ever present**, so `RelayOnlySelector` has no relay candidate, returns
+    /// `PathSelection::none()`, and iroh keeps whatever it was already doing.
+    ///
+    /// So a `PathSelector` cannot implement relay-only: it chooses among paths iroh has ALREADY
+    /// opened, and when a direct path wins there is no relay path open to choose. iroh's own
+    /// `RelayOnly` works at the socket layer (it also suppresses hole-punching) and is not
+    /// reachable through the public `path_selector` API.
+    ///
+    /// `#[ignore]` so it does not fail the suite while the feature is known-broken; run it with
+    /// `--ignored` to re-measure. Un-ignore when the mechanism is fixed — do not delete it.
+    #[cfg(feature = "unstable-relay-only")]
+    #[ignore = "#116: relay_only is non-functional — a PathSelector cannot force the relay; see the doc comment"]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn relay_only_keeps_data_on_the_relay_while_a_direct_path_exists() {
+        use std::time::Duration;
+        tokio::time::timeout(Duration::from_secs(90), async {
+            let (relay_map, _relay_url, _guard) = iroh::test_utils::run_relay_server()
+                .await
+                .expect("in-process relay");
+
+            // The SERVER accepts; only the client forces relay-only, so this proves the selector
+            // and not merely "both ends refused to hole-punch".
+            let server = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .relay_mode(iroh::RelayMode::Custom(relay_map.clone()))
+                .ca_tls_config(iroh_relay::tls::CaTlsConfig::insecure_skip_verify())
+                .alpns(vec![b"mcpmesh/relayonly/test".to_vec()])
+                .bind()
+                .await
+                .expect("bind server");
+            let server_addr = server.addr();
+            tokio::spawn(async move {
+                while let Some(incoming) = server.accept().await {
+                    if let Ok(conn) = incoming.await
+                        && let Ok((mut send, _recv)) = conn.accept_bi().await
+                    {
+                        let _ = send.write_all(b"ok").await;
+                        let _ = send.finish();
+                    }
+                }
+            });
+
+            let client = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .relay_mode(iroh::RelayMode::Custom(relay_map))
+                .ca_tls_config(iroh_relay::tls::CaTlsConfig::insecure_skip_verify())
+                .path_selector(std::sync::Arc::new(super::RelayOnlySelector))
+                .bind()
+                .await
+                .expect("bind client");
+
+            let conn = client
+                .connect(server_addr, b"mcpmesh/relayonly/test")
+                .await
+                .expect("connect over the relay");
+            let (mut send, mut recv) = conn.open_bi().await.expect("open bi");
+            send.write_all(b"hi").await.unwrap();
+            send.finish().unwrap();
+            let _ = recv.read_to_end(64).await;
+
+            // Give hole-punching every chance to succeed and be selected. The default selector
+            // WOULD switch to direct here — that is what `peer_path.rs` asserts — so if we still
+            // read a relay path as selected, the selector is doing the work.
+            let mut direct_available = false;
+            let mut selected_relay = false;
+            for _ in 0..40 {
+                for p in &conn.paths() {
+                    if p.is_ip() {
+                        direct_available = true;
+                    }
+                    if p.is_relay() && p.is_selected() {
+                        selected_relay = true;
+                    }
+                }
+                if direct_available && selected_relay {
+                    break;
+                }
+            }
+
+            assert!(
+                direct_available,
+                "SETUP: loopback must offer a direct path, or this proves nothing — the selector \
+                 would trivially pick the only path there is"
+            );
+            assert!(
+                selected_relay,
+                "relay_only must keep DATA on the relay while a direct path is available; the \
+                 default selector switches to direct here (peer_path.rs asserts that)"
+            );
+        })
+        .await
+        .expect("relay-only e2e timed out");
+    }
 
     /// #105: a BOOTED daemon must have the relay-ready ticket wait ON.
     ///
