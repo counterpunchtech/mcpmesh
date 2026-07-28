@@ -62,15 +62,22 @@ are in the [operator runbook §5](operator.md#5-self-hosting-relay--discovery-10
 | `discovery_urls` | `[]` | Your self-hosted discovery URLs, used for both publishing and resolving peer addresses. Required when `discovery_mode = "custom"`. |
 | `relay_only` | `false` | **TESTING ONLY (#116).** Force application data over the **relay** even when a direct path exists. Requires building with the `unstable-relay-only` cargo feature — without it the field still parses (configs stay portable) but is **ignored with a warning**, never a startup error. See the caveats below. |
 
+An unknown mode, or a `"custom"` mode without its URL list, is a **startup error** — the daemon
+refuses to run rather than silently falling back to public infrastructure.
+
 ### `relay_only` — what it does and does not do
 
 Relay behaviour is otherwise only testable by physically breaking direct connectivity (#116 was
 filed after moving a machine onto a phone hotspot, twice). The trap: **two machines on a LAN with
 IPv6 hole-punch direct**, so a "WAN" test on different subnets can silently still be direct.
 
-**It selects the relay path; it does not prevent hole-punching.** A direct path may still form — it
-simply never carries application data. `status` reports `relay`, because the path field is derived
-from which path iroh actually selected, so the observable agrees with reality.
+**It selects the relay path when one is OPEN; it does not prevent hole-punching, and it is not a
+guarantee.** A direct path may still form — it simply never carries application data while a relay
+path exists. But if **no** relay path is open (hermetic mode, an unreachable relay, or the window
+before the relay connects), the selector selects nothing and traffic takes whatever iroh already
+chose — usually **direct**, with no error. `doctor` warns for the configurations it can detect;
+check `status`, which reports `direct`/`relay` honestly because the field is derived from which path
+iroh actually selected.
 
 **It is behind a cargo feature on purpose.** It compiles against `iroh`'s `path_selector`, which
 iroh gates behind `unstable-custom-transports` and documents as *"not covered by semantic versioning
@@ -81,12 +88,11 @@ control that risk, so a production build must never depend on it:
 cargo build -p mcpmesh-node --features unstable-relay-only
 ```
 
-**Untested end to end in CI.** The selector's logic cannot be unit-tested — iroh exposes no public
-constructor for a path-selection context — and a hermetic harness has relays disabled, so there is
-no relay path to select. Validate on real hardware before trusting it.
-
-An unknown mode, or a `"custom"` mode without its URL list, is a **startup error** — the daemon
-refuses to run rather than silently falling back to public infrastructure.
+**Not yet covered end to end.** The selector's `select()` cannot be *unit*-tested — iroh exposes no
+public constructor for a path-selection context. An end-to-end test IS possible and is not yet
+written: `iroh::test_utils::run_relay_server()` gives a hermetic harness with a real relay (the
+`peer_path` suite already uses it), so a two-endpoint test asserting `PeerPath::Relay` with the
+feature on is achievable. Until it exists, validate on real hardware before trusting this flag.
 
 ## `[limits]`
 

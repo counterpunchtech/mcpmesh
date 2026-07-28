@@ -19,6 +19,11 @@ workspace = true
 name = "mcpmesh"
 path = "src/main.rs"
 
+[features]
+# TEST-ONLY (#116): forwards to mcpmesh-node so `doctor` can report whether THIS binary can
+# honour `[network] relay_only`. Default off — see node/Cargo.toml for the semver rationale.
+unstable-relay-only = ["mcpmesh-node/unstable-relay-only"]
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true

@@ -540,7 +540,42 @@ pub fn net_plan(net: &crate::config::NetworkCfg) -> Result<NetPlan> {
 /// ALPNs on one endpoint; `Endpoint::builder(preset)`, `.secret_key()`, `.relay_mode()`,
 /// `.address_lookup()`, `.bind()` per the pinned crate; `RelayMode::custom(urls)` builds the
 /// custom `RelayMap`; all preset paths yield the same `Builder` type.
-/// TEST-ONLY (#116): a [`PathSelector`] that carries application data over the RELAY whenever a
+pub(crate) async fn build_endpoint(
+    secret: iroh::SecretKey,
+    net: &crate::config::NetworkCfg,
+    roster_mode: bool,
+) -> Result<iroh::Endpoint> {
+    let builder = match net_plan(net)? {
+        NetPlan::Hermetic => iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .relay_mode(iroh::RelayMode::Disabled),
+        NetPlan::Mesh {
+            relay,
+            discovery: DiscoveryPlan::N0,
+        } => iroh::Endpoint::builder(iroh::endpoint::presets::N0).relay_mode(relay),
+        NetPlan::Mesh {
+            relay,
+            discovery: DiscoveryPlan::Custom(urls),
+        } => {
+            let mut b = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal).relay_mode(relay);
+            for u in urls {
+                b = b
+                    .address_lookup(iroh::address_lookup::PkarrPublisher::builder(u.clone()))
+                    .address_lookup(iroh::address_lookup::PkarrResolver::builder(u));
+            }
+            b
+        }
+    };
+    let alpns = alpns_for(roster_mode);
+    let builder = apply_relay_only(builder, net);
+    builder
+        .secret_key(secret)
+        .alpns(alpns)
+        .bind()
+        .await
+        .context("bind iroh endpoint")
+}
+
+/// TEST-ONLY (#116): an iroh `PathSelector` that carries application data over the RELAY whenever a
 /// relay path is open, even if a direct path exists.
 ///
 /// Why this is behind `unstable-relay-only`: `Endpoint::builder().path_selector` is gated behind
@@ -576,41 +611,6 @@ impl iroh::endpoint::transports::PathSelector for RelayOnlySelector {
         }
         selection
     }
-}
-
-pub(crate) async fn build_endpoint(
-    secret: iroh::SecretKey,
-    net: &crate::config::NetworkCfg,
-    roster_mode: bool,
-) -> Result<iroh::Endpoint> {
-    let builder = match net_plan(net)? {
-        NetPlan::Hermetic => iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
-            .relay_mode(iroh::RelayMode::Disabled),
-        NetPlan::Mesh {
-            relay,
-            discovery: DiscoveryPlan::N0,
-        } => iroh::Endpoint::builder(iroh::endpoint::presets::N0).relay_mode(relay),
-        NetPlan::Mesh {
-            relay,
-            discovery: DiscoveryPlan::Custom(urls),
-        } => {
-            let mut b = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal).relay_mode(relay);
-            for u in urls {
-                b = b
-                    .address_lookup(iroh::address_lookup::PkarrPublisher::builder(u.clone()))
-                    .address_lookup(iroh::address_lookup::PkarrResolver::builder(u));
-            }
-            b
-        }
-    };
-    let alpns = alpns_for(roster_mode);
-    let builder = apply_relay_only(builder, net);
-    builder
-        .secret_key(secret)
-        .alpns(alpns)
-        .bind()
-        .await
-        .context("bind iroh endpoint")
 }
 
 /// Install the relay-only path selector when the config asks for it AND the build supports it
