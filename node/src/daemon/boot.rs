@@ -540,6 +540,44 @@ pub fn net_plan(net: &crate::config::NetworkCfg) -> Result<NetPlan> {
 /// ALPNs on one endpoint; `Endpoint::builder(preset)`, `.secret_key()`, `.relay_mode()`,
 /// `.address_lookup()`, `.bind()` per the pinned crate; `RelayMode::custom(urls)` builds the
 /// custom `RelayMap`; all preset paths yield the same `Builder` type.
+/// TEST-ONLY (#116): a [`PathSelector`] that carries application data over the RELAY whenever a
+/// relay path is open, even if a direct path exists.
+///
+/// Why this is behind `unstable-relay-only`: `Endpoint::builder().path_selector` is gated behind
+/// iroh's `unstable-custom-transports` and documented as "not covered by semantic versioning
+/// guarantees and may change in any release without a major version bump". mcpmesh exact-pins iroh
+/// to control exactly that, so a production build must never compile against it.
+///
+/// **It does not stop hole-punching.** A selector chooses among the paths iroh has already opened;
+/// preventing direct paths from forming is socket-level behaviour it cannot reach. A direct path
+/// may still exist — it simply never carries data. `status` reports `relay` regardless, because #64
+/// derives `PeerPath` from `Path::is_selected()`, so the observable agrees with reality.
+///
+/// Returning `none()` when no relay path is open leaves iroh's current selection alone rather than
+/// inventing one — the trait documents an empty selection as "keep the current one".
+#[cfg(feature = "unstable-relay-only")]
+#[derive(Debug)]
+pub(crate) struct RelayOnlySelector;
+
+#[cfg(feature = "unstable-relay-only")]
+impl iroh::endpoint::transports::PathSelector for RelayOnlySelector {
+    fn select(
+        &self,
+        ctx: &iroh::endpoint::transports::PathSelectionContext<'_>,
+    ) -> iroh::endpoint::transports::PathSelection {
+        let mut selection = iroh::endpoint::transports::PathSelection::none();
+        if let Some(p) = ctx.paths().find(|p| {
+            matches!(
+                p.network_path().remote(),
+                iroh::endpoint::transports::Addr::Relay(..)
+            )
+        }) {
+            selection.set(&p);
+        }
+        selection
+    }
+}
+
 pub(crate) async fn build_endpoint(
     secret: iroh::SecretKey,
     net: &crate::config::NetworkCfg,
@@ -566,12 +604,52 @@ pub(crate) async fn build_endpoint(
         }
     };
     let alpns = alpns_for(roster_mode);
+    let builder = apply_relay_only(builder, net);
     builder
         .secret_key(secret)
         .alpns(alpns)
         .bind()
         .await
         .context("bind iroh endpoint")
+}
+
+/// Install the relay-only path selector when the config asks for it AND the build supports it
+/// (#116).
+///
+/// The two arms are the whole point of the feature gate: with it OFF, `relay_only = true` still
+/// PARSES (so a config file is portable between a test build and a production one) but is ignored
+/// — loudly. A startup error would brick a node over a testing switch; a SILENT ignore would let
+/// someone believe they tested the relay when they did not, which is the exact failure #116
+/// reports.
+#[cfg(feature = "unstable-relay-only")]
+fn apply_relay_only(
+    builder: iroh::endpoint::Builder,
+    net: &crate::config::NetworkCfg,
+) -> iroh::endpoint::Builder {
+    if net.relay_only {
+        tracing::warn!(
+            "[network] relay_only = true — TESTING POSTURE: application data is forced over the \
+             relay even where a direct path exists. Not for production."
+        );
+        return builder.path_selector(std::sync::Arc::new(RelayOnlySelector));
+    }
+    builder
+}
+
+#[cfg(not(feature = "unstable-relay-only"))]
+fn apply_relay_only(
+    builder: iroh::endpoint::Builder,
+    net: &crate::config::NetworkCfg,
+) -> iroh::endpoint::Builder {
+    if net.relay_only {
+        tracing::warn!(
+            "[network] relay_only = true is IGNORED — this binary was built without the \
+             `unstable-relay-only` cargo feature. Traffic will take whatever path iroh selects, \
+             which on a LAN with IPv6 is usually DIRECT. Rebuild with the feature, or do not rely \
+             on this test having exercised the relay."
+        );
+    }
+    builder
 }
 
 /// The ALPNs a daemon advertises, by trust mode (#61).
@@ -685,6 +763,38 @@ async fn compose_roster_transport(
 mod tests {
     use super::*;
 
+    /// #116: `relay_only = true` PARSES on a build without the feature, and does not error.
+    ///
+    /// A config file must stay portable between a test build and a production one. Making the
+    /// field feature-gated would turn a shared config into a parse error on the wrong binary; a
+    /// startup error would brick a node over a testing switch. The ignore is loud (a `warn!` in
+    /// `apply_relay_only`) — a SILENT ignore is the failure #116 reports, where you believe you
+    /// tested the relay and did not.
+    #[test]
+    fn relay_only_parses_regardless_of_the_feature() {
+        let cfg: crate::config::NetworkCfg =
+            toml::from_str("relay_only = true\n").expect("the field parses on ANY build");
+        assert!(cfg.relay_only);
+        // And the default posture is off, so an ordinary config is unaffected.
+        let plain: crate::config::NetworkCfg = toml::from_str("").unwrap();
+        assert!(!plain.relay_only, "default must be off");
+    }
+
+    // #116: the SELECTOR'S LOGIC IS NOT UNIT-TESTED, and that is a limitation of iroh's API rather
+    // than an omission here. `PathSelectionContext` has no public constructor — iroh's own
+    // `for_test` helpers are `pub(crate)` — so there is no way to hand the selector a candidate set
+    // from outside the crate.
+    //
+    // A test asserting `format!("{selector:?}")` was written and DELETED: it exercised nothing and
+    // would have read as coverage for the one property that matters ("picks relay over direct").
+    //
+    // What IS covered here: the config field parses on any build, defaults off, and the
+    // feature-off path warns rather than ignoring silently. What is NOT: that traffic actually
+    // takes the relay. That needs a real relay and two hosts, which the hermetic harness cannot
+    // provide (relays are disabled there, so there would be no relay path to select) — and it is
+    // precisely what the issue's filer offered to run on their two-machine Mac<->Jetson setup.
+    // Validate there before trusting this flag.
+
     /// #105: a BOOTED daemon must have the relay-ready ticket wait ON.
     ///
     /// The wait is opt-in and `boot_node` is the ONLY caller of `enable_relay_wait`, so deleting
@@ -772,6 +882,7 @@ mod tests {
             relay_urls: relay_urls.iter().map(|s| s.to_string()).collect(),
             discovery_mode: disc.into(),
             discovery_urls: disc_urls.iter().map(|s| s.to_string()).collect(),
+            relay_only: false,
         };
 
         // Defaults → the n0 mesh.
@@ -846,6 +957,7 @@ mod tests {
             relay_urls: vec!["https://relay.acme.com".into()],
             discovery_mode: "custom".into(),
             discovery_urls: vec!["https://dns.acme.com/pkarr".into()],
+            relay_only: false,
         };
         let ep = build_endpoint(iroh::SecretKey::from_bytes(&[9u8; 32]), &net, false)
             .await

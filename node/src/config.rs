@@ -110,6 +110,18 @@ pub struct NetworkCfg {
     pub discovery_mode: String,
     /// Self-hosted pkarr relay URLs, required when `discovery_mode = "custom"`.
     pub discovery_urls: Vec<String>,
+    /// TESTING ONLY (#116): force application data over the RELAY even when a direct path exists.
+    ///
+    /// Requires the `unstable-relay-only` cargo feature. Without it this field still PARSES — a
+    /// config must stay portable between a test build and a production one — but is ignored with a
+    /// `warn!`. It is never a startup error: a testing switch must not brick a node, and it must
+    /// never be ignored SILENTLY, because believing you tested the relay when you did not is the
+    /// exact failure #116 reports.
+    ///
+    /// Selects the relay path; it does NOT prevent hole-punching (that is socket-level behaviour a
+    /// `PathSelector` cannot reach). A direct path may still form — it simply never carries data,
+    /// and `status` reports `relay` because #64 derives the path from `is_selected()`.
+    pub relay_only: bool,
 }
 impl Default for NetworkCfg {
     fn default() -> Self {
@@ -118,6 +130,7 @@ impl Default for NetworkCfg {
             relay_urls: Vec::new(),
             discovery_mode: "default".into(),
             discovery_urls: Vec::new(),
+            relay_only: false,
         }
     }
 }

@@ -10,6 +10,17 @@ description = "Embed a full mcpmesh node in-process — the daemon core as a lib
 [lints]
 workspace = true
 
+[features]
+# TEST-ONLY (#116). Enables `[network] relay_only`, which forces application data over the relay
+# while a direct path exists — the only way to exercise relayed behaviour without physically
+# breaking direct connectivity.
+#
+# DEFAULT OFF, deliberately: it compiles against iroh's `path_selector`, which iroh gates behind
+# `unstable-custom-transports` and documents as "not covered by semantic versioning guarantees and
+# may change in any release without a major version bump". mcpmesh exact-pins iroh to control that
+# risk, so a normal build must never depend on it — only a test build that opts in.
+unstable-relay-only = ["iroh/unstable-custom-transports"]
+
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true

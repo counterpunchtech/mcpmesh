@@ -637,6 +637,7 @@ mod tests {
             relay_urls: relay_urls.iter().map(|s| s.to_string()).collect(),
             discovery_mode: disc.into(),
             discovery_urls: disc_urls.iter().map(|s| s.to_string()).collect(),
+            relay_only: false,
         }
     }
 
