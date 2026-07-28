@@ -60,6 +60,30 @@ The watcher observes selected-path changes and, on a **settled** change, updates
 cache and emits `StreamFrame::Reachability` — the same frame `status` and the probe path already
 produce.
 
+### BOTH directions, or the reported use case stays broken
+
+There are **two** connection seams, and the issue's framing only implies one:
+
+| direction | seam | lifetime holder |
+|---|---|---|
+| inbound | `gate_and_register` (`node/src/daemon/accept.rs:33`) — the single gate for ALL gated ALPNs | `Registration` RAII |
+| outbound | `mcpmesh_net::connect` (`net/src/endpoint.rs:496`), via `connect_with_timeout` (`node/src/daemon/dial.rs:173`) | the returned `SessionTransport` |
+
+Installing the watcher only at the accept path would cover sessions *others* open to us and miss
+every session *we* open. That is backwards for the reported use case: an embedder rendering a
+privacy indicator for a call it initiated is on the **outbound** path. Shipping inbound-only would
+close the issue while leaving the motivating scenario silent — a fix that reads as done and is not.
+
+Both seams install the same watcher. The inbound one ties to `Registration`; the outbound one ties
+to the session transport. Neither needs a new lifetime concept, because `path_events()` ends when
+its connection closes.
+
+**Probe connections are deliberately excluded.** `probe_peer`'s 600ms connection (`reach.rs:327`)
+already classifies its own path and writes the cache through the ticket discipline; attaching a
+watcher to it would double-write the same observation and emit a frame for a connection that exists
+only to measure. The pairing (`rendezvous.rs:517`) and app-blob (`provider.rs:446`) dials are
+likewise out of scope — they are not user sessions and their path carries no privacy claim.
+
 ### Per-peer, not per-session — and the collapse is real
 
 `PeerReachability` is keyed per peer. A connection is per session, and two concurrent sessions to
@@ -156,3 +180,10 @@ probes cannot observe a live transition by construction.
    the failure mode where the one transition that mattered is the one that was missed.
 7. **Regression — a peer with no path change produces no frame**, so a healthy long-lived session
    stays quiet.
+9. **Integration — an OUTBOUND session emits too.** Same as test 1 but with the local node dialing
+   the peer rather than accepting from it. This is the motivating scenario, and an inbound-only
+   implementation passes test 1 while failing this one — which is precisely the "reads as done, is
+   not" outcome the design section warns about.
+10. **Regression — a probe connection emits NOTHING.** Run `probe_peer` against a peer with no user
+   session and assert no frame is pushed beyond the probe's own transition. Fails if the watcher
+   was attached indiscriminately to every `connect`.
