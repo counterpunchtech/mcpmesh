@@ -1017,10 +1017,27 @@ pub enum StreamFrame {
     /// online/offline indicator — and so work queued for an unreachable peer can flush the moment
     /// it returns, rather than on the next poll tick.
     ///
-    /// Emitted on a CHANGE of `reachable` only. A refreshed probe with the same verdict emits
-    /// nothing, so a peer that stays up does not produce a frame per TTL refresh; `rtt_ms`/`meta`/
-    /// `services` drift is advisory detail and is not a transition. `age_secs` is `0` — the probe
-    /// just completed.
+    /// Emitted on a change of `reachable` **or of `path`**. A refresh with the same verdict AND the
+    /// same path emits nothing, so a peer that stays up does not produce a frame per TTL refresh;
+    /// `rtt_ms`/`meta`/`services` drift is advisory detail and is not a transition. `age_secs` is
+    /// `0` — the observation just completed.
+    ///
+    /// **Do not treat this as an up/down toggle.** It carried that meaning through 0.18, and this
+    /// doc said "on a CHANGE of `reachable` only" until 1.22 — which stopped being true in 0.19.0
+    /// (#92 item 1), when `path` joined the transition rule. A consumer that assumed same-verdict
+    /// frames were impossible was reading a stale guarantee.
+    ///
+    /// Two producers, as of API 1.22:
+    ///
+    /// - a **probe** completing (`status`/`subscribe` refreshing a stale entry), which carries a
+    ///   measured `rtt_ms`; and
+    /// - a **live session** whose selected path changed under it (#92 item 2), which carries
+    ///   `rtt_ms: None` on a first observation — no round trip was measured and none is invented.
+    ///
+    /// The second producer is why `path` is trustworthy for a long-lived session: a session that
+    /// degrades Direct→Relay mid-call now says so when it happens, rather than staying silently
+    /// mislabelled until something probes. `path` is a truth claim about where user data went, so
+    /// `Unknown` means "we do not know" and must never be rendered as private.
     Reachability { peer: PeerReachability },
     /// The subscriber fell `dropped` records behind the broadcast ring; the stream continues (a
     /// fresh reconnect would re-`Snapshot`). Never drops the subscriber — lag is reported, never fatal.
@@ -1078,7 +1095,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   new methods, or a strictness change like params validation — bumped in the same change that
 ///   makes it. A client can guard with `api_minor >= N` for a feature it needs, or refuse a daemon
 ///   older than a minor it requires. It never resets except on a MAJOR bump.
-pub const API_VERSION: &str = "1.21";
+pub const API_VERSION: &str = "1.22";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -1105,7 +1122,7 @@ pub const API_VERSION: &str = "1.21";
 /// and of a published hash, so un-sharing a file no longer requires unpairing the person (#62); to
 /// 16 when the app-blob provider became available in PAIRING mode — the blob verbs previously
 /// errored on any daemon without an org root key, though their scope gate never needed one (#61).
-pub const API_MINOR: u32 = 21;
+pub const API_MINOR: u32 = 22;
 
 #[cfg(test)]
 mod tests {

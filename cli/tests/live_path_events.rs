@@ -50,6 +50,91 @@ fn assemble(
     )
 }
 
+/// Stand up a relay + two nodes, with the peer's address known ONLY via the relay so a session
+/// provably starts relayed and hole-punches mid-flight. Returns the guards that must outlive the
+/// test (tempdir, accept task, relay), our mesh, and the peer's.
+///
+/// Shared because all three tests need the identical situation and it is 60 lines of setup; the
+/// relay-only `last_addr` in particular is load-bearing — without it the dial may come up direct
+/// and there is no transition to observe.
+#[allow(clippy::type_complexity)]
+async fn live_session_harness() -> (
+    (
+        tempfile::TempDir,
+        tokio::task::JoinHandle<()>,
+        Box<dyn std::any::Any + Send>,
+    ),
+    Arc<MeshState>,
+    Arc<MeshState>,
+    (),
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let (relay_map, relay_url, relay_guard) = iroh::test_utils::run_relay_server()
+        .await
+        .expect("run in-process relay");
+
+    let mk = || {
+        iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .relay_mode(iroh::RelayMode::Custom(relay_map.clone()))
+            .ca_tls_config(iroh_relay::tls::CaTlsConfig::insecure_skip_verify())
+            .alpns(vec![ALPN_MCP.to_vec(), ALPN_PING.to_vec()])
+            .bind()
+    };
+    let peer_ep = mk().await.expect("bind peer");
+    let our_ep = mk().await.expect("bind ours");
+    let peer_id = *peer_ep.id().as_bytes();
+    let our_id = *our_ep.id().as_bytes();
+
+    let peer_store = Arc::new(PeerStore::open(&dir.path().join("peer.redb")).unwrap());
+    peer_store
+        .add(PeerEntry {
+            endpoint_id: our_id,
+            nickname: "us".into(),
+            services: vec![],
+            paired_at: None,
+            user_id: None,
+            last_addr: None,
+        })
+        .unwrap();
+    let our_store = Arc::new(PeerStore::open(&dir.path().join("our.redb")).unwrap());
+    our_store
+        .add(PeerEntry {
+            endpoint_id: peer_id,
+            nickname: "bob".into(),
+            services: vec![],
+            paired_at: None,
+            user_id: None,
+            // RELAY-ONLY hint: the session STARTS relayed, so the direct path is selected later,
+            // mid-session. That later selection is the event under test.
+            last_addr: Some(
+                serde_json::to_string(
+                    &iroh::EndpointAddr::new(iroh::EndpointId::from_bytes(&peer_id).unwrap())
+                        .with_relay_url(relay_url.clone()),
+                )
+                .expect("serialize relay addr"),
+            ),
+        })
+        .unwrap();
+
+    let peer_cfg = dir.path().join("peer.toml");
+    std::fs::write(&peer_cfg, "").unwrap();
+    let peer_mesh = assemble(peer_ep, peer_store, peer_cfg);
+    let accept = daemon::spawn_accept_loop(
+        peer_mesh.clone(),
+        Arc::new(build_services_audited(
+            &Config::default(),
+            &mcpmesh::audit::AuditSink::disabled(),
+            &MeshLimiters::unlimited(),
+        )),
+    );
+
+    let our_cfg = dir.path().join("our.toml");
+    std::fs::write(&our_cfg, "").unwrap();
+    let mesh = assemble(our_ep, our_store, our_cfg);
+
+    ((dir, accept, Box::new(relay_guard)), mesh, peer_mesh, ())
+}
+
 /// A session we OPEN (the reported use case: an embedder rendering a privacy indicator for a call
 /// it initiated) must push a `Reachability` frame when its selected path changes under it.
 #[tokio::test(flavor = "multi_thread")]
@@ -173,4 +258,83 @@ async fn a_live_relay_to_direct_transition_pushes_a_frame() {
     })
     .await
     .expect("live path event test timed out");
+}
+
+/// The #58 defect class: the stream and `status` must not disagree. A watcher that emits without
+/// writing the cache leaves `status` reporting the OLD path — so a consumer that re-reads after the
+/// event sees the frame contradicted by the very surface it would use to confirm it.
+///
+/// **Measured coverage, not assumed.** In this scenario the watcher SEEDS the cache entry (no probe
+/// has run, so there is no prior row), which means only `commit_observation`'s insert branch
+/// executes. Mutating that branch to store the wrong path fails this suite; mutating the UPDATE
+/// branch to emit without persisting does NOT — it is never reached here. Covering the update
+/// branch needs a prior entry, i.e. a probe first and a path change second, which is a different
+/// fixture and is not pretended to be covered by this one.
+#[tokio::test(flavor = "multi_thread")]
+async fn status_agrees_with_the_frame_the_watcher_just_pushed() {
+    timeout(Duration::from_secs(120), async {
+        let (harness, mesh, _peer_mesh, _relay) = live_session_harness().await;
+        let mut rx = mesh.reach_bcast_for_test().subscribe();
+
+        let _session = daemon::dial_service(&mesh, "bob", "echo")
+            .await
+            .expect("open a mesh session to the peer");
+
+        let frame = timeout(Duration::from_secs(45), rx.recv())
+            .await
+            .expect("a live path change must push a frame")
+            .expect("broadcast channel alive");
+
+        // `reachability_of` is what `status` projects from. It must already reflect the pushed
+        // value, with NO probe needed to reconcile them.
+        let rows = daemon::reachability_of(&mesh);
+        let row = rows
+            .iter()
+            .find(|r| r.name == "bob")
+            .expect("the peer must appear in the status projection");
+        assert_eq!(
+            row.path, frame.path,
+            "status must agree with the frame that was just pushed — a watcher that emits without \
+             writing the cache leaves status contradicting its own event stream"
+        );
+        drop(harness);
+    })
+    .await
+    .expect("status coherence test timed out");
+}
+
+/// #61 cost a release to a detached task holding a lock. A watcher is exactly that shape, so its
+/// boundedness is a regression test, not an assumption: when the session closes, the watcher must
+/// stop writing.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_watcher_stops_when_its_session_closes() {
+    timeout(Duration::from_secs(120), async {
+        let (harness, mesh, _peer_mesh, _relay) = live_session_harness().await;
+        let mut rx = mesh.reach_bcast_for_test().subscribe();
+
+        let session = daemon::dial_service(&mesh, "bob", "echo")
+            .await
+            .expect("open a mesh session to the peer");
+        let _ = timeout(Duration::from_secs(45), rx.recv())
+            .await
+            .expect("a live path change must push a frame");
+
+        // Close the session and let the watcher observe the end of its event stream.
+        drop(session);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // Whatever the cache says now must STAY said: a watcher still running would keep taking
+        // tickets and writing.
+        let seq_after_close = mesh.probe_seq_for_test();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            mesh.probe_seq_for_test(),
+            seq_after_close,
+            "the watcher must end with its connection — a task still taking tickets after the \
+             session closed is the #61 shape: a detached task outliving what it watches"
+        );
+        drop(harness);
+    })
+    .await
+    .expect("watcher lifetime test timed out");
 }
