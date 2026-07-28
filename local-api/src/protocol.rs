@@ -620,7 +620,7 @@ pub enum Request {
     /// two interchangeably after a fetch.
     BlobRepublish(BlobRepublishParams),
     /// List the daemon's blob scopes (name → hashes + grants). Tag `"blob_list"`.
-    BlobList,
+    BlobList(BlobListParams),
     /// Fetch a `mcpmesh/blob/1` ticket THROUGH the daemon (BLAKE3-verified streaming) and export the
     /// verified blob to `dest_path` (a local file the same-uid daemon writes). Answers a
     /// [`BlobFetchResult`] with the verified hash + byte length. Tag `"blob_fetch"`.
@@ -681,12 +681,47 @@ pub struct ScopeInfo {
     /// pre-`api_minor` 19 client sees exactly what it saw before.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub withdrawn: Vec<String>,
+    /// Size of `hashes` — always present, even when `counts_only` empties the vector (#84b).
+    #[serde(default)]
+    pub hash_count: usize,
+    /// Size of `grants`.
+    #[serde(default)]
+    pub grant_count: usize,
+    /// Size of `withdrawn`.
+    #[serde(default)]
+    pub withdrawn_count: usize,
+}
+
+/// Params of [`Request::BlobList`] (#84b). ALL optional — `blob_list {}` still works, which
+/// matters because the verb took no params before `api_minor` 20.
+///
+/// A DEFAULT LIMIT applies when `limit` is absent. Deliberate: unpaged, `blob_list` renders every
+/// scope into one frame against the 16 MiB cap whose violation closes the connection on the third
+/// strike, so an unbounded listing kills the caller rather than merely being large.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BlobListParams {
+    /// EXACT scope name, never a prefix.
+    pub scope: Option<String>,
+    /// Only scopes containing this hash; the rendering you send is normalized first.
+    pub hash: Option<String>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    /// Omit `hashes`/`grants`/`withdrawn`, keep the counts.
+    pub counts_only: bool,
 }
 
 /// Result of [`Request::BlobList`]: the daemon's scopes. Additive-only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobScopeList {
     pub scopes: Vec<ScopeInfo>,
+    /// Scopes matching the filter BEFORE `limit`/`offset` (#84b). Without this you cannot tell a
+    /// complete answer from a clipped one.
+    #[serde(default)]
+    pub total: usize,
+    /// True when more scopes matched than were returned. Page with `offset` to see the rest.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 /// Result of [`Request::BlobFetch`]: the verified hash + byte length written to `dest_path`.
@@ -1042,7 +1077,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   new methods, or a strictness change like params validation — bumped in the same change that
 ///   makes it. A client can guard with `api_minor >= N` for a feature it needs, or refuse a daemon
 ///   older than a minor it requires. It never resets except on a MAJOR bump.
-pub const API_VERSION: &str = "1.19";
+pub const API_VERSION: &str = "1.20";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -1069,7 +1104,7 @@ pub const API_VERSION: &str = "1.19";
 /// and of a published hash, so un-sharing a file no longer requires unpairing the person (#62); to
 /// 16 when the app-blob provider became available in PAIRING mode — the blob verbs previously
 /// errored on any daemon without an org root key, though their scope gate never needed one (#61).
-pub const API_MINOR: u32 = 19;
+pub const API_MINOR: u32 = 20;
 
 #[cfg(test)]
 mod tests {
@@ -1917,7 +1952,12 @@ mod tests {
                 hashes: vec!["ab".repeat(32)],
                 grants: vec!["alice".into()],
                 withdrawn: vec![],
+                hash_count: 1,
+                grant_count: 1,
+                withdrawn_count: 0,
             }],
+            total: 1,
+            truncated: false,
         };
         let v = serde_json::to_value(&res).unwrap();
         assert_eq!(v["scopes"][0]["name"], "docs");

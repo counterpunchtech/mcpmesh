@@ -426,9 +426,20 @@ impl ControlClient {
         .await
     }
 
-    /// List the daemon's blob scopes (name → hashes + grants).
+    /// List the daemon's blob scopes (name → hashes + grants + withdrawn).
+    ///
+    /// A DEFAULT LIMIT applies (#84b) — check `truncated` and page with
+    /// [`blob_list_paged`](Self::blob_list_paged) rather than assuming you saw everything.
     pub async fn blob_list(&mut self) -> Result<BlobScopeList, ClientError> {
-        self.request_typed(Request::BlobList, "blob_list result")
+        self.blob_list_paged(Default::default()).await
+    }
+
+    /// List blob scopes with filters + paging (#84b, `api_minor >= 20`).
+    pub async fn blob_list_paged(
+        &mut self,
+        params: crate::BlobListParams,
+    ) -> Result<BlobScopeList, ClientError> {
+        self.request_typed(Request::BlobList(params), "blob_list result")
             .await
     }
 

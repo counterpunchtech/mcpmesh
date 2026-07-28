@@ -423,6 +423,11 @@ impl AppBlobs {
     }
 
     /// The current scope table (name, hashes, grants) for `list`.
+    /// One filtered, bounded page of the scope table (#84b).
+    pub fn list_page(&self, q: &crate::blobs::scope::ListQuery) -> crate::blobs::scope::ScopePage {
+        self.scopes.list_page(q)
+    }
+
     pub fn list(&self) -> Vec<crate::blobs::scope::ScopeRow> {
         self.scopes.list()
     }

@@ -427,6 +427,14 @@ impl ScopeStore {
         self.inner.read().expect("scope lock not poisoned").list()
     }
 
+    /// One filtered, bounded page (#84b).
+    pub fn list_page(&self, q: &ListQuery) -> ScopePage {
+        self.inner
+            .read()
+            .expect("scope lock not poisoned")
+            .list_page(q)
+    }
+
     fn persist(&self, scopes: &BlobScopes) -> Result<()> {
         let json = serde_json::to_string_pretty(scopes).context("serialize blob scopes")?;
         crate::roster::atomic_write_str(&self.path, &json)
