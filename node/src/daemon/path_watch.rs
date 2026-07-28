@@ -54,6 +54,69 @@ pub(crate) fn decide(observed: &PeerPath, cached: Option<&PeerPath>) -> Option<P
     }
 }
 
+/// Commit a settled observation for `endpoint_id` and emit if it changed anything.
+///
+/// **The watcher is a SECOND writer to the reachability cache**, alongside `probe_peer`. That is
+/// the hazard here, not the emission. `seq` must be a ticket taken BEFORE observing, exactly as
+/// `probe_peer` does, so an in-flight 3s probe that started earlier cannot land later and overwrite
+/// a fresher live observation — which would re-poison the cache for a full TTL and, since #58, push
+/// a stale path a consumer then renders as a privacy claim.
+///
+/// Only `path` is the watcher's to set. `reachable`/`rtt_ms`/`meta`/`services` come from a probe's
+/// pong; a live connection carrying data IS reachability evidence, but inventing an `rtt_ms` from a
+/// path event would be a fabricated measurement, so a seeded entry carries `rtt_ms: None`.
+#[allow(dead_code)]
+pub(crate) fn commit_observation(
+    mesh: &std::sync::Arc<super::MeshState>,
+    endpoint_id: [u8; 32],
+    seq: u64,
+    observed: &PeerPath,
+) -> Option<mcpmesh_local_api::PeerReachability> {
+    let committed = {
+        let mut cache = mesh
+            .reachability
+            .lock()
+            .expect("reachability lock not poisoned");
+        // A NEWER writer already landed — drop ours rather than moving the cache backwards.
+        if let Some(existing) = cache.get(&endpoint_id)
+            && !super::reach::supersedes(seq, existing)
+        {
+            return None;
+        }
+        let cached = cache.get(&endpoint_id).map(|e| e.path.clone());
+        let path = decide(observed, cached.as_ref())?;
+        match cache.get_mut(&endpoint_id) {
+            Some(entry) => {
+                entry.path = path.clone();
+                entry.seq = seq;
+                entry.probed_at = crate::util::epoch_now_i64();
+                entry.clone()
+            }
+            None => {
+                // First knowledge, from a LIVE session: it is up by construction — we are talking
+                // to it — but we have measured no RTT and hold none of its pong metadata.
+                let entry = super::ReachEntry {
+                    reachable: true,
+                    rtt_ms: None,
+                    probed_at: crate::util::epoch_now_i64(),
+                    meta: String::new(),
+                    services: Vec::new(),
+                    seq,
+                    path,
+                };
+                cache.insert(endpoint_id, entry.clone());
+                entry
+            }
+        }
+    };
+    // Same single constructor the probe path and `status` use, so the three cannot drift.
+    let nickname = mesh.store.resolve(&endpoint_id).ok().flatten()?.nickname;
+    let row = super::reach::reachability_row(nickname, endpoint_id, Some(&committed), Some(0));
+    // Best-effort: `send` errors only when there are no subscribers, the common case.
+    let _ = mesh.reach_bcast.send(row.clone());
+    Some(row)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,6 +159,107 @@ mod tests {
         assert_eq!(
             decide(&PeerPath::Unknown, Some(&PeerPath::Relay { url: None })),
             None
+        );
+    }
+
+    /// The hazard this whole module has to get right: the watcher is a SECOND writer to the
+    /// reachability cache. An in-flight probe that STARTED earlier can complete later (a 3s timeout
+    /// losing to a live path event), and must not move the cache backwards.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_older_writer_never_overwrites_a_newer_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+        std::fs::write(&cfg, "").unwrap();
+        let mesh = crate::daemon::testutil::hermetic_mesh(cfg).await;
+        let eid = [9u8; 32];
+        mesh.store
+            .add(crate::allowlist::PeerEntry {
+                endpoint_id: eid,
+                nickname: "bob".into(),
+                services: vec![],
+                paired_at: None,
+                user_id: None,
+                last_addr: None,
+            })
+            .unwrap();
+
+        // A NEWER writer (ticket 7) lands Direct.
+        let row = commit_observation(&mesh, eid, 7, &PeerPath::Direct);
+        assert!(row.is_some(), "first observation commits");
+
+        // An OLDER writer (ticket 3) tries to report Relay — the stale value. It must be dropped.
+        let row = commit_observation(&mesh, eid, 3, &PeerPath::Relay { url: None });
+        assert!(
+            row.is_none(),
+            "an older writer must not overwrite a newer observation — this is the #58 defect \
+             class, and here it would push a stale path a consumer renders as a privacy claim"
+        );
+        let cached = mesh
+            .reachability
+            .lock()
+            .unwrap()
+            .get(&eid)
+            .map(|e| e.path.clone());
+        assert_eq!(
+            cached,
+            Some(PeerPath::Direct),
+            "the cache must still hold the NEWER value"
+        );
+    }
+
+    /// First knowledge from a live session: reachable by construction (we are talking to it), but
+    /// no RTT has been measured. Inventing one would be a fabricated measurement.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_seeded_entry_is_reachable_with_no_fabricated_rtt() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+        std::fs::write(&cfg, "").unwrap();
+        let mesh = crate::daemon::testutil::hermetic_mesh(cfg).await;
+        let eid = [11u8; 32];
+        mesh.store
+            .add(crate::allowlist::PeerEntry {
+                endpoint_id: eid,
+                nickname: "carol".into(),
+                services: vec![],
+                paired_at: None,
+                user_id: None,
+                last_addr: None,
+            })
+            .unwrap();
+
+        let row = commit_observation(&mesh, eid, 1, &PeerPath::Direct).expect("seeds an entry");
+        assert!(row.reachable, "a live session IS reachability evidence");
+        assert_eq!(
+            row.rtt_ms, None,
+            "no RTT was measured — never fabricate one"
+        );
+        assert_eq!(row.path, PeerPath::Direct);
+    }
+
+    /// An unchanged path must not commit or emit, even with a fresh ticket — otherwise a stable
+    /// session rewrites the cache and pushes a frame on every path event for its whole life.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unchanged_path_commits_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+        std::fs::write(&cfg, "").unwrap();
+        let mesh = crate::daemon::testutil::hermetic_mesh(cfg).await;
+        let eid = [13u8; 32];
+        mesh.store
+            .add(crate::allowlist::PeerEntry {
+                endpoint_id: eid,
+                nickname: "dave".into(),
+                services: vec![],
+                paired_at: None,
+                user_id: None,
+                last_addr: None,
+            })
+            .unwrap();
+
+        assert!(commit_observation(&mesh, eid, 1, &PeerPath::Direct).is_some());
+        assert!(
+            commit_observation(&mesh, eid, 2, &PeerPath::Direct).is_none(),
+            "a repeat observation is not news, however fresh its ticket"
         );
     }
 
