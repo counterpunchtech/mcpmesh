@@ -304,8 +304,13 @@ async fn status_agrees_with_the_frame_the_watcher_just_pushed() {
 }
 
 /// #61 cost a release to a detached task holding a lock. A watcher is exactly that shape, so its
-/// boundedness is a regression test, not an assumption: when the session closes, the watcher must
-/// stop writing.
+/// boundedness is a regression test, not an assumption.
+///
+/// **This asserts the TASK ENDS, not that side-effects stop.** The first version watched
+/// `probe_seq` and was vacuous: a leaked watcher parked on `events.next()` forever emits nothing,
+/// which is indistinguishable from a settled connection. The #92 review proved it by moving a
+/// strong `Connection` into the task — the exact leak the design forbids — and the test still
+/// passed. Joining the handle is the only thing that tells the two apart.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_watcher_stops_when_its_session_closes() {
     timeout(Duration::from_secs(120), async {
@@ -319,19 +324,29 @@ async fn the_watcher_stops_when_its_session_closes() {
             .await
             .expect("a live path change must push a frame");
 
-        // Close the session and let the watcher observe the end of its event stream.
+        // Close the session; the watcher's event stream must end with it.
         drop(session);
-        tokio::time::sleep(Duration::from_secs(2)).await;
 
-        // Whatever the cache says now must STAY said: a watcher still running would keep taking
-        // tickets and writing.
-        let seq_after_close = mesh.probe_seq_for_test();
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        assert_eq!(
-            mesh.probe_seq_for_test(),
-            seq_after_close,
-            "the watcher must end with its connection — a task still taking tickets after the \
-             session closed is the #61 shape: a detached task outliving what it watches"
+        // Deliberately NOT closing the endpoint: that tears down every connection regardless of
+        // who holds a handle, which MASKS the leak this test exists to catch. The watcher must end
+        // because the SESSION ended.
+
+        // Whatever else is true, the watcher must not keep running. A task still parked here is
+        // holding an Arc<MeshState> — and through it the peer store's redb handle — past the
+        // lifetime of the thing it watches. That is #61.
+        let ended = timeout(Duration::from_secs(20), async {
+            loop {
+                if daemon::live_path_watchers_for_test() == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await;
+        assert!(
+            ended.is_ok(),
+            "the watcher must END with its connection — a task outliving what it watches is the \
+             #61 shape, and it holds the peer store's redb handle open"
         );
         drop(harness);
     })

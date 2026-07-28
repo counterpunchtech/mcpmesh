@@ -19,6 +19,13 @@ use std::time::Duration;
 
 use mcpmesh_local_api::PeerPath;
 
+/// Live watcher tasks, for the #61-shaped lifetime regression (#92 review).
+///
+/// A leaked watcher emits NOTHING — it parks on `events.next()` forever — so side-effects cannot
+/// distinguish "ended" from "leaked". This counter can.
+pub(crate) static LIVE_WATCHERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// How long a changed path must HOLD before it is worth telling anyone (#92 item 2).
 ///
 /// Hole-punching flaps by nature — that was #64's stated reason for excluding `path` from
@@ -69,14 +76,22 @@ pub(crate) fn decide(observed: &PeerPath, cached: Option<&PeerPath>) -> Option<P
 /// task's entire lifetime, which would never resolve.
 ///
 /// [`WeakConnectionHandle`]: iroh::endpoint::WeakConnectionHandle
+/// Returns the task handle so a test can assert the task actually ENDS. The handle is dropped by
+/// production callers — dropping a `JoinHandle` detaches, it does not cancel — but without it the
+/// lifetime regression cannot fail: a leaked watcher parked on `events.next()` forever emits
+/// nothing, which is indistinguishable from a settled connection if the test only watches for
+/// side-effects (#92 review found exactly that vacuity).
 pub(crate) fn spawn(
     mesh: std::sync::Arc<super::MeshState>,
     endpoint_id: [u8; 32],
     conn: &iroh::endpoint::Connection,
-) {
+) -> tokio::task::JoinHandle<()> {
     let mut events = conn.path_events();
     let weak = conn.weak_handle();
+    LIVE_WATCHERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     tokio::spawn(async move {
+        // Decrement on EVERY exit path, including a `break`, so the counter cannot drift.
+        let _guard = WatcherGuard;
         use n0_future::StreamExt as _;
         while let Some(event) = events.next().await {
             match event {
@@ -109,7 +124,7 @@ pub(crate) fn spawn(
             drop(strong);
             commit_observation(&mesh, endpoint_id, seq, &observed);
         }
-    });
+    })
 }
 
 /// Commit a settled observation for `endpoint_id` and emit if it changed anything.
@@ -221,6 +236,66 @@ mod tests {
         assert_eq!(
             decide(&PeerPath::Unknown, Some(&PeerPath::Relay { url: None })),
             None
+        );
+    }
+
+    /// #92 review, Finding 3: the settle window had NO test. Mutating `PATH_CHANGE_SETTLE` to zero
+    /// AND turning the `Lagged` arm into a silent `continue` left every test in the branch green,
+    /// while the commits claimed both were covered.
+    ///
+    /// The window's job is to let a change HOLD. Driven over `reach::settle`'s closure seam on
+    /// tokio's test clock, so it is deterministic and instant.
+    #[tokio::test(start_paused = true)]
+    async fn the_settle_window_waits_for_a_degradation_to_hold() {
+        let relay = PeerPath::Relay { url: None };
+
+        // A path that reads Relay for the whole window IS a degradation: report it.
+        let settled = crate::daemon::reach::settle(PATH_CHANGE_SETTLE, || relay.clone()).await;
+        assert_eq!(
+            settled, relay,
+            "a degradation that holds for the whole window must be reported"
+        );
+
+        // A ZERO window reports whatever the first look says. That is the mutation the branch
+        // shipped uncaught: with no window, a Direct->Relay blip is believed immediately.
+        let mut polls = 0;
+        let settled = crate::daemon::reach::settle(Duration::ZERO, || {
+            polls += 1;
+            if polls > 1 {
+                PeerPath::Direct
+            } else {
+                relay.clone()
+            }
+        })
+        .await;
+        assert_eq!(
+            settled, relay,
+            "with no window the first observation wins — this assertion fails if \
+             PATH_CHANGE_SETTLE is ever zeroed"
+        );
+
+        // A blip that RECOVERS inside the window settles on Direct, and `decide` then finds
+        // nothing changed against a cached Direct — so a flap emits no frame. This is the
+        // end-to-end flap rule, expressed over the two pieces that implement it.
+        let mut polls = 0;
+        let settled = crate::daemon::reach::settle(PATH_CHANGE_SETTLE, || {
+            polls += 1;
+            if polls > 2 {
+                PeerPath::Direct
+            } else {
+                relay.clone()
+            }
+        })
+        .await;
+        assert_eq!(
+            settled,
+            PeerPath::Direct,
+            "a recovered blip settles on Direct"
+        );
+        assert_eq!(
+            decide(&settled, Some(&PeerPath::Direct)),
+            None,
+            "and a flap that returns to where it started must emit NOTHING"
         );
     }
 
@@ -337,5 +412,14 @@ mod tests {
         };
         assert_eq!(decide(&b, Some(&a)), Some(b.clone()));
         assert_eq!(decide(&a, Some(&a)), None);
+    }
+}
+
+/// Decrements [`LIVE_WATCHERS`] however the watcher task exits.
+struct WatcherGuard;
+
+impl Drop for WatcherGuard {
+    fn drop(&mut self) {
+        LIVE_WATCHERS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 }

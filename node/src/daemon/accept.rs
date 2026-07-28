@@ -119,7 +119,8 @@ pub fn spawn_accept_loop(mesh: Arc<MeshState>, services: Arc<Services>) -> JoinH
                         // for spawning, never the security boundary.
                         let remote = mcpmesh_net::EndpointId::from(conn.remote_id());
                         if mesh.gate.resolve(&remote).is_some() {
-                            super::path_watch::spawn(mesh.clone(), *remote.as_bytes(), &conn);
+                            let _ =
+                                super::path_watch::spawn(mesh.clone(), *remote.as_bytes(), &conn);
                         }
                         run_mesh_connection(
                             conn,

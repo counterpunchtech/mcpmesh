@@ -91,6 +91,14 @@ pub fn admitted_services_for_test(
     caller_admitted_services(mesh, identity)
 }
 pub use reach::{REACH_TTL_SECS, ReachEntry, probe_peer, reachability_of};
+
+/// Live path-watcher tasks (#92 review). `#[doc(hidden)]` — a TEST SEAM for the #61-shaped
+/// lifetime regression: a leaked watcher emits nothing, so only a count distinguishes it from a
+/// watcher that ended.
+#[doc(hidden)]
+pub fn live_path_watchers_for_test() -> usize {
+    path_watch::LIVE_WATCHERS.load(std::sync::atomic::Ordering::Relaxed)
+}
 pub use roster_install::{
     install_roster_view_and_sever, should_staleness_sever, staleness_sweep_once,
 };
