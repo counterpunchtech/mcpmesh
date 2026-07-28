@@ -77,6 +77,26 @@ impl Verdict {
 /// relay/discovery is self-hosted (`"custom"`) — "self-hosting only one of the two is an
 /// incomplete mitigation".
 pub fn check_network(net: &crate::config::NetworkCfg) -> Verdict {
+    // #116: `relay_only` is checked FIRST and reported through `doctor`, because the daemon's
+    // `tracing::warn!` reaches nobody — no `tracing_subscriber` is installed in the shipped
+    // binary, so a warning about an ignored testing flag is emitted into the void. `doctor` is
+    // pure, `--json`, and agent-facing, which makes it the one channel a CI harness can actually
+    // assert on. Without this, "flag set, feature forgotten" is a green run that never touched
+    // the relay — the exact belief #116 was filed about.
+    if net.relay_only {
+        if !cfg!(feature = "unstable-relay-only") {
+            return Verdict::warn(
+                "[network] relay_only = true is IGNORED — this binary lacks the                  `unstable-relay-only` cargo feature. Traffic takes whatever path iroh selects,                  which on a LAN with IPv6 is usually DIRECT. Do NOT treat this run as having                  exercised the relay.",
+            );
+        }
+        if net.relay_mode == "disabled" {
+            return Verdict::warn(
+                "[network] relay_only = true with a hermetic relay_mode — hermetic mode opens NO \
+                 relay path, so there is nothing to select and traffic stays direct. relay_only \
+                 cannot be honoured here.",
+            );
+        }
+    }
     match crate::daemon::net_plan(net) {
         Err(e) => Verdict::error(format!(
             "[network] invalid — the daemon will refuse to start: {e}"
@@ -637,6 +657,58 @@ mod tests {
             relay_urls: relay_urls.iter().map(|s| s.to_string()).collect(),
             discovery_mode: disc.into(),
             discovery_urls: disc_urls.iter().map(|s| s.to_string()).collect(),
+            relay_only: false,
+        }
+    }
+
+    /// #116: `doctor` must SAY when `relay_only` cannot be honoured.
+    ///
+    /// The daemon's `tracing::warn!` reaches nobody — no subscriber is installed in the shipped
+    /// binary — so a warning about an ignored testing flag goes into the void. That made the
+    /// "loud ignore" a SILENT ignore, which is the failure #116 is about: believing you tested
+    /// the relay when you did not. `doctor` is pure, `--json`, and agent-facing, so a CI harness
+    /// can assert on it.
+    #[test]
+    fn doctor_warns_when_relay_only_cannot_be_honoured() {
+        // Built WITHOUT the feature (the default, and how CI runs): the flag does nothing.
+        #[cfg(not(feature = "unstable-relay-only"))]
+        {
+            let v = check_network(&cfg_with_relay_only("default", true));
+            assert_eq!(
+                v.level,
+                Level::Warn,
+                "an ignored relay_only must warn: {v:?}"
+            );
+            assert!(
+                v.message.contains("IGNORED"),
+                "and must say so plainly: {}",
+                v.message
+            );
+        }
+        // Hermetic mode opens no relay path, so relay_only cannot be honoured on ANY build.
+        let v = check_network(&cfg_with_relay_only("disabled", true));
+        assert_eq!(
+            v.level,
+            Level::Warn,
+            "relay_only + hermetic must warn: {v:?}"
+        );
+
+        // And an ordinary config is untouched — no new noise for anyone not using the flag.
+        let plain = check_network(&cfg_with_relay_only("disabled", false));
+        assert!(
+            !plain.message.contains("relay_only"),
+            "no relay_only noise when unset: {}",
+            plain.message
+        );
+    }
+
+    fn cfg_with_relay_only(relay_mode: &str, relay_only: bool) -> crate::config::NetworkCfg {
+        crate::config::NetworkCfg {
+            relay_mode: relay_mode.into(),
+            relay_urls: vec![],
+            discovery_mode: "default".into(),
+            discovery_urls: vec![],
+            relay_only,
         }
     }
 

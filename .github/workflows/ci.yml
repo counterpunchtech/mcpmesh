@@ -21,6 +21,12 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+      # #116: the ONLY thing that compiles the `unstable-relay-only` path. It depends on iroh's
+      # `unstable-custom-transports`, which iroh excludes from semver — so without this a breaking
+      # iroh change lands silently and is discovered by a human running a two-machine test. The
+      # whole point of the feature gate is that production is unaffected; this is what tells us the
+      # gated code still builds at all.
+      - run: cargo clippy -p mcpmesh-node -p mcpmesh --all-targets --locked --features unstable-relay-only -- -D warnings
   deny:
     runs-on: ubuntu-latest
     timeout-minutes: 10
