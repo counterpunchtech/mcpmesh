@@ -125,7 +125,11 @@ fn watch_session(
     transport: SessionTransport,
     conn: iroh::endpoint::Connection,
 ) -> SessionTransport {
-    let _ = super::path_watch::spawn(mesh.clone(), *conn.remote_id().as_bytes(), &conn);
+    drop(super::path_watch::spawn(
+        mesh.clone(),
+        *conn.remote_id().as_bytes(),
+        &conn,
+    ));
     transport
 }
 

@@ -194,6 +194,15 @@ pub(crate) fn commit_observation(
     Some(row)
 }
 
+/// Decrements [`LIVE_WATCHERS`] however the watcher task exits.
+struct WatcherGuard;
+
+impl Drop for WatcherGuard {
+    fn drop(&mut self) {
+        LIVE_WATCHERS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,14 +421,5 @@ mod tests {
         };
         assert_eq!(decide(&b, Some(&a)), Some(b.clone()));
         assert_eq!(decide(&a, Some(&a)), None);
-    }
-}
-
-/// Decrements [`LIVE_WATCHERS`] however the watcher task exits.
-struct WatcherGuard;
-
-impl Drop for WatcherGuard {
-    fn drop(&mut self) {
-        LIVE_WATCHERS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
