@@ -51,6 +51,28 @@ This makes an unpublish durable **on the node that ran it**. A recipient's re-ad
 `blob_revoke`/`blob_unpublish` bind only where they run (documented in 0.14.1). This issue does not
 change that and cannot.
 
+## Residues, stated rather than discovered later
+
+Found by adversarial review; each is a deliberate boundary, not an oversight:
+
+- **Per-`(scope, hash)`, and `blob_grant` creates scopes implicitly.** So `blob_grant` into a fresh
+  name followed by `blob_republish` re-exposes withdrawn content under that name, with no file and
+  no `blob_publish`. A scope is the unit of sharing, so this is consistent — but it means
+  "unpublish" is not "this can no longer be served from here", and the docs now say so.
+- **A downgrade erases every tombstone.** `#[serde(default)]` lets a pre-0.17 daemon load a 0.17
+  sidecar; the moment it performs any mutation it rewrites the file without `withdrawn`. Same class
+  as a non-persistent tombstone, triggered by version rather than restart. Not fixable without a
+  schema-version marker.
+- **`publish_scope`'s import runs OUTSIDE the membership lock**, so a `blob_publish` issued before
+  an `unpublish` can acquire after it and clear the withdrawal — the arrival-order-versus-
+  acquisition-order hazard, surviving on the publish path. Defensible (publish IS the deliberate
+  un-withdraw, and the operator did issue both), but it means the class is closed for `republish`
+  only.
+- **The withdrawn set is never pruned** and is caller-controlled: `blob_unpublish` records a hash
+  even when the scope never held it. Bounded in practice for a human operator; a machine driver
+  calling unpublish as hygiene grows it without limit. `blob_list` now surfaces it, so at least the
+  growth is visible.
+
 ## Surface + versioning
 
 - `Scope.withdrawn: BTreeSet<String>`, `#[serde(default)]` so existing sidecars load unchanged and

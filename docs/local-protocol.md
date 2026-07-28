@@ -167,8 +167,14 @@ Methods split into two groups by audience:
 | `blob_unpublish` | `{scope, hash}` — remove a blake3 hash from ONE scope (#62, `api_minor >= 15`). Refuses **subsequent** GETs from that scope; does **not** delete bytes and does **not** interrupt a transfer in flight — see the note below. `hash` must parse as blake3 (case-insensitive); garbage is an error, not a silent no-op. An already-absent hash is a clean no-op; an unknown **scope** is `-32040`. | `{}` (ack) |
 | `blob_republish` | `{scope, hash}` — make a blob this daemon ALREADY holds servable **from here**, in a scope it controls (#83, `api_minor >= 18`). No filesystem round-trip and no third copy: `blob_publish {scope, path}` was the only route back in and re-imported bytes the store already held. The blob must be held **COMPLETE** — an absent hash, or partial bytes from an interrupted fetch, answer `-32041`. A hash deliberately WITHDRAWN by `blob_unpublish` answers **`-32042`** and is NOT restored — see the warning below (#107, `api_minor >= 19`). **Grants nobody NEW** — but see the warning below: it re-exposes the hash to every principal the target scope already grants. The returned ticket names THIS node. Idempotent. | `{ticket, hash}` |
 
-> **As of `api_minor >= 19` (#107), `blob_republish` can no longer undo a `blob_unpublish` on this
-> node.** `blob_unpublish` records a durable withdrawal, persisted with the scope table, and a later
+> **As of `api_minor >= 19` (#107), `blob_republish` can no longer undo a `blob_unpublish` for that
+> hash IN THAT SCOPE.**
+>
+> The withdrawal is per-`(scope, hash)`. Republishing the same hash into a **different** scope on
+> this node is still allowed and will expose it to whatever that scope grants — and `blob_grant`
+> creates a scope implicitly, so two cheap calls can re-expose withdrawn content under a new name.
+> That is by design (a scope is the unit of sharing), but do not read "unpublish" as "this content
+> can no longer be served from here". `blob_unpublish` records a durable withdrawal, persisted with the scope table, and a later
 > `blob_republish` of that hash into that scope is refused with `-32042`. The withdrawal is cleared
 > only by a deliberate `blob_publish {scope, path}` — naming the FILE — because that is an operator
 > re-sharing specific content on purpose. `blob_grant` never clears it: it names a principal, not a
@@ -677,6 +683,8 @@ Reference: [`cli/src/backends/spawn.rs`](../cli/src/backends/spawn.rs) (`run`),
 | `-32602` | invalid params (a required field missing or the wrong type) |
 | `-32603` | internal error |
 | `-32040` | no such service — the name is in neither `config.toml` nor the ephemeral registry (`service_allow_grant` / `service_allow_revoke`, `api_minor >= 11`) |
+| `-32041` | `blob_republish` — the blob is not held COMPLETE by this daemon (#83). Remedy: fetch it first. |
+| `-32042` | `blob_republish` — the blob was deliberately WITHDRAWN from that scope (#107). Remedy: `blob_publish {scope, path}` from the file if the re-share is intended. |
 | `-32000` | operation failed — `message` carries the detail. One common instance: the daemon is in control-only mode with no mesh (e.g. `invite`/`pair` before a mesh exists) |
 | `-32055` | *(session only)* peer unreachable |
 | `-32054` | *(session only)* session refused |
