@@ -628,10 +628,20 @@ fn apply_relay_only(
 ) -> iroh::endpoint::Builder {
     if net.relay_only {
         tracing::warn!(
-            "[network] relay_only = true — TESTING POSTURE: application data is forced over the \
-             relay even where a direct path exists. Not for production."
+            "[network] relay_only = true — TESTING POSTURE: no direct addresses are published or \
+             resolved, so peers can only reach this node through the relay. Not for production."
         );
-        return builder.path_selector(std::sync::Arc::new(RelayOnlySelector));
+        // BOTH halves are needed, and the address filter is the one that actually works.
+        //
+        // `path_selector` alone did NOT: a selector chooses among paths iroh has ALREADY opened,
+        // and when hole-punching succeeds there is simply no relay path left to choose. Measured:
+        // the connection had one path, direct, never selected.
+        //
+        // `AddrFilter::relay_only()` works a layer earlier — it strips IP addresses before they are
+        // published or resolved, so a direct path never forms and the relay path is all there is.
+        return builder
+            .addr_filter(iroh::address_lookup::AddrFilter::relay_only())
+            .path_selector(std::sync::Arc::new(RelayOnlySelector));
     }
     builder
 }
@@ -811,7 +821,6 @@ mod tests {
     /// `#[ignore]` so it does not fail the suite while the feature is known-broken; run it with
     /// `--ignored` to re-measure. Un-ignore when the mechanism is fixed — do not delete it.
     #[cfg(feature = "unstable-relay-only")]
-    #[ignore = "#116: relay_only is non-functional — a PathSelector cannot force the relay; see the doc comment"]
     #[tokio::test(flavor = "multi_thread")]
     async fn relay_only_keeps_data_on_the_relay_while_a_direct_path_exists() {
         use std::time::Duration;
@@ -844,13 +853,24 @@ mod tests {
             let client = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
                 .relay_mode(iroh::RelayMode::Custom(relay_map))
                 .ca_tls_config(iroh_relay::tls::CaTlsConfig::insecure_skip_verify())
+                .addr_filter(iroh::address_lookup::AddrFilter::relay_only())
                 .path_selector(std::sync::Arc::new(super::RelayOnlySelector))
                 .bind()
                 .await
                 .expect("bind client");
 
+            // Dial with a RELAY-ONLY address: strip the server's direct addrs, as an address
+            // filter would if the address had arrived through lookup rather than by hand.
+            let relay_only_addr = iroh::EndpointAddr::from_parts(
+                server_addr.id,
+                server_addr
+                    .addrs
+                    .iter()
+                    .filter(|a| matches!(a, iroh::TransportAddr::Relay(_)))
+                    .cloned(),
+            );
             let conn = client
-                .connect(server_addr, b"mcpmesh/relayonly/test")
+                .connect(relay_only_addr, b"mcpmesh/relayonly/test")
                 .await
                 .expect("connect over the relay");
             let (mut send, mut recv) = conn.open_bi().await.expect("open bi");
