@@ -153,9 +153,23 @@ const PATH_SETTLE: Duration = Duration::from_millis(600);
 /// reports whatever is selected then — a genuinely relayed peer costs the full window once per
 /// probe, and reports `Relay`, which is the truthful answer for it.
 async fn settled_path(conn: &iroh::endpoint::Connection) -> mcpmesh_local_api::PeerPath {
-    let deadline = tokio::time::Instant::now() + PATH_SETTLE;
+    settle(PATH_SETTLE, || selected_path(conn)).await
+}
+
+/// The polling half of [`settled_path`], over a closure rather than a live connection (#110).
+///
+/// Split out because the property "keep looking until Direct, then stop; give up at the deadline"
+/// is pure timing logic, and pinning it through a real hole-punch made the integration suite
+/// depend on CI network luck. The e2e test proves we read the SELECTED path; this proves we WAIT
+/// for it. Neither test can cover both without one of them going vacuous — reordering the e2e test
+/// to be non-flaky silently stopped it catching a zeroed `PATH_SETTLE`.
+async fn settle<F>(window: Duration, mut probe: F) -> mcpmesh_local_api::PeerPath
+where
+    F: FnMut() -> mcpmesh_local_api::PeerPath,
+{
+    let deadline = tokio::time::Instant::now() + window;
     loop {
-        let path = selected_path(conn);
+        let path = probe();
         if path == mcpmesh_local_api::PeerPath::Direct || tokio::time::Instant::now() >= deadline {
             return path;
         }
@@ -463,6 +477,66 @@ mod tests {
             seq: 0,
             path: mcpmesh_local_api::PeerPath::Unknown,
         }
+    }
+
+    /// #64/#110: the probe WAITS for hole-punching rather than classifying the instant the pong
+    /// lands. A fresh dial starts on the relay, so a zero settle window reports `Relay` for every
+    /// peer on a relay-enabled node — the bug #64 shipped and then fixed.
+    ///
+    /// This lives here, not in the e2e suite, because the e2e version could only observe it by
+    /// racing a real hole-punch: that made it flaky on Windows and Linux CI (#110), and the
+    /// reordering that de-flaked it stopped catching this mutation entirely. Time is driven by
+    /// tokio's test clock, so it is deterministic and instant.
+    #[tokio::test(start_paused = true)]
+    async fn the_probe_waits_for_the_direct_path_instead_of_classifying_immediately() {
+        use mcpmesh_local_api::PeerPath;
+        use std::time::Duration;
+
+        // A connection that is relayed for the first three polls, then hole-punches.
+        let mut polls = 0;
+        let path = super::settle(super::PATH_SETTLE, || {
+            polls += 1;
+            if polls > 3 {
+                PeerPath::Direct
+            } else {
+                PeerPath::Relay { url: None }
+            }
+        })
+        .await;
+        assert_eq!(
+            path,
+            PeerPath::Direct,
+            "the settle window must outlast a punch that takes a few polls — classifying on the \
+             first look is what made Direct unreachable on every relay-enabled node"
+        );
+        assert_eq!(polls, 4, "it must stop polling as soon as Direct appears");
+
+        // A ZEROED window is the mutation the e2e suite used to catch: it returns whatever the
+        // very first look says, which for a fresh dial is always the relay.
+        let mut polls = 0;
+        let path = super::settle(Duration::ZERO, || {
+            polls += 1;
+            if polls > 3 {
+                PeerPath::Direct
+            } else {
+                PeerPath::Relay { url: None }
+            }
+        })
+        .await;
+        assert_eq!(
+            path,
+            PeerPath::Relay { url: None },
+            "with no settle window the relay answer wins — this assertion is what fails if \
+             PATH_SETTLE is ever zeroed or the wait is removed"
+        );
+
+        // A genuinely relayed peer pays the whole window and truthfully reports Relay.
+        let path = super::settle(super::PATH_SETTLE, || PeerPath::Relay { url: None }).await;
+        assert_eq!(
+            path,
+            PeerPath::Relay { url: None },
+            "a peer with no direct path must report Relay, not Unknown or Direct"
+        );
     }
 
     /// #64 review: a relay URL reaching the wire must carry NO credential. Relay URLs are

@@ -9,9 +9,20 @@
 //! The suite the change originally shipped with ran only with relays DISABLED, so it could not
 //! observe that at all. Here a REAL relay runs in-process.
 //!
+//! **Ordering matters (#110).** The connection that proves a direct path exists is established
+//! BEFORE the probe assertions and held open across them. Probing first was flaky on Windows and
+//! Linux CI: each `probe_peer` dials fresh, waits 600ms for hole-punching, and drops the
+//! connection, so a punch that misses the window leaves nothing cached and the next probe restarts.
+//! Twelve probes are twelve independent attempts, not one cumulative wait.
+//!
 //! **Known coverage limit.** This suite pins that a relayed peer eventually reports `Direct` once
-//! hole-punching completes — which catches both shipped bugs (the address-map derivation, and
-//! classifying before the path settles). It does NOT distinguish a classifier that reads the
+//! hole-punching completes, which catches the address-map derivation bug. It NO LONGER catches the
+//! other #64 bug, classifying before the path settles: holding the connection open means a probe's
+//! fresh dial finds an already-validated direct address, so a zeroed `PATH_SETTLE` passes here.
+//! That property moved to `reach.rs`'s
+//! `the_probe_waits_for_the_direct_path_instead_of_classifying_immediately`, which drives it on
+//! tokio's test clock instead of a real hole-punch. Verified by mutation, in both directions.
+//! It also does NOT distinguish a classifier that reads the
 //! SELECTED path from one that reads open paths in iteration order: mutating `is_selected()` away
 //! still passes, because the probe connection surfaces the direct path first. That guarantee rests
 //! on iroh's documented semantics for `Path::is_selected()` and on reading its source, not on a
@@ -122,8 +133,54 @@ async fn the_path_reports_the_route_data_actually_takes() {
         std::fs::write(dir.path().join("our.toml"), "").unwrap();
         let mesh = assemble(our_ep, our_store, dir.path().join("our.toml"));
 
-        // Probe until a direct path is selected. The first probe may still be on the relay while
-        // hole-punching completes; what must NOT happen is being pinned to Relay forever.
+        // SETUP FIRST, and HOLD the connection open for the rest of the test (#110).
+        //
+        // This ordering is the whole point. `probe_peer` dials a FRESH connection, waits at most
+        // `PATH_SETTLE` (600ms) for hole-punching, then DROPS it. When the punch does not land
+        // inside that window — routine on a loaded CI runner — the connection dies before the
+        // direct path is validated, so nothing is cached and the next probe starts over. Probing in
+        // a loop therefore does not converge: it is twelve independent 600ms attempts, not one
+        // cumulative 6s wait, and it reported Relay twelve times on both Windows and Linux.
+        //
+        // Holding ONE connection lets the punch complete once. The endpoint then has a validated
+        // direct address for this peer, so every later dial selects it promptly. That is also what
+        // production does — real sessions are long-lived, not 600ms probes.
+        let probe_conn = mesh_endpoint_dial(&mesh, peer_id, &relay_url).await;
+        let (mut relay_open, mut direct_selected) = (false, false);
+        // Generous: this is waiting for the NETWORK, not asserting a latency budget. A tight bound
+        // here is what made this suite flaky in the first place.
+        for _ in 0..120 {
+            for path in &probe_conn.paths() {
+                if path.is_relay() {
+                    relay_open = true;
+                }
+                if path.is_ip() && path.is_selected() {
+                    direct_selected = true;
+                }
+            }
+            if relay_open && direct_selected {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        // A SETUP check, not a behavioural one — be clear about which. It proves the scenario is
+        // the interesting one: a relay path OPEN alongside a SELECTED direct path, which is the
+        // configuration where reading open addresses and reading the selected path disagree.
+        //
+        // It does NOT pin the classifier: a version that ignores `is_selected()` still passes this
+        // whole test, because the probe connection's path iteration happens to surface the direct
+        // path first. The guarantee that we read the SELECTED path is enforced by construction and
+        // by iroh's own documented semantics ("selected for application data transmission"), not
+        // by this test. See the module header.
+        assert!(
+            relay_open && direct_selected,
+            "setup: expected an OPEN relay path alongside a SELECTED direct one \
+             (relay_open={relay_open}, direct_selected={direct_selected}) — without that overlap \
+             this test cannot distinguish reading the selected path from reading open addresses"
+        );
+
+        // Now the behavioural assertion, with the punch already landed. A probe still opens its own
+        // connection, so it must still classify correctly — but it is no longer racing the network.
         let mut seen = Vec::new();
         let mut got_direct = false;
         for _ in 0..12 {
@@ -141,38 +198,9 @@ async fn the_path_reports_the_route_data_actually_takes() {
             "with a direct path available, the field must eventually report Direct — reporting \
              Relay forever is the bug this suite exists to catch. Saw: {seen:?}"
         );
-
-        // A SETUP check, not a behavioural one — be clear about which. It proves the scenario is
-        // the interesting one: a relay path OPEN alongside a SELECTED direct path, which is the
-        // configuration where reading open addresses and reading the selected path disagree.
-        //
-        // It does NOT pin the classifier: a version that ignores `is_selected()` still passes this
-        // whole test, because the probe connection's path iteration happens to surface the direct
-        // path first. The guarantee that we read the SELECTED path is enforced by construction and
-        // by iroh's own documented semantics ("selected for application data transmission"), not
-        // by this test. See the module header.
-        let probe_conn = mesh_endpoint_dial(&mesh, peer_id, &relay_url).await;
-        let (mut relay_open, mut direct_selected) = (false, false);
-        for _ in 0..20 {
-            for path in &probe_conn.paths() {
-                if path.is_relay() {
-                    relay_open = true;
-                }
-                if path.is_ip() && path.is_selected() {
-                    direct_selected = true;
-                }
-            }
-            if relay_open && direct_selected {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(150)).await;
-        }
-        assert!(
-            relay_open && direct_selected,
-            "setup: expected an OPEN relay path alongside a SELECTED direct one \
-             (relay_open={relay_open}, direct_selected={direct_selected}) — without that overlap \
-             this test cannot distinguish reading the selected path from reading open addresses"
-        );
+        // Keep the connection alive to here: dropping it earlier would let the endpoint discard the
+        // validated direct path mid-test and reintroduce exactly the race this fix removes.
+        drop(probe_conn);
 
         // Whatever it reported along the way, it must never have been a value we do not model.
         for p in &seen {
