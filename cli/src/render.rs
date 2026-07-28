@@ -352,6 +352,25 @@ pub fn reachability_lines(reachability: &[PeerReachability]) -> Vec<String> {
                 Some(ms) if r.reachable => format!("  {} · {label} · {ms}ms", r.name),
                 _ => format!("  {} · {label}", r.name),
             };
+            // #116: show WHICH PATH carried the traffic. #64 added the field and 0.19.0 made a
+            // path change emit a transition, but human output never rendered it — so "did my test
+            // actually use the relay?" was log archaeology, and an embedder on a LAN with IPv6
+            // can hole-punch direct while believing they exercised the relay.
+            //
+            // Word only, never the relay URL: `--json` carries `path.url` for tooling, and this
+            // surface stays nickname + status words + a latency number.
+            //
+            // `Unknown` renders as "path unknown", NOT as nothing and NEVER as "direct". #64 is
+            // explicit that Unknown means "we do not know", and that rendering it as private is
+            // the one misuse that turns this field into a false privacy statement — omitting it
+            // would read as "no relay involved", which is the same lie by silence.
+            if r.reachable {
+                line.push_str(match &r.path {
+                    mcpmesh_local_api::PeerPath::Direct => " · direct",
+                    mcpmesh_local_api::PeerPath::Relay { .. } => " · relay",
+                    _ => " · path unknown",
+                });
+            }
             // #40: the peer's app metadata (from the probe pong), control-char-stripped +
             // truncated for the terminal (peer-controlled bytes — same hygiene as #39's
             // presence line; `--json` carries the raw value).
@@ -911,6 +930,73 @@ mod tests {
         assert!(!rendered.contains("mcpmesh serve") && !rendered.contains("mcpmesh pair"));
     }
 
+    /// #116: the path is VISIBLE in human output. Without it "did my test actually use the relay?"
+    /// is log archaeology — and two machines on a LAN with IPv6 hole-punch direct, so an embedder
+    /// can believe they exercised the relay when they did not.
+    #[test]
+    fn reachability_lines_show_which_path_carried_the_traffic() {
+        let peer_at = |name: &str, path: mcpmesh_local_api::PeerPath| PeerReachability {
+            name: name.into(),
+            reachable: true,
+            rtt_ms: Some(12),
+            age_secs: Some(1),
+            meta: String::new(),
+            principal: None,
+            path,
+        };
+        let lines = reachability_lines(&[
+            peer_at("d", mcpmesh_local_api::PeerPath::Direct),
+            peer_at(
+                "r",
+                mcpmesh_local_api::PeerPath::Relay {
+                    url: Some("https://relay.example/".into()),
+                },
+            ),
+            peer_at("u", mcpmesh_local_api::PeerPath::Unknown),
+        ]);
+        assert!(lines[0].contains("· direct"), "{}", lines[0]);
+        assert!(lines[1].contains("· relay"), "{}", lines[1]);
+
+        // The relay URL is NOT in human output — `--json` carries it; this surface stays
+        // nickname + status words + a latency number.
+        assert!(
+            !lines[1].contains("relay.example"),
+            "the relay URL belongs in --json, not the terminal: {}",
+            lines[1]
+        );
+
+        // Unknown is stated, never omitted and never rendered as direct. #64: Unknown means "we do
+        // not know" and rendering it as private is the one misuse that makes this field a false
+        // privacy statement — silence would read as "no relay involved", the same lie.
+        assert!(
+            lines[2].contains("path unknown"),
+            "Unknown must be STATED: {}",
+            lines[2]
+        );
+        assert!(
+            !lines[2].contains("· direct"),
+            "and must never read as direct: {}",
+            lines[2]
+        );
+    }
+
+    /// An offline peer has no path to report — appending one would invent a claim about traffic
+    /// that never flowed.
+    #[test]
+    fn an_offline_peer_reports_no_path() {
+        let lines = reachability_lines(&[PeerReachability {
+            name: "gone".into(),
+            reachable: false,
+            rtt_ms: None,
+            age_secs: Some(90),
+            meta: String::new(),
+            principal: None,
+            path: mcpmesh_local_api::PeerPath::Unknown,
+        }]);
+        assert!(!lines[0].contains("path"), "{}", lines[0]);
+        assert!(!lines[0].contains("direct"), "{}", lines[0]);
+    }
+
     #[test]
     fn reachability_lines_render_online_offline_and_checking() {
         let lines = reachability_lines(&[
@@ -942,7 +1028,12 @@ mod tests {
                 path: Default::default(),
             },
         ]);
-        assert_eq!(lines[0], "  alice · online · 23ms");
+        // #116: an ONLINE peer now states its path. This fixture never set one, so it is
+        // `Unknown` — and Unknown is STATED rather than omitted, because silence would read as
+        // "no relay involved" (#64: rendering Unknown as private is the one misuse that makes
+        // this a false privacy statement).
+        assert_eq!(lines[0], "  alice · online · 23ms · path unknown");
+        // Offline and never-probed peers carry no path — there was no traffic to characterise.
         assert_eq!(lines[1], "  bob · offline");
         // A never-probed peer reads as a STATE, not a bare ellipsis (issue #12).
         assert_eq!(lines[2], "  carol · checking…");
