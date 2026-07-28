@@ -26,6 +26,9 @@ use mcpmesh_local_api::PeerPath;
 /// relay→direct transition of a healthy dial, so it needs its own damping. Same 600ms as
 /// `reach::PATH_SETTLE` and for the same reason: it is the measured time for a loopback punch to
 /// settle, and it is well inside any session's lifetime.
+// Consumed by the watcher loop in the next commit (Task 3); CI runs clippy -D warnings, so the
+// gap between the pure rule landing and its caller landing must not leave the branch red.
+#[allow(dead_code)]
 pub(crate) const PATH_CHANGE_SETTLE: Duration = Duration::from_millis(600);
 
 /// Should an observation be committed and emitted?
@@ -37,6 +40,7 @@ pub(crate) const PATH_CHANGE_SETTLE: Duration = Duration::from_millis(600);
 /// only when the observation DIFFERS from what a consumer already believes. A watcher that emits
 /// on every event turns a flapping connection into a frame storm, which is the noise #64 avoided
 /// by excluding `path` entirely.
+#[allow(dead_code)]
 pub(crate) fn decide(observed: &PeerPath, cached: Option<&PeerPath>) -> Option<PeerPath> {
     // `Unknown` is never worth emitting: it means "we do not know", and pushing it would replace a
     // consumer's correct belief with an absence of one. A connection tearing down reports Unknown
