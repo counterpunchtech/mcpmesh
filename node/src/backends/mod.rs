@@ -212,6 +212,103 @@ mod tests {
     use crate::audit::{AuditSink, RequestAuditor};
     use crate::limits::{RateGate, RateLimiter};
 
+    /// #91: a server-initiated NOTIFICATION reaches the peer, and is NOT metered.
+    ///
+    /// Direction B forwards every frame the local server writes, including method-bearing ones,
+    /// with no limiter consult — which is what makes "an agent reacts to an incoming message"
+    /// possible rather than requiring the peer to poll. That behaviour was emergent and untested;
+    /// #45's stateless rework removes the `initialize` handshake this session shape is built
+    /// around, and a property nobody wrote down is a property nobody notices removing.
+    ///
+    /// The rate gate here is set to a budget of ONE and then exhausted by the inbound request, so
+    /// an implementation that metered Direction B against the same per-identity budget would drop
+    /// or -32053 this notification instead of forwarding it.
+    #[tokio::test]
+    async fn a_server_initiated_notification_reaches_the_peer_unmetered() {
+        timeout(Duration::from_secs(10), async {
+            let (mut peer_w, tr) = duplex(64 * 1024);
+            let (tw, peer_r) = duplex(64 * 1024);
+            let mut transport = NdjsonTransport::new(tr, tw, MAX_FRAME_BYTES);
+            let (server_write, srv_stdin) = duplex(64 * 1024);
+            let (srv_stdout, server_read) = duplex(64 * 1024);
+
+            // The server answers the request AND pushes an unsolicited notification afterwards.
+            let server = tokio::spawn(async move {
+                let mut srv_w = srv_stdout;
+                let mut reader = FrameReader::new(srv_stdin, MAX_FRAME_BYTES);
+                let mut seen = 0usize;
+                while let Ok(Some(Inbound::Frame(f))) = reader.next().await {
+                    seen += 1;
+                    if f["method"] == "tools/call" {
+                        write_frame(&mut srv_w, &json!({"jsonrpc":"2.0","id":f["id"]}))
+                            .await
+                            .unwrap();
+                        // UNSOLICITED: no id, a method, nobody asked for it.
+                        write_frame(
+                            &mut srv_w,
+                            &json!({"jsonrpc":"2.0","method":"notifications/message",
+                                    "params":{"level":"info","data":"pushed"}}),
+                        )
+                        .await
+                        .unwrap();
+                    }
+                }
+                seen
+            });
+
+            // Budget of ONE request per minute — consumed by `tools/call` below.
+            let rate = RateGate::new(
+                std::sync::Arc::new(crate::limits::RateLimiter::per_minute(1, 1)),
+                None,
+            );
+            let pump_task = tokio::spawn(async move {
+                pump(
+                    json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
+                    &mut transport,
+                    server_read,
+                    server_write,
+                    RequestAuditor::new(AuditSink::disabled(), Some("bob".into()), "echo".into()),
+                    rate,
+                )
+                .await
+            });
+
+            write_frame(
+                &mut peer_w,
+                &json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{}}),
+            )
+            .await
+            .unwrap();
+
+            let mut peer_reader = FrameReader::new(peer_r, MAX_FRAME_BYTES);
+            let reply = match peer_reader.next().await.unwrap() {
+                Some(Inbound::Frame(f)) => f,
+                other => panic!("expected the id=2 reply, got {other:?}"),
+            };
+            assert_eq!(reply["id"], 2, "the solicited reply arrives first");
+
+            let pushed = match peer_reader.next().await.unwrap() {
+                Some(Inbound::Frame(f)) => f,
+                other => panic!("expected the server-initiated notification, got {other:?}"),
+            };
+            assert_eq!(
+                pushed["method"], "notifications/message",
+                "an unsolicited server notification must reach the peer — this is what makes push \
+                 possible instead of polling (#91): {pushed}"
+            );
+            assert!(
+                pushed.get("id").is_none_or(|v| v.is_null()),
+                "and it is a notification, not a request: {pushed}"
+            );
+
+            drop(peer_w);
+            let _ = server.await;
+            let _ = pump_task.await;
+        })
+        .await
+        .expect("server-initiated notification test timed out");
+    }
+
     /// The client sends `initialize` + one request and then EOFs the transport; the
     /// server replies to BOTH only after seeing its stdin close. Both replies must
     /// still reach the peer (the old select!-cancel dropped them) and `pump` must
