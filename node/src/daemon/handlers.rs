@@ -228,7 +228,7 @@ pub(crate) async fn blob_list(
             truncated: false,
         });
     };
-    let page = provider.list_page(&q);
+    let page = provider.list_page(&q)?;
     Ok(BlobScopeList {
         scopes: page
             .rows

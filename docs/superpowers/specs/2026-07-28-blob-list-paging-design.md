@@ -5,9 +5,14 @@
 ## Problem
 
 `blob_list` renders **every** scope with **every** hash, grant and (since 0.17.0) withdrawal, into a
-single response. The control frame cap is 16 MiB and a violation closes the connection on the third
-strike — so this does not degrade at scale, it **fails**, and it takes the caller's control
-connection with it.
+single response. The control frame cap is 16 MiB, and past it the **client** rejects the frame as
+malformed. The control surface carries no strike bound (`control.rs` says so explicitly), so the
+connection survives — but the caller gets an opaque `Malformed("response")` with no way to page.
+An unusable answer, not a dead connection.
+
+*(An earlier draft of this spec, and the first commit message, claimed the connection was closed on
+the third strike. That is the MESH path's behaviour, not the control path's. The fix is still right;
+the justification was wrong.)*
 
 The owner has now confirmed (#84d) that the intended granularity is **one scope per file**
 (`file:<hash>`). That makes scope count grow with every file ever shared, so the cliff is reached by

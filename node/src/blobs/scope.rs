@@ -15,12 +15,16 @@ use serde::{Deserialize, Serialize};
 /// `BTreeSet` for deterministic serialization + list ordering.
 /// Default cap on how many scopes one `blob_list` returns (#84b).
 ///
-/// NOT unbounded. `blob_list` renders every scope into a single control frame against a 16 MiB cap
-/// whose violation closes the connection on the third strike, so an unbounded listing does not
-/// degrade at scale — it kills the caller's connection. With one-scope-per-file granularity
-/// (#84d) that is reached by ordinary use. A truncated answer the caller can detect and page
-/// through is strictly better than a dead connection.
+/// NOT unbounded. `blob_list` renders every scope into a single control frame against a 16 MiB
+/// cap; past it the CLIENT rejects the frame as malformed. The control surface carries no strike
+/// bound (see `control.rs`), so the connection survives — but the caller gets an opaque
+/// `Malformed("response")` with no way to page, which is an unusable answer rather than a large
+/// one. With one-scope-per-file granularity (#84d) that is reached by ordinary use.
 pub const DEFAULT_LIST_LIMIT: usize = 256;
+
+/// Hard ceiling on a caller-supplied `limit` (#84b review). Without it, `{"limit": 1000000}`
+/// reproduces the unbounded listing the default exists to prevent.
+pub const MAX_LIST_LIMIT: usize = 4096;
 
 /// One row of a `blob_list` page: `(name, hashes, grants, withdrawn, hash_count, grant_count,
 /// withdrawn_count)`. The counts are always present, even when `counts_only` empties the vectors.
@@ -168,14 +172,18 @@ impl BlobScopes {
     /// Order is scope name — the table is a `BTreeMap`, so it is already sorted and stable. Paging
     /// without a stable order returns overlapping or missing rows that look plausible, which is
     /// worse than not paging at all.
-    pub fn list_page(&self, q: &ListQuery) -> ScopePage {
+    pub fn list_page(&self, q: &ListQuery) -> anyhow::Result<ScopePage> {
         // Normalize the hash filter so a caller's base32 rendering matches a stored canonical hex,
         // matching the rule #83 established for every other hash-taking surface.
-        let want_hash = q
-            .hash
-            .as_deref()
-            .and_then(|h| crate::blobs::parse_blob_hash(h).ok())
-            .map(|h| h.to_hex().to_string());
+        // A malformed hash is an ERROR, not "no filter" (#84b review). `.ok()` here collapsed a
+        // truncated paste or a trailing newline into `None`, which means NO FILTER — so the caller
+        // asked "which scopes contain this hash" and was told "all of them", with `total` claiming
+        // the full count. That is a silent wrong answer on an authorization-introspection surface,
+        // and every other hash-taking verb (`blob_republish`, `blob_unpublish`) propagates instead.
+        let want_hash = match q.hash.as_deref() {
+            Some(h) => Some(crate::blobs::parse_blob_hash(h)?.to_hex().to_string()),
+            None => None,
+        };
 
         let matching: Vec<(&String, &Scope)> = self
             .scopes
@@ -188,7 +196,9 @@ impl BlobScopes {
 
         let total = matching.len();
         let offset = q.offset.unwrap_or(0);
-        let limit = q.limit.unwrap_or(DEFAULT_LIST_LIMIT);
+        // Clamp: `{"limit": 1000000}` is the first thing a client writes on seeing
+        // `truncated: true`, and it reproduces the exact unbounded listing this exists to prevent.
+        let limit = q.limit.unwrap_or(DEFAULT_LIST_LIMIT).min(MAX_LIST_LIMIT);
         let rows: Vec<ScopePageRow> = matching
             .into_iter()
             .skip(offset)
@@ -214,11 +224,11 @@ impl BlobScopes {
             })
             .collect();
         let truncated = offset + rows.len() < total;
-        ScopePage {
+        Ok(ScopePage {
             rows,
             total,
             truncated,
-        }
+        })
     }
 
     /// Was this hash deliberately withdrawn from this scope (#107)?
@@ -428,7 +438,7 @@ impl ScopeStore {
     }
 
     /// One filtered, bounded page (#84b).
-    pub fn list_page(&self, q: &ListQuery) -> ScopePage {
+    pub fn list_page(&self, q: &ListQuery) -> anyhow::Result<ScopePage> {
         self.inner
             .read()
             .expect("scope lock not poisoned")
@@ -730,7 +740,7 @@ mod listing_tests {
     /// caller can tell a complete answer from a clipped one.
     #[test]
     fn an_unfiltered_listing_reports_its_total_and_is_not_truncated() {
-        let page = table(5).list_page(&ListQuery::default());
+        let page = table(5).list_page(&ListQuery::default()).unwrap();
         assert_eq!(page.rows.len(), 5);
         assert_eq!(page.total, 5);
         assert!(!page.truncated, "5 scopes fit under any sane default");
@@ -741,7 +751,7 @@ mod listing_tests {
     /// default limit turns that into a truncated answer the caller can detect and page through.
     #[test]
     fn the_default_limit_truncates_and_says_so() {
-        let page = table(300).list_page(&ListQuery::default());
+        let page = table(300).list_page(&ListQuery::default()).unwrap();
         assert_eq!(page.rows.len(), DEFAULT_LIST_LIMIT, "default limit applies");
         assert_eq!(page.total, 300, "total counts MATCHES, not returned rows");
         assert!(
@@ -756,15 +766,19 @@ mod listing_tests {
     #[test]
     fn offset_and_limit_page_without_overlap_or_gaps() {
         let t = table(25);
-        let p1 = t.list_page(&ListQuery {
-            limit: Some(10),
-            ..Default::default()
-        });
-        let p2 = t.list_page(&ListQuery {
-            limit: Some(10),
-            offset: Some(10),
-            ..Default::default()
-        });
+        let p1 = t
+            .list_page(&ListQuery {
+                limit: Some(10),
+                ..Default::default()
+            })
+            .unwrap();
+        let p2 = t
+            .list_page(&ListQuery {
+                limit: Some(10),
+                offset: Some(10),
+                ..Default::default()
+            })
+            .unwrap();
         let n1: Vec<&String> = p1.rows.iter().map(|r| &r.0).collect();
         let n2: Vec<&String> = p2.rows.iter().map(|r| &r.0).collect();
         assert_eq!(n1.len(), 10);
@@ -789,13 +803,84 @@ mod listing_tests {
         let mut s = BlobScopes::default();
         s.publish_hash("file:aa", "11");
         s.publish_hash("file:aabb", "22");
-        let page = s.list_page(&ListQuery {
-            scope: Some("file:aa".into()),
-            ..Default::default()
-        });
+        let page = s
+            .list_page(&ListQuery {
+                scope: Some("file:aa".into()),
+                ..Default::default()
+            })
+            .unwrap();
         assert_eq!(page.rows.len(), 1);
         assert_eq!(page.rows[0].0, "file:aa");
         assert_eq!(page.total, 1, "and the total reflects the filter");
+    }
+
+    /// Spec item 5: the `hash` filter NORMALIZES, so a base32 rendering matches a scope storing
+    /// canonical hex — the rule #83 established for every hash-taking surface.
+    #[test]
+    fn the_hash_filter_normalizes_the_callers_rendering() {
+        let canonical = format!("{:064x}", 42);
+        let mut s = BlobScopes::default();
+        s.publish_hash("file:has-it", &canonical);
+        s.publish_hash("file:lacks-it", &format!("{:064x}", 43));
+
+        let parsed = crate::blobs::parse_blob_hash(&canonical).unwrap();
+        let base32 = data_encoding::BASE32_NOPAD
+            .encode(parsed.as_bytes())
+            .to_ascii_lowercase();
+        assert_ne!(base32, canonical, "the fixture must actually differ");
+
+        let page = s
+            .list_page(&ListQuery {
+                hash: Some(base32),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(page.rows.len(), 1, "the base32 rendering must match");
+        assert_eq!(page.rows[0].0, "file:has-it");
+    }
+
+    /// #84b review: a MALFORMED hash filter must ERROR, not silently return everything.
+    ///
+    /// `.ok()` collapsed a bad hash to "no filter", so a truncated paste or a trailing newline
+    /// answered "which scopes contain this hash" with EVERY scope, and `total` claimed the full
+    /// count. A silent wrong answer on an authorization-introspection surface is worse than a
+    /// refusal, and every other hash-taking verb propagates the parse error.
+    #[test]
+    fn a_malformed_hash_filter_errors_instead_of_matching_everything() {
+        let s = table(5);
+        for bad in ["abc", "", "not-a-hash", &format!("{:064x}\n", 1)] {
+            let got = s.list_page(&ListQuery {
+                hash: Some(bad.to_string()),
+                ..Default::default()
+            });
+            assert!(
+                got.is_err(),
+                "{bad:?} must be refused, not treated as no-filter (would have returned all 5)"
+            );
+        }
+    }
+
+    /// A caller-supplied `limit` is CLAMPED to `MAX_LIST_LIMIT`.
+    ///
+    /// Without the clamp, `{"limit": 1000000}` — the obvious move on seeing `truncated: true` —
+    /// reproduces the unbounded listing the default exists to prevent. Uses a table LARGER than
+    /// the ceiling so the assertion is about the clamp rather than about the fixture.
+    #[test]
+    fn an_enormous_limit_is_clamped_to_the_ceiling() {
+        let big = table(MAX_LIST_LIMIT + 50);
+        let page = big
+            .list_page(&ListQuery {
+                limit: Some(usize::MAX),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            page.rows.len(),
+            MAX_LIST_LIMIT,
+            "a caller cannot opt out of the cap"
+        );
+        assert_eq!(page.total, MAX_LIST_LIMIT + 50, "total is still honest");
+        assert!(page.truncated, "and it says it truncated");
     }
 
     /// `counts_only` answers "how many files / how many withdrawn" in constant response size —
@@ -804,14 +889,17 @@ mod listing_tests {
     fn counts_only_omits_the_vectors_but_keeps_the_counts() {
         let mut s = table(3);
         s.unpublish_hash("file:0000", &format!("{:064x}", 0));
-        let page = s.list_page(&ListQuery {
-            counts_only: true,
-            ..Default::default()
-        });
+        let page = s
+            .list_page(&ListQuery {
+                counts_only: true,
+                ..Default::default()
+            })
+            .unwrap();
         let row = page.rows.iter().find(|r| r.0 == "file:0000").unwrap();
         assert!(row.1.is_empty(), "hashes omitted");
         assert!(row.2.is_empty(), "grants omitted");
         assert!(row.3.is_empty(), "withdrawn omitted");
+        assert_eq!(row.4, 0, "hash_count: the one hash was withdrawn");
         assert_eq!(row.5, 1, "but the grant count survives");
         assert_eq!(row.6, 1, "and the withdrawn count");
     }

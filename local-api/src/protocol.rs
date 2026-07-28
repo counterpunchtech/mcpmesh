@@ -696,8 +696,9 @@ pub struct ScopeInfo {
 /// matters because the verb took no params before `api_minor` 20.
 ///
 /// A DEFAULT LIMIT applies when `limit` is absent. Deliberate: unpaged, `blob_list` renders every
-/// scope into one frame against the 16 MiB cap whose violation closes the connection on the third
-/// strike, so an unbounded listing kills the caller rather than merely being large.
+/// scope into one frame against the 16 MiB cap; past it the CLIENT rejects the frame as malformed.
+/// The control surface carries no strike bound, so the connection survives — but the caller gets an
+/// opaque failure with no way to page, which is unusable rather than merely large.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BlobListParams {
