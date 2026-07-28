@@ -26,6 +26,7 @@ pub(crate) mod boot;
 pub(crate) mod config_write;
 mod dial;
 mod handlers;
+mod path_watch;
 mod reach;
 mod roster_install;
 mod sever;
