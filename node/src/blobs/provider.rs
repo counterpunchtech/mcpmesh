@@ -389,10 +389,19 @@ impl AppBlobs {
     /// hook. The BYTES remain in the store — there is no reclaim (#80) — so do not describe this to
     /// a user as deletion. A transfer already streaming is not interrupted.
     pub async fn unpublish(&self, scope: &str, hash_hex: &str) -> Result<bool> {
+        // NORMALIZE FIRST (#107 review). Since #107 this call WRITES a persistent key into the
+        // withdrawn set, so a non-canonical rendering no longer merely fails to match — it records
+        // a junk entry that no `republish` will ever compare equal to, in a set nothing prunes.
+        // The control socket normalizes before calling, but `AppBlobs` is public API of a
+        // published crate, so a library consumer passing uppercase hex must not poison the
+        // sidecar. `republish` already normalizes one function away.
+        let canonical = crate::blobs::parse_blob_hash(hash_hex)?
+            .to_hex()
+            .to_string();
         // #104: same lock as `republish`, so a revocation cannot land inside a republish's
         // check-then-insert window and be overwritten by it.
         let _membership = self.hash_membership.lock().await;
-        self.scopes.unpublish_hash(scope, hash_hex)
+        self.scopes.unpublish_hash(scope, &canonical)
     }
 
     /// TEST-ONLY: pause between the import and the scope insert (#104).
@@ -414,7 +423,7 @@ impl AppBlobs {
     }
 
     /// The current scope table (name, hashes, grants) for `list`.
-    pub fn list(&self) -> Vec<(String, Vec<String>, Vec<String>)> {
+    pub fn list(&self) -> Vec<crate::blobs::scope::ScopeRow> {
         self.scopes.list()
     }
 
@@ -604,7 +613,7 @@ mod tests {
         let hashes: Vec<String> = provider
             .list()
             .into_iter()
-            .flat_map(|(_, hashes, _)| hashes)
+            .flat_map(|(_, hashes, _, _)| hashes)
             .collect();
         assert!(
             !hashes.contains(&absent),
@@ -818,8 +827,8 @@ mod tests {
         let recorded: Vec<String> = provider
             .list()
             .into_iter()
-            .filter(|(name, _, _)| name == "room")
-            .flat_map(|(_, hashes, _)| hashes)
+            .filter(|(name, _, _, _)| name == "room")
+            .flat_map(|(_, hashes, _, _)| hashes)
             .collect();
         assert_eq!(
             recorded,
@@ -870,7 +879,7 @@ mod tests {
             let hashes: Vec<String> = provider
                 .list()
                 .into_iter()
-                .flat_map(|(_, hashes, _)| hashes)
+                .flat_map(|(_, hashes, _, _)| hashes)
                 .collect();
             assert!(
                 !hashes.contains(&hash_hex),
@@ -917,7 +926,7 @@ mod tests {
             let hashes: Vec<String> = provider
                 .list()
                 .into_iter()
-                .flat_map(|(_, hashes, _)| hashes)
+                .flat_map(|(_, hashes, _, _)| hashes)
                 .collect();
             assert!(
                 !hashes.contains(&hash_hex),
@@ -1028,7 +1037,7 @@ mod tests {
             let hashes: Vec<String> = provider
                 .list()
                 .into_iter()
-                .flat_map(|(_, hashes, _)| hashes)
+                .flat_map(|(_, hashes, _, _)| hashes)
                 .collect();
             assert!(
                 !hashes.contains(&hash_hex),
@@ -1088,7 +1097,7 @@ mod tests {
         let rooms: Vec<(String, Vec<String>)> = provider
             .list()
             .into_iter()
-            .map(|(name, hashes, _)| (name, hashes))
+            .map(|(name, hashes, _, _)| (name, hashes))
             .collect();
         assert_eq!(
             rooms,

@@ -13,6 +13,12 @@ use serde::{Deserialize, Serialize};
 /// One scope: the blob hashes it contains + the principals it grants. Hashes are bare 64-char blake3
 /// hex (`Hash::to_hex()`); principals are stable ids/names: `{eid} ∪ {user_id} ∪ groups` (#38 — never nicknames).
 /// `BTreeSet` for deterministic serialization + list ordering.
+/// One row of the scope listing: `(name, hashes, grants, withdrawn)`.
+///
+/// Named because it grew a fourth member with #107's withdrawal set and an anonymous 4-tuple
+/// stopped being readable at the call sites.
+pub type ScopeRow = (String, Vec<String>, Vec<String>, Vec<String>);
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Scope {
     pub hashes: BTreeSet<String>,
@@ -132,13 +138,19 @@ impl BlobScopes {
     /// capabilities; a hash reachable in scope A does not become reachable via scope B's grant.
     pub fn allows(&self, hash_hex: &str, principals: &HashSet<&str>) -> bool {
         self.scopes.values().any(|sc| {
-            sc.hashes.contains(hash_hex)
+            // A withdrawal outranks residual membership (#107 review). `hashes` and `withdrawn`
+            // are kept disjoint by the API, but this is an AUTHZ gate: if the two ever disagree —
+            // a hand-edited sidecar, external tooling, a partial rollback, a future third
+            // insertion site — the tombstone must win rather than the leftover row. Cheap
+            // belt-and-braces on the one surface where fail-open is unacceptable.
+            !sc.withdrawn.contains(hash_hex)
+                && sc.hashes.contains(hash_hex)
                 && sc.grants.iter().any(|g| principals.contains(g.as_str()))
         })
     }
 
     /// Deterministic `(name, hashes, grants)` rendering for `list` (sorted by BTree order).
-    pub fn list(&self) -> Vec<(String, Vec<String>, Vec<String>)> {
+    pub fn list(&self) -> Vec<ScopeRow> {
         self.scopes
             .iter()
             .map(|(name, sc)| {
@@ -146,6 +158,10 @@ impl BlobScopes {
                     name.clone(),
                     sc.hashes.iter().cloned().collect(),
                     sc.grants.iter().cloned().collect(),
+                    // #107: surface withdrawals. Without this a tombstone is discoverable only by
+                    // triggering a -32042, and the set — which only `blob_publish` ever prunes —
+                    // grows invisibly.
+                    sc.withdrawn.iter().cloned().collect(),
                 )
             })
             .collect()
@@ -304,8 +320,8 @@ impl ScopeStore {
     }
 
     /// Deterministic list rendering (delegates to `BlobScopes::list`).
-    pub fn list(&self) -> Vec<(String, Vec<String>, Vec<String>)> {
-        self.snapshot().list()
+    pub fn list(&self) -> Vec<ScopeRow> {
+        self.inner.read().expect("scope lock not poisoned").list()
     }
 
     fn persist(&self, scopes: &BlobScopes) -> Result<()> {

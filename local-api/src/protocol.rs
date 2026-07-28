@@ -675,6 +675,12 @@ pub struct ScopeInfo {
     pub name: String,
     pub hashes: Vec<String>,
     pub grants: Vec<String>,
+    /// Hashes deliberately WITHDRAWN from this scope (#107): `blob_unpublish` was called, and
+    /// `blob_republish` of these into THIS scope is refused with [`ERR_BLOB_WITHDRAWN`]. Cleared
+    /// only by a deliberate `blob_publish {scope, path}`. Additive — omitted when empty, so a
+    /// pre-`api_minor` 19 client sees exactly what it saw before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub withdrawn: Vec<String>,
 }
 
 /// Result of [`Request::BlobList`]: the daemon's scopes. Additive-only.
@@ -1910,6 +1916,7 @@ mod tests {
                 name: "docs".into(),
                 hashes: vec!["ab".repeat(32)],
                 grants: vec!["alice".into()],
+                withdrawn: vec![],
             }],
         };
         let v = serde_json::to_value(&res).unwrap();

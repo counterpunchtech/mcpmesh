@@ -215,10 +215,11 @@ pub(crate) async fn blob_list(state: &DaemonState) -> Result<BlobScopeList> {
         Some(provider) => provider
             .list()
             .into_iter()
-            .map(|(name, hashes, grants)| ScopeInfo {
+            .map(|(name, hashes, grants, withdrawn)| ScopeInfo {
                 name,
                 hashes,
                 grants,
+                withdrawn,
             })
             .collect(),
         None => Vec::new(),
