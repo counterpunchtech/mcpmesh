@@ -56,11 +56,17 @@ pub(crate) fn decide(observed: &PeerPath, cached: Option<&PeerPath>) -> Option<P
 /// bounded by the session and needs no separate shutdown path. #61 cost a release to a detached
 /// task holding a lock; this one holds no lock and no strong connection handle.
 ///
-/// **It must NOT hold a `Connection`.** Re-reading the path after the settle window needs a
-/// `&Connection`, but a clone kept for the task's life would keep the session open until the task
-/// exits — and the task exits when the session closes. That is a deadlock, and it would make the
-/// "dies with its connection" property untestable. A [`WeakConnectionHandle`] is upgraded per read
-/// instead: if the upgrade fails the connection is gone and the watcher stops, which is correct.
+/// **It must not hold a `Connection` FOR THE TASK'S LIFE.** Re-reading the path after the settle
+/// window needs a `&Connection`, but a clone kept for the whole task would keep the session open
+/// until the task exits — and the task exits when the session closes. That is a deadlock, and it
+/// would make the "dies with its connection" property untestable.
+///
+/// A [`WeakConnectionHandle`] is upgraded per observation instead. To be exact, because an earlier
+/// version of this comment overstated it (#92 review): `upgrade()` DOES yield a strong
+/// `Connection`, and it is held across the `settle(...).await` — up to `PATH_CHANGE_SETTLE` per
+/// event, and the full window for a relayed path since `settle` only short-circuits on `Direct`.
+/// So teardown can be delayed by that bounded window; what is avoided is a handle held for the
+/// task's entire lifetime, which would never resolve.
 ///
 /// [`WeakConnectionHandle`]: iroh::endpoint::WeakConnectionHandle
 pub(crate) fn spawn(
@@ -138,9 +144,14 @@ pub(crate) fn commit_observation(
         let path = decide(observed, cached.as_ref())?;
         match cache.get_mut(&endpoint_id) {
             Some(entry) => {
+                // `probed_at` is the timestamp for the WHOLE row, and the row still carries the
+                // probe's `rtt_ms`/`meta`/`services`. Refreshing it here would stamp a 300s-old RTT
+                // as `age_secs: 0` on the wire AND stop `reachability_of` scheduling the refresh
+                // probe that would correct it — the TTL is gated on this field. The module doc says
+                // inventing an `rtt_ms` would be a fabricated measurement; forging that
+                // measurement's FRESHNESS is the same lie with an extra step (#92 review).
                 entry.path = path.clone();
                 entry.seq = seq;
-                entry.probed_at = crate::util::epoch_now_i64();
                 entry.clone()
             }
             None => {
