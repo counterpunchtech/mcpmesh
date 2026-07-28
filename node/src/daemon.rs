@@ -415,6 +415,28 @@ impl MeshState {
         &self.endpoint
     }
 
+    /// The reachability broadcast, for subscribing BEFORE the event under test can occur.
+    ///
+    /// `#[doc(hidden)]` — a TEST SEAM (#92 item 2). The live-path suite must subscribe before it
+    /// opens the session, or the transition it exists to observe can land in the gap between open
+    /// and subscribe and the test passes or fails on timing rather than on behaviour.
+    #[doc(hidden)]
+    pub fn reach_bcast_for_test(
+        &self,
+    ) -> &tokio::sync::broadcast::Sender<mcpmesh_local_api::PeerReachability> {
+        &self.reach_bcast
+    }
+
+    /// The current probe ticket counter.
+    ///
+    /// `#[doc(hidden)]` — a TEST SEAM (#92 item 2). Reading it before and after proves a frame came
+    /// from a LIVE session rather than from a probe: probe-driven path frames are item (1), shipped
+    /// in 0.19.0, so a test that cannot tell the two apart proves nothing about item (2).
+    #[doc(hidden)]
+    pub fn probe_seq_for_test(&self) -> u64 {
+        self.probe_seq.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Install an EPHEMERAL service registration directly (#36's in-memory map).
     ///
     /// `pub` (like [`MeshState::new`] and [`spawn_accept_loop`]) so integration tests can stand up
