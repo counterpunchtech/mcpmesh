@@ -40,12 +40,26 @@ enter → ensure watch cron → TRIAGE ─(no work)→ idle (cron re-fires TRIAG
 ### 0. Enter maintainer mode
 
 1. Announce (above) and state the goal.
-2. **Ensure exactly ONE watch cron exists.** `CronList` first. Create the maintainer cron only if
-   absent, with `CronCreate` `cron: "*/10 * * * *"`, `recurring: true`, and
-   `prompt: "mcpmesh-maintainer: check the issue queue and upstream iroh releases, and take the next unblocked issue."`
-   — that prompt re-invokes THIS skill on each fire (its description matches). **`CronDelete` any
-   prior generic issue-check cron** (e.g. one whose prompt is just "check for any new issues…") so
-   the two loops don't both fire. Tell the user the session-only + 7-day-expiry caveats once.
+2. **Ensure exactly ONE watch cron exists — LIST, DELETE ALL, THEN CREATE.** In that order, every
+   time, with no "only if absent" shortcut:
+
+   1. `CronList`.
+   2. `CronDelete` **every** job whose prompt mentions `mcpmesh-maintainer`, plus any prior generic
+      issue-check cron (e.g. one whose prompt is just "check for any new issues…").
+   3. `CronCreate` exactly one: `cron: "*/10 * * * *"`, `recurring: true`,
+      `prompt: "mcpmesh-maintainer: check the issue queue and upstream iroh releases, and take the next unblocked issue."`
+      — that prompt re-invokes THIS skill on each fire (its description matches).
+   4. `CronList` again and **confirm exactly one remains**. If more than one, delete and redo.
+
+   **Never create without listing and deleting first.** "Create only if absent" reads as safe and is
+   not: a create that races a stale job, or a `CronDelete` whose id was wrong, leaves two. They fire
+   on the same schedule, so the tick arrives two or three times at once, TRIAGE runs concurrently
+   with itself, and the duplicates are invisible unless you `CronList`. This happened — four
+   maintainer crons accumulated in one session, and the only symptom was repeated wake-ups that
+   looked like the user prompting twice.
+
+   Tell the user the session-only + 7-day-expiry caveats once.
+
    **Do NOT add a second cron for the iroh watch** — it rides this one (TRIAGE step 1). A separate
    cron would keep firing during WORK, exactly what the pause in step 5 exists to prevent.
 3. Go straight to **TRIAGE** now — don't wait for the first fire.
@@ -104,7 +118,9 @@ enter → ensure watch cron → TRIAGE ─(no work)→ idle (cron re-fires TRIAG
    iroh line) and stop for this tick. The watch cron re-fires TRIAGE later. Do NOT invent work.
 6. **Unblocked issue(s) exist** → pick the **most logical next** one (state your reasoning: user
    impact, unblocks other work, smallest safe increment). Then:
-   - **Pause the watch cron** (`CronDelete` its id) so checks don't interleave with implementation.
+   - **Pause the watch cron**: `CronList`, then `CronDelete` **every** maintainer job — not "its
+     id". If a duplicate leaked earlier, deleting one leaves the other firing straight through
+     WORK, which is exactly what pausing exists to prevent.
    - Proceed to **WORK**.
 
 ### 2. WORK — implement the issue fully
@@ -223,7 +239,10 @@ on a real network. The loopback e2e suite gates CI in the meantime.
 
 ### 4. RESUME
 
-1. **Recreate the watch cron** (step 0.2) — it was deleted during WORK.
+1. **Recreate the watch cron by re-running step 0.2 IN FULL** — list, delete all, create one,
+   `CronList` again to confirm exactly one. Do not shortcut to a bare `CronCreate` because "it was
+   deleted during WORK": that assumption is how duplicates accumulate, since a delete may have
+   missed a job or a prior RESUME may already have created one.
 2. Go straight back to **TRIAGE** (a just-finished issue may unblock the next one). Its step 1
    re-runs the iroh watch, which is what keeps the daily guarantee intact across a long WORK — no
    ticks fire while the cron is paused. Keep going until TRIAGE finds no actionable work, then idle
@@ -231,8 +250,9 @@ on a real network. The loopback e2e suite gates CI in the meantime.
 
 ## Stop / escalate
 
-- **User says stop** ("exit maintainer mode", "stop the loop"): `CronDelete` the watch cron,
-  report the last state, and stop.
+- **User says stop** ("exit maintainer mode", "stop the loop"): `CronList`, `CronDelete` **every**
+  maintainer job, `CronList` once more to confirm none remain, report the last state, and stop.
+  Deleting "the" cron is not enough if more than one exists.
 - **Genuine blocker** the code/spec can't resolve (ambiguous requirements only the owner can
   settle, a design fork with real product tradeoffs, a red gate you can't fix): pause, report
   concretely (what you tried, what's blocking), and ask — do NOT guess on irreversible steps.
@@ -247,6 +267,10 @@ on a real network. The loopback e2e suite gates CI in the meantime.
   reviewer's mutation once and shipped an authorization hole into a commit.
 - **Never**: truncate verification output with `head`/`tail`, and never report "N suites green"
   from a run that stopped at the first failing binary.
+- **Never**: `CronCreate` a watch cron without `CronList` + `CronDelete`-all first, and never skip
+  the `CronList` afterwards that confirms exactly one remains. Duplicates are silent — they fire on
+  the same schedule, so the only symptom is a tick arriving two or three times, which reads as the
+  user prompting repeatedly. Four accumulated in one session before anyone looked.
 - **Never**: attribute a failure to "machine load" or "environmental" from a SINGLE timing sample.
   Compare whole-suite runs, or run the same test on `main` in a worktree. Single-sample timings on
   this machine have produced two confident-and-wrong diagnoses in both directions.
@@ -269,4 +293,4 @@ recurring gotcha, write a memory (one fact per file) and add its one-line pointe
 | Gate | commit FIRST, then dispatch the review subagent — before `git push` |
 | PR | `gh pr create` · `gh run watch <id> --exit-status` · `gh pr merge --squash` |
 | Release | `git tag vX.Y.Z` · `cargo xtask publish` · `gh release create` · bump `Formula/mcpmesh.rb` |
-| Loop | `CronCreate "*/10 * * * *"` / `CronDelete` / `CronList` |
+| Loop | ALWAYS `CronList` → `CronDelete` all → `CronCreate "*/10 * * * *"` → `CronList` to verify exactly one |
