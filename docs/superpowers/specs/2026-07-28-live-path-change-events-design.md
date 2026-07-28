@@ -67,7 +67,18 @@ There are **two** connection seams, and the issue's framing only implies one:
 | direction | seam | lifetime holder |
 |---|---|---|
 | inbound | `gate_and_register` (`node/src/daemon/accept.rs:33`) — the single gate for ALL gated ALPNs | `Registration` RAII |
-| outbound | `mcpmesh_net::connect` (`net/src/endpoint.rs:496`), via `connect_with_timeout` (`node/src/daemon/dial.rs:173`) | the returned `SessionTransport` |
+| outbound | `mcpmesh_net::connect` (`net/src/endpoint.rs:490`), via `connect_with_timeout` (`node/src/daemon/dial.rs:173`) | the returned `SessionTransport` |
+
+**The outbound seam requires a `mcpmesh-net` surface change.** `connect` returns only
+`SessionTransport` — an alias for `NdjsonTransport<RecvStream, SendStream>`, i.e. the QUIC streams
+— and DROPS the `Connection` at `endpoint.rs:497`. Nothing upstream can call `path_events()` on it.
+`connect` must return the connection alongside the transport. That is a **BREAKING change to a
+published crate**, which `RELEASING.md` makes MINOR on its own; 0.20.0 is already MINOR, so it adds
+no version cost, but it is an embedder-visible break and belongs in the release notes rather than
+being discovered on a `cargo update`.
+
+The watcher stays in `node`, not `net`: net has no knowledge of the reachability cache, and pushing
+it down would mean plumbing a callback through net for one caller's benefit.
 
 Installing the watcher only at the accept path would cover sessions *others* open to us and miss
 every session *we* open. That is backwards for the reported use case: an embedder rendering a

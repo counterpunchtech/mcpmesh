@@ -144,10 +144,31 @@ proves nothing.
 
 ### Task 5: Wire the OUTBOUND seam — the motivating case
 
-**Files:** `node/src/daemon/dial.rs`
+**Files:** `net/src/endpoint.rs`, `net/src/lib.rs`, `node/src/daemon/dial.rs`
 
-- [ ] **Step 1:** In `connect_with_timeout`, spawn the same watcher on the established connection.
-      Do **not** attach it in `reach.rs`'s probe dial, `rendezvous.rs`, or `provider.rs` — see the
+> **BLOCKER found while planning — `connect` discards the `Connection`.**
+> `net::connect` (`net/src/endpoint.rs:490`) opens the bi-stream and returns only
+> `SessionTransport`, which is `NdjsonTransport<RecvStream, SendStream>` — the QUIC **streams**, not
+> the connection. `conn` is dropped at `:497`. So `connect_with_timeout` never holds a `Connection`
+> and **cannot** call `path_events()` on one. The outbound half of this issue is unreachable
+> without changing net's surface.
+>
+> (The session keeps working today because quinn's streams hold the connection alive internally.
+> Dropping the handle does not close it — but it does mean nobody upstream can observe it.)
+
+- [ ] **Step 1: Return the connection from `connect`.** Change it to yield the `Connection`
+      alongside the transport, so `node` — which owns `MeshState`, `reach_bcast` and the reachability
+      cache — spawns the watcher. Do **not** push the watcher down into `net`: net has no knowledge
+      of the reachability cache and would need a callback plumbed through it, inverting the layering
+      for one caller.
+
+      **This is a BREAKING change to a published crate** (`mcpmesh-net`), so per `RELEASING.md` it
+      forces MINOR on its own. 0.20.0 is already MINOR for the behaviour change, so it costs nothing
+      extra — but it must be stated in the release notes as an embedder-visible break, not slipped
+      in. Any downstream calling `mcpmesh_net::connect` will fail to compile on `cargo update`.
+
+- [ ] **Step 2:** In `connect_with_timeout`, spawn the watcher on the returned connection. Do
+      **not** attach it in `reach.rs`'s probe dial, `rendezvous.rs`, or `provider.rs` — see the
       spec's exclusion list.
 - [ ] **Step 2:** Run the Task 1 test — it must now PASS.
 - [ ] **Step 3: Add the regression:** a `probe_peer` against a peer with no user session pushes no
