@@ -395,6 +395,41 @@ the mesh and, from that point, every byte in each direction is the remote MCP se
 `initialize`, `tools/list`, `tools/call`, and so on, in the same newline-framed JSON. The client
 pumps its consumer's stdin/stdout against this connection until either side closes.
 
+### Server-initiated frames (push), and what is metered
+
+A served backend — `run` or `socket` — **may** write unsolicited notifications and requests to the
+connected peer, not only responses. This is a contract, not an accident (#91): it is what lets an
+agent *react* to an incoming message instead of polling for one.
+
+**Outbound frames are NOT metered.** `[limits].rate_limit_per_min` applies only to what the REMOTE
+peer sends inbound. The limiter is keyed on the authenticated endpoint (SECURITY invariant 1), and
+an outbound frame originates from YOUR local server — charging it against the peer's budget would
+let a chatty local server exhaust the allowance of the peer it is talking to. So push is free and
+polling is not; budget accordingly.
+
+*(Contrast the inbound direction, which consults the limiter before forwarding a method-bearing
+frame, answers `-32053` with `retry_after_ms` for a request, and **silently drops** an over-limit
+notification — that silence is #76.)*
+
+**Ordering is FIFO in the server's own output order.** Both directions write through the same
+mutex-guarded transport writer, and the outbound direction reads the server's stdout sequentially,
+so a notification emitted between two responses arrives between them. There is no reordering and no
+separate priority channel.
+
+**Backpressure reaches the local server.** A blocked send stops the outbound direction draining the
+server's stdout, so the OS pipe buffer fills and the server blocks on write. There is **no bounded
+queue and no buffering** — a slow or gone peer applies backpressure rather than accumulating frames
+in the daemon. That is deliberate: the alternative is unbounded memory growth keyed on a peer that
+may never read again.
+
+**Session lifetime is unchanged by pushing.** The session ends on the server's output EOF or the
+peer going away; an unsolicited frame neither extends nor shortens it.
+
+> ⚠️ **This contract is written against the CURRENT wire.** MCP vNext (#45) removes the `initialize`
+> handshake this session shape is built around. The push property must be re-established explicitly
+> under that rework — it is exactly the kind of property that disappears unnoticed when the
+> surrounding shape changes, which is why it is written down here first.
+
 `peer` may be a **local nickname** or the peer's **stable `b64u:` user_id** — the same
 self-sovereign identity attested *inbound* on `_meta["mcpmesh/peer"].user_id` (see [the identity
 contract](#the-identity-contract)). Addressing by `user_id` makes outbound symmetric with inbound:
