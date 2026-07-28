@@ -13,6 +13,51 @@ use serde::{Deserialize, Serialize};
 /// One scope: the blob hashes it contains + the principals it grants. Hashes are bare 64-char blake3
 /// hex (`Hash::to_hex()`); principals are stable ids/names: `{eid} ∪ {user_id} ∪ groups` (#38 — never nicknames).
 /// `BTreeSet` for deterministic serialization + list ordering.
+/// Default cap on how many scopes one `blob_list` returns (#84b).
+///
+/// NOT unbounded. `blob_list` renders every scope into a single control frame against a 16 MiB cap
+/// whose violation closes the connection on the third strike, so an unbounded listing does not
+/// degrade at scale — it kills the caller's connection. With one-scope-per-file granularity
+/// (#84d) that is reached by ordinary use. A truncated answer the caller can detect and page
+/// through is strictly better than a dead connection.
+pub const DEFAULT_LIST_LIMIT: usize = 256;
+
+/// One row of a `blob_list` page: `(name, hashes, grants, withdrawn, hash_count, grant_count,
+/// withdrawn_count)`. The counts are always present, even when `counts_only` empties the vectors.
+pub type ScopePageRow = (
+    String,
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+    usize,
+    usize,
+    usize,
+);
+
+/// Filters + paging for `blob_list` (#84b). All optional; `Default` is "everything, default limit".
+#[derive(Debug, Clone, Default)]
+pub struct ListQuery {
+    /// Exact scope name — never a prefix. Under one-scope-per-file, names are derived from hashes
+    /// and share prefixes constantly, so a prefix match would return neighbours.
+    pub scope: Option<String>,
+    /// Only scopes containing this hash. The CALLER's rendering is normalized before comparing.
+    pub hash: Option<String>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    /// Omit the three vectors, keep the counts.
+    pub counts_only: bool,
+}
+
+/// One page of a listing, plus what the caller needs to know it is a page.
+#[derive(Debug, Clone)]
+pub struct ScopePage {
+    pub rows: Vec<ScopePageRow>,
+    /// Scopes matching the filter BEFORE limit/offset. Without this a caller cannot distinguish a
+    /// complete answer from a clipped one.
+    pub total: usize,
+    pub truncated: bool,
+}
+
 /// One row of the scope listing: `(name, hashes, grants, withdrawn)`.
 ///
 /// Named because it grew a fourth member with #107's withdrawal set and an anonymous 4-tuple
@@ -116,6 +161,64 @@ impl BlobScopes {
             sc.withdrawn.insert(hash_hex.to_string());
             sc.hashes.remove(hash_hex)
         })
+    }
+
+    /// One page of the scope table (#84b), filtered and bounded.
+    ///
+    /// Order is scope name — the table is a `BTreeMap`, so it is already sorted and stable. Paging
+    /// without a stable order returns overlapping or missing rows that look plausible, which is
+    /// worse than not paging at all.
+    pub fn list_page(&self, q: &ListQuery) -> ScopePage {
+        // Normalize the hash filter so a caller's base32 rendering matches a stored canonical hex,
+        // matching the rule #83 established for every other hash-taking surface.
+        let want_hash = q
+            .hash
+            .as_deref()
+            .and_then(|h| crate::blobs::parse_blob_hash(h).ok())
+            .map(|h| h.to_hex().to_string());
+
+        let matching: Vec<(&String, &Scope)> = self
+            .scopes
+            .iter()
+            .filter(|(name, sc)| {
+                q.scope.as_deref().is_none_or(|want| want == name.as_str())
+                    && want_hash.as_deref().is_none_or(|h| sc.hashes.contains(h))
+            })
+            .collect();
+
+        let total = matching.len();
+        let offset = q.offset.unwrap_or(0);
+        let limit = q.limit.unwrap_or(DEFAULT_LIST_LIMIT);
+        let rows: Vec<ScopePageRow> = matching
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|(name, sc)| {
+                let (h, g, w) = (sc.hashes.len(), sc.grants.len(), sc.withdrawn.len());
+                let take = |set: &BTreeSet<String>| -> Vec<String> {
+                    if q.counts_only {
+                        Vec::new()
+                    } else {
+                        set.iter().cloned().collect()
+                    }
+                };
+                (
+                    name.clone(),
+                    take(&sc.hashes),
+                    take(&sc.grants),
+                    take(&sc.withdrawn),
+                    h,
+                    g,
+                    w,
+                )
+            })
+            .collect();
+        let truncated = offset + rows.len() < total;
+        ScopePage {
+            rows,
+            total,
+            truncated,
+        }
     }
 
     /// Was this hash deliberately withdrawn from this scope (#107)?
@@ -599,5 +702,109 @@ mod withdrawal_tests {
                 .allows("aa", &["b64u:alice"].into_iter().collect()),
             "and the existing grant still works"
         );
+    }
+}
+
+#[cfg(test)]
+mod listing_tests {
+    use super::*;
+
+    fn table(n: usize) -> BlobScopes {
+        let mut s = BlobScopes::default();
+        for i in 0..n {
+            s.publish_hash(&format!("file:{i:04}"), &format!("{i:064x}"));
+            s.grant(&format!("file:{i:04}"), "b64u:alice");
+        }
+        s
+    }
+
+    /// #84b back-compat: an unfiltered listing still works, and now reports how many matched so a
+    /// caller can tell a complete answer from a clipped one.
+    #[test]
+    fn an_unfiltered_listing_reports_its_total_and_is_not_truncated() {
+        let page = table(5).list_page(&ListQuery::default());
+        assert_eq!(page.rows.len(), 5);
+        assert_eq!(page.total, 5);
+        assert!(!page.truncated, "5 scopes fit under any sane default");
+    }
+
+    /// The failure #84 reports is a CLOSED CONNECTION, not a slow one: `blob_list` renders every
+    /// scope into one frame against a 16 MiB cap whose violation strikes the connection out. A
+    /// default limit turns that into a truncated answer the caller can detect and page through.
+    #[test]
+    fn the_default_limit_truncates_and_says_so() {
+        let page = table(300).list_page(&ListQuery::default());
+        assert_eq!(page.rows.len(), DEFAULT_LIST_LIMIT, "default limit applies");
+        assert_eq!(page.total, 300, "total counts MATCHES, not returned rows");
+        assert!(
+            page.truncated,
+            "a clipped answer must announce itself — a caller that cannot tell is the silent \
+             wrong answer this repo keeps re-learning"
+        );
+    }
+
+    /// Paging must not overlap or skip. The table is a BTreeMap so name order is stable; without a
+    /// stable order paging returns garbage that looks plausible.
+    #[test]
+    fn offset_and_limit_page_without_overlap_or_gaps() {
+        let t = table(25);
+        let p1 = t.list_page(&ListQuery {
+            limit: Some(10),
+            ..Default::default()
+        });
+        let p2 = t.list_page(&ListQuery {
+            limit: Some(10),
+            offset: Some(10),
+            ..Default::default()
+        });
+        let n1: Vec<&String> = p1.rows.iter().map(|r| &r.0).collect();
+        let n2: Vec<&String> = p2.rows.iter().map(|r| &r.0).collect();
+        assert_eq!(n1.len(), 10);
+        assert_eq!(n2.len(), 10);
+        assert!(
+            n1.iter().all(|n| !n2.contains(n)),
+            "pages must be disjoint: {n1:?} vs {n2:?}"
+        );
+        let mut union: Vec<String> = n1.iter().chain(n2.iter()).map(|s| (*s).clone()).collect();
+        union.sort();
+        let expected: Vec<String> = (0..20).map(|i| format!("file:{i:04}")).collect();
+        assert_eq!(
+            union, expected,
+            "and together they are the first 20 in order"
+        );
+    }
+
+    /// Exact match, not prefix or substring — `file:aa` must not match `file:aabb`. Under
+    /// one-scope-per-file the names are derived from hashes and share prefixes constantly.
+    #[test]
+    fn the_scope_filter_is_exact_not_a_prefix() {
+        let mut s = BlobScopes::default();
+        s.publish_hash("file:aa", "11");
+        s.publish_hash("file:aabb", "22");
+        let page = s.list_page(&ListQuery {
+            scope: Some("file:aa".into()),
+            ..Default::default()
+        });
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.rows[0].0, "file:aa");
+        assert_eq!(page.total, 1, "and the total reflects the filter");
+    }
+
+    /// `counts_only` answers "how many files / how many withdrawn" in constant response size —
+    /// the common question under one-scope-per-file — without shipping every hash.
+    #[test]
+    fn counts_only_omits_the_vectors_but_keeps_the_counts() {
+        let mut s = table(3);
+        s.unpublish_hash("file:0000", &format!("{:064x}", 0));
+        let page = s.list_page(&ListQuery {
+            counts_only: true,
+            ..Default::default()
+        });
+        let row = page.rows.iter().find(|r| r.0 == "file:0000").unwrap();
+        assert!(row.1.is_empty(), "hashes omitted");
+        assert!(row.2.is_empty(), "grants omitted");
+        assert!(row.3.is_empty(), "withdrawn omitted");
+        assert_eq!(row.5, 1, "but the grant count survives");
+        assert_eq!(row.6, 1, "and the withdrawn count");
     }
 }
