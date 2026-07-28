@@ -125,7 +125,7 @@ pub async fn probe_peer(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> ReachEn
 /// Tickets are taken at probe START, so a LOWER ticket is an OLDER probe: it may complete later
 /// (a 3s timeout losing to a 50ms pong) but must not win. Equal is impossible — tickets are unique
 /// — and is treated as "write" so the guard can never wedge.
-fn supersedes(seq: u64, existing: &ReachEntry) -> bool {
+pub(crate) fn supersedes(seq: u64, existing: &ReachEntry) -> bool {
     seq >= existing.seq
 }
 
@@ -174,7 +174,7 @@ async fn settled_path(conn: &iroh::endpoint::Connection) -> mcpmesh_local_api::P
 /// to be non-flaky silently stopped it catching a zeroed `PATH_SETTLE`.
 ///
 /// Note the seam covers the WINDOW's behaviour, not the window's USE — see [`settled_path`].
-async fn settle<F>(window: Duration, mut probe: F) -> mcpmesh_local_api::PeerPath
+pub(crate) async fn settle<F>(window: Duration, mut probe: F) -> mcpmesh_local_api::PeerPath
 where
     F: FnMut() -> mcpmesh_local_api::PeerPath,
 {
@@ -197,7 +197,7 @@ where
 /// relayed forever.
 ///
 /// No selected path (a snapshot taken as the connection tears down) → `Unknown`, never a guess.
-fn selected_path(conn: &iroh::endpoint::Connection) -> mcpmesh_local_api::PeerPath {
+pub(crate) fn selected_path(conn: &iroh::endpoint::Connection) -> mcpmesh_local_api::PeerPath {
     let paths = conn.paths();
     for path in &paths {
         if !path.is_selected() {
@@ -266,7 +266,7 @@ fn is_transition(previous: Option<&ReachEntry>, current: &ReachEntry) -> bool {
 /// `entry == None` is a peer never probed: `reachable: false` with no age, which a consumer renders
 /// as "checking…". `age_secs` is the caller's, since the snapshot computes it from `probed_at`
 /// while a transition event is fresh by construction.
-fn reachability_row(
+pub(crate) fn reachability_row(
     nickname: String,
     endpoint_id: [u8; 32],
     entry: Option<&ReachEntry>,

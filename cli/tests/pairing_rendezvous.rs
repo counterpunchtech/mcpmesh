@@ -951,7 +951,7 @@ async fn paired_and_granted_peer_is_admitted_to_the_service_end_to_end() {
         // The gate RESOLVES bob's endpoint_id -> "bob" (his PeerEntry); select_service ADMITS
         // "bob" to notes (config allow now has bob, live after the grant's reload); the echo
         // stub answers and MCPMESH_PEER_NAME is injected as "bob".
-        let mut transport = connect(&bob, alice_addr, "notes").await.unwrap();
+        let mut transport = connect(&bob, alice_addr, "notes").await.unwrap().0;
         transport
             .send_value(json!({
                 "jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -1055,7 +1055,7 @@ async fn rename_after_pairing_keeps_the_peer_admitted() {
         )
         .await
         .expect("pairing succeeds");
-        let mut t = connect(&bob, alice_addr.clone(), "notes").await.unwrap();
+        let mut t = connect(&bob, alice_addr.clone(), "notes").await.unwrap().0;
         t.send_value(json!({
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": {"protocolVersion": "2025-11-25",
@@ -1101,7 +1101,7 @@ async fn rename_after_pairing_keeps_the_peer_admitted() {
         );
 
         // ---- THE PAYOFF: bob dials again and is STILL admitted (pre-#38: -32054) ----
-        let mut t = connect(&bob, alice_addr, "notes").await.unwrap();
+        let mut t = connect(&bob, alice_addr, "notes").await.unwrap().0;
         t.send_value(json!({
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": {"protocolVersion": "2025-11-25",

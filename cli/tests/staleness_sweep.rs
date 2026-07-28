@@ -129,13 +129,13 @@ async fn staleness_sweep_cuts_roster_session_but_not_pairing() {
         let _task = spawn_accept_loop(mesh.clone(), Arc::new(build_services(&cfg)));
 
         // Both complete a live session while the roster is fresh.
-        let mut alice_t = connect(&alice_client, addr.clone(), "echo").await.unwrap();
+        let mut alice_t = connect(&alice_client, addr.clone(), "echo").await.unwrap().0;
         alice_t.send_value(initialize_frame("echo")).await.unwrap();
         assert_eq!(
             alice_t.recv_value().await.unwrap().unwrap()["result"]["serverInfo"]["name"],
             "echo-stub"
         );
-        let mut bob_t = connect(&bob_client, addr.clone(), "echo").await.unwrap();
+        let mut bob_t = connect(&bob_client, addr.clone(), "echo").await.unwrap().0;
         bob_t.send_value(initialize_frame("echo")).await.unwrap();
         assert_eq!(
             bob_t.recv_value().await.unwrap().unwrap()["result"]["serverInfo"]["name"],

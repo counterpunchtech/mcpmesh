@@ -214,7 +214,7 @@ async fn hero_flow_minus_pairing() {
         // bi-stream, so no MCP frame is ever exchanged (no initialize response).
         // ─────────────────────────────────────────────────────────────────────────────
         let stranger_ep = local_endpoint().await;
-        match connect(&stranger_ep, alice_addr, "files").await {
+        match connect(&stranger_ep, alice_addr, "files").await.map(|(t, _)| t) {
             // Refused at connection establishment — no session, no MCP frame.
             Err(_) => {}
             // Or the connect races ahead of the gate close: the stranger may open a stream,

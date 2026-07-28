@@ -208,7 +208,10 @@ async fn install_severs_a_revoked_roster_session_but_not_a_pairing_session() {
 
         // alice (rostered) completes a live session — proves a rostered peer serves under the
         // composed gate (the folded T6 assertion).
-        let mut alice_t = connect(&alice_client, addr.clone(), "echo").await.unwrap();
+        let mut alice_t = connect(&alice_client, addr.clone(), "echo")
+            .await
+            .unwrap()
+            .0;
         alice_t.send_value(initialize_frame("echo")).await.unwrap();
         let alice_init = alice_t.recv_value().await.unwrap().unwrap();
         assert_eq!(
@@ -217,7 +220,7 @@ async fn install_severs_a_revoked_roster_session_but_not_a_pairing_session() {
         );
 
         // bob (pairing-only) completes a live session.
-        let mut bob_t = connect(&bob_client, addr.clone(), "echo").await.unwrap();
+        let mut bob_t = connect(&bob_client, addr.clone(), "echo").await.unwrap().0;
         bob_t.send_value(initialize_frame("echo")).await.unwrap();
         let bob_init = bob_t.recv_value().await.unwrap().unwrap();
         assert_eq!(
@@ -315,7 +318,7 @@ async fn a_peer_the_roster_revokes_is_refused_pre_mcp() {
 
         // Dial mesh + attempt to initialize. The server refuses at the gate (QUIC 401) before any
         // stream is served → the client observes the connection end without a session frame.
-        match connect(&client, addr, "echo").await {
+        match connect(&client, addr, "echo").await.map(|(t, _)| t) {
             Err(_) => {} // refused at/near handshake — a valid "closed" outcome
             Ok(mut transport) => {
                 let _ = transport.send_value(initialize_frame("echo")).await;
@@ -392,12 +395,12 @@ async fn install_severs_a_dropped_roster_session_but_keeps_a_still_listed_one() 
         let _task = spawn_accept_loop(mesh.clone(), Arc::new(build_services(&cfg)));
 
         // Both rostered peers open a live session (each registered as roster_user = Some(..)).
-        let mut carol_t = connect(&carol_client, addr.clone(), "echo").await.unwrap();
+        let mut carol_t = connect(&carol_client, addr.clone(), "echo").await.unwrap().0;
         carol_t.send_value(initialize_frame("echo")).await.unwrap();
         let carol_init = carol_t.recv_value().await.unwrap().unwrap();
         assert_eq!(carol_init["result"]["serverInfo"]["name"], "echo-stub");
 
-        let mut dave_t = connect(&dave_client, addr.clone(), "echo").await.unwrap();
+        let mut dave_t = connect(&dave_client, addr.clone(), "echo").await.unwrap().0;
         dave_t.send_value(initialize_frame("echo")).await.unwrap();
         let dave_init = dave_t.recv_value().await.unwrap().unwrap();
         assert_eq!(dave_init["result"]["serverInfo"]["name"], "echo-stub");

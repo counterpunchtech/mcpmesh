@@ -62,9 +62,10 @@ pub async fn dial_service(
         let devices = view.devices_for_user(peer);
         if !devices.is_empty() {
             let candidates = order_dial_candidates(&devices, &mesh.presence_table, peer);
-            return race_dial(&mesh.endpoint, candidates, service)
+            let (transport, conn) = race_dial(&mesh.endpoint, candidates, service)
                 .await
-                .with_context(|| format!("dial {peer}/{service}"));
+                .with_context(|| format!("dial {peer}/{service}"))?;
+            return Ok(watch_session(mesh, transport, conn));
         }
     }
     // Pairing-mode fallback. `peer` is resolved to stored entries by, in order:
@@ -95,17 +96,41 @@ pub async fn dial_service(
     // Several devices share the resolved user_id → race them (bare-id, discovery-resolved),
     // mirroring the roster person→device path.
     if !multi.is_empty() {
-        return race_dial(&mesh.endpoint, multi, service)
+        let (transport, conn) = race_dial(&mesh.endpoint, multi, service)
             .await
-            .with_context(|| format!("dial {peer}/{service}"));
+            .with_context(|| format!("dial {peer}/{service}"))?;
+        return Ok(watch_session(mesh, transport, conn));
     }
     let entry = single.with_context(|| format!("peer '{peer}' is not in the allowlist"))?;
     let endpoint_id = iroh::EndpointId::from_bytes(&entry.endpoint_id)
         .map_err(|e| anyhow::anyhow!("stored endpoint id for '{peer}' is invalid: {e}"))?;
     let addr = stored_dial_addr(entry.last_addr.as_deref(), endpoint_id);
-    connect_with_timeout(&mesh.endpoint, addr, service, DIAL_TIMEOUT)
+    let (transport, conn) = connect_with_timeout(&mesh.endpoint, addr, service, DIAL_TIMEOUT)
         .await
-        .with_context(|| format!("dial {peer}/{service}"))
+        .with_context(|| format!("dial {peer}/{service}"))?;
+    Ok(watch_session(mesh, transport, conn))
+}
+
+/// Attach the #92 item 2 path watcher to an OUTBOUND session and hand back the transport.
+///
+/// The peer id comes from the CONNECTION (`remote_id`), not from the caller's bookkeeping: the
+/// racing dial does not tell its caller which candidate won, and the connection is the only thing
+/// that knows for certain who is on the other end.
+///
+/// This is the seam that makes #92 item 2 real. Watching only the accept path would cover sessions
+/// others open to us and miss every session WE open — and the reported use case is an embedder
+/// rendering a privacy indicator for a call it initiated.
+fn watch_session(
+    mesh: &Arc<MeshState>,
+    transport: SessionTransport,
+    conn: iroh::endpoint::Connection,
+) -> SessionTransport {
+    drop(super::path_watch::spawn(
+        mesh.clone(),
+        *conn.remote_id().as_bytes(),
+        &conn,
+    ));
+    transport
 }
 
 /// Dial an EXACT endpoint named by its `eid:<hex>` device principal (#41). Decodes the 64-hex
@@ -133,9 +158,10 @@ async fn dial_by_eid(mesh: &Arc<MeshState>, hex: &str, service: &str) -> Result<
         .flatten()
         .and_then(|e| e.last_addr);
     let addr = stored_dial_addr(last_addr.as_deref(), endpoint_id);
-    connect_with_timeout(&mesh.endpoint, addr, service, DIAL_TIMEOUT)
+    let (transport, conn) = connect_with_timeout(&mesh.endpoint, addr, service, DIAL_TIMEOUT)
         .await
-        .with_context(|| format!("dial eid:{hex}/{service}"))
+        .with_context(|| format!("dial eid:{hex}/{service}"))?;
+    Ok(watch_session(mesh, transport, conn))
 }
 
 /// Assemble the single-nickname dial [`iroh::EndpointAddr`]: the stored `endpoint_id` plus,
@@ -175,7 +201,7 @@ pub(crate) async fn connect_with_timeout(
     addr: iroh::EndpointAddr,
     service: &str,
     timeout: Duration,
-) -> Result<SessionTransport> {
+) -> Result<(SessionTransport, iroh::endpoint::Connection)> {
     match tokio::time::timeout(timeout, connect(endpoint, addr, service)).await {
         // A typed ConnectError (dial vs open-stream) converts into the anyhow chain.
         Ok(r) => r.map_err(Into::into),
@@ -254,17 +280,20 @@ pub async fn race_dial(
     endpoint: &iroh::Endpoint,
     candidates: Vec<[u8; 32]>,
     service: &str,
-) -> Result<SessionTransport> {
+) -> Result<(SessionTransport, iroh::endpoint::Connection)> {
     anyhow::ensure!(!candidates.is_empty(), "no dial candidates to race");
 
     // Each racer is a 'static task, so it owns a cloned endpoint + service (iroh::Endpoint is a cheap
     // Arc-backed clone). Dropping the set on return ABORTS every still-running racer — the loser cancel.
-    let mut set: tokio::task::JoinSet<Result<SessionTransport>> = tokio::task::JoinSet::new();
-    let spawn_dial = |set: &mut tokio::task::JoinSet<Result<SessionTransport>>, eid: [u8; 32]| {
-        let ep = endpoint.clone();
-        let svc = service.to_string();
-        set.spawn(async move { dial_one(&ep, eid, &svc).await });
-    };
+    let mut set: tokio::task::JoinSet<Result<(SessionTransport, iroh::endpoint::Connection)>> =
+        tokio::task::JoinSet::new();
+    let spawn_dial =
+        |set: &mut tokio::task::JoinSet<Result<(SessionTransport, iroh::endpoint::Connection)>>,
+         eid: [u8; 32]| {
+            let ep = endpoint.clone();
+            let svc = service.to_string();
+            set.spawn(async move { dial_one(&ep, eid, &svc).await });
+        };
 
     let mut next = 0usize; // index of the next candidate to launch
     spawn_dial(&mut set, candidates[next]); // candidate 0 immediately
@@ -318,7 +347,7 @@ async fn dial_one(
     endpoint: &iroh::Endpoint,
     eid: [u8; 32],
     service: &str,
-) -> Result<SessionTransport> {
+) -> Result<(SessionTransport, iroh::endpoint::Connection)> {
     let endpoint_id = iroh::EndpointId::from_bytes(&eid)
         .map_err(|e| anyhow::anyhow!("roster device endpoint id is invalid: {e}"))?;
     let addr = iroh::EndpointAddr::from(endpoint_id);
@@ -518,7 +547,7 @@ mod tests {
                 .bind()
                 .await
                 .unwrap();
-            let transport = connect(&client_ep, server_addr, "echo").await.unwrap();
+            let transport = connect(&client_ep, server_addr, "echo").await.unwrap().0;
 
             // Control side, one whole DuplexStream per direction (dropping `ctl_in_w`
             // is the control-side EOF; a split half would keep the stream alive).

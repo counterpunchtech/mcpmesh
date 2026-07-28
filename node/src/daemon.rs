@@ -26,6 +26,7 @@ pub(crate) mod boot;
 pub(crate) mod config_write;
 mod dial;
 mod handlers;
+mod path_watch;
 mod reach;
 mod roster_install;
 mod sever;
@@ -90,6 +91,14 @@ pub fn admitted_services_for_test(
     caller_admitted_services(mesh, identity)
 }
 pub use reach::{REACH_TTL_SECS, ReachEntry, probe_peer, reachability_of};
+
+/// Live path-watcher tasks (#92 review). `#[doc(hidden)]` — a TEST SEAM for the #61-shaped
+/// lifetime regression: a leaked watcher emits nothing, so only a count distinguishes it from a
+/// watcher that ended.
+#[doc(hidden)]
+pub fn live_path_watchers_for_test() -> usize {
+    path_watch::LIVE_WATCHERS.load(std::sync::atomic::Ordering::Relaxed)
+}
 pub use roster_install::{
     install_roster_view_and_sever, should_staleness_sever, staleness_sweep_once,
 };
@@ -413,6 +422,28 @@ impl MeshState {
     #[doc(hidden)]
     pub fn endpoint_for_test(&self) -> &iroh::Endpoint {
         &self.endpoint
+    }
+
+    /// The reachability broadcast, for subscribing BEFORE the event under test can occur.
+    ///
+    /// `#[doc(hidden)]` — a TEST SEAM (#92 item 2). The live-path suite must subscribe before it
+    /// opens the session, or the transition it exists to observe can land in the gap between open
+    /// and subscribe and the test passes or fails on timing rather than on behaviour.
+    #[doc(hidden)]
+    pub fn reach_bcast_for_test(
+        &self,
+    ) -> &tokio::sync::broadcast::Sender<mcpmesh_local_api::PeerReachability> {
+        &self.reach_bcast
+    }
+
+    /// The current probe ticket counter.
+    ///
+    /// `#[doc(hidden)]` — a TEST SEAM (#92 item 2). Reading it before and after proves a frame came
+    /// from a LIVE session rather than from a probe: probe-driven path frames are item (1), shipped
+    /// in 0.19.0, so a test that cannot tell the two apart proves nothing about item (2).
+    #[doc(hidden)]
+    pub fn probe_seq_for_test(&self) -> u64 {
+        self.probe_seq.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Install an EPHEMERAL service registration directly (#36's in-memory map).

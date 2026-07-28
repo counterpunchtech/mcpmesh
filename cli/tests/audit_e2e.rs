@@ -83,7 +83,8 @@ async fn real_session_audits_with_hashed_args_and_all_event_classes() {
         // arguments carry `secret`.
         let mut transport = mcpmesh_net::connect(&caller_ep, server_addr, "notes")
             .await
-            .unwrap();
+            .unwrap()
+            .0;
         // initialize
         transport
             .send_value(json!({

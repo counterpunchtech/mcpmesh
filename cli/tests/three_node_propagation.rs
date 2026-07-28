@@ -348,7 +348,7 @@ async fn revoked_device_cut_from_live_session_within_60s_across_nodes() {
         //    else "cut" proves nothing).
         let mut alice_t = connect(&alice_dialer, b_addr.clone(), "echo")
             .await
-            .expect("A dials B's echo service");
+            .expect("A dials B's echo service").0;
         alice_t.send_value(initialize_frame("echo")).await.unwrap();
         let init = alice_t.recv_value().await.unwrap().unwrap();
         assert_eq!(
@@ -422,7 +422,7 @@ async fn revoked_device_cut_from_live_session_within_60s_across_nodes() {
         // 5. The stale-pair revocation-wins clause: B STILL holds a pair ALLOW for A (nickname in
         //    echo's `allow`), yet a FRESH A dial post-revocation is refused PRE-MCP — revocation wins
         //    over the pair entry (§4.1(1)). The (pairs ∪ roster) composition, cross-node.
-        match connect(&alice_dialer, b_addr, "echo").await {
+        match connect(&alice_dialer, b_addr, "echo").await.map(|(t, _)| t) {
             Err(_) => {} // refused at/near handshake — a valid "closed" outcome
             Ok(mut t) => {
                 let _ = t.send_value(initialize_frame("echo")).await;

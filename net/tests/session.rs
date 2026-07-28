@@ -106,7 +106,7 @@ async fn known_peer_completes_initialize_and_echo() -> anyhow::Result<()> {
         let services = echo_services(&client);
         let _handle = serve(server, gate, services, Arc::new(ConnRegistry::new()));
 
-        let mut transport = connect(&client, addr, "echo").await?;
+        let mut transport = connect(&client, addr, "echo").await?.0;
         transport
             .send_value(
                 json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
@@ -143,7 +143,7 @@ async fn unknown_service_gets_32054_with_marker() -> anyhow::Result<()> {
         let services = echo_services(&client);
         let _handle = serve(server, gate, services, Arc::new(ConnRegistry::new()));
 
-        let mut transport = connect(&client, addr, "nope").await?;
+        let mut transport = connect(&client, addr, "nope").await?.0;
         transport
             .send_value(
                 json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
@@ -174,7 +174,7 @@ async fn unknown_endpoint_is_refused_before_mcp() -> anyhow::Result<()> {
 
         // The gate must close the connection: either `connect` itself errors, or
         // the first read returns closed — but no MCP frame is ever exchanged.
-        match connect(&stranger, addr, "echo").await {
+        match connect(&stranger, addr, "echo").await.map(|(t, _)| t) {
             Err(_) => {}
             Ok(mut transport) => {
                 let outcome = transport.recv_value().await;
@@ -219,7 +219,7 @@ async fn peer_not_in_service_allow_is_refused() -> anyhow::Result<()> {
             Arc::new(ConnRegistry::new()),
         );
 
-        let mut transport = connect(&client, addr, "notes").await?;
+        let mut transport = connect(&client, addr, "notes").await?.0;
         transport
             .send_value(
                 json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
@@ -412,7 +412,7 @@ async fn two_machine_connect() -> anyhow::Result<()> {
     tokio::time::timeout(Duration::from_secs(60), async {
         // SAME initialize + tools/call echo assertions as
         // known_peer_completes_initialize_and_echo, over the real network.
-        let mut transport = connect(&client, peer, "echo").await?;
+        let mut transport = connect(&client, peer, "echo").await?.0;
         transport
             .send_value(
                 json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{

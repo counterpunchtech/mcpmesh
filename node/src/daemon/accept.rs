@@ -108,6 +108,23 @@ pub fn spawn_accept_loop(mesh: Arc<MeshState>, services: Arc<Services>) -> JoinH
                 let alpn = conn.alpn().to_vec();
                 match alpn.as_slice() {
                     a if a == ALPN_MCP => {
+                        // #92 item 2: watch THIS session's selected path, so a mid-session
+                        // degradation pushes a frame when it happens rather than waiting for a
+                        // probe. This arm — NOT `gate_and_register`, which serves only the
+                        // gossip/roster-blob/app-blob arms and never sees ALPN_MCP.
+                        //
+                        // Gated first, so a stranger never gets a task spawned on its behalf
+                        // (SECURITY invariant 4: strangers stay cheap). `run_mesh_connection`
+                        // re-resolves and owns the real refusal; this is only a cheap precondition
+                        // for spawning, never the security boundary.
+                        let remote = mcpmesh_net::EndpointId::from(conn.remote_id());
+                        if mesh.gate.resolve(&remote).is_some() {
+                            drop(super::path_watch::spawn(
+                                mesh.clone(),
+                                *remote.as_bytes(),
+                                &conn,
+                            ));
+                        }
                         run_mesh_connection(
                             conn,
                             mesh.gate.clone(),
