@@ -675,6 +675,12 @@ pub struct ScopeInfo {
     pub name: String,
     pub hashes: Vec<String>,
     pub grants: Vec<String>,
+    /// Hashes deliberately WITHDRAWN from this scope (#107): `blob_unpublish` was called, and
+    /// `blob_republish` of these into THIS scope is refused with [`ERR_BLOB_WITHDRAWN`]. Cleared
+    /// only by a deliberate `blob_publish {scope, path}`. Additive — omitted when empty, so a
+    /// pre-`api_minor` 19 client sees exactly what it saw before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub withdrawn: Vec<String>,
 }
 
 /// Result of [`Request::BlobList`]: the daemon's scopes. Additive-only.
@@ -1022,6 +1028,10 @@ pub const ERR_NO_SUCH_SERVICE: i64 = -32040;
 /// The named blob is not held COMPLETE by this daemon (#83, `blob_republish`). Distinct from
 /// [`ERR_NO_SUCH_SERVICE`] because the remedy differs: fetch the blob first.
 pub const ERR_NO_SUCH_BLOB: i64 = -32041;
+/// The blob was deliberately withdrawn from this scope (#107). Distinct from
+/// [`ERR_NO_SUCH_BLOB`]: that means "fetch it first", this means "someone un-shared this on
+/// purpose — `blob_publish` from the file if the re-share is intended".
+pub const ERR_BLOB_WITHDRAWN: i64 = -32042;
 
 pub const API_NAME: &str = "mcpmesh-local/1";
 /// The protocol-compatibility version as `"MAJOR.MINOR"`, distinct from the crate/stack version.
@@ -1032,7 +1042,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   new methods, or a strictness change like params validation — bumped in the same change that
 ///   makes it. A client can guard with `api_minor >= N` for a feature it needs, or refuse a daemon
 ///   older than a minor it requires. It never resets except on a MAJOR bump.
-pub const API_VERSION: &str = "1.18";
+pub const API_VERSION: &str = "1.19";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -1059,7 +1069,7 @@ pub const API_VERSION: &str = "1.18";
 /// and of a published hash, so un-sharing a file no longer requires unpairing the person (#62); to
 /// 16 when the app-blob provider became available in PAIRING mode — the blob verbs previously
 /// errored on any daemon without an org root key, though their scope gate never needed one (#61).
-pub const API_MINOR: u32 = 18;
+pub const API_MINOR: u32 = 19;
 
 #[cfg(test)]
 mod tests {
@@ -1906,6 +1916,7 @@ mod tests {
                 name: "docs".into(),
                 hashes: vec!["ab".repeat(32)],
                 grants: vec!["alice".into()],
+                withdrawn: vec![],
             }],
         };
         let v = serde_json::to_value(&res).unwrap();

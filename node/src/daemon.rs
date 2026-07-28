@@ -58,8 +58,8 @@ pub use accept::spawn_accept_loop;
 pub use boot::serve_forever;
 pub use dial::{dial_service, pipe_session, race_dial};
 pub use handlers::{
-    NoSuchBlob, NoSuchBlobScope, NoSuchService, grant_service_access, grant_service_allow,
-    remove_peer, rename_peer, revoke_service_access, revoke_service_allow,
+    BlobWithdrawn, NoSuchBlob, NoSuchBlobScope, NoSuchService, grant_service_access,
+    grant_service_allow, remove_peer, rename_peer, revoke_service_access, revoke_service_allow,
 };
 pub(crate) use reach::caller_admitted_services;
 /// The services this identity is admitted to, as the accept path computes them (#100). Test seam:

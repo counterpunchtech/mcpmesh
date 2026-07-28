@@ -744,6 +744,11 @@ fn respond<T: serde::Serialize>(id: Value, method: &str, r: anyhow::Result<T>) -
         // #83: a missing BLOB gets its own code — "fetch it first" is a different remedy from
         // "that scope does not exist", and a client should not have to parse messages to tell them
         // apart. Checked BEFORE the shared arm below.
+        Err(e) if e.downcast_ref::<crate::daemon::BlobWithdrawn>().is_some() => error(
+            id,
+            mcpmesh_local_api::ERR_BLOB_WITHDRAWN,
+            format!("{method} failed: {e}"),
+        ),
         Err(e) if e.downcast_ref::<crate::daemon::NoSuchBlob>().is_some() => error(
             id,
             mcpmesh_local_api::ERR_NO_SUCH_BLOB,

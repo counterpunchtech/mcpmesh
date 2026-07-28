@@ -508,3 +508,74 @@ async fn the_daemon_fetch_path_exports_to_disk_without_buffering() {
     .await
     .expect("streaming fetch test timed out");
 }
+
+/// #107 OVER THE WIRE: a withdrawn hash stays refused by the GATE even after a `blob_republish`
+/// that would previously have restored it.
+///
+/// The unit tests prove `republish` returns `BlobWithdrawn`. That is not the security property —
+/// the property is that a granted peer's GET is refused on the ALPN. Those are different
+/// guarantees, and only this one is the promise made to an operator who ran `blob_unpublish`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_withdrawn_blob_stays_refused_over_the_wire_after_a_republish_attempt() {
+    timeout(Duration::from_secs(90), async {
+        let root = SigningKey::from_bytes(&[23u8; 32]);
+        let provider_ep = provider_endpoint().await;
+        let alice_ep = caller_endpoint().await;
+        let alice_id = *alice_ep.id().as_bytes();
+
+        let roster = Arc::new(RosterGate::empty());
+        let view = mint_view(&root, 1, &[(alice_id, "alice")], &[]);
+        let (mesh, dir) = serving_provider(provider_ep.clone(), roster.clone(), view).await;
+        seed_addr(&alice_ep, &provider_ep);
+
+        let src = dir.path().join("withdrawn.bin");
+        std::fs::write(&src, vec![7u8; 4096]).unwrap();
+        let provider = mesh.app_blobs().await.unwrap();
+        let (ticket, hash) = provider.publish_scope("docs", &src).await.unwrap();
+        provider.grant("docs", "alice").unwrap();
+
+        let fetch = |tag: &'static str| {
+            let (ep, ticket) = (alice_ep.clone(), ticket.clone());
+            async move {
+                let d = tempfile::tempdir().unwrap();
+                let f = AppBlobs::open_fetcher(d.path().join(tag), ep)
+                    .await
+                    .unwrap();
+                timeout(Duration::from_secs(15), f.fetch(&ticket)).await
+            }
+        };
+
+        assert!(
+            matches!(fetch("a").await, Ok(Ok(_))),
+            "setup: alice fetches before the withdrawal"
+        );
+
+        provider.unpublish("docs", &hash).await.unwrap();
+        assert!(
+            matches!(fetch("b").await, Ok(Err(_))),
+            "the gate refuses a withdrawn hash"
+        );
+
+        // The bytes are still in the store (#80: no reclaim), so republish is the route that used
+        // to bring them back. It must be refused...
+        let err = provider
+            .republish("docs", &hash)
+            .await
+            .expect_err("republishing a withdrawn hash must fail");
+        assert!(
+            err.downcast_ref::<mcpmesh::daemon::BlobWithdrawn>()
+                .is_some(),
+            "with BlobWithdrawn, so a client can tell it from 'fetch it first': {err}"
+        );
+
+        // ...and, the part that actually matters, the peer must STILL be refused on the wire.
+        let after = fetch("c").await;
+        assert!(
+            matches!(after, Ok(Err(_))),
+            "a withdrawn blob must remain unfetchable after a republish attempt — the API error is \
+             not the guarantee, this is: {after:?}"
+        );
+    })
+    .await
+    .expect("withdrawn-over-the-wire test timed out");
+}

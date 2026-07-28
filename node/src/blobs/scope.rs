@@ -13,10 +13,30 @@ use serde::{Deserialize, Serialize};
 /// One scope: the blob hashes it contains + the principals it grants. Hashes are bare 64-char blake3
 /// hex (`Hash::to_hex()`); principals are stable ids/names: `{eid} ∪ {user_id} ∪ groups` (#38 — never nicknames).
 /// `BTreeSet` for deterministic serialization + list ordering.
+/// One row of the scope listing: `(name, hashes, grants, withdrawn)`.
+///
+/// Named because it grew a fourth member with #107's withdrawal set and an anonymous 4-tuple
+/// stopped being readable at the call sites.
+pub type ScopeRow = (String, Vec<String>, Vec<String>, Vec<String>);
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Scope {
     pub hashes: BTreeSet<String>,
     pub grants: BTreeSet<String>,
+    /// Hashes deliberately WITHDRAWN from this scope (#107).
+    ///
+    /// `blob_unpublish` removes reachability but not bytes (#80: no reclaim), so the blob stays
+    /// complete in the local store forever and `blob_republish` would re-add it to this scope —
+    /// whose grants unpublish never touched — restoring access with no grant call and no warning.
+    /// A lock cannot close that: exclusion is in lock-ACQUISITION order, not request-arrival order,
+    /// so an unpublish that acquires first is still erased by a republish acquiring second.
+    ///
+    /// Persisted with the rest of the sidecar. A tombstone that evaporated on restart would be
+    /// worse than none: it reads as durable, then silently reverts.
+    ///
+    /// `#[serde(default)]` so sidecars written before 0.17.0 load unchanged.
+    #[serde(default)]
+    pub withdrawn: BTreeSet<String>,
 }
 
 /// The full scope table: `scope_name -> Scope`. `Default` is the empty table.
@@ -33,11 +53,14 @@ impl BlobScopes {
 
     /// Add a blob hash INTO a scope (creating the scope if absent).
     pub fn publish_hash(&mut self, scope: &str, hash_hex: &str) {
-        self.scopes
-            .entry(scope.to_string())
-            .or_default()
-            .hashes
-            .insert(hash_hex.to_string());
+        let sc = self.scopes.entry(scope.to_string()).or_default();
+        // Publishing CLEARS a withdrawal (#107). This is the deliberate act: `blob_publish` names a
+        // FILE on disk, so the operator is saying "this content, in this scope, I mean it".
+        // `blob_republish` — which names only a hash the node happens to hold, and is the call an
+        // embedder is tempted to make as fetch hygiene — is refused instead, and `blob_grant` never
+        // touches this, since granting a PRINCIPAL says nothing about a hash.
+        sc.withdrawn.remove(hash_hex);
+        sc.hashes.insert(hash_hex.to_string());
     }
 
     /// Grant a scope to a principal (creating the scope if absent).
@@ -86,9 +109,20 @@ impl BlobScopes {
     /// there is no reclaim verb (#80). A hash published into several scopes stays reachable through
     /// the others, and a transfer already streaming is not interrupted.
     pub fn unpublish_hash(&mut self, scope: &str, hash_hex: &str) -> bool {
+        self.scopes.get_mut(scope).is_some_and(|sc| {
+            // Record the withdrawal even when the hash was not currently listed: the operator has
+            // expressed "not this content, not in this scope", and a republish afterwards must
+            // still be refused (#107).
+            sc.withdrawn.insert(hash_hex.to_string());
+            sc.hashes.remove(hash_hex)
+        })
+    }
+
+    /// Was this hash deliberately withdrawn from this scope (#107)?
+    pub fn is_withdrawn(&self, scope: &str, hash_hex: &str) -> bool {
         self.scopes
-            .get_mut(scope)
-            .is_some_and(|sc| sc.hashes.remove(hash_hex))
+            .get(scope)
+            .is_some_and(|sc| sc.withdrawn.contains(hash_hex))
     }
 
     /// Does this scope exist at all? Lets a caller distinguish "no such scope" (an operator typo,
@@ -104,13 +138,19 @@ impl BlobScopes {
     /// capabilities; a hash reachable in scope A does not become reachable via scope B's grant.
     pub fn allows(&self, hash_hex: &str, principals: &HashSet<&str>) -> bool {
         self.scopes.values().any(|sc| {
-            sc.hashes.contains(hash_hex)
+            // A withdrawal outranks residual membership (#107 review). `hashes` and `withdrawn`
+            // are kept disjoint by the API, but this is an AUTHZ gate: if the two ever disagree —
+            // a hand-edited sidecar, external tooling, a partial rollback, a future third
+            // insertion site — the tombstone must win rather than the leftover row. Cheap
+            // belt-and-braces on the one surface where fail-open is unacceptable.
+            !sc.withdrawn.contains(hash_hex)
+                && sc.hashes.contains(hash_hex)
                 && sc.grants.iter().any(|g| principals.contains(g.as_str()))
         })
     }
 
     /// Deterministic `(name, hashes, grants)` rendering for `list` (sorted by BTree order).
-    pub fn list(&self) -> Vec<(String, Vec<String>, Vec<String>)> {
+    pub fn list(&self) -> Vec<ScopeRow> {
         self.scopes
             .iter()
             .map(|(name, sc)| {
@@ -118,6 +158,10 @@ impl BlobScopes {
                     name.clone(),
                     sc.hashes.iter().cloned().collect(),
                     sc.grants.iter().cloned().collect(),
+                    // #107: surface withdrawals. Without this a tombstone is discoverable only by
+                    // triggering a -32042, and the set — which only `blob_publish` ever prunes —
+                    // grows invisibly.
+                    sc.withdrawn.iter().cloned().collect(),
                 )
             })
             .collect()
@@ -225,6 +269,15 @@ impl ScopeStore {
     }
 
     /// Does this scope exist? See [`BlobScopes::has_scope`].
+    /// Was this hash deliberately withdrawn from this scope (#107)? Same lock discipline as
+    /// every other authz read.
+    pub fn is_withdrawn(&self, scope: &str, hash_hex: &str) -> bool {
+        self.inner
+            .read()
+            .expect("scope lock not poisoned")
+            .is_withdrawn(scope, hash_hex)
+    }
+
     pub fn has_scope(&self, scope: &str) -> bool {
         self.inner
             .read()
@@ -267,8 +320,8 @@ impl ScopeStore {
     }
 
     /// Deterministic list rendering (delegates to `BlobScopes::list`).
-    pub fn list(&self) -> Vec<(String, Vec<String>, Vec<String>)> {
-        self.snapshot().list()
+    pub fn list(&self) -> Vec<ScopeRow> {
+        self.inner.read().expect("scope lock not poisoned").list()
     }
 
     fn persist(&self, scopes: &BlobScopes) -> Result<()> {
@@ -440,5 +493,111 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = ScopeStore::load(dir.path().join("does-not-exist.json")).unwrap();
         assert!(store.snapshot().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod withdrawal_tests {
+    use super::*;
+
+    /// #107: an unpublish must be DURABLE against a later republish on this node. Bytes are never
+    /// reclaimed (#80), so `has()` stays true forever and republish would otherwise re-add the hash
+    /// to a scope whose grants unpublish never touched — restoring access with no grant call.
+    #[test]
+    fn unpublish_records_a_withdrawal_that_blocks_republish() {
+        let mut s = BlobScopes::default();
+        s.publish_hash("room", "aa");
+        s.grant("room", "b64u:alice");
+        assert!(s.unpublish_hash("room", "aa"), "the hash was there");
+        assert!(
+            s.is_withdrawn("room", "aa"),
+            "unpublish must record the withdrawal, not merely drop the hash"
+        );
+    }
+
+    /// Per-(scope, hash), not global: withdrawing H from A must not block H in B, nor a different
+    /// hash in A. Fails if the set is kept per-store instead of per-scope.
+    #[test]
+    fn a_withdrawal_is_scoped_to_one_scope_and_one_hash() {
+        let mut s = BlobScopes::default();
+        s.publish_hash("a", "h1");
+        s.publish_hash("b", "h1");
+        s.publish_hash("a", "h2");
+        s.unpublish_hash("a", "h1");
+        assert!(s.is_withdrawn("a", "h1"));
+        assert!(!s.is_withdrawn("b", "h1"), "another scope is unaffected");
+        assert!(!s.is_withdrawn("a", "h2"), "another hash is unaffected");
+    }
+
+    /// The deliberate act clears it: `blob_publish` names a FILE, so it is an operator saying "I
+    /// mean this content, in this scope".
+    #[test]
+    fn publishing_from_a_path_clears_the_withdrawal() {
+        let mut s = BlobScopes::default();
+        s.publish_hash("room", "aa");
+        s.unpublish_hash("room", "aa");
+        assert!(s.is_withdrawn("room", "aa"));
+        s.publish_hash("room", "aa");
+        assert!(
+            !s.is_withdrawn("room", "aa"),
+            "a deliberate publish-from-path is the un-withdraw"
+        );
+    }
+
+    /// Granting a PRINCIPAL says nothing about a hash. If it cleared withdrawals, content would
+    /// resurrect as a side effect of an unrelated act — the silent widening this issue exists to
+    /// stop.
+    #[test]
+    fn granting_a_principal_does_not_clear_a_withdrawal() {
+        let mut s = BlobScopes::default();
+        s.publish_hash("room", "aa");
+        s.unpublish_hash("room", "aa");
+        s.grant("room", "b64u:bob");
+        assert!(
+            s.is_withdrawn("room", "aa"),
+            "a grant must never un-withdraw — it names a principal, not a hash"
+        );
+    }
+
+    /// #107's load-bearing property: the withdrawal SURVIVES A RESTART. A tombstone that
+    /// evaporated on reload would be worse than none — it reads as durable, then silently reverts,
+    /// and the operator has no way to notice.
+    #[test]
+    fn a_withdrawal_survives_a_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scopes.json");
+        {
+            let store = ScopeStore::new(path.clone());
+            store.publish_hash("room", "aa").unwrap();
+            store.grant("room", "b64u:alice").unwrap();
+            store.unpublish_hash("room", "aa").unwrap();
+            assert!(store.is_withdrawn("room", "aa"));
+        }
+        let reloaded = ScopeStore::load(path).unwrap();
+        assert!(
+            reloaded.is_withdrawn("room", "aa"),
+            "the withdrawal must persist — a daemon restart must not silently un-revoke"
+        );
+    }
+
+    /// A sidecar written BEFORE 0.17.0 has no `withdrawn` field; it must load, not fail closed on
+    /// deserialization and not fail open by inventing withdrawals.
+    #[test]
+    fn a_pre_0_17_sidecar_loads_with_no_withdrawals() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.json");
+        std::fs::write(
+            &path,
+            r#"{"scopes":{"room":{"hashes":["aa"],"grants":["b64u:alice"]}}}"#,
+        )
+        .unwrap();
+        let store = ScopeStore::load(path).expect("an old sidecar still loads");
+        assert!(!store.is_withdrawn("room", "aa"), "nothing was withdrawn");
+        assert!(
+            store
+                .snapshot()
+                .allows("aa", &["b64u:alice"].into_iter().collect()),
+            "and the existing grant still works"
+        );
     }
 }

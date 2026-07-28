@@ -300,6 +300,16 @@ impl AppBlobs {
         if !self.store.blobs().has(hash).await.unwrap_or(false) {
             anyhow::bail!(crate::daemon::NoSuchBlob(canonical));
         }
+        // #107: a deliberate withdrawal outranks "we still hold the bytes". Checked INSIDE the
+        // membership lock, so an unpublish that lands first cannot be overtaken — which is the
+        // half a lock alone could never fix, since exclusion is in acquisition order, not
+        // request-arrival order.
+        if self.scopes.is_withdrawn(scope, &canonical) {
+            anyhow::bail!(crate::daemon::BlobWithdrawn {
+                scope: scope.to_string(),
+                hash: canonical,
+            });
+        }
         #[cfg(test)]
         {
             let d = *self
@@ -379,10 +389,19 @@ impl AppBlobs {
     /// hook. The BYTES remain in the store — there is no reclaim (#80) — so do not describe this to
     /// a user as deletion. A transfer already streaming is not interrupted.
     pub async fn unpublish(&self, scope: &str, hash_hex: &str) -> Result<bool> {
+        // NORMALIZE FIRST (#107 review). Since #107 this call WRITES a persistent key into the
+        // withdrawn set, so a non-canonical rendering no longer merely fails to match — it records
+        // a junk entry that no `republish` will ever compare equal to, in a set nothing prunes.
+        // The control socket normalizes before calling, but `AppBlobs` is public API of a
+        // published crate, so a library consumer passing uppercase hex must not poison the
+        // sidecar. `republish` already normalizes one function away.
+        let canonical = crate::blobs::parse_blob_hash(hash_hex)?
+            .to_hex()
+            .to_string();
         // #104: same lock as `republish`, so a revocation cannot land inside a republish's
         // check-then-insert window and be overwritten by it.
         let _membership = self.hash_membership.lock().await;
-        self.scopes.unpublish_hash(scope, hash_hex)
+        self.scopes.unpublish_hash(scope, &canonical)
     }
 
     /// TEST-ONLY: pause between the import and the scope insert (#104).
@@ -404,7 +423,7 @@ impl AppBlobs {
     }
 
     /// The current scope table (name, hashes, grants) for `list`.
-    pub fn list(&self) -> Vec<(String, Vec<String>, Vec<String>)> {
+    pub fn list(&self) -> Vec<crate::blobs::scope::ScopeRow> {
         self.scopes.list()
     }
 
@@ -594,7 +613,7 @@ mod tests {
         let hashes: Vec<String> = provider
             .list()
             .into_iter()
-            .flat_map(|(_, hashes, _)| hashes)
+            .flat_map(|(_, hashes, _, _)| hashes)
             .collect();
         assert!(
             !hashes.contains(&absent),
@@ -808,8 +827,8 @@ mod tests {
         let recorded: Vec<String> = provider
             .list()
             .into_iter()
-            .filter(|(name, _, _)| name == "room")
-            .flat_map(|(_, hashes, _)| hashes)
+            .filter(|(name, _, _, _)| name == "room")
+            .flat_map(|(_, hashes, _, _)| hashes)
             .collect();
         assert_eq!(
             recorded,
@@ -860,7 +879,7 @@ mod tests {
             let hashes: Vec<String> = provider
                 .list()
                 .into_iter()
-                .flat_map(|(_, hashes, _)| hashes)
+                .flat_map(|(_, hashes, _, _)| hashes)
                 .collect();
             assert!(
                 !hashes.contains(&hash_hex),
@@ -907,7 +926,7 @@ mod tests {
             let hashes: Vec<String> = provider
                 .list()
                 .into_iter()
-                .flat_map(|(_, hashes, _)| hashes)
+                .flat_map(|(_, hashes, _, _)| hashes)
                 .collect();
             assert!(
                 !hashes.contains(&hash_hex),
@@ -983,6 +1002,80 @@ mod tests {
         assert_eq!(&caller.read_bytes(hash).await.unwrap()[..], b"capped");
     }
 
+    /// #107: the race #104's lock could NOT close. A mutex orders by ACQUISITION, not by request
+    /// arrival, so an unpublish that acquires first is still erased by a republish acquiring
+    /// second — both returning success, operator told the file was withdrawn while it is served.
+    ///
+    /// Closed with state rather than exclusion: unpublish records a withdrawal, and republish
+    /// refuses it. Asserted in the ORDER THAT USED TO LOSE — unpublish completes first, then
+    /// republish runs — which is exactly the interleaving a lock cannot help with.
+    #[tokio::test]
+    async fn a_completed_unpublish_is_not_undone_by_a_later_republish() {
+        tokio::time::timeout(std::time::Duration::from_secs(90), async {
+            let dir = tempfile::tempdir().unwrap();
+            let provider = AppBlobs::open_fetcher(dir.path().join("blobs"), ep().await)
+                .await
+                .unwrap();
+            provider.grant("room", "b64u:alice").unwrap();
+            let src = dir.path().join("f.bin");
+            std::fs::write(&src, b"withdrawn content").unwrap();
+            let (_t, hash_hex) = provider.publish_scope("room", &src).await.unwrap();
+
+            assert!(provider.unpublish("room", &hash_hex).await.unwrap());
+
+            // The bytes are still in the store (#80: no reclaim), so `has()` is true and the ONLY
+            // thing standing between the operator's revocation and its silent undoing is #107.
+            let err = provider
+                .republish("room", &hash_hex)
+                .await
+                .expect_err("a withdrawn hash must not republish");
+            assert!(
+                err.downcast_ref::<crate::daemon::BlobWithdrawn>().is_some(),
+                "must be BlobWithdrawn so a client can tell it from 'fetch it first', got: {err}"
+            );
+
+            let hashes: Vec<String> = provider
+                .list()
+                .into_iter()
+                .flat_map(|(_, hashes, _, _)| hashes)
+                .collect();
+            assert!(
+                !hashes.contains(&hash_hex),
+                "and the scope must still not list it (got {hashes:?})"
+            );
+        })
+        .await
+        .expect("durable revocation test timed out");
+    }
+
+    /// The deliberate re-share still works: `blob_publish` from a FILE clears the withdrawal, and
+    /// a republish afterwards is allowed again. Without this, a withdrawal would be permanent and
+    /// an operator could never re-share the same content into that scope.
+    #[tokio::test]
+    async fn publishing_from_the_file_again_lifts_the_withdrawal() {
+        tokio::time::timeout(std::time::Duration::from_secs(90), async {
+            let dir = tempfile::tempdir().unwrap();
+            let provider = AppBlobs::open_fetcher(dir.path().join("blobs"), ep().await)
+                .await
+                .unwrap();
+            provider.grant("room", "b64u:alice").unwrap();
+            let src = dir.path().join("f.bin");
+            std::fs::write(&src, b"re-shared on purpose").unwrap();
+            let (_t, hash_hex) = provider.publish_scope("room", &src).await.unwrap();
+            provider.unpublish("room", &hash_hex).await.unwrap();
+            provider.republish("room", &hash_hex).await.unwrap_err();
+
+            // The deliberate act: name the FILE again.
+            provider.publish_scope("room", &src).await.unwrap();
+            provider
+                .republish("room", &hash_hex)
+                .await
+                .expect("after a deliberate re-publish, republish is allowed again");
+        })
+        .await
+        .expect("un-withdraw test timed out");
+    }
+
     /// Republish is idempotent (the scope hash set is a set), so a client may call it
     /// unconditionally after every fetch without special-casing the second time.
     #[tokio::test]
@@ -1004,7 +1097,7 @@ mod tests {
         let rooms: Vec<(String, Vec<String>)> = provider
             .list()
             .into_iter()
-            .map(|(name, hashes, _)| (name, hashes))
+            .map(|(name, hashes, _, _)| (name, hashes))
             .collect();
         assert_eq!(
             rooms,
