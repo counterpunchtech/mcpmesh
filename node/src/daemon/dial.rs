@@ -543,7 +543,7 @@ mod tests {
                 .bind()
                 .await
                 .unwrap();
-            let transport = connect(&client_ep, server_addr, "echo").await.unwrap();
+            let transport = connect(&client_ep, server_addr, "echo").await.unwrap().0;
 
             // Control side, one whole DuplexStream per direction (dropping `ctl_in_w`
             // is the control-side EOF; a split half would keep the stream alive).

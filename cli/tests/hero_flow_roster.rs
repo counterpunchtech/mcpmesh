@@ -213,7 +213,7 @@ async fn group_based_allow_admits_a_rostered_caller_and_injects_full_identity() 
 
         // alice dials echo: the composed gate resolves her to {name:"alice", user_id:Some("alice"),
         // groups:[team-eng, all]}; select_service admits via the GROUP arm (allow=["team-eng"]).
-        let mut alice_t = connect(&alice_client, addr, "echo").await.unwrap();
+        let mut alice_t = connect(&alice_client, addr, "echo").await.unwrap().0;
         alice_t.send_value(initialize_frame("echo")).await.unwrap();
         let init = alice_t.recv_value().await.unwrap().unwrap();
         assert_eq!(
@@ -332,7 +332,7 @@ async fn revoking_a_rostered_device_severs_its_live_session_and_a_stale_pair_ent
         let _task = spawn_accept_loop(mesh.clone(), Arc::new(build_services(&cfg)));
 
         // alice (rostered, group-admitted, and ALSO holding a stale pair entry) completes a session.
-        let mut alice_t = connect(&alice_client, addr.clone(), "echo").await.unwrap();
+        let mut alice_t = connect(&alice_client, addr.clone(), "echo").await.unwrap().0;
         alice_t.send_value(initialize_frame("echo")).await.unwrap();
         assert_eq!(
             alice_t.recv_value().await.unwrap().unwrap()["result"]["serverInfo"]["name"],
@@ -341,7 +341,7 @@ async fn revoking_a_rostered_device_severs_its_live_session_and_a_stale_pair_ent
         );
 
         // bob (pairing-only) completes a session.
-        let mut bob_t = connect(&bob_client, addr.clone(), "echo").await.unwrap();
+        let mut bob_t = connect(&bob_client, addr.clone(), "echo").await.unwrap().0;
         bob_t.send_value(initialize_frame("echo")).await.unwrap();
         assert_eq!(
             bob_t.recv_value().await.unwrap().unwrap()["result"]["serverInfo"]["name"],
@@ -396,7 +396,7 @@ async fn revoking_a_rostered_device_severs_its_live_session_and_a_stale_pair_ent
         // A FRESH dial from alice's (now-revoked) endpoint — which STILL holds the stale pair entry —
         // is refused PRE-MCP: revocation wins over the pair entry (§4.1(1)). The composed gate's
         // is_revoked check rejects it before any session frame.
-        match connect(&alice_client, addr, "echo").await {
+        match connect(&alice_client, addr, "echo").await.map(|(t, _)| t) {
             Err(_) => {} // refused at/near handshake — a valid "closed" outcome
             Ok(mut t) => {
                 let _ = t.send_value(initialize_frame("echo")).await;

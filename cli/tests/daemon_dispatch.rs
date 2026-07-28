@@ -102,7 +102,7 @@ async fn accept_loop_routes_mesh_alpn_to_a_gated_session() {
         let _task = spawn_accept_loop(mesh.clone(), Arc::new(build_services(&cfg)));
 
         // Dial mcp/1 and complete initialize → the mesh handler served the session.
-        let mut transport = connect(&client, addr, "echo").await.unwrap();
+        let mut transport = connect(&client, addr, "echo").await.unwrap().0;
         transport
             .send_value(json!({
                 "jsonrpc": "2.0", "id": 1, "method": "initialize",

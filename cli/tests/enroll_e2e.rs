@@ -442,7 +442,7 @@ async fn full_enrollment_via_porcelain_admits_a_group_service_and_revocation_cut
         // groups:[team-eng]}; select_service admits via the GROUP arm (allow=["team-eng"]).
         let mut joiner_t = connect(&joiner_client, addr.clone(), "echo")
             .await
-            .expect("the rostered joiner dials echo");
+            .expect("the rostered joiner dials echo").0;
         joiner_t.send_value(initialize_frame("echo")).await.unwrap();
         let init = joiner_t.recv_value().await.unwrap().unwrap();
         assert_eq!(
@@ -491,7 +491,7 @@ async fn full_enrollment_via_porcelain_admits_a_group_service_and_revocation_cut
         );
 
         // (b) a FRESH dial from the (now-revoked) joiner endpoint is refused PRE-MCP (revocation wins).
-        match connect(&joiner_client, addr.clone(), "echo").await {
+        match connect(&joiner_client, addr.clone(), "echo").await.map(|(t, _)| t) {
             Err(_) => {} // refused at/near handshake — a valid "closed" outcome
             Ok(mut t) => {
                 let _ = t.send_value(initialize_frame("echo")).await;

@@ -88,7 +88,7 @@ async fn daemon_serves_run_service_and_injects_caller_identity_over_the_mesh() {
         );
 
         // Connect as the trusted peer and complete initialize + tools/call.
-        let mut transport = connect(&client, addr, "echo").await.unwrap();
+        let mut transport = connect(&client, addr, "echo").await.unwrap().0;
         transport
             .send_value(json!({
                 "jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -225,7 +225,7 @@ async fn hot_reload_serves_a_newly_registered_service_over_the_mesh() {
         mesh.set_accept_task(accept_task).await;
 
         // Pre-swap: `echo` is refused (unknown/unauthorized service, §5).
-        let mut t_before = connect(&before, addr.clone(), "echo").await.unwrap();
+        let mut t_before = connect(&before, addr.clone(), "echo").await.unwrap().0;
         let refused = send_initialize(&mut t_before, "echo").await;
         assert_eq!(
             refused["error"]["code"], -32054,
@@ -264,7 +264,7 @@ async fn hot_reload_serves_a_newly_registered_service_over_the_mesh() {
 
         // Post-swap: a real second endpoint completes initialize + tools/call against the
         // newly-served `echo` — admitted via its eid principal, identity injected.
-        let mut t_after = connect(&after, addr.clone(), "echo").await.unwrap();
+        let mut t_after = connect(&after, addr.clone(), "echo").await.unwrap().0;
         let init = send_initialize(&mut t_after, "echo").await;
         assert_eq!(
             init["result"]["serverInfo"]["name"], "echo-stub",
@@ -299,7 +299,7 @@ async fn hot_reload_serves_a_newly_registered_service_over_the_mesh() {
                 last_addr: None,
             })
             .unwrap();
-        let mut t_ghost = connect(&ghost, addr, "echo").await.unwrap();
+        let mut t_ghost = connect(&ghost, addr, "echo").await.unwrap().0;
         let ghost_refused = send_initialize(&mut t_ghost, "echo").await;
         assert_eq!(
             ghost_refused["error"]["code"], -32054,

@@ -402,7 +402,7 @@ async fn four_command_hero_flow() {
         // connection is closed with QUIC 401 BEFORE any bi-stream, so no MCP frame is exchanged.
         // ══════════════════════════════════════════════════════════════════════════════════
         let stranger_ep = mesh_endpoint().await;
-        match connect(&stranger_ep, alice_addr.clone(), "notes").await {
+        match connect(&stranger_ep, alice_addr.clone(), "notes").await.map(|(t, _)| t) {
             // Refused at connection establishment — no session, no MCP frame.
             Err(_) => {}
             // Or the connect races ahead of the gate close: the stranger may open a stream, but its
