@@ -300,6 +300,16 @@ impl AppBlobs {
         if !self.store.blobs().has(hash).await.unwrap_or(false) {
             anyhow::bail!(crate::daemon::NoSuchBlob(canonical));
         }
+        // #107: a deliberate withdrawal outranks "we still hold the bytes". Checked INSIDE the
+        // membership lock, so an unpublish that lands first cannot be overtaken — which is the
+        // half a lock alone could never fix, since exclusion is in acquisition order, not
+        // request-arrival order.
+        if self.scopes.is_withdrawn(scope, &canonical) {
+            anyhow::bail!(crate::daemon::BlobWithdrawn {
+                scope: scope.to_string(),
+                hash: canonical,
+            });
+        }
         #[cfg(test)]
         {
             let d = *self
@@ -981,6 +991,80 @@ mod tests {
         .expect("fetch timed out")
         .expect("the fallback direct-address ticket must still round-trip");
         assert_eq!(&caller.read_bytes(hash).await.unwrap()[..], b"capped");
+    }
+
+    /// #107: the race #104's lock could NOT close. A mutex orders by ACQUISITION, not by request
+    /// arrival, so an unpublish that acquires first is still erased by a republish acquiring
+    /// second — both returning success, operator told the file was withdrawn while it is served.
+    ///
+    /// Closed with state rather than exclusion: unpublish records a withdrawal, and republish
+    /// refuses it. Asserted in the ORDER THAT USED TO LOSE — unpublish completes first, then
+    /// republish runs — which is exactly the interleaving a lock cannot help with.
+    #[tokio::test]
+    async fn a_completed_unpublish_is_not_undone_by_a_later_republish() {
+        tokio::time::timeout(std::time::Duration::from_secs(90), async {
+            let dir = tempfile::tempdir().unwrap();
+            let provider = AppBlobs::open_fetcher(dir.path().join("blobs"), ep().await)
+                .await
+                .unwrap();
+            provider.grant("room", "b64u:alice").unwrap();
+            let src = dir.path().join("f.bin");
+            std::fs::write(&src, b"withdrawn content").unwrap();
+            let (_t, hash_hex) = provider.publish_scope("room", &src).await.unwrap();
+
+            assert!(provider.unpublish("room", &hash_hex).await.unwrap());
+
+            // The bytes are still in the store (#80: no reclaim), so `has()` is true and the ONLY
+            // thing standing between the operator's revocation and its silent undoing is #107.
+            let err = provider
+                .republish("room", &hash_hex)
+                .await
+                .expect_err("a withdrawn hash must not republish");
+            assert!(
+                err.downcast_ref::<crate::daemon::BlobWithdrawn>().is_some(),
+                "must be BlobWithdrawn so a client can tell it from 'fetch it first', got: {err}"
+            );
+
+            let hashes: Vec<String> = provider
+                .list()
+                .into_iter()
+                .flat_map(|(_, hashes, _)| hashes)
+                .collect();
+            assert!(
+                !hashes.contains(&hash_hex),
+                "and the scope must still not list it (got {hashes:?})"
+            );
+        })
+        .await
+        .expect("durable revocation test timed out");
+    }
+
+    /// The deliberate re-share still works: `blob_publish` from a FILE clears the withdrawal, and
+    /// a republish afterwards is allowed again. Without this, a withdrawal would be permanent and
+    /// an operator could never re-share the same content into that scope.
+    #[tokio::test]
+    async fn publishing_from_the_file_again_lifts_the_withdrawal() {
+        tokio::time::timeout(std::time::Duration::from_secs(90), async {
+            let dir = tempfile::tempdir().unwrap();
+            let provider = AppBlobs::open_fetcher(dir.path().join("blobs"), ep().await)
+                .await
+                .unwrap();
+            provider.grant("room", "b64u:alice").unwrap();
+            let src = dir.path().join("f.bin");
+            std::fs::write(&src, b"re-shared on purpose").unwrap();
+            let (_t, hash_hex) = provider.publish_scope("room", &src).await.unwrap();
+            provider.unpublish("room", &hash_hex).await.unwrap();
+            provider.republish("room", &hash_hex).await.unwrap_err();
+
+            // The deliberate act: name the FILE again.
+            provider.publish_scope("room", &src).await.unwrap();
+            provider
+                .republish("room", &hash_hex)
+                .await
+                .expect("after a deliberate re-publish, republish is allowed again");
+        })
+        .await
+        .expect("un-withdraw test timed out");
     }
 
     /// Republish is idempotent (the scope hash set is a set), so a client may call it

@@ -165,6 +165,29 @@ impl std::fmt::Display for NoSuchBlob {
 }
 impl std::error::Error for NoSuchBlob {}
 
+/// The blob was deliberately WITHDRAWN from this scope (#107) — `blob_unpublish` was called, and
+/// `blob_republish` must not silently resurrect it.
+///
+/// Distinct from [`NoSuchBlob`] because the remedies are opposites: `NoSuchBlob` means "fetch it
+/// first", this means "someone withdrew this on purpose; re-publish from the file if you mean it".
+#[derive(Debug)]
+pub struct BlobWithdrawn {
+    pub scope: String,
+    pub hash: String,
+}
+
+impl std::fmt::Display for BlobWithdrawn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "blob '{}' was withdrawn from scope '{}' — republishing will not restore it; \
+             'blob_publish' from the file if the re-share is intended",
+            self.hash, self.scope
+        )
+    }
+}
+impl std::error::Error for BlobWithdrawn {}
+
 /// Handle a `blob_republish` control request (#83): make a blob this daemon ALREADY holds servable
 /// from here, in a scope it controls. No filesystem round-trip and no third copy of the bytes.
 pub(crate) async fn blob_republish(
