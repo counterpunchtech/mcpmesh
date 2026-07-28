@@ -257,9 +257,13 @@ mod tests {
             });
 
             // Budget of ONE request per minute — consumed by `tools/call` below.
+            // Some(endpoint), NOT None: RateGate::admit_at returns Ok unconditionally for a
+            // None identity, so a None gate meters NOTHING and cannot distinguish the property
+            // under test from an absent limiter. The first version of this test used None and was
+            // therefore vacuous — metering Direction B did not break it.
             let rate = RateGate::new(
                 std::sync::Arc::new(crate::limits::RateLimiter::per_minute(1, 1)),
-                None,
+                Some(mcpmesh_net::EndpointId::from_bytes([9u8; 32])),
             );
             let pump_task = tokio::spawn(async move {
                 pump(
@@ -279,13 +283,36 @@ mod tests {
             )
             .await
             .unwrap();
+            // A SECOND metered request makes the exhaustion OBSERVABLE rather than assumed.
+            write_frame(
+                &mut peer_w,
+                &json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{}}),
+            )
+            .await
+            .unwrap();
 
             let mut peer_reader = FrameReader::new(peer_r, MAX_FRAME_BYTES);
-            let reply = match peer_reader.next().await.unwrap() {
-                Some(Inbound::Frame(f)) => f,
-                other => panic!("expected the id=2 reply, got {other:?}"),
+            let mut saw_limited = false;
+            let reply = loop {
+                match peer_reader.next().await.unwrap() {
+                    Some(Inbound::Frame(f)) => {
+                        if f["error"]["code"] == -32053 {
+                            saw_limited = true;
+                            continue;
+                        }
+                        if f["id"] == 2 {
+                            break f;
+                        }
+                    }
+                    other => panic!("expected the id=2 reply, got {other:?}"),
+                }
             };
-            assert_eq!(reply["id"], 2, "the solicited reply arrives first");
+            assert_eq!(reply["id"], 2, "the solicited reply arrives");
+            assert!(
+                saw_limited,
+                "the per-identity budget must be EXHAUSTED by now — without that this test cannot \
+                 distinguish 'Direction B is unmetered' from 'there was budget left'"
+            );
 
             let pushed = match peer_reader.next().await.unwrap() {
                 Some(Inbound::Frame(f)) => f,
