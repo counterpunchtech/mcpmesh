@@ -51,7 +51,9 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 /// `last_addr` hint attached when usable, exactly like `dial::dial_service`'s single-nickname
 /// fallback (discovery still resolves/merges addresses; hermetic localhost tests seed a
 /// `MemoryLookup` or store a hint), sends one ping frame,
-/// reads the pong, and measures RTT (dial + round-trip). Writes the outcome into the in-memory
+/// reads the pong, and measures RTT (dial + round-trip, stamped AT THE PONG — it deliberately
+/// EXCLUDES the `PATH_SETTLE` window that `settled_path` spends afterwards deciding which path we
+/// are on, #123). Writes the outcome into the in-memory
 /// `MeshState::reachability` cache and returns it. Reachable ⇔ a pong arrived within
 /// `PROBE_TIMEOUT`; a gate refusal (no pong) or any dial/IO failure is a clean `reachable:false`.
 pub async fn probe_peer(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> ReachEntry {
@@ -60,24 +62,25 @@ pub async fn probe_peer(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> ReachEn
         .probe_seq
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let started = std::time::Instant::now();
-    let outcome = tokio::time::timeout(PROBE_TIMEOUT, probe_once(mesh, endpoint_id)).await;
+    let outcome = tokio::time::timeout(PROBE_TIMEOUT, probe_once(mesh, endpoint_id, started)).await;
     // `probe_once` returns the peer's (already length-capped) metadata on a reachable pong.
     // `path` rides the probe OUTCOME, so it is exactly as fresh as `reachable`/`rtt_ms` and an
     // unreachable peer reports `Unknown` rather than a stale route (#64 review). Reading it from
     // the endpoint's address map after the fact reported `Direct` for a peer that had just gone
     // away, because iroh leaves those entries Active for up to a minute after the connection dies.
-    let (reachable, meta, services, path) = match outcome {
-        Ok(Ok((meta, services, path))) => (true, meta, services, path),
+    let (reachable, meta, services, path, rtt_ms) = match outcome {
+        Ok(Ok((meta, services, path, rtt_ms))) => (true, meta, services, path, Some(rtt_ms)),
         _ => (
             false,
             String::new(),
             Vec::new(),
             mcpmesh_local_api::PeerPath::Unknown,
+            None,
         ),
     };
     let entry = ReachEntry {
         reachable,
-        rtt_ms: reachable.then(|| started.elapsed().as_millis() as u64),
+        rtt_ms,
         probed_at: epoch_now_i64(),
         meta,
         services,
@@ -307,7 +310,8 @@ fn stored_row(
 async fn probe_once(
     mesh: &Arc<MeshState>,
     endpoint_id: [u8; 32],
-) -> Result<(String, Vec<String>, mcpmesh_local_api::PeerPath)> {
+    started: std::time::Instant,
+) -> Result<(String, Vec<String>, mcpmesh_local_api::PeerPath, u64)> {
     let id = iroh::EndpointId::from_bytes(&endpoint_id)
         .map_err(|e| anyhow::anyhow!("invalid endpoint id: {e}"))?;
     // Attach the pairing-persisted `last_addr` hint, exactly as `dial::dial_service` does
@@ -350,7 +354,19 @@ async fn probe_once(
         // on any relay-enabled node — i.e. every real deployment — which is the opposite of the
         // truthful-locality-claim this field exists to support.
         Some(Inbound::Frame(v)) => {
-            Ok((pong_meta(&v), pong_services(&v), settled_path(&conn).await))
+            // Stamp the RTT HERE, at the pong — BEFORE `settled_path` spends up to `PATH_SETTLE`
+            // deciding which path we are on (#123). Measuring after it meant a relayed peer could
+            // never report under 600ms, because most of the number was our own deliberate wait.
+            // An embedder read ~820ms on two machines one LAN hop apart and filed it as a 66x
+            // fleet latency degradation; ~73% of that figure was this window. `rtt_ms` now means
+            // what its name says: dial + round trip.
+            let rtt_ms = started.elapsed().as_millis() as u64;
+            Ok((
+                pong_meta(&v),
+                pong_services(&v),
+                settled_path(&conn).await,
+                rtt_ms,
+            ))
         }
         _ => anyhow::bail!("no pong from peer"),
     }
@@ -488,6 +504,48 @@ mod tests {
             seq: 0,
             path: mcpmesh_local_api::PeerPath::Unknown,
         }
+    }
+
+    /// #123: `rtt_ms` is stamped at the PONG, not after the settle window, so a relayed peer can
+    /// report a sub-`PATH_SETTLE` figure. Before this, `path == Relay` implied `rtt_ms >= 600` BY
+    /// CONSTRUCTION — the field was named for wire latency and mostly contained our own wait, and
+    /// an embedder built a fleet-health rung on a condition that was unreachable.
+    ///
+    /// **What this does and does NOT pin — measured, not assumed.** It establishes the PROPERTY
+    /// that matters: a reading taken before the window can fall under it, and one taken after
+    /// cannot. It does NOT pin `probe_once`'s call site. Moving the stamp back after
+    /// `settled_path` — i.e. restoring the exact #123 bug — leaves this green, verified by
+    /// mutation.
+    ///
+    /// Same shape as `settled_path`'s documented hole: pinning the call site needs a live
+    /// connection whose pong and hole-punch can be separated, and a duration assertion on a loaded
+    /// machine lies (this repo has two confident-and-wrong diagnoses from exactly that). Recorded
+    /// as a known gap rather than claimed as coverage.
+    #[tokio::test(start_paused = true)]
+    async fn rtt_is_stamped_at_the_pong_and_excludes_the_settle_window() {
+        use mcpmesh_local_api::PeerPath;
+        use std::time::Duration;
+
+        let started = tokio::time::Instant::now();
+        // Stand in for the pong arriving quickly on a relayed connection.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let at_pong = started.elapsed();
+
+        // Then the settle window runs, as it does for a peer with no direct path.
+        let settled = super::settle(super::PATH_SETTLE, || PeerPath::Relay { url: None }).await;
+        let after_settle = started.elapsed();
+
+        assert_eq!(settled, PeerPath::Relay { url: None });
+        assert!(
+            at_pong < super::PATH_SETTLE,
+            "the pong stamp must be able to fall UNDER the settle window — that is the whole \
+             point of #123: relayed-and-fast has to be a reportable state"
+        );
+        assert!(
+            after_settle >= super::PATH_SETTLE,
+            "and the post-settle reading is necessarily >= the window, which is what the field \
+             used to contain"
+        );
     }
 
     /// #64/#110: the probe WAITS for hole-punching rather than classifying the instant the pong

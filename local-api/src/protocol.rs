@@ -127,7 +127,15 @@ pub struct PeerReachability {
     pub name: String,    // the peer's nickname
     pub reachable: bool, // result of the last probe (false if never probed)
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rtt_ms: Option<u64>, // last measured round-trip, if reachable
+    /// Last measured round-trip, if reachable: dial + ping/pong, stamped AT THE PONG.
+    ///
+    /// It EXCLUDES the window the daemon spends afterwards determining which path the connection
+    /// settled on. Before 0.20.1 it included that window, so a relayed peer could never report
+    /// under 600ms and most of the figure was a deliberate wait rather than time on the wire —
+    /// an embedder read ~820ms across one LAN hop and reported it as a 66x latency regression
+    /// (#123). It is a wire-latency measurement now, so "relayed AND low rtt_ms" is a reachable
+    /// state and a usable diagnostic.
+    pub rtt_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub age_secs: Option<u64>, // None = never probed (consumer shows "checking…")
     /// The peer's OPTIONAL app metadata (#40) — the same opaque ≤256B blob #39 exposes via
