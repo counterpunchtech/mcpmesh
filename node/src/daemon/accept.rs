@@ -52,6 +52,12 @@ fn gate_and_register(
         });
     if registration.is_none() {
         conn.close(mcpmesh_net::CLOSE_UNAUTHORIZED.into(), b"unauthorized");
+    } else {
+        // #92 item 2: watch this session's selected path, so a mid-session degradation pushes a
+        // frame when it happens rather than waiting for something to probe. AFTER the gate, so a
+        // stranger never gets a task spawned on its behalf (SECURITY invariant 4: strangers stay
+        // cheap). The watcher ends with the connection and holds no strong handle to it.
+        super::path_watch::spawn(mesh.clone(), *remote.as_bytes(), conn);
     }
     registration
 }
