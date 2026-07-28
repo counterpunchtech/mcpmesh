@@ -674,7 +674,14 @@ pub(crate) async fn handle_request(req: &Value, state: &DaemonState) -> Value {
             })
             .await,
         ),
-        Some("blob_list") => respond(id, "blob_list", crate::daemon::blob_list(state).await),
+        Some("blob_list") => respond(
+            id,
+            "blob_list",
+            with_params(&params, |p: mcpmesh_local_api::BlobListParams| {
+                crate::daemon::blob_list(state, p)
+            })
+            .await,
+        ),
         Some("blob_fetch") => respond(
             id,
             "blob_fetch",

@@ -7,7 +7,7 @@ named pipe on Windows. Anything that can open the endpoint and parse JSON can sp
 language — [`local-api/examples/status.py`](../local-api/examples/status.py) is a complete client
 in ~60 lines of dependency-free Python.
 
-> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.19`, `api_minor` `19`) and evolves
+> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.20`, `api_minor` `20`) and evolves
 > **additively** (see [Versioning](#versioning)), but until a stable release this document — like the
 > wire format itself — may change without a migration path. Pin the mcpmesh version you build
 > against. Source of truth is the Rust in [`local-api/`](../local-api/src/protocol.rs); where this
@@ -195,7 +195,7 @@ Methods split into two groups by audience:
 > publisher's control entirely: content addressing means `blob_revoke`/`blob_unpublish` bind only
 > the node they run on. Treat them as "stop serving from here", never as "unshare from everyone".
 
-| `blob_list` | *(none)* | `{scopes:[{name, hashes:[…], grants:[…]}]}` |
+| `blob_list` | `{scope?, hash?, limit?, offset?, counts_only?}` — the daemon's scopes (name → hashes + grants + withdrawn + counts). **All params optional; `blob_list {}` still works.** `scope` is an EXACT match, never a prefix. `hash` is normalized before comparing. **A DEFAULT LIMIT of 256 scopes applies when `limit` is absent (#84b, `api_minor >= 20`)** — unpaged, this verb rendered every scope into one frame against the 16 MiB cap; past it the CLIENT rejects the frame as malformed. The control surface carries **no** strike bound, so the connection survives — but you get an opaque error and no way to page, which is an unusable answer rather than a large one. **Note the cap counts SCOPES, not bytes:** one legacy scope holding very many hashes can still exceed the frame at `limit: 1` (see #84a). Check `truncated` and page with `offset`; `total` is the match count BEFORE limit/offset. `counts_only` omits the three vectors and keeps `hash_count`/`grant_count`/`withdrawn_count`. | `{scopes:[…], total, truncated}` |
 | `blob_fetch` | `{ticket, dest_path}` | `{hash, bytes_len}` |
 
 > **`blob_fetch` blocks the control connection, and cannot be cancelled.**
@@ -717,7 +717,7 @@ things:
   `api_minor >= 13`, and the `run`-backend `MCPMESH_PEER_EID` identity var (#60) is
   `api_minor >= 14`; ephemeral-service grant/revoke plus the `-32040`
   no-such-service error (#55, #69) are `api_minor >= 11`; app blobs in PAIRING mode (#61) are
-  `api_minor >= 16`; `blob_republish` (#83) is `api_minor >= 18`; `status` + `peer_services` — and the `mcpmesh/ping/1` probe's `services` field, which shares the same resolver — answering from the live registry rather than `config.toml` (#100) is `api_minor >= 17`; the `blob_revoke` / `blob_unpublish` verbs
+  `api_minor >= 16`; `blob_republish` (#83) is `api_minor >= 18`; durable withdrawals + `-32042` (#107) are `api_minor >= 19`; `blob_list` filters/paging and its DEFAULT LIMIT (#84b) are `api_minor >= 20`; `status` + `peer_services` — and the `mcpmesh/ping/1` probe's `services` field, which shares the same resolver — answering from the live registry rather than `config.toml` (#100) is `api_minor >= 17`; the `blob_revoke` / `blob_unpublish` verbs
   (#62) are `api_minor >= 15`; the pushed `reachability` stream frame (#58)
   is `api_minor >= 12`; the `set_nickname` verb
   and `StatusResult.self_nickname` are `api_minor >= 2` (#37); STABLE-principal `allow`

@@ -209,22 +209,47 @@ pub(crate) async fn blob_republish(
 }
 
 /// Handle a `blob_list` control request: the daemon's scopes (name → hashes + grants).
-pub(crate) async fn blob_list(state: &DaemonState) -> Result<BlobScopeList> {
+pub(crate) async fn blob_list(
+    state: &DaemonState,
+    params: mcpmesh_local_api::BlobListParams,
+) -> Result<BlobScopeList> {
     let mesh = state.mesh_required()?;
-    let scopes = match mesh.app_blobs().await {
-        Some(provider) => provider
-            .list()
-            .into_iter()
-            .map(|(name, hashes, grants, withdrawn)| ScopeInfo {
-                name,
-                hashes,
-                grants,
-                withdrawn,
-            })
-            .collect(),
-        None => Vec::new(),
+    let q = crate::blobs::scope::ListQuery {
+        scope: params.scope,
+        hash: params.hash,
+        limit: params.limit,
+        offset: params.offset,
+        counts_only: params.counts_only,
     };
-    Ok(BlobScopeList { scopes })
+    let Some(provider) = mesh.app_blobs().await else {
+        return Ok(BlobScopeList {
+            scopes: Vec::new(),
+            total: 0,
+            truncated: false,
+        });
+    };
+    let page = provider.list_page(&q)?;
+    Ok(BlobScopeList {
+        scopes: page
+            .rows
+            .into_iter()
+            .map(
+                |(name, hashes, grants, withdrawn, hash_count, grant_count, withdrawn_count)| {
+                    ScopeInfo {
+                        name,
+                        hashes,
+                        grants,
+                        withdrawn,
+                        hash_count,
+                        grant_count,
+                        withdrawn_count,
+                    }
+                },
+            )
+            .collect(),
+        total: page.total,
+        truncated: page.truncated,
+    })
 }
 
 /// Handle a `blob_fetch` control request: fetch a `mcpmesh/blob/1` ticket THROUGH the daemon
@@ -1914,7 +1939,7 @@ mod tests {
     #[tokio::test]
     async fn blob_ops_error_without_a_mesh() {
         let st = DaemonState::new("test");
-        assert!(blob_list(&st).await.is_err());
+        assert!(blob_list(&st, Default::default()).await.is_err());
         assert!(
             blob_publish(&st, "scope".into(), "/tmp/x".into())
                 .await

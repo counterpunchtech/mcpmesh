@@ -306,8 +306,22 @@ enum BlobCmd {
     /// Grant a scope to a principal: a `b64u:` user_id, an `eid:` device principal, a roster
     /// group name, or a paired peer's nickname (resolved to its stable principal at write time).
     Grant { scope: String, principal: String },
-    /// List the daemon's blob scopes (name → hashes + grants).
-    List,
+    /// List the daemon's blob scopes (name → hashes + grants). A DEFAULT LIMIT applies; the
+    /// output says so when it truncates.
+    List {
+        /// Only this scope (exact name, never a prefix).
+        #[arg(long)]
+        scope: Option<String>,
+        /// Return at most N scopes (capped by the daemon).
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Skip N scopes — page with this after seeing a truncation notice.
+        #[arg(long)]
+        offset: Option<usize>,
+        /// Counts only: omit the hash/grant lists, keep the totals.
+        #[arg(long)]
+        counts_only: bool,
+    },
     /// Fetch a `mcpmesh/blob/1` ticket THROUGH the daemon (hash-verified) and write it to `dest`.
     Fetch {
         /// The ticket string (from `blob publish`).
@@ -741,11 +755,25 @@ fn run_internal_blob(command: BlobCmd, json: bool) -> anyhow::Result<()> {
                     println!("Granted scope '{scope}' to '{principal}'.");
                 }
             }
-            BlobCmd::List => {
-                let r = client.blob_list().await?;
+            BlobCmd::List {
+                limit,
+                offset,
+                counts_only,
+                scope,
+            } => {
+                let r = client
+                    .blob_list_paged(mcpmesh_local_api::BlobListParams {
+                        scope,
+                        hash: None,
+                        limit,
+                        offset,
+                        counts_only,
+                    })
+                    .await?;
                 if json {
                     println!("{}", serde_json::to_value(&r)?);
                 } else {
+                    let shown = r.scopes.len();
                     for s in r.scopes {
                         // Surface discipline (#38): a raw `eid:`/`b64u:` device/person
                         // principal is a machine id — redact it to a neutral placeholder in
@@ -765,8 +793,21 @@ fn run_internal_blob(command: BlobCmd, json: bool) -> anyhow::Result<()> {
                         println!(
                             "{}: {} blob(s), granted to [{}]",
                             s.name,
-                            s.hashes.len(),
+                            // The AUTHORITATIVE count — `hashes` is empty under `--counts-only`
+                            // and would read as 0 (#84b review).
+                            s.hash_count,
                             grants.join(", ")
+                        );
+                    }
+                    // NEVER truncate silently (#84b). A default limit applies, so a bare
+                    // `blob list` on a busy daemon shows a page — say so, and say how to see
+                    // the rest, or the CLI ships the exact silent wrong answer the paging work
+                    // exists to remove.
+                    if r.truncated {
+                        println!(
+                            "\n… showing {} of {} scope(s). Use --offset to page, or --limit to \
+                             raise the cap.",
+                            shown, r.total
                         );
                     }
                 }
