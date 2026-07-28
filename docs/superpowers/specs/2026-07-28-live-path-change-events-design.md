@@ -20,9 +20,36 @@ privacy indicator that lies partway through.
 
 ## Approach — one watcher per admitted connection
 
-iroh 1.0.3 exposes `Connection::paths_stream()`, a per-connection watcher. The accept path already
-holds a `Registration` RAII guard for exactly the connection's lifetime (`net/src/registry.rs:64`),
-which is the seam: spawn the watcher alongside it, and let it end when the connection does.
+iroh 1.0.3 exposes a per-connection watcher. The accept path already holds a `Registration` RAII
+guard for exactly the connection's lifetime (`net/src/registry.rs:64`), which is the seam: spawn the
+watcher alongside it, and let it end when the connection does.
+
+### Use `path_events()`, NOT `paths_stream()`
+
+The issue names `paths_stream()`. That is the wrong one, and the difference is load-bearing —
+verified against iroh 1.0.3's source, not assumed:
+
+| | `paths_stream()` | `path_events()` |
+|---|---|---|
+| yields | `PathList` snapshots | individual `PathEvent`s |
+| borrows the `Connection` | **yes** (`PathListStream<'_>`) | **no** (`PathEventStream`) |
+| spawnable | only by moving a `Connection` clone in and calling it *inside* the task | directly |
+
+`paths_stream()` borrowing means a watcher task built on it needs a cloned `Connection` held for the
+task's life — which keeps the connection alive and defeats the "dies with its connection" property
+test 6 exists to prove. `path_events()` is documented as movable into a spawned task and its stream
+**ends when the connection closes**, which is exactly the lifetime contract we want.
+
+`PathEvent::Selected { remote_addr, .. }` fires precisely on "this path was selected for
+transmission of application data" — the same `is_selected()` semantics #64 settled on — so the
+watcher filters for that variant and maps `remote_addr` through the existing classification, rather
+than diffing snapshots.
+
+**`PathEvent::Lagged { missed }` must be handled.** A watcher that ignores it silently misses the
+transition it exists to report. On `Lagged`, re-read `Connection::paths()` (iroh documents the
+current selected path as recoverable there) and treat the result as an observation. Dropping the
+event because "we'll catch the next one" is how a privacy indicator stays wrong — there may be no
+next one on a stable connection.
 
 ```
 accept → trust gate → register_checked → Registration (RAII)
@@ -120,6 +147,12 @@ probes cannot observe a live transition by construction.
    fabricates an RTT.
 6. **Regression — the watcher task dies with its connection.** Close the connection and assert the
    task ends (no leaked task, no cache writes afterwards). #61 cost a release to a detached task
-   holding a lock; a per-connection task is exactly that shape and must be proven bounded.
+   holding a lock; a per-connection task is exactly that shape and must be proven bounded. This is
+   also why `path_events()` is required over `paths_stream()`: the latter's borrow forces a
+   `Connection` clone into the task, which would keep the connection alive and make this test
+   unpassable by construction.
+8. **Unit — a `Lagged` event is not dropped.** Feed `PathEvent::Lagged` and assert the watcher
+   re-reads current state rather than skipping. Fails if the match arm is a silent `continue` —
+   the failure mode where the one transition that mattered is the one that was missed.
 7. **Regression — a peer with no path change produces no frame**, so a healthy long-lived session
    stays quiet.
