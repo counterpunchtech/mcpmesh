@@ -5,7 +5,7 @@
 //! on this machine.
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use tokio::sync::{broadcast, mpsc};
 
@@ -279,6 +279,10 @@ struct RequestAuditorInner {
     peer: Option<String>,
     service: String,
     pending: Mutex<HashMap<String, Pending>>,
+    /// Has a dropped notification already been reported for this session (#76 review)? Cleared by
+    /// the next delivered line, so a peer that recovers and is throttled again is reported again.
+    /// Per-auditor, i.e. per session, which is also per authenticated peer.
+    drop_reported: AtomicBool,
 }
 
 impl RequestAuditor {
@@ -289,6 +293,7 @@ impl RequestAuditor {
                 peer,
                 service,
                 pending: Mutex::new(HashMap::new()),
+                drop_reported: AtomicBool::new(false),
             })),
         }
     }
@@ -310,6 +315,15 @@ impl RequestAuditor {
     /// the missing reply channel really costs — but observable after the fact.
     pub fn on_dropped(&self, frame: &Value) {
         let Some(inner) = &self.inner else { return };
+        // Report ONCE until this auditor sees a delivery again (#76 review). Without this it is
+        // the #84a audit-log DoS by another door: measured 274,310 records/s through the drop
+        // path, and because `record` try_sends into a bounded channel and a 256-deep broadcast
+        // ring, the flood EVICTS unrelated records — 18,382 of 20,000 lost by a live subscriber.
+        // A peer that is already throttled would become the cheapest way to clear trust events
+        // and session open/close out of every operator's live view.
+        if inner.drop_reported.swap(true, Ordering::Relaxed) {
+            return;
+        }
         let Some(method) = frame.get("method").and_then(Value::as_str) else {
             return;
         };
@@ -335,6 +349,8 @@ impl RequestAuditor {
 
     pub fn on_request(&self, frame: &Value) {
         let Some(inner) = &self.inner else { return };
+        // A line got through: re-arm the drop report, so a later throttle is news again (#76).
+        inner.drop_reported.store(false, Ordering::Relaxed);
         let Some(method) = frame.get("method").and_then(Value::as_str) else {
             return; // not a request/notification line (e.g. a client-side response); nothing to log
         };

@@ -111,7 +111,7 @@ where
                     // Per-identity rate limit: consult BEFORE forwarding a
                     // proxied REQUEST/notification (a method-bearing frame). FAIL-SAFE over-limit —
                     // DROP the request (never forward, never queue), reply -32053{retry_after_ms}
-                    // for a request id (silent-drop a notification), and CONTINUE the session
+                    // for a request id (a notification gets no reply but IS audited, #76), and CONTINUE the session
                     // (bounded backpressure, not a close).
                     if frame.get("method").is_some()
                         && let Err(retry_after_ms) = rate.admit()
