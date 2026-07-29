@@ -339,7 +339,7 @@ pub fn default_blobs_dir() -> std::io::Result<PathBuf> {
 /// The persisted blob-scope sidecar (`<data_dir>/blob-scopes.json`). One JSON document:
 /// `scope_name -> { hashes, grants }`, atomic-write single-writer.
 pub fn default_blob_scopes_path() -> std::io::Result<PathBuf> {
-    Ok(data_dir()?.join("blob-scopes.json"))
+    Ok(data_dir()?.join("blob-scopes.redb"))
 }
 
 /// Per-platform STATE dir for durable, per-node runtime state: `$XDG_STATE_HOME/mcpmesh`

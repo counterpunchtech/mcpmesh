@@ -341,7 +341,7 @@ async fn boot_node(paths: NodePaths, config: Option<Config>) -> Result<BootedNod
     {
         let scopes_path = paths.blob_scopes_path.clone();
         match blocking("join app-blob scopes load", move || {
-            crate::blobs::scope::ScopeStore::load(scopes_path)
+            crate::blobs::scope::ScopeStore::open(scopes_path)
         })
         .await
         {
