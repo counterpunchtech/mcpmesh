@@ -24,6 +24,7 @@ fn scaled_ac_limiter_engages_and_memory_is_bounded() {
         rate_limit_per_min: 120,
         max_inflight: 16,
         max_sessions: 4,
+        blob_bytes_per_min: 0,
     });
     let t0 = Instant::now();
     for peer in 0u8..20 {
@@ -100,6 +101,7 @@ fn literal_20x120_10min() {
         rate_limit_per_min: 120,
         max_inflight: 16,
         max_sessions: 4,
+        blob_bytes_per_min: 0,
     });
     let start = Instant::now();
     let mut served = 0u64;
