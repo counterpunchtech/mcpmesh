@@ -514,8 +514,10 @@ impl AppBlobs {
 ///    with `APP_BLOB_EVENT_MASK`, which ALSO pins these types (get_many/push = `Disabled`, observe =
 ///    `Intercept`): if a future iroh-blobs delivers them as events instead of refusing at the mask,
 ///    they are still denied here.
-/// Should this chunk be sent (#84a)? Pure, so the two rules that matter are testable without a
-/// live transfer — the async arm is a thin shell over it.
+/// Should this chunk be sent (#84a)?
+///
+/// Pure, so the two rules that matter are testable without a live transfer — the async arm is a
+/// thin shell over it.
 ///
 /// `endpoint` is the connection's authenticated endpoint from the loop-local map, or `None` when
 /// the connection has no `ClientConnected` record.
