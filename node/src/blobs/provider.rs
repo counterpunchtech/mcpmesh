@@ -503,6 +503,37 @@ impl AppBlobs {
     }
 }
 
+/// Which `blob_fetch` status to record, and whether to record at all (#84a fourth review).
+///
+/// Derived from the DECISION, never from a flag that excludes one variant: an earlier version used
+/// `!matches!(decision, Err(RateLimited))`, so a GET refused with `Permission` was audited as a
+/// successful fetch. The wire answer was right and the audit trail — the surface an operator
+/// investigates with — lied.
+///
+/// `None` means "say nothing": a budget refusal is reported ONCE per endpoint until it fetches
+/// successfully again. Refusals are cheap now that they precede any bytes, so recording every one
+/// trades an uplink DoS for an audit-log DoS (measured ~2250 records/s).
+fn audit_status(
+    decision: &Result<(), AbortReason>,
+    endpoint: Option<mcpmesh_net::EndpointId>,
+    reported: &mut HashSet<mcpmesh_net::EndpointId>,
+) -> Option<&'static str> {
+    match decision {
+        Err(AbortReason::Permission) => Some("denied"),
+        Err(AbortReason::RateLimited) => match endpoint {
+            // Already told the operator about this peer; stay quiet until it recovers.
+            Some(eid) if !reported.insert(eid) => None,
+            _ => Some("rate_limited"),
+        },
+        Ok(()) => {
+            if let Some(eid) = endpoint {
+                reported.remove(&eid); // recovered: a future refusal is news again
+            }
+            Some("ok")
+        }
+    }
+}
+
 /// The full GET-admission decision: authz first, then budget (#84a review).
 ///
 /// Exists because pinning `request_budget_ok` alone left the CRITICAL fix unpinned — deleting the
@@ -689,25 +720,7 @@ fn spawn_gate_loop(
                     // refused with `Permission` — an unattributable connection — was audited as a
                     // successful fetch. The wire answer was right; the audit trail lied, which is
                     // the surface an operator investigates with (#84a third review).
-                    let status = match &decision {
-                        Err(AbortReason::Permission) => Some("denied"),
-                        Err(AbortReason::RateLimited) => {
-                            // Distinct from "denied" so an operator can tell a bandwidth event
-                            // from an authz failure. Reported ONCE per endpoint until it succeeds:
-                            // a refusal is cheap, so recording every one trades an uplink DoS for
-                            // an audit-log DoS.
-                            match conn_eid {
-                                Some(eid) if !budget_reported.insert(eid) => None, // already told
-                                _ => Some("rate_limited"),
-                            }
-                        }
-                        Ok(()) => {
-                            if let Some(eid) = conn_eid {
-                                budget_reported.remove(&eid); // recovered: report a future refusal
-                            }
-                            Some("ok")
-                        }
-                    };
+                    let status = audit_status(&decision, conn_eid, &mut budget_reported);
                     if let Some(status) = status {
                         audit.record(AuditRecord::blob_fetch(
                             now_ts(),
@@ -739,6 +752,91 @@ fn spawn_gate_loop(
 
 #[cfg(test)]
 mod tests {
+    /// #84a fourth review: the three audit statuses, and the dedup.
+    ///
+    /// All three of these survived a fully green 595-test suite as mutations: recording "ok" for a
+    /// Permission refusal (a verbatim regression of the blocker the previous round fixed), and
+    /// deleting the dedup entirely. Nothing asserted a "denied" or "rate_limited" blob_fetch
+    /// record anywhere in the tree — not even the pre-existing "denied".
+    #[test]
+    fn the_audit_status_follows_the_decision_and_reports_a_refusal_once() {
+        use mcpmesh_net::EndpointId;
+        let eid = EndpointId::from_bytes([2u8; 32]);
+        let mut seen = HashSet::new();
+
+        // An authz refusal is "denied" — NOT "ok". This is the exact regression the third review
+        // caught: status derived by excluding RateLimited recorded a Permission refusal as success.
+        assert_eq!(
+            super::audit_status(&Err(AbortReason::Permission), Some(eid), &mut seen),
+            Some("denied"),
+            "a refused GET must never be audited as a successful fetch"
+        );
+        // Unattributable connections take the same path.
+        assert_eq!(
+            super::audit_status(&Err(AbortReason::Permission), None, &mut seen),
+            Some("denied")
+        );
+
+        // A budget refusal is distinct from an authz denial, and reported ONCE.
+        assert_eq!(
+            super::audit_status(&Err(AbortReason::RateLimited), Some(eid), &mut seen),
+            Some("rate_limited"),
+            "the first refusal is news — the issue's complaint was that nothing reported it"
+        );
+        for _ in 0..500 {
+            assert_eq!(
+                super::audit_status(&Err(AbortReason::RateLimited), Some(eid), &mut seen),
+                None,
+                "and every later one is silent — refusals are cheap, so recording each would \
+                 trade an uplink DoS for an audit-log DoS (~2250 records/s measured)"
+            );
+        }
+
+        // Recovering re-arms the report, so an ongoing attack is not invisible forever.
+        assert_eq!(
+            super::audit_status(&Ok(()), Some(eid), &mut seen),
+            Some("ok")
+        );
+        assert_eq!(
+            super::audit_status(&Err(AbortReason::RateLimited), Some(eid), &mut seen),
+            Some("rate_limited"),
+            "a peer that recovered and re-offended must be reported again"
+        );
+
+        // A second endpoint is tracked independently.
+        let other = EndpointId::from_bytes([3u8; 32]);
+        assert_eq!(
+            super::audit_status(&Err(AbortReason::RateLimited), Some(other), &mut seen),
+            Some("rate_limited")
+        );
+    }
+
+    /// #84a fourth review: `request_budget_ok` must fail CLOSED on an unattributable connection.
+    ///
+    /// Reverting it to `is_none_or` — fail OPEN, the inverse of `throttle_decision`'s rule —
+    /// survived the whole suite, because every other test passes `Some(..)` and the two forms
+    /// differ only on `None`.
+    #[test]
+    fn request_budget_ok_fails_closed_on_an_unattributable_connection() {
+        use crate::config::LimitsCfg;
+        use crate::limits::MeshLimiters;
+
+        // Even with NO budget configured, an unattributable connection is refused: fail-closed is
+        // about attribution, not about the budget being on.
+        let off = MeshLimiters::from_config(&LimitsCfg::default());
+        assert!(
+            !super::request_budget_ok(None, &off),
+            "a connection with no ClientConnected record must be refused — metering it against \
+             nobody is the per-connection bypass by another route"
+        );
+
+        let on = MeshLimiters::from_config(&LimitsCfg {
+            blob_bytes_per_min: super::IROH_CHUNK_BYTES * 4,
+            ..Default::default()
+        });
+        assert!(!super::request_budget_ok(None, &on));
+    }
+
     /// #84a review: GET admission must consult the budget, not only authz.
     ///
     /// This is THE critical fix, and nothing pinned it: deleting the budget check from the GET arm
@@ -811,15 +909,18 @@ mod tests {
              operators to use serves zero bytes, which is the state the doc warns against"
         );
 
-        // One chunk of budget is exactly the bricking case the doc now forbids.
-        let bricked = MeshLimiters::from_config(&LimitsCfg {
-            blob_bytes_per_min: super::IROH_CHUNK_BYTES,
+        // A sub-floor value is FLOORED, not honoured (#84a fourth review). Documenting a floor
+        // and not enforcing it left an operator with a daemon that silently capped every servable
+        // blob at `budget - 16384` bytes; the repo idiom is `max_sessions.max(1)`.
+        let floored = MeshLimiters::from_config(&LimitsCfg {
+            blob_bytes_per_min: super::IROH_CHUNK_BYTES, // one chunk: below the floor
             ..Default::default()
         });
-        assert!(super::request_budget_ok(Some(&eid), &bricked));
+        assert!(super::request_budget_ok(Some(&eid), &floored));
         assert!(
-            super::throttle_decision(Some(&eid), super::IROH_CHUNK_BYTES, &bricked).is_err(),
-            "16384 admits then starves — this is why the floor is two chunks"
+            super::throttle_decision(Some(&eid), super::IROH_CHUNK_BYTES, &floored).is_ok(),
+            "a sub-floor budget must be raised to a usable one, not honoured into a daemon that \
+             admits a request and then truncates every blob"
         );
     }
 
@@ -896,13 +997,18 @@ mod tests {
 
         let eid = EndpointId::from_bytes([1u8; 32]);
         let lim = MeshLimiters::from_config(&LimitsCfg {
-            blob_bytes_per_min: 20_480,
+            blob_bytes_per_min: 32_768, // == the enforced floor (two chunks)
             ..Default::default()
         });
 
+        // 32768 == two chunks, so two fit and the third does not.
         assert!(
             super::throttle_decision(Some(&eid), 16_384, &lim).is_ok(),
             "the first chunk is inside the budget"
+        );
+        assert!(
+            super::throttle_decision(Some(&eid), 16_384, &lim).is_ok(),
+            "and the second"
         );
         assert!(
             matches!(

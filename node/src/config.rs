@@ -157,11 +157,15 @@ pub struct LimitsCfg {
     /// A peer that exceeds it gets its transfer ABORTED (retryable), not paced — pacing holds the
     /// request open and turns a bandwidth problem into an unbounded-concurrency one.
     ///
-    /// **Must be 0 or at least 32768** (two chunks). Admission reserves one chunk BEFORE any
-    /// bytes, and the transfer then meters its own chunks — so 16384 admits a request and serves
-    /// nothing. Below 32768 app-blob serving fails closed for every peer: safe, but silent, and
-    /// the first draft of this comment recommended exactly the bricking value. Requires a restart:
-    /// the limiter and the provider's event mask are both built once at boot.
+    /// **Use 0 or at least 32768** (two chunks); a value in `1..32768` is FLOORED to 32768.
+    ///
+    /// Admission reserves one chunk before any bytes and the transfer then meters its own chunks,
+    /// so a sub-floor budget does not fail closed — it silently caps every servable blob at
+    /// roughly `budget - 16384` bytes and truncates anything larger. Measured: 20480 serves a
+    /// 4 KiB blob and nothing bigger. Two earlier drafts of this comment got that wrong, first
+    /// recommending the bricking value and then claiming it failed closed.
+    ///
+    /// Requires a restart: the limiter and the provider's event mask are both built once at boot.
     pub blob_bytes_per_min: u64,
 }
 impl Default for LimitsCfg {

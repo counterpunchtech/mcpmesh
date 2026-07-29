@@ -215,6 +215,11 @@ const PAIR_ACCEPT_PER_MIN: u32 = 30;
 /// that churn per endpoint.
 const BLOB_CONN_PER_MIN: u32 = 60;
 
+/// The smallest USEFUL app-blob byte budget: two chunks (#84a). One chunk is reserved at request
+/// admission before any bytes, so a budget below this admits a request and then starves the
+/// transfer. A configured value in `1..MIN` is floored to this rather than honoured.
+pub const MIN_BLOB_BYTES_PER_MIN: u64 = 2 * 16 * 1024;
+
 /// The daemon's rate/concurrency limiter bundle, built ONCE from config and carried
 /// on `MeshState`. Bundled so `MeshState` gains ONE handle. Every map is bounded.
 pub struct MeshLimiters {
@@ -251,12 +256,15 @@ impl MeshLimiters {
             )),
             // 0 = unlimited (the default): no bucket, no map, nothing consulted (#84a).
             blob_bytes: (limits.blob_bytes_per_min > 0).then(|| {
+                // FLOOR at two chunks, the repo idiom (`max_sessions.max(1)`, daemon.rs). A budget
+                // between 1 and 32767 admits a request (reserving one chunk) and then silently
+                // caps every servable blob at `budget - 16384` bytes — measured. Documenting a
+                // floor and not enforcing it leaves an operator with a daemon that truncates
+                // large blobs and says nothing (#84a fourth review).
+                let per_min = limits.blob_bytes_per_min.max(MIN_BLOB_BYTES_PER_MIN);
                 // Capacity == the per-minute rate: the burst a peer may take instantly is one
                 // minute's worth, matching how `requests`/`blob_conn` are sized.
-                Arc::new(RateLimiter::per_minute_f64(
-                    limits.blob_bytes_per_min as f64,
-                    limits.blob_bytes_per_min as f64,
-                ))
+                Arc::new(RateLimiter::per_minute_f64(per_min as f64, per_min as f64))
             }),
         })
     }
@@ -334,12 +342,14 @@ mod tests {
         let t0 = Instant::now();
 
         let cfg = LimitsCfg {
-            blob_bytes_per_min: 20_480,
+            blob_bytes_per_min: 32_768, // == the enforced floor (two chunks)
             ..Default::default()
         };
         let lim = MeshLimiters::from_config(&cfg);
 
+        // 32768 == two chunks, so two fit and the third does not.
         assert!(lim.admit_blob_bytes_at(&a, 16_384, t0), "first chunk fits");
+        assert!(lim.admit_blob_bytes_at(&a, 16_384, t0), "second chunk fits");
         assert!(
             !lim.admit_blob_bytes_at(&a, 16_384, t0),
             "the same endpoint must be refused once its own budget is spent"
