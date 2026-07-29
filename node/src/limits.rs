@@ -93,6 +93,15 @@ pub struct RateLimiter {
 impl RateLimiter {
     /// Build from a per-minute rate (config `[limits].rate_limit_per_min`). `burst` = bucket
     /// capacity (the instantaneous allowance); sustained rate = `per_min / 60` tokens·s⁻¹.
+    /// [`per_minute`](Self::per_minute) with `f64` capacity — a byte budget exceeds `u32` (#84a).
+    pub fn per_minute_f64(per_min: f64, burst: f64) -> Self {
+        Self {
+            capacity: burst.max(1.0),
+            refill_per_sec: per_min.max(1.0) / 60.0,
+            buckets: Mutex::new(HashMap::new()),
+        }
+    }
+
     pub fn per_minute(per_min: u32, burst: u32) -> Self {
         Self {
             capacity: f64::from(burst.max(1)),
@@ -126,6 +135,29 @@ impl RateLimiter {
             .expect("present after the insert above");
         t.last_seen = now;
         t.bucket.try_take(now)
+    }
+
+    /// [`check`](Self::check) for a variable cost — the byte-budget path (#84a).
+    ///
+    /// Same per-endpoint map, same bounded-map `make_room` discipline; only the cost differs. A
+    /// second metering primitive would have meant a second unbounded map to get wrong.
+    pub fn check_cost(&self, endpoint: &EndpointId, now: Instant, cost: f64) -> Result<(), u64> {
+        let mut map = self.buckets.lock().expect("rate limiter mutex");
+        if !map.contains_key(endpoint) {
+            make_room(&mut map, now);
+            map.insert(
+                *endpoint,
+                Tracked {
+                    bucket: TokenBucket::new(self.capacity, self.refill_per_sec, now),
+                    last_seen: now,
+                },
+            );
+        }
+        let t = map
+            .get_mut(endpoint)
+            .expect("present after the insert above");
+        t.last_seen = now;
+        t.bucket.try_take_cost(now, cost)
     }
 
     /// Number of tracked buckets (the AC's bounded-memory assertion reads this).
@@ -189,6 +221,10 @@ pub struct MeshLimiters {
     pub requests: Arc<RateLimiter>,
     /// A GLOBAL pair-ALPN accept bucket (bounds a distinct-id stranger flood).
     pair_accept: Mutex<TokenBucket>,
+    /// Per-authenticated-endpoint app-blob BYTE budget (`[limits].blob_bytes_per_min`, #84a).
+    /// `None` when the budget is 0 = unlimited, so the default deployment allocates nothing and
+    /// consults nothing — the feature is opt-in and changes no existing behaviour on upgrade.
+    blob_bytes: Option<Arc<RateLimiter>>,
     /// Per-authenticated-endpoint app-blob connection buckets.
     blob_conn: Arc<RateLimiter>,
 }
@@ -212,6 +248,15 @@ impl MeshLimiters {
                 BLOB_CONN_PER_MIN,
                 BLOB_CONN_PER_MIN,
             )),
+            // 0 = unlimited (the default): no bucket, no map, nothing consulted (#84a).
+            blob_bytes: (limits.blob_bytes_per_min > 0).then(|| {
+                // Capacity == the per-minute rate: the burst a peer may take instantly is one
+                // minute's worth, matching how `requests`/`blob_conn` are sized.
+                Arc::new(RateLimiter::per_minute_f64(
+                    limits.blob_bytes_per_min as f64,
+                    limits.blob_bytes_per_min as f64,
+                ))
+            }),
         })
     }
 
@@ -226,6 +271,7 @@ impl MeshLimiters {
                 now,
             )),
             blob_conn: RateLimiter::unlimited_shared(),
+            blob_bytes: None,
         })
     }
 
@@ -241,6 +287,28 @@ impl MeshLimiters {
             .is_ok()
     }
 
+    /// Admit `bytes` of app-blob payload for `endpoint` (#84a).
+    ///
+    /// **FAIL-CLOSED on an unknown endpoint is the caller's job**, not this one: this answers only
+    /// "is there budget". A `Throttle` event names a CONNECTION, and a connection with no recorded
+    /// endpoint must be refused rather than metered against nobody — see `provider.rs`.
+    ///
+    /// `true` when no budget is configured (0 = unlimited), so the default path allocates nothing.
+    pub fn admit_blob_bytes(&self, endpoint: &EndpointId, bytes: u64) -> bool {
+        self.admit_blob_bytes_at(endpoint, bytes, Instant::now())
+    }
+    pub fn admit_blob_bytes_at(&self, endpoint: &EndpointId, bytes: u64, now: Instant) -> bool {
+        match &self.blob_bytes {
+            Some(l) => l.check_cost(endpoint, now, bytes as f64).is_ok(),
+            None => true,
+        }
+    }
+
+    /// Is a byte budget configured at all? Lets the provider skip arming the throttle intercept.
+    pub fn blob_bytes_enabled(&self) -> bool {
+        self.blob_bytes.is_some()
+    }
+
     /// Admit one app-blob connection from `endpoint` (FAIL-SAFE: `false` = over-limit → close).
     pub fn admit_blob_conn(&self, endpoint: &EndpointId) -> bool {
         self.admit_blob_conn_at(endpoint, Instant::now())
@@ -252,6 +320,45 @@ impl MeshLimiters {
 
 #[cfg(test)]
 mod tests {
+    /// #84a: the byte budget is PER ENDPOINT, and 0 means unlimited.
+    ///
+    /// Per-endpoint is the whole design. A `Throttle` event names a CONNECTION, so a budget keyed
+    /// on `connection_id` would give a peer a fresh allowance per connection — 60 connections a
+    /// minute, 60 budgets, which is exactly the bypass #84a reports.
+    #[test]
+    fn the_byte_budget_is_per_endpoint_and_zero_is_unlimited() {
+        use crate::config::LimitsCfg;
+        let a = EndpointId::from_bytes([1u8; 32]);
+        let b = EndpointId::from_bytes([2u8; 32]);
+        let t0 = Instant::now();
+
+        let cfg = LimitsCfg {
+            blob_bytes_per_min: 20_480,
+            ..Default::default()
+        };
+        let lim = MeshLimiters::from_config(&cfg);
+
+        assert!(lim.admit_blob_bytes_at(&a, 16_384, t0), "first chunk fits");
+        assert!(
+            !lim.admit_blob_bytes_at(&a, 16_384, t0),
+            "the same endpoint must be refused once its own budget is spent"
+        );
+        assert!(
+            lim.admit_blob_bytes_at(&b, 16_384, t0),
+            "a DIFFERENT endpoint has its own budget — one peer must not starve another"
+        );
+
+        // 0 = unlimited is the default: nothing is consulted, however much is asked for.
+        let lim = MeshLimiters::from_config(&LimitsCfg::default());
+        assert!(!lim.blob_bytes_enabled(), "default must be off");
+        for _ in 0..100 {
+            assert!(
+                lim.admit_blob_bytes_at(&a, u64::MAX, t0),
+                "with no budget configured nothing is metered — upgrading must not start refusing"
+            );
+        }
+    }
+
     /// #84a: a byte budget must meter BYTES, not calls.
     ///
     /// The existing blob limiter counts CONNECTIONS, so one granted peer can re-pull a 4 GB blob on
@@ -369,6 +476,7 @@ mod tests {
             rate_limit_per_min: 5,
             max_inflight: 16,
             max_sessions: 4,
+            blob_bytes_per_min: 0,
         };
         let ml = MeshLimiters::from_config(&cfg);
         let t = Instant::now();
@@ -390,6 +498,7 @@ mod tests {
             rate_limit_per_min: 120,
             max_inflight: 16,
             max_sessions: 4,
+            blob_bytes_per_min: 0,
         });
         // The GLOBAL pair-accept bucket engages after its burst (bounds a distinct-id stranger flood).
         let mut admitted = 0;
