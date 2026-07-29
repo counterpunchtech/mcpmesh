@@ -43,16 +43,6 @@ use crate::daemon::RELAY_READY_TIMEOUT;
 /// `connected: Intercept` records the authenticated endpoint id; `get: Intercept` scope-checks every
 /// single-blob GET (the AC fetch path — unchanged). `throttle` stays at its default
 /// (`ThrottleMode::None`) — it is a transfer-throttling knob, not a request-serving gate.
-/// The mask WITH the #84a byte budget armed. Separate from the default because
-/// `ThrottleMode::Intercept` makes iroh-blobs round-trip an irpc message PER CHUNK (~16 KiB), so a
-/// 4 GB transfer becomes ~262k round-trips through the gate loop. Arming it unconditionally made
-/// the blob AC suites time out even with no budget configured — the cost is real and must only be
-/// paid by a deployment that asked for it.
-const APP_BLOB_EVENT_MASK_METERED: EventMask = EventMask {
-    throttle: ThrottleMode::Intercept,
-    ..APP_BLOB_EVENT_MASK
-};
-
 const APP_BLOB_EVENT_MASK: EventMask = EventMask {
     connected: ConnectMode::Intercept,
     get: RequestMode::Intercept,
@@ -61,6 +51,21 @@ const APP_BLOB_EVENT_MASK: EventMask = EventMask {
     observe: ObserveMode::Intercept,
     throttle: ThrottleMode::None,
 };
+
+/// [`APP_BLOB_EVENT_MASK`] with the #84a byte budget armed — identical except `throttle`.
+///
+/// Separate from the default because `ThrottleMode::Intercept` makes iroh-blobs round-trip an irpc
+/// message PER CHUNK (~16 KiB), so a 4 GiB transfer is ~262k round-trips through the gate loop.
+/// The cost is in-process and small, but a deployment that has not configured a budget should not
+/// pay it at all. Chosen ONCE in `load`, so changing the config key needs a daemon restart.
+const APP_BLOB_EVENT_MASK_METERED: EventMask = EventMask {
+    throttle: ThrottleMode::Intercept,
+    ..APP_BLOB_EVENT_MASK
+};
+
+/// iroh-blobs' leaf/chunk size (`IROH_BLOCK_SIZE`, 16 KiB) — the unit a `Throttle` event reports,
+/// and the amount reserved at request admission (#84a review).
+const IROH_CHUNK_BYTES: u64 = 16 * 1024;
 
 /// The gated app-blob provider. `events` is `Some` for a serving daemon (the request-time
 /// scope Intercept gate is armed) and `None` for a caller-only fetcher. `scopes` is the persisted
@@ -505,6 +510,22 @@ impl AppBlobs {
 ///
 /// `endpoint` is the connection's authenticated endpoint from the loop-local map, or `None` when
 /// the connection has no `ClientConnected` record.
+/// Is there budget to ADMIT a new GET request (#84a review)?
+///
+/// Separate from [`throttle_decision`] because the per-chunk hook is not sufficient on its own:
+/// iroh-blobs writes the chunk BEFORE the hook runs, and a refusal resets only the stream, so a
+/// peer that ignores the abort collects one free chunk per request forever. This is the gate that
+/// runs before any bytes.
+///
+/// Reserves [`IROH_CHUNK_BYTES`] rather than peeking: a zero-cost check always passes, and
+/// reserving makes an opened-but-undrained request cost the peer something.
+fn request_budget_ok(
+    endpoint: Option<&mcpmesh_net::EndpointId>,
+    limits: &crate::limits::MeshLimiters,
+) -> bool {
+    endpoint.is_none_or(|eid| limits.admit_blob_bytes(eid, IROH_CHUNK_BYTES))
+}
+
 fn throttle_decision(
     endpoint: Option<&mcpmesh_net::EndpointId>,
     size: u64,
@@ -608,16 +629,39 @@ fn spawn_gate_loop(
                     let peer = identity
                         .as_ref()
                         .map(|i| i.user_id.clone().unwrap_or_else(|| i.name.clone()));
+                    // #84a: enforce the byte budget HERE, before any bytes, as well as per chunk.
+                    // The per-chunk `Throttle` hook fires AFTER iroh-blobs has written the chunk,
+                    // and a refusal resets only the STREAM — the connection survives and nothing
+                    // bounds requests per connection. So a peer ignoring the abort gets one free
+                    // ~16 KiB chunk per request, indefinitely: measured at ~1800x the configured
+                    // rate from a single connection. Refusing the REQUEST is what bounds that.
+                    //
+                    // Reserves one chunk rather than peeking: a zero-cost check would always pass
+                    // (`tokens >= 0.0`), and reserving means a peer that opens many requests it
+                    // never drains still pays for them. Evaluated ONCE — calling it twice would
+                    // double-charge.
+                    let budget_ok =
+                        !allow || request_budget_ok(conns.get(&msg.connection_id), limits.as_ref());
                     audit.record(AuditRecord::blob_fetch(
                         now_ts(),
                         peer,
                         hash_hex,
-                        if allow { "ok".into() } else { "denied".into() },
+                        match (allow, budget_ok) {
+                            (false, _) => "denied".into(),
+                            // #84a: a refusal is REPORTED, not silent. The issue's complaint was
+                            // that mcpmesh "neither refuses it nor reports it happened"; a budget
+                            // that refuses silently fixes one half. Distinct from "denied" so an
+                            // operator can tell a bandwidth event from an authz failure.
+                            (true, false) => "rate_limited".into(),
+                            (true, true) => "ok".into(),
+                        },
                     ));
-                    let res = if allow {
-                        Ok(())
-                    } else {
+                    let res = if !allow {
                         Err(AbortReason::Permission)
+                    } else if !budget_ok {
+                        Err(AbortReason::RateLimited)
+                    } else {
+                        Ok(())
                     };
                     msg.tx.send(res).await.ok();
                 }
@@ -642,6 +686,67 @@ fn spawn_gate_loop(
 
 #[cfg(test)]
 mod tests {
+    /// #84a review: the default mask must be UNCHANGED, and the metered one must differ in
+    /// exactly one field.
+    ///
+    /// Nothing pinned this: mutating the code to always use the metered mask survived the whole
+    /// suite, because the only tests that could notice are network suites that flake on this
+    /// machine. A const assertion is deterministic and instant.
+    #[test]
+    fn the_metered_mask_differs_from_the_default_in_throttle_alone() {
+        let d = super::APP_BLOB_EVENT_MASK;
+        let m = super::APP_BLOB_EVENT_MASK_METERED;
+
+        assert_eq!(
+            d.throttle,
+            ThrottleMode::None,
+            "a deployment with no budget must not arm the per-chunk intercept"
+        );
+        assert_eq!(m.throttle, ThrottleMode::Intercept);
+
+        // Every OTHER field identical — the metered mask must not relax an authz decision.
+        assert_eq!(d.connected, m.connected, "connect gate");
+        assert_eq!(d.get, m.get, "the GET scope gate");
+        assert_eq!(d.get_many, m.get_many, "get_many stays denied");
+        assert_eq!(d.push, m.push, "push stays denied");
+        assert_eq!(d.observe, m.observe, "observe stays intercepted");
+    }
+
+    /// #84a review: the budget must refuse the REQUEST, not only the chunk.
+    ///
+    /// The per-chunk hook fires after iroh-blobs has written the chunk, and a `RateLimited` abort
+    /// resets only the stream — the connection survives and nothing caps requests per connection.
+    /// Measured before this gate existed: ~1800x the configured rate from ONE connection, because
+    /// every new request collected a free ~16 KiB chunk. Metering only per chunk does not bound an
+    /// adversarial peer, only a polite one.
+    #[test]
+    fn a_request_is_refused_once_the_endpoint_budget_is_spent() {
+        use crate::config::LimitsCfg;
+        use crate::limits::MeshLimiters;
+        use mcpmesh_net::EndpointId;
+
+        let eid = EndpointId::from_bytes([4u8; 32]);
+        // Exactly two chunks of budget.
+        let lim = MeshLimiters::from_config(&LimitsCfg {
+            blob_bytes_per_min: super::IROH_CHUNK_BYTES * 2,
+            ..Default::default()
+        });
+
+        assert!(super::request_budget_ok(Some(&eid), &lim), "first request");
+        assert!(super::request_budget_ok(Some(&eid), &lim), "second request");
+        assert!(
+            !super::request_budget_ok(Some(&eid), &lim),
+            "the THIRD request must be refused before any bytes — metering only per chunk lets a \
+             peer take one free chunk per request forever, which is ~1800x the budget in practice"
+        );
+
+        // With no budget configured, admission is never blocked.
+        let off = MeshLimiters::from_config(&LimitsCfg::default());
+        for _ in 0..100 {
+            assert!(super::request_budget_ok(Some(&eid), &off));
+        }
+    }
+
     /// #84a: the two rules that decide whether a chunk goes out.
     ///
     /// Extracted as a pure function because the live path is an async irpc arm firing per ~16 KiB

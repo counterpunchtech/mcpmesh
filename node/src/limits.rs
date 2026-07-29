@@ -91,9 +91,8 @@ pub struct RateLimiter {
 }
 
 impl RateLimiter {
-    /// Build from a per-minute rate (config `[limits].rate_limit_per_min`). `burst` = bucket
-    /// capacity (the instantaneous allowance); sustained rate = `per_min / 60` tokens·s⁻¹.
-    /// [`per_minute`](Self::per_minute) with `f64` capacity — a byte budget exceeds `u32` (#84a).
+    /// [`per_minute`](Self::per_minute) with `f64` capacity, for a budget that exceeds `u32`
+    /// (`[limits].blob_bytes_per_min` is a byte count, #84a).
     pub fn per_minute_f64(per_min: f64, burst: f64) -> Self {
         Self {
             capacity: burst.max(1.0),
@@ -102,6 +101,8 @@ impl RateLimiter {
         }
     }
 
+    /// Build from a per-minute rate (config `[limits].rate_limit_per_min`). `burst` = bucket
+    /// capacity (the instantaneous allowance); sustained rate = `per_min / 60` tokens·s⁻¹.
     pub fn per_minute(per_min: u32, burst: u32) -> Self {
         Self {
             capacity: f64::from(burst.max(1)),

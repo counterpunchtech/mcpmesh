@@ -156,7 +156,10 @@ pub struct LimitsCfg {
     ///
     /// A peer that exceeds it gets its transfer ABORTED (retryable), not paced — pacing holds the
     /// request open and turns a bandwidth problem into an unbounded-concurrency one.
-    #[serde(default)]
+    ///
+    /// **Must be 0 or at least 16384** (one chunk). A smaller non-zero value cannot admit a single
+    /// chunk, so app-blob serving fails closed for every peer — safe, but silent. Requires a
+    /// restart: the limiter and the provider's event mask are both built once at boot.
     pub blob_bytes_per_min: u64,
 }
 impl Default for LimitsCfg {
