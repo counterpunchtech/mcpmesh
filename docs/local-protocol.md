@@ -555,9 +555,11 @@ Upholding the surface discipline: a record carries names, counts, and a status �
 a service name, a method/tool name, an argument **digest**, and byte/latency **numbers** — never raw
 arguments, response content, endpoint-ids, or keys.
 
-**`reachability`** — a peer went online or offline (`api_minor >= 12`, #58). Pushed so you do not
-have to poll `status` for a liveness indicator, and so work queued for an unreachable peer can flush
-the instant it returns rather than on the next poll tick.
+**`reachability`** — a peer's reachability OR its network path changed (`api_minor >= 12`, #58;
+`path` joined the rule at 21, #92). Not an up/down toggle — see below. Pushed so work queued for an
+unreachable peer can flush the instant it returns rather than on the next poll tick. It reduces
+polling; it does not replace it — for a peer with no open session, `status` is what drives the
+probe that produces these frames (see below).
 
 ```json
 {
@@ -599,8 +601,14 @@ that daemon never made.
 The daemon errs the same way: while hole-punching, a relay and a direct path can BOTH be active, and
 it reports `relay` in that case. Overstating privacy is worse than understating it.
 
-`path` is captured by the same probe that sets `reachable`/`rtt_ms`, so it shares their freshness —
-one TTL, one `age_secs`. `rtt_ms` is not a proxy for it: a fast relay beats a slow direct path.
+`rtt_ms` is not a proxy for `path`: a fast relay beats a slow direct path.
+
+**`path` and `reachable` no longer share one freshness.** Through `api_minor` 21 they did — one
+probe set both, under one TTL and one `age_secs`. Since **22** a live session updates `path` alone
+and deliberately leaves `probed_at`/`rtt_ms`/`meta` untouched (re-stamping them would forge the
+freshness of a measurement nobody took). So a `status` row can carry a path observed seconds ago
+beside an `age_secs` and `rtt_ms` many times older, and a pushed frame reports `age_secs: 0` for the
+PATH while its `rtt_ms` may be stale. Treat `age_secs` as the age of the *probe*, not of `path`.
 
 Through `api_minor` 22, `rtt_ms` also contained the daemon's own path-settle window, so a relayed
 peer could never report under 600ms and "relayed **and** fast" was unreachable by construction. From
@@ -621,14 +629,44 @@ the background; the daemon waits briefly for the path to settle, but under load 
 The next probe reports the settled answer. So treat `unknown` as "not yet known" and re-read, rather
 than as a stable property of the peer — and never as "private".
 
-A path change alone does **not** emit a `reachability` frame — only the `reachable` verdict flipping
-does. Hole-punching flaps by nature, and the stream stays quiet through it; read `status` if you
-need the current path.
+Emitted on a **transition**: the `reachable` verdict changed, **or `path` changed**, or this is the
+first probe of that peer. A refresh that re-confirms the same verdict *and* the same path emits
+nothing, so a peer that stays up does not produce a frame per cache refresh; `rtt_ms`/`meta` drift
+is advisory detail, not a transition. `age_secs` is `0` — the observation just completed.
 
-Emitted on a **transition** only: the `reachable` verdict changed, or this is the first probe of
-that peer. A refreshed probe that re-confirms the same verdict emits nothing, so a peer that stays
-up does not produce a frame per cache refresh; `rtt_ms`/`meta` drift is advisory detail, not a
-transition. `age_secs` is `0` — the probe just completed.
+**Do not treat this as an up/down toggle.** It carried that meaning through `api_minor` **20**
+(0.18.0), and this document wrongly said so — "a path change alone does not emit a frame" — until
+**0.20.3** corrected it. It stopped being true at `api_minor` **21** (0.19.0), when `path` joined
+the transition rule; same-verdict frames have been possible ever since. `api_minor` cannot date
+this correction, because it describes behaviour that already shipped — the release can.
+
+**Two producers, since `api_minor` 22:**
+
+| producer | when |
+|---|---|
+| a completing **probe** | `status`, `subscribe`'s snapshot, or `peer_services` refreshes a stale entry |
+| a **live session** | its selected path changed under it (0.20.0) |
+
+**`rtt_ms` does not tell you which one sent a frame.** A probe reporting a peer *unreachable*
+carries `null`, and a live-session update on a peer a probe already measured carries that earlier —
+possibly stale — number. There is no producer discriminator on the wire; if you need one, ask for it.
+
+The live producer is why `path` is trustworthy for a long-lived session: a call that degrades
+`direct` → `relay` says so **when it happens**, rather than staying silently mislabelled until
+something probes.
+
+**Subscribing is not sufficient on its own.** The live producer only watches peers with an OPEN
+session — a paired peer you are not talking to has no watcher. And there is no periodic probe loop:
+probes are demand-driven, and `subscribe` triggers them exactly once, at snapshot time. For
+session-less peers, polling `status` is what *drives* the probe producer, not a legacy alternative
+to it. Subscribe for live sessions; keep polling if you need liveness for idle peers.
+
+Hole-punching flaps by nature, and the stream stays mostly quiet through it — but **not
+symmetrically**. Both the probe and the live watcher wait up to ~600ms for a change to hold, and
+that wait short-circuits the moment a path becomes `direct`. So a `direct → relay → direct` flap is
+damped and emits nothing, while a `relay → direct → relay` flap emits the `direct` immediately and
+the return to `relay` after the window: two frames for a blip. Do not treat a single `direct` frame
+as durable evidence of locality — it may be a hole-punch that did not survive.
 
 This is the **pairing-mode probe**. Roster-mode presence travels on the gossip topic and surfaces
 through `status`; it is not (yet) an event here.
