@@ -31,7 +31,7 @@ impl NodePaths {
             roster_path: config.join("roster.json"),
             state_db_path: data.join("state.redb"),
             blobs_dir: data.join("blobs"),
-            blob_scopes_path: data.join("blob-scopes.json"),
+            blob_scopes_path: data.join("blob-scopes.redb"),
             audit_dir: root.join("state").join("audit"),
         }
     }
@@ -71,7 +71,7 @@ mod tests {
         assert_eq!(p.roster_path, Path::new("/r/config/roster.json"));
         assert_eq!(p.state_db_path, Path::new("/r/data/state.redb"));
         assert_eq!(p.blobs_dir, Path::new("/r/data/blobs"));
-        assert_eq!(p.blob_scopes_path, Path::new("/r/data/blob-scopes.json"));
+        assert_eq!(p.blob_scopes_path, Path::new("/r/data/blob-scopes.redb"));
         assert_eq!(p.audit_dir, Path::new("/r/state/audit"));
     }
 }

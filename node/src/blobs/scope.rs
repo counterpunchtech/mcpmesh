@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::RwLock;
 
 use anyhow::{Context, Result};
+use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
 /// One scope: the blob hashes it contains + the principals it grants. Hashes are bare 64-char blake3
@@ -284,7 +285,7 @@ impl BlobScopes {
 /// The scope store. An in-RAM `RwLock<BlobScopes>` serves the hot authz read (`snapshot`, a cheap
 /// clone taken per GET — no lock held across the async reply); every mutation
 /// (`publish_hash`/`grant`/`revoke_*`/`unpublish_hash`) mutates and atomically persists the JSON
-/// sidecar (`crate::roster::atomic_write_str` = write-new + rename).
+/// keyed redb store, one row per scope (#84c). Mutations that touch ONE scope write one row.
 ///
 /// **`write_lock` serializes mutate-AND-persist as one unit.** An earlier version dropped the
 /// `inner` write lock before persisting, which serialized the mutation but NOT the file write: two
@@ -294,11 +295,35 @@ impl BlobScopes {
 /// surface. Control connections are one task each, so concurrent verbs are ordinary usage, not an
 /// exotic race (#62 review, reproduced).
 pub struct ScopeStore {
+    /// Kept for error messages and diagnostics; redb owns the file itself.
+    #[allow(dead_code)]
     path: PathBuf,
     inner: RwLock<BlobScopes>,
-    /// Held across mutate+persist so the file write order matches the mutation order.
+    /// Held across mutate+persist so the write order matches the mutation order.
     write_lock: std::sync::Mutex<()>,
+    /// The keyed backing store (#84c). `None` for a memory-only store (`new`) — the caller-only
+    /// fetcher and most tests — which never persists.
+    ///
+    /// Every mutation used to clone the WHOLE table and re-serialize it to one JSON sidecar, so
+    /// publishing file N+1 cost O(N) and N files cost O(N²). That was tolerable when a scope was a
+    /// room; #84(d) settled that a scope is one FILE (`file:<hash>`), so scope count grows with
+    /// every file ever shared.
+    db: Option<Database>,
 }
+
+/// One row per scope: `scope_name -> serde_json(Scope)`.
+///
+/// Per-scope FILES were the obvious alternative and are wrong here: scope names are `file:<hash>`
+/// and `:` is invalid in a Windows filename, which CI builds and tests. Encoding names into safe
+/// filenames buys a directory of thousands of tiny files, a name→file mapping to maintain, and no
+/// transaction across a multi-scope mutation.
+const SCOPES: TableDefinition<&str, &[u8]> = TableDefinition::new("scopes");
+
+/// Rows written since process start — the #84c property, countable.
+///
+/// File size cannot show it: redb reuses free pages, so a whole-table rewrite and a keyed write
+/// produce byte-identical files. Measured at 500 vs 125,250 rows for the same 500 publishes.
+pub(crate) static ROWS_WRITTEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl ScopeStore {
     /// An EMPTY store bound to `path` (does not read the file). Used for a caller-only fetcher (no
@@ -308,11 +333,102 @@ impl ScopeStore {
             path,
             inner: RwLock::new(BlobScopes::default()),
             write_lock: std::sync::Mutex::new(()),
+            db: None, // memory-only: nothing to persist to
         }
+    }
+
+    /// Open the keyed store at `path`, MIGRATING a pre-0.22 JSON sidecar if one is present (#84c).
+    ///
+    /// - redb file exists → use it.
+    /// - redb absent, sidecar present → import it in ONE transaction, then RENAME the sidecar to
+    ///   `<name>.migrated` rather than deleting it. A destructive migration of authorization state
+    ///   on first boot of a new version is not something to do silently, and a downgrade after
+    ///   migration would otherwise start with every grant and withdrawal invisible.
+    /// - neither → empty.
+    ///
+    /// A corrupt sidecar is still a HARD ERROR: fail closed, never silently reset grants.
+    pub fn open(path: PathBuf) -> Result<Self> {
+        let sidecar = path.with_extension("json");
+        let db = Database::create(&path)
+            .with_context(|| format!("open blob scope store {}", path.display()))?;
+        // Ensure the table exists so a read-only path never trips over a missing table.
+        {
+            let txn = db.begin_write()?;
+            txn.open_table(SCOPES)?;
+            txn.commit()?;
+        }
+        // Migrate iff the TABLE is empty — NOT iff the file was absent (#84c review).
+        //
+        // `Database::create` creates the file, so gating on `path.exists()` put the decision
+        // OUTSIDE the transaction that protects it: any failure between create and commit — a
+        // corrupt sidecar, a crash, a kill — flipped the next boot to "not fresh" and the sidecar
+        // was never read again. The node then came up looking healthy with every grant and every
+        // withdrawal tombstone gone, silently, on the SECOND boot. Losing tombstones is fail-OPEN
+        // on #107: a withdrawn hash becomes republishable.
+        let fresh = {
+            let txn = db.begin_read()?;
+            txn.open_table(SCOPES)?.iter()?.next().is_none()
+        };
+
+        let mut scopes = BlobScopes::default();
+        if fresh && sidecar.exists() {
+            let bytes = std::fs::read(&sidecar)
+                .with_context(|| format!("read blob scopes {}", sidecar.display()))?;
+            scopes = serde_json::from_slice::<BlobScopes>(&bytes)
+                .with_context(|| format!("parse blob scopes {}", sidecar.display()))?;
+            // ONE transaction for the whole import: a half-migrated authorization table is worse
+            // than an unmigrated one.
+            let txn = db.begin_write()?;
+            {
+                let mut t = txn.open_table(SCOPES)?;
+                for (name, scope) in &scopes.scopes {
+                    t.insert(name.as_str(), serde_json::to_vec(scope)?.as_slice())?;
+                }
+            }
+            txn.commit()?;
+            let keep = sidecar.with_extension("json.migrated");
+            std::fs::rename(&sidecar, &keep).with_context(|| {
+                format!(
+                    "rename migrated sidecar {} -> {}",
+                    sidecar.display(),
+                    keep.display()
+                )
+            })?;
+            tracing::info!(
+                sidecar = %sidecar.display(), kept = %keep.display(),
+                "migrated blob scopes to the keyed store (#84c)"
+            );
+        } else {
+            if sidecar.exists() {
+                // Not fatal: redb wins by design (spec case 4, a downgrade-then-upgrade). But an
+                // operator should know the file is being ignored rather than discover it after a
+                // restore.
+                tracing::warn!(
+                    sidecar = %sidecar.display(),
+                    "a blob-scope sidecar sits beside a non-empty keyed store and is being IGNORED"
+                );
+            }
+            let txn = db.begin_read()?;
+            let t = txn.open_table(SCOPES)?;
+            for row in t.iter()? {
+                let (k, v) = row?;
+                scopes
+                    .scopes
+                    .insert(k.value().to_string(), serde_json::from_slice(v.value())?);
+            }
+        }
+        Ok(Self {
+            path,
+            inner: RwLock::new(scopes),
+            write_lock: std::sync::Mutex::new(()),
+            db: Some(db),
+        })
     }
 
     /// Load the persisted sidecar, or an EMPTY store when the file is absent (fresh node). A present
     /// file MUST parse (a corrupt sidecar is a hard error — fail closed, do not silently reset grants).
+    #[deprecated(note = "#84c: use `open`, which is keyed and O(log N) per mutation")]
+    #[allow(dead_code)]
     pub fn load(path: PathBuf) -> Result<Self> {
         let scopes = match std::fs::read(&path) {
             Ok(bytes) => serde_json::from_slice::<BlobScopes>(&bytes)
@@ -327,6 +443,7 @@ impl ScopeStore {
             path,
             inner: RwLock::new(scopes),
             write_lock: std::sync::Mutex::new(()),
+            db: None,
         })
     }
 
@@ -348,7 +465,7 @@ impl ScopeStore {
             g.publish_hash(scope, hash_hex);
             g.clone()
         };
-        self.persist(&snapshot)
+        self.persist_scope(scope, snapshot.scopes.get(scope))
     }
 
     /// Grant a scope to a principal + persist (single-writer). Same lock/persist discipline.
@@ -362,7 +479,7 @@ impl ScopeStore {
             g.grant(scope, principal);
             g.clone()
         };
-        self.persist(&snapshot)
+        self.persist_scope(scope, snapshot.scopes.get(scope))
     }
 
     /// Revoke `principals` from ONE scope + persist (#62, `blob_revoke`). Same lock/persist
@@ -377,7 +494,7 @@ impl ScopeStore {
             let changed = g.revoke_from_scope(scope, principals);
             (changed, g.clone())
         };
-        self.persist(&snapshot)?;
+        self.persist_scope(scope, snapshot.scopes.get(scope))?;
         Ok(changed)
     }
 
@@ -410,7 +527,7 @@ impl ScopeStore {
             let changed = g.unpublish_hash(scope, hash_hex);
             (changed, g.clone())
         };
-        self.persist(&snapshot)?;
+        self.persist_scope(scope, snapshot.scopes.get(scope))?;
         Ok(changed)
     }
 
@@ -445,14 +562,208 @@ impl ScopeStore {
             .list_page(q)
     }
 
+    /// Write the CURRENT table (#84c).
+    ///
+    /// Still O(N) in rows touched, but now ONE transaction against a keyed store rather than a
+    /// whole-file re-serialize, and every caller that knows which scope changed should use
+    /// [`persist_scope`](Self::persist_scope) instead. Kept for the multi-scope mutations
+    /// (`revoke_principals`, the unpair hygiene sweep) that genuinely touch every row — those were
+    /// already O(N) and are now at least atomic.
     fn persist(&self, scopes: &BlobScopes) -> Result<()> {
-        let json = serde_json::to_string_pretty(scopes).context("serialize blob scopes")?;
-        crate::roster::atomic_write_str(&self.path, &json)
+        let Some(db) = &self.db else { return Ok(()) };
+        let txn = db.begin_write()?;
+        {
+            let mut t = txn.open_table(SCOPES)?;
+            // Drop rows that no longer exist, then write the survivors.
+            let stale: Vec<String> = t
+                .iter()?
+                .filter_map(|r| r.ok().map(|(k, _)| k.value().to_string()))
+                .filter(|k| !scopes.scopes.contains_key(k))
+                .collect();
+            for k in stale {
+                t.remove(k.as_str())?;
+            }
+            for (name, scope) in &scopes.scopes {
+                t.insert(name.as_str(), serde_json::to_vec(scope)?.as_slice())?;
+                ROWS_WRITTEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Write ONE scope — the O(log N) path (#84c).
+    ///
+    /// This is the point of the change: `publish_hash`, `unpublish_hash`, `grant` and
+    /// `revoke_from_scope` touch exactly one scope, and under one-scope-per-file (#84d) the table
+    /// grows with every file ever shared. Re-serializing all of it per publish made N files cost
+    /// O(N²).
+    ///
+    /// `None` removes the row (a scope that no longer exists).
+    fn persist_scope(&self, name: &str, scope: Option<&Scope>) -> Result<()> {
+        let Some(db) = &self.db else { return Ok(()) };
+        let txn = db.begin_write()?;
+        {
+            let mut t = txn.open_table(SCOPES)?;
+            match scope {
+                Some(sc) => {
+                    t.insert(name, serde_json::to_vec(sc)?.as_slice())?;
+                    ROWS_WRITTEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                None => {
+                    t.remove(name)?;
+                }
+            }
+        }
+        txn.commit()?;
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    /// #84c: a single-scope mutation must write ONE row, not the whole table.
+    ///
+    /// Every mutation used to clone the entire scope table and re-serialize it to a JSON sidecar,
+    /// so publishing file N+1 cost O(N) and N files cost O(N²). Under one-scope-per-file (#84d)
+    /// the table grows with every file ever shared, so that is the ordinary path, not an abuse.
+    ///
+    /// Asserted on the STORE FILE rather than on timing — this repo has learned that timing
+    /// assertions on a loaded machine lie. A whole-table rewrite of 200 scopes touches bytes for
+    /// every one of them; a keyed write touches one row.
+    #[test]
+    fn a_single_scope_mutation_does_not_rewrite_the_whole_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ScopeStore::open(dir.path().join("scopes.redb")).unwrap();
+
+        for i in 0..200 {
+            store
+                .publish_hash(&format!("file:{i:04}"), &format!("{i:064x}"))
+                .unwrap();
+        }
+        // Reopening must see every one of them: keyed writes are not a lossy shortcut.
+        drop(store);
+        let store = ScopeStore::open(dir.path().join("scopes.redb")).unwrap();
+        assert_eq!(
+            store.snapshot().scopes.len(),
+            200,
+            "all scopes survive a reopen"
+        );
+        assert!(
+            !store
+                .snapshot()
+                .allows(&format!("{:064x}", 199), &HashSet::new()),
+            "no principal is granted by publishing alone"
+        );
+
+        // One more publish, then confirm the OTHER 200 rows are byte-identical — i.e. the write
+        // touched one key. A whole-table rewrite would re-serialize all of them.
+        // Count ROWS WRITTEN, not file growth. The first version asserted on file size and was
+        // VACUOUS: redb reuses free pages, so a whole-table rewrite and a keyed write produce
+        // byte-identical files — measured at 500 vs 125,250 rows written, both 0 bytes of growth.
+        // The spec asked for the write count for exactly this reason (#84c review).
+        let before = ROWS_WRITTEN.load(std::sync::atomic::Ordering::Relaxed);
+        store
+            .publish_hash("file:9999", &format!("{:064x}", 9999))
+            .unwrap();
+        let wrote = ROWS_WRITTEN.load(std::sync::atomic::Ordering::Relaxed) - before;
+        assert_eq!(
+            wrote, 1,
+            "publishing one more scope into a 200-scope table wrote {wrote} rows — a keyed write \
+             must cost ONE row, not a re-serialize of the whole table (#84c)"
+        );
+    }
+
+    /// #84c review: a redb file left behind by a FAILED migration must not suppress the retry.
+    ///
+    /// `Database::create` makes the file, so gating the migration on `path.exists()` put the
+    /// decision outside the transaction protecting it: a corrupt sidecar, a crash, or a kill
+    /// between create and commit flipped the next boot to "not fresh", the sidecar was never read
+    /// again, and the node came up looking healthy with every grant and every withdrawal tombstone
+    /// gone — silently, on the SECOND boot. Losing tombstones is fail-OPEN on #107.
+    #[test]
+    fn an_empty_store_left_by_a_failed_migration_still_migrates() {
+        let dir = tempfile::tempdir().unwrap();
+        let redb = dir.path().join("blob-scopes.redb");
+        let sidecar = dir.path().join("blob-scopes.json");
+
+        let mut scopes = BlobScopes::default();
+        let sc = scopes.scopes.entry("file:abc".to_string()).or_default();
+        sc.grants.insert("eid:deadbeef".to_string());
+        sc.withdrawn.insert("bb".repeat(32));
+        std::fs::write(&sidecar, serde_json::to_string(&scopes).unwrap()).unwrap();
+
+        // Simulate the crash: the store FILE exists with the table created, but no rows and the
+        // sidecar still present — exactly the state a kill between create and commit leaves.
+        {
+            let db = Database::create(&redb).unwrap();
+            let txn = db.begin_write().unwrap();
+            txn.open_table(SCOPES).unwrap();
+            txn.commit().unwrap();
+        }
+
+        let store = ScopeStore::open(redb).expect("open after a failed migration");
+        let snap = store.snapshot();
+        let got = snap
+            .scopes
+            .get("file:abc")
+            .expect("the retry must find the sidecar — an empty store is not a migrated store");
+        assert!(got.grants.contains("eid:deadbeef"), "grants recovered");
+        assert!(
+            got.withdrawn.contains(&"bb".repeat(32)),
+            "and withdrawals — losing a tombstone silently un-revokes a withdrawn hash (#107)"
+        );
+        assert!(
+            dir.path().join("blob-scopes.json.migrated").exists(),
+            "and the sidecar is kept, as on a first-time migration"
+        );
+    }
+
+    /// #84c: a pre-0.22 JSON sidecar is migrated, and KEPT rather than deleted.
+    #[test]
+    fn an_old_sidecar_is_migrated_and_renamed_not_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let redb = dir.path().join("blob-scopes.redb");
+        let sidecar = dir.path().join("blob-scopes.json");
+
+        // A 0.21-era sidecar with a grant and a withdrawal.
+        let mut scopes = BlobScopes::default();
+        let sc = scopes.scopes.entry("file:abc".to_string()).or_default();
+        sc.hashes.insert("aa".repeat(32));
+        sc.grants.insert("eid:deadbeef".to_string());
+        sc.withdrawn.insert("bb".repeat(32));
+        std::fs::write(&sidecar, serde_json::to_string(&scopes).unwrap()).unwrap();
+
+        let store = ScopeStore::open(redb.clone()).unwrap();
+        let snap = store.snapshot();
+        let got = snap.scopes.get("file:abc").expect("the scope migrated");
+        assert!(got.hashes.contains(&"aa".repeat(32)), "hashes survive");
+        assert!(
+            got.grants.contains("eid:deadbeef"),
+            "GRANTS survive — this is authorization state"
+        );
+        assert!(
+            got.withdrawn.contains(&"bb".repeat(32)),
+            "withdrawals survive (#107)"
+        );
+
+        assert!(!sidecar.exists(), "the sidecar is moved aside");
+        assert!(
+            dir.path().join("blob-scopes.json.migrated").exists(),
+            "and KEPT — a downgrade after migration would otherwise find no sidecar and start with \
+             every grant and withdrawal invisible, which is worse than the state it replaced"
+        );
+
+        // Re-opening must NOT re-run the migration (the redb file now wins).
+        drop(store);
+        let again = ScopeStore::open(redb).unwrap();
+        assert_eq!(
+            again.snapshot().scopes.len(),
+            1,
+            "migration does not run twice"
+        );
+    }
+
     use super::*;
 
     /// #62: a per-scope revoke must NOT behave like the global unpair-hygiene revoke. Wiring
@@ -592,13 +903,15 @@ mod tests {
     #[test]
     fn store_persists_and_reloads_the_same_scopes() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("blob-scopes.json");
-        let store = ScopeStore::new(path.clone());
+        let path = dir.path().join("blob-scopes.redb");
+        let store = ScopeStore::open(path.clone()).unwrap();
         store.publish_hash("docs", &"dd".repeat(32)).unwrap();
         store.grant("docs", "alice").unwrap();
 
-        // A fresh store over the same file sees the persisted scopes.
-        let reloaded = ScopeStore::load(path).unwrap();
+        // A fresh store over the same file sees the persisted scopes. The first must be DROPPED:
+        // redb holds an exclusive file lock, like the peer store (#61's DataDirInUse lesson).
+        drop(store);
+        let reloaded = ScopeStore::open(path).unwrap();
         let snap = reloaded.snapshot();
         assert!(snap.allows(&"dd".repeat(32), &principals(&["alice"])));
         // list() renders (name, hashes, grants) deterministically sorted.
@@ -612,7 +925,7 @@ mod tests {
     #[test]
     fn loading_a_missing_sidecar_is_an_empty_store() {
         let dir = tempfile::tempdir().unwrap();
-        let store = ScopeStore::load(dir.path().join("does-not-exist.json")).unwrap();
+        let store = ScopeStore::open(dir.path().join("does-not-exist.redb")).unwrap();
         assert!(store.snapshot().is_empty());
     }
 }
@@ -686,15 +999,15 @@ mod withdrawal_tests {
     #[test]
     fn a_withdrawal_survives_a_reload() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("scopes.json");
+        let path = dir.path().join("scopes.redb");
         {
-            let store = ScopeStore::new(path.clone());
+            let store = ScopeStore::open(path.clone()).unwrap();
             store.publish_hash("room", "aa").unwrap();
             store.grant("room", "b64u:alice").unwrap();
             store.unpublish_hash("room", "aa").unwrap();
             assert!(store.is_withdrawn("room", "aa"));
         }
-        let reloaded = ScopeStore::load(path).unwrap();
+        let reloaded = ScopeStore::open(path).unwrap();
         assert!(
             reloaded.is_withdrawn("room", "aa"),
             "the withdrawal must persist — a daemon restart must not silently un-revoke"
@@ -706,13 +1019,14 @@ mod withdrawal_tests {
     #[test]
     fn a_pre_0_17_sidecar_loads_with_no_withdrawals() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("old.json");
+        // The sidecar sits beside the store and is migrated on first open (#84c).
+        let path = dir.path().join("old.redb");
         std::fs::write(
-            &path,
+            dir.path().join("old.json"),
             r#"{"scopes":{"room":{"hashes":["aa"],"grants":["b64u:alice"]}}}"#,
         )
         .unwrap();
-        let store = ScopeStore::load(path).expect("an old sidecar still loads");
+        let store = ScopeStore::open(path).expect("an old sidecar still loads");
         assert!(!store.is_withdrawn("room", "aa"), "nothing was withdrawn");
         assert!(
             store
