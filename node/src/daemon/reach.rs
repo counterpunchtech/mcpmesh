@@ -61,7 +61,7 @@ pub async fn probe_peer(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> ReachEn
     let seq = mesh
         .probe_seq
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let started = std::time::Instant::now();
+    let started = tokio::time::Instant::now();
     let outcome = tokio::time::timeout(PROBE_TIMEOUT, probe_once(mesh, endpoint_id, started)).await;
     // `probe_once` returns the peer's (already length-capped) metadata on a reachable pong.
     // `path` rides the probe OUTCOME, so it is exactly as fresh as `reachable`/`rtt_ms` and an
@@ -310,7 +310,7 @@ fn stored_row(
 async fn probe_once(
     mesh: &Arc<MeshState>,
     endpoint_id: [u8; 32],
-    started: std::time::Instant,
+    started: tokio::time::Instant,
 ) -> Result<(String, Vec<String>, mcpmesh_local_api::PeerPath, u64)> {
     let id = iroh::EndpointId::from_bytes(&endpoint_id)
         .map_err(|e| anyhow::anyhow!("invalid endpoint id: {e}"))?;
@@ -360,16 +360,24 @@ async fn probe_once(
             // An embedder read ~820ms on two machines one LAN hop apart and filed it as a 66x
             // fleet latency degradation; ~73% of that figure was this window. `rtt_ms` now means
             // what its name says: dial + round trip.
-            let rtt_ms = started.elapsed().as_millis() as u64;
-            Ok((
-                pong_meta(&v),
-                pong_services(&v),
-                settled_path(&conn).await,
-                rtt_ms,
-            ))
+            let (rtt_ms, path) = stamp_then_settle(started, settled_path(&conn)).await;
+            Ok((pong_meta(&v), pong_services(&v), path, rtt_ms))
         }
         _ => anyhow::bail!("no pong from peer"),
     }
+}
+
+/// Stamp the RTT, THEN wait for the path to settle — in that order (#123).
+///
+/// A seam, not decoration: it is the only way to pin the ORDER without a live connection whose
+/// pong and hole-punch can be separated. Inlining these two lines at the call site restores the
+/// #123 bug with the whole suite green, which is exactly what happened before this existed.
+pub(crate) async fn stamp_then_settle(
+    started: tokio::time::Instant,
+    settle: impl std::future::Future<Output = mcpmesh_local_api::PeerPath>,
+) -> (u64, mcpmesh_local_api::PeerPath) {
+    let rtt_ms = started.elapsed().as_millis() as u64;
+    (rtt_ms, settle.await)
 }
 
 /// Extract the optional app metadata from a pong frame, applying the receive cap (#40): a
@@ -506,45 +514,34 @@ mod tests {
         }
     }
 
-    /// #123: `rtt_ms` is stamped at the PONG, not after the settle window, so a relayed peer can
-    /// report a sub-`PATH_SETTLE` figure. Before this, `path == Relay` implied `rtt_ms >= 600` BY
-    /// CONSTRUCTION — the field was named for wire latency and mostly contained our own wait, and
-    /// an embedder built a fleet-health rung on a condition that was unreachable.
+    /// #123: the RTT is stamped at the PONG, BEFORE the settle window — pinned on the ORDER, on
+    /// tokio's paused clock, so it is deterministic and instant.
     ///
-    /// **What this does and does NOT pin — measured, not assumed.** It establishes the PROPERTY
-    /// that matters: a reading taken before the window can fall under it, and one taken after
-    /// cannot. It does NOT pin `probe_once`'s call site. Moving the stamp back after
-    /// `settled_path` — i.e. restoring the exact #123 bug — leaves this green, verified by
-    /// mutation.
-    ///
-    /// Same shape as `settled_path`'s documented hole: pinning the call site needs a live
-    /// connection whose pong and hole-punch can be separated, and a duration assertion on a loaded
-    /// machine lies (this repo has two confident-and-wrong diagnoses from exactly that). Recorded
-    /// as a known gap rather than claimed as coverage.
+    /// The first attempt at this test exercised `settle` in isolation and was a PROXY: moving the
+    /// stamp back after `settled_path` restored the bug with the whole suite green. The adversarial
+    /// review found the cheap pin I had claimed did not exist — `tokio::time::Instant` follows the
+    /// test clock while still measuring wall time in an unpaused runtime, so the seam can be driven
+    /// with no live connection and no wall-clock assertion.
     #[tokio::test(start_paused = true)]
-    async fn rtt_is_stamped_at_the_pong_and_excludes_the_settle_window() {
+    async fn the_rtt_is_stamped_before_the_settle_window() {
         use mcpmesh_local_api::PeerPath;
         use std::time::Duration;
 
         let started = tokio::time::Instant::now();
-        // Stand in for the pong arriving quickly on a relayed connection.
-        tokio::time::sleep(Duration::from_millis(40)).await;
-        let at_pong = started.elapsed();
+        tokio::time::sleep(Duration::from_millis(40)).await; // the pong arrives
 
-        // Then the settle window runs, as it does for a peer with no direct path.
-        let settled = super::settle(super::PATH_SETTLE, || PeerPath::Relay { url: None }).await;
-        let after_settle = started.elapsed();
+        // A genuinely relayed peer: no direct path ever appears, so the window runs in full.
+        let (rtt_ms, path) = super::stamp_then_settle(started, async {
+            tokio::time::sleep(super::PATH_SETTLE).await;
+            PeerPath::Relay { url: None }
+        })
+        .await;
 
-        assert_eq!(settled, PeerPath::Relay { url: None });
-        assert!(
-            at_pong < super::PATH_SETTLE,
-            "the pong stamp must be able to fall UNDER the settle window — that is the whole \
-             point of #123: relayed-and-fast has to be a reportable state"
-        );
-        assert!(
-            after_settle >= super::PATH_SETTLE,
-            "and the post-settle reading is necessarily >= the window, which is what the field \
-             used to contain"
+        assert_eq!(path, PeerPath::Relay { url: None });
+        assert_eq!(
+            rtt_ms, 40,
+            "the RTT must be time to the PONG, not pong + PATH_SETTLE — a relayed peer has to be \
+             able to report under 600ms, which is the whole of #123"
         );
     }
 
