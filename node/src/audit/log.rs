@@ -296,6 +296,43 @@ impl RequestAuditor {
     /// Direction A (caller → local server): a request line is about to be forwarded. Hash its args
     /// (NEVER stored raw), extract method + tool NAME, and either remember it by id (a request, to be
     /// completed by its response) or — for a notification (no id) — record it immediately.
+    /// Record a method-bearing frame that was DROPPED by the rate limiter and never forwarded
+    /// (#76).
+    ///
+    /// A dropped REQUEST gets a synthesized `-32053` on the wire, so its sender learns of it. A
+    /// dropped NOTIFICATION gets nothing — JSON-RPC gives it no reply channel — which made the
+    /// loss silent and undetectable, so an embedder relying on server-initiated pushes could never
+    /// make its reconciliation path optional.
+    ///
+    /// "No reply channel" is not "the sender cannot be told": the loss is now visible in the audit
+    /// log and the `subscribe` stream, with `status: "rate_limited"`, distinct from a delivered
+    /// notification (which carries no status). Not correlated to a specific frame — that is what
+    /// the missing reply channel really costs — but observable after the fact.
+    pub fn on_dropped(&self, frame: &Value) {
+        let Some(inner) = &self.inner else { return };
+        let Some(method) = frame.get("method").and_then(Value::as_str) else {
+            return;
+        };
+        let tool = if method == "tools/call" {
+            frame
+                .pointer("/params/name")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        } else {
+            None
+        };
+        let mut rec = AuditRecord::proxied_notification(
+            now_ts(),
+            inner.peer.clone(),
+            inner.service.clone(),
+            method.to_string(),
+            tool,
+            args_hash(frame.get("params").unwrap_or(&Value::Null)),
+        );
+        rec.status = Some("rate_limited".into());
+        inner.sink.record(rec);
+    }
+
     pub fn on_request(&self, frame: &Value) {
         let Some(inner) = &self.inner else { return };
         let Some(method) = frame.get("method").and_then(Value::as_str) else {
@@ -398,6 +435,53 @@ impl RequestAuditor {
 
 #[cfg(test)]
 mod tests {
+    /// #76: a notification dropped by the rate limiter must be OBSERVABLE.
+    ///
+    /// A dropped request gets a synthesized -32053 on the wire; a notification has no reply
+    /// channel and got nothing, so the loss was indistinguishable from delivery. An embedder
+    /// relying on server-initiated pushes then has undetectable loss and can never make its
+    /// reconciliation path optional — a permanent complexity cost for an invisible failure mode.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dropped_notification_is_recorded_distinctly_from_a_delivered_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = AuditSink::new(AuditLog::spawn(dir.path().to_path_buf()));
+        let mut rx = sink.subscribe().expect("auditing enabled");
+        let auditor = RequestAuditor::new(sink.clone(), Some("bob".into()), "notes".into());
+
+        let note = serde_json::json!({"method": "notifications/progress", "params": {"p": 1}});
+
+        // Delivered: recorded with NO status.
+        auditor.on_request(&note);
+        let delivered = rx
+            .recv()
+            .await
+            .expect("a delivered notification is recorded");
+        assert_eq!(delivered.method.as_deref(), Some("notifications/progress"));
+        assert_eq!(
+            delivered.status, None,
+            "a delivered notification carries no status"
+        );
+
+        // Dropped: recorded with status rate_limited, so the two are distinguishable.
+        auditor.on_dropped(&note);
+        let dropped = rx
+            .recv()
+            .await
+            .expect("a DROPPED notification must be recorded too");
+        assert_eq!(dropped.method.as_deref(), Some("notifications/progress"));
+        assert_eq!(
+            dropped.status.as_deref(),
+            Some("rate_limited"),
+            "the drop must be distinguishable from delivery — otherwise the loss is silent, which \
+             is the whole of #76"
+        );
+        // And it still carries no raw args, only the hash.
+        assert!(
+            dropped.args_hash.is_some(),
+            "args are hashed, never retained"
+        );
+    }
+
     /// #73: a live-session row carries the STABLE principal, not just a display nickname.
     ///
     /// Two devices under one nickname were indistinguishable in the subscribe snapshot's
