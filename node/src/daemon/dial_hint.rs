@@ -114,9 +114,13 @@ mod tests {
             .add(PeerEntry {
                 endpoint_id: eid,
                 nickname: "bob".into(),
-                services: vec![],
-                paired_at: None,
-                user_id: None,
+                services: vec!["notes".into(), "kb".into()],
+                // NON-EMPTY deliberately (#124 third review): the earlier fixture seeded these
+                // empty, so mutations that clobbered `user_id`/`services`/`paired_at` all
+                // SURVIVED — including the loss of a verified `user_id`, which is the entire
+                // reason this code takes the care it does.
+                paired_at: Some("2026-07-29T00:00:00Z".into()),
+                user_id: Some("b64u:someuser".into()),
                 last_addr: Some(stale.clone()),
             })
             .unwrap();
@@ -157,9 +161,26 @@ mod tests {
             "refreshing must never CREATE a peer — that would be an authorization path"
         );
 
-        // The identity fields the pairing path protects are untouched.
+        // EVERY identity field the pairing path protects must survive a hint refresh. `user_id`
+        // above all: a resolve-then-add refresh downgraded a verified one to `None` at a measured
+        // 33% under a concurrent re-pair, which is why the write is a single transaction.
         let row = mesh.store.resolve(&eid).unwrap().unwrap();
         assert_eq!(row.nickname, "bob");
         assert_eq!(row.endpoint_id, eid);
+        assert_eq!(
+            row.user_id.as_deref(),
+            Some("b64u:someuser"),
+            "a verified user_id must NEVER be downgraded by a dial-hint refresh"
+        );
+        assert_eq!(
+            row.services,
+            vec!["notes".to_string(), "kb".to_string()],
+            "the dial directory must survive — clobbering it is the reverse-pairing bug"
+        );
+        assert_eq!(
+            row.paired_at.as_deref(),
+            Some("2026-07-29T00:00:00Z"),
+            "the original pairing stamp stands"
+        );
     }
 }

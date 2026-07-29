@@ -118,7 +118,11 @@ impl PeerStore {
             let mut entry: PeerEntry = serde_json::from_slice(existing.value())?;
             drop(existing);
             if entry.last_addr.as_deref() == Some(last_addr) {
-                false // unchanged: skip the write entirely
+                // Unchanged: ABORT rather than commit. Committing an empty txn still costs a
+                // ~6ms fsync and holds redb's global writer lock for it, blocking pairing, peer
+                // add and rename — measured 5.9ms vs 21us, ~280x (#124 third review). Dropping
+                // the txn uncommitted aborts it, which is redb's documented behaviour.
+                return Ok(false);
             } else {
                 entry.last_addr = Some(last_addr.to_string());
                 let bytes = serde_json::to_vec(&entry)?;
