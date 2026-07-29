@@ -7,7 +7,7 @@ named pipe on Windows. Anything that can open the endpoint and parse JSON can sp
 language — [`local-api/examples/status.py`](../local-api/examples/status.py) is a complete client
 in ~60 lines of dependency-free Python.
 
-> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.23`, `api_minor` `23`) and evolves
+> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.24`, `api_minor` `24`) and evolves
 > **additively** (see [Versioning](#versioning)), but until a stable release this document — like the
 > wire format itself — may change without a migration path. Pin the mcpmesh version you build
 > against. Source of truth is the Rust in [`local-api/`](../local-api/src/protocol.rs); where this
@@ -608,6 +608,13 @@ peer could never report under 600ms and "relayed **and** fast" was unreachable b
 treat a relayed peer with a low `rtt_ms` as evidence that a direct path *should* have been available
 (#123). Guard on `api_minor >= 23` before building on it — an older daemon reports the inflated
 number with no way to tell from the value alone.
+
+Through `api_minor` 23, `reachable` shared its deadline with that same classification window: a
+relayed peer whose pong arrived after roughly 2.4s timed out *while the route was being determined*
+and was reported **offline despite answering**. From `api_minor` **24** the exchange alone decides
+`reachable`, and a classification failure degrades `path` to `unknown` rather than flipping the
+verdict (#128). Guard on `api_minor >= 24` before trusting a `false` for a high-latency relayed
+peer.
 
 **A first probe may report `unknown`.** A fresh connection starts on the relay and hole-punches in
 the background; the daemon waits briefly for the path to settle, but under load that can time out.
