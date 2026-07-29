@@ -36,16 +36,29 @@ impl TokenBucket {
     /// empty, where `ms` is the ceil-milliseconds until the NEXT token (FAIL-SAFE deny — never a
     /// spend on empty, never negative). A zero refill rate reports a long, bounded wait.
     pub fn try_take(&mut self, now: Instant) -> Result<(), u64> {
+        self.try_take_cost(now, 1.0)
+    }
+
+    /// [`try_take`](Self::try_take) for a variable cost (#84a).
+    ///
+    /// A byte budget meters CHUNKS, not calls: iroh-blobs' `Throttle` event carries the chunk
+    /// `size` (usually 16 KiB), so a fixed cost of 1 would count events and let one peer move
+    /// unbounded bytes at a bounded event rate — the exact shape #84a reports.
+    ///
+    /// A cost above `capacity` can never be satisfied by waiting, so it is refused with the
+    /// full-refill wait rather than a deficit that under-reports. Costs are `f64` to match the
+    /// bucket's existing arithmetic; a chunk size is far inside the exact-integer range.
+    pub fn try_take_cost(&mut self, now: Instant, cost: f64) -> Result<(), u64> {
         let elapsed = now
             .saturating_duration_since(self.last_refill)
             .as_secs_f64();
         self.last_refill = now;
         self.tokens = (self.tokens + elapsed * self.refill_per_sec).min(self.capacity);
-        if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
+        if self.tokens >= cost {
+            self.tokens -= cost;
             Ok(())
         } else {
-            let deficit = 1.0 - self.tokens;
+            let deficit = cost - self.tokens;
             let secs = if self.refill_per_sec > 0.0 {
                 deficit / self.refill_per_sec
             } else {
@@ -239,6 +252,42 @@ impl MeshLimiters {
 
 #[cfg(test)]
 mod tests {
+    /// #84a: a byte budget must meter BYTES, not calls.
+    ///
+    /// The existing blob limiter counts CONNECTIONS, so one granted peer can re-pull a 4 GB blob on
+    /// each of 60 connections a minute. iroh-blobs' `Throttle` event carries the chunk `size`
+    /// (usually 16 KiB), so a fixed cost of 1 per event would bound the event rate and leave the
+    /// byte rate unbounded — which is the bug, not the fix.
+    #[test]
+    fn a_bucket_can_meter_a_variable_cost() {
+        let t0 = Instant::now();
+        // 20 KiB of capacity, refilling slowly enough that the window does not matter here.
+        let mut b = TokenBucket::new(20_480.0, 1.0, t0);
+
+        assert!(
+            b.try_take_cost(t0, 16_384.0).is_ok(),
+            "the first 16 KiB chunk fits inside a 20 KiB budget"
+        );
+        assert!(
+            b.try_take_cost(t0, 16_384.0).is_err(),
+            "the SECOND must be refused — 32 KiB does not fit in 20 KiB. A limiter that counted \
+             calls would admit it, which is exactly #84a: bounded events, unbounded bytes"
+        );
+
+        // A cost larger than the whole bucket is unsatisfiable, not merely delayed-a-little.
+        let mut b = TokenBucket::new(1_024.0, 1.0, t0);
+        let wait = b
+            .try_take_cost(t0, 4_096.0)
+            .expect_err("a chunk larger than capacity cannot be admitted");
+        assert!(wait > 0, "a refusal must report a wait, not zero");
+
+        // And the cost-1 path is unchanged, so every existing caller keeps its semantics.
+        let mut b = TokenBucket::new(2.0, 1.0, t0);
+        assert!(b.try_take(t0).is_ok());
+        assert!(b.try_take(t0).is_ok());
+        assert!(b.try_take(t0).is_err(), "capacity 2 admits exactly two");
+    }
+
     use super::*;
     use std::time::{Duration, Instant};
 
