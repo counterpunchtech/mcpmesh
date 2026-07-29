@@ -43,6 +43,16 @@ use crate::daemon::RELAY_READY_TIMEOUT;
 /// `connected: Intercept` records the authenticated endpoint id; `get: Intercept` scope-checks every
 /// single-blob GET (the AC fetch path — unchanged). `throttle` stays at its default
 /// (`ThrottleMode::None`) — it is a transfer-throttling knob, not a request-serving gate.
+/// The mask WITH the #84a byte budget armed. Separate from the default because
+/// `ThrottleMode::Intercept` makes iroh-blobs round-trip an irpc message PER CHUNK (~16 KiB), so a
+/// 4 GB transfer becomes ~262k round-trips through the gate loop. Arming it unconditionally made
+/// the blob AC suites time out even with no budget configured — the cost is real and must only be
+/// paid by a deployment that asked for it.
+const APP_BLOB_EVENT_MASK_METERED: EventMask = EventMask {
+    throttle: ThrottleMode::Intercept,
+    ..APP_BLOB_EVENT_MASK
+};
+
 const APP_BLOB_EVENT_MASK: EventMask = EventMask {
     connected: ConnectMode::Intercept,
     get: RequestMode::Intercept,
@@ -155,6 +165,7 @@ impl AppBlobs {
         gate: Arc<dyn TrustGate>,
         endpoint: Endpoint,
         audit: AuditSink,
+        limits: Arc<crate::limits::MeshLimiters>,
     ) -> Result<Arc<Self>> {
         tokio::fs::create_dir_all(&blobs_dir)
             .await
@@ -167,8 +178,14 @@ impl AppBlobs {
         // const's SECURITY note). Since `get: Intercept` also routes
         // get_many/observe/push to the drain loop today; the pinned fields keep them refused even if
         // a future iroh-blobs honors the per-type fields directly.
-        let (events, rx) = EventSender::channel(64, APP_BLOB_EVENT_MASK);
-        let gate_loop = spawn_gate_loop(rx, gate, scopes.clone(), audit);
+        // Only pay the per-chunk intercept when a budget is actually configured (#84a).
+        let mask = if limits.blob_bytes_enabled() {
+            APP_BLOB_EVENT_MASK_METERED
+        } else {
+            APP_BLOB_EVENT_MASK
+        };
+        let (events, rx) = EventSender::channel(64, mask);
+        let gate_loop = spawn_gate_loop(rx, gate, scopes.clone(), audit, limits);
         Ok(Arc::new(Self {
             store,
             endpoint,
@@ -502,6 +519,7 @@ fn spawn_gate_loop(
     gate: Arc<dyn TrustGate>,
     scopes: Arc<ScopeStore>,
     audit: AuditSink,
+    limits: Arc<crate::limits::MeshLimiters>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut conns: HashMap<u64, mcpmesh_net::EndpointId> = HashMap::new();
@@ -513,6 +531,30 @@ fn spawn_gate_loop(
                             conns.insert(msg.connection_id, (*eid.as_bytes()).into());
                             Ok(())
                         }
+                        None => Err(AbortReason::Permission),
+                    };
+                    msg.tx.send(res).await.ok();
+                }
+                // #84a: meter BYTES per authenticated endpoint. The connection limiter counts
+                // connections, which cannot see one granted peer re-pulling a 4 GB blob on each of
+                // 60 connections a minute.
+                //
+                // `Throttle` names a CONNECTION, so the endpoint comes from the same loop-local
+                // map `ClientConnected` populates — metering per connection would hand a peer a
+                // fresh budget per connection, which IS the bypass.
+                ProviderMessage::Throttle(msg) => {
+                    let res = match conns.get(&msg.connection_id) {
+                        // Over budget: RateLimited, never Permission. The peer is authorized and
+                        // pacing failed; conflating them would make a bandwidth event read as an
+                        // authz denial. iroh-blobs documents RateLimited as "OK to try again".
+                        Some(eid) if !limits.admit_blob_bytes(eid, msg.size) => {
+                            Err(AbortReason::RateLimited)
+                        }
+                        Some(_) => Ok(()),
+                        // FAIL CLOSED. A chunk for a connection we have no `ClientConnected`
+                        // record for cannot be attributed, and metering it against nobody is the
+                        // same bypass by another route. `ClientConnected` already refuses an
+                        // endpoint-less connection, so reaching here means something is wrong.
                         None => Err(AbortReason::Permission),
                     };
                     msg.tx.send(res).await.ok();
@@ -696,6 +738,7 @@ mod tests {
                 b_gate,
                 b_ep.clone(),
                 crate::audit::AuditSink::disabled(),
+                crate::limits::MeshLimiters::unlimited(),
             )
             .await
             .unwrap();
@@ -769,6 +812,7 @@ mod tests {
                 b_gate,
                 b_ep.clone(),
                 crate::audit::AuditSink::disabled(),
+                crate::limits::MeshLimiters::unlimited(),
             )
             .await
             .unwrap();
@@ -1204,6 +1248,7 @@ mod tests {
                 gate,
                 provider_ep.clone(),
                 crate::audit::AuditSink::disabled(),
+                crate::limits::MeshLimiters::unlimited(),
             )
             .await
             .unwrap();
@@ -1285,6 +1330,7 @@ mod tests {
                 gate,
                 provider_ep.clone(),
                 crate::audit::AuditSink::disabled(),
+                crate::limits::MeshLimiters::unlimited(),
             )
             .await
             .unwrap();
@@ -1366,6 +1412,7 @@ mod tests {
                 gate,
                 provider_ep.clone(),
                 sink,
+                crate::limits::MeshLimiters::unlimited(),
             )
             .await
             .unwrap();

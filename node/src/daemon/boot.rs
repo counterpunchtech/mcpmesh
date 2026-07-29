@@ -352,6 +352,7 @@ async fn boot_node(paths: NodePaths, config: Option<Config>) -> Result<BootedNod
                     mesh.gate.clone(),
                     mesh.endpoint.clone(),
                     audit.clone(),
+                    mesh.limits().clone(),
                 )
                 .await
                 {
