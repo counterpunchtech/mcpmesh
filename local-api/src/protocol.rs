@@ -1099,10 +1099,15 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///
 /// - **MAJOR** matches the `/N` in [`API_NAME`] and changes only on a breaking wire change (the
 ///   transport already rejects a mismatched `api`, so an equality check on that is redundant).
-/// - **MINOR** ([`API_MINOR`]) increments on EVERY surface change within a major — additive fields,
-///   new methods, or a strictness change like params validation — bumped in the same change that
-///   makes it. A client can guard with `api_minor >= N` for a feature it needs, or refuse a daemon
-///   older than a minor it requires. It never resets except on a MAJOR bump.
+/// - **MINOR** ([`API_MINOR`]) increments on a surface change within a major — additive fields, new
+///   methods, or a strictness change like params validation — bumped in the same change that makes
+///   it. A client can guard with `api_minor >= N` for a feature it needs, or refuse a daemon older
+///   than a minor it requires. It never resets except on a MAJOR bump.
+///
+///   It also bumps for a change to what a field MEANS with no change to its shape — six of the
+///   twenty-four have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
+///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
+///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
 pub const API_VERSION: &str = "1.24";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
@@ -1129,7 +1134,39 @@ pub const API_VERSION: &str = "1.24";
 /// (#60); to 15 with the `blob_revoke` / `blob_unpublish` verbs — per-scope withdrawal of a grant
 /// and of a published hash, so un-sharing a file no longer requires unpairing the person (#62); to
 /// 16 when the app-blob provider became available in PAIRING mode — the blob verbs previously
-/// errored on any daemon without an org root key, though their scope gate never needed one (#61).
+/// errored on any daemon without an org root key, though their scope gate never needed one (#61);
+/// to 17 when the service answer began coming from the LIVE registry rather than config + overlay,
+/// so a grant the accept path would refuse is no longer advertised. Three surfaces share that
+/// resolver and all changed together: `status`'s `services[].allow`, `peer_services`' name list,
+/// and the `mcpmesh/ping/1` probe's `services`. No wire shape changed, only the source of truth —
+/// exactly the class of change a downstream cannot see in a type diff (#100); to 18 with `blob_republish`, so a fetched blob can
+/// be re-served and every recipient becomes a source (#83); to 19 with durable blob revocation — an
+/// unpublish now survives a later republish via a per-scope withdrawal set, and
+/// [`ERR_BLOB_WITHDRAWN`] distinguishes "deliberately withdrawn" from "never had it" (#107); to 20
+/// with `blob_list` filters + paging AND a DEFAULT limit of 256 scopes (the clamp is 4096) — a
+/// daemon with more scopes than that previously answered with
+/// everything, and past the 16 MiB frame cap the CLIENT rejected the response as malformed, leaving
+/// the caller an opaque failure with no way to page. The connection survived: the control surface
+/// carries no strike bound. This is a behaviour change for existing callers, detectable via the new
+/// `total`/`truncated` (#84b); to 21 when a
+/// PATH change became a reachability transition — [`StreamFrame::Reachability`] stopped being an
+/// up/down toggle and same-verdict frames became possible (#92); to 22 with a SECOND producer for
+/// that frame: a live per-session watcher that pushes when a session's selected path changes,
+/// rather than waiting for a probe, at a cadence probes never had (#92); to 23 when
+/// [`PeerReachability::rtt_ms`] stopped including the path-settle window — a relayed peer could
+/// previously never report under 600ms, so "relayed AND fast" was unreachable by construction
+/// (#123); to 24 when `reachable` stopped sharing a deadline with path classification — a relayed
+/// peer whose pong arrived after ~2.4s was reported OFFLINE while it was answering (#128).
+///
+/// **Not every semantic change gets a minor, and that is the gap to watch (#122).** A minor marks a
+/// change to this *surface*. A change to behaviour BEHIND the surface — same fields, same shapes,
+/// different meaning — may not bump it, and is invisible to a type diff. 17 and 24 above happen to
+/// be that class and did bump; do not infer from them that every such change will. When bumping
+/// several minors at once, read this block end to end AND the release notes, not the diff.
+///
+/// That class is bigger than it looks: **10, 17, 21, 22, 23 and 24 all shipped with no change to
+/// any type in this file** — they moved meaning, not shape. Six of the twenty-four. A downstream
+/// that diffs types across a multi-minor bump sees nothing for any of them.
 pub const API_MINOR: u32 = 24;
 
 #[cfg(test)]
