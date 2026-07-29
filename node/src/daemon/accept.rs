@@ -124,9 +124,6 @@ pub fn spawn_accept_loop(mesh: Arc<MeshState>, services: Arc<Services>) -> JoinH
                                 *remote.as_bytes(),
                                 &conn,
                             ));
-                            // #124: this connection knows the peer's ACTUAL address. Write it back
-                            // so a peer that changed networks stops being dialed at a dead one.
-                            super::dial_hint::refresh(&mesh, *remote.as_bytes(), &conn);
                         }
                         run_mesh_connection(
                             conn,

@@ -121,6 +121,11 @@ pub(crate) fn spawn(
             let observed =
                 super::reach::settle(PATH_CHANGE_SETTLE, || super::reach::selected_path(&strong))
                     .await;
+            // #124: the selected path just settled, so THIS is the moment the connection knows
+            // the peer's real direct address — not accept time, when only the relay path exists.
+            // Refreshing here means the stored dial hint tracks reality instead of being written
+            // once at pairing and going permanently stale after a network change.
+            super::dial_hint::refresh(&mesh, endpoint_id, &strong).await;
             drop(strong);
             commit_observation(&mesh, endpoint_id, seq, &observed);
         }

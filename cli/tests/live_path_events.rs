@@ -66,7 +66,7 @@ async fn live_session_harness() -> (
     ),
     Arc<MeshState>,
     Arc<MeshState>,
-    (),
+    Arc<PeerStore>,
 ) {
     let dir = tempfile::tempdir().unwrap();
     let (relay_map, relay_url, relay_guard) = iroh::test_utils::run_relay_server()
@@ -130,9 +130,14 @@ async fn live_session_harness() -> (
 
     let our_cfg = dir.path().join("our.toml");
     std::fs::write(&our_cfg, "").unwrap();
-    let mesh = assemble(our_ep, our_store, our_cfg);
+    let mesh = assemble(our_ep, our_store.clone(), our_cfg);
 
-    ((dir, accept, Box::new(relay_guard)), mesh, peer_mesh, ())
+    (
+        (dir, accept, Box::new(relay_guard)),
+        mesh,
+        peer_mesh,
+        our_store,
+    )
 }
 
 /// A session we OPEN (the reported use case: an embedder rendering a privacy indicator for a call
@@ -352,4 +357,74 @@ async fn the_watcher_stops_when_its_session_closes() {
     })
     .await
     .expect("watcher lifetime test timed out");
+}
+
+/// #124: the persisted dial hint must self-heal from a LIVE session, and must never become a relay
+/// URL.
+///
+/// This drives a real session and asserts the STORED value, which is the coverage the first attempt
+/// lacked: its unit test called the store helper directly, so deleting the sole production call
+/// site left the whole suite green and the relay-URL defect had nothing that could see it.
+///
+/// The session provably starts relayed (relay-only `last_addr`), so at accept time the only path is
+/// the relay. A hint sampled then would BE the relay URL — and since `stored_dial_addr` replaces the
+/// bare-id dial, that leaves no direct candidate at all, self-inflicting the very bug #124 reports.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_live_session_refreshes_the_dial_hint_and_never_stores_a_relay() {
+    timeout(Duration::from_secs(120), async {
+        let (harness, mesh, _peer_mesh, our_store) = live_session_harness().await;
+        let peer_id = our_store
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|e| e.nickname == "bob")
+            .expect("peer seeded")
+            .endpoint_id;
+
+        // Seeded relay-only, which is exactly the degraded state #124 describes.
+        let before = our_store.resolve(&peer_id).unwrap().unwrap().last_addr;
+        assert!(
+            before.as_deref().is_some_and(|s| s.contains("Relay")),
+            "fixture must start from a relay-only hint, or this proves nothing: {before:?}"
+        );
+
+        let _session = daemon::dial_service(&mesh, "bob", "echo")
+            .await
+            .expect("open a mesh session to the peer");
+
+        // The watcher refreshes once the direct path is SELECTED, so wait for the hint to change.
+        let mut healed = None;
+        for _ in 0..80 {
+            let now = our_store.resolve(&peer_id).unwrap().unwrap().last_addr;
+            if now != before {
+                healed = now;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let healed = healed.expect(
+            "a live session must refresh the stale dial hint — leaving it is #124: the peer is \
+             dialed at a dead address forever and every session falls back to the relay",
+        );
+        assert!(
+            !healed.contains("Relay"),
+            "a relay URL must NEVER become a dial hint — it replaces the bare-id dial, so the \
+             direct-candidate set becomes empty and the fix inflicts the bug it exists to fix: \
+             {healed}"
+        );
+        assert!(
+            healed.contains("Ip"),
+            "the refreshed hint must carry the peer's DIRECT address: {healed}"
+        );
+
+        // Identity fields the pairing path protects must survive a hint refresh.
+        let row = our_store.resolve(&peer_id).unwrap().unwrap();
+        assert_eq!(
+            row.nickname, "bob",
+            "a hint refresh must not touch identity"
+        );
+        drop(harness);
+    })
+    .await
+    .expect("dial hint refresh test timed out");
 }

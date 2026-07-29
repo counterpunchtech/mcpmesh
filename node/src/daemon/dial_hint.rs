@@ -32,17 +32,23 @@ use super::MeshState;
 ///
 /// **Never downgrades `Some` to `None`**, matching the pairing path's rule: an empty path snapshot
 /// means we learned nothing, not that the peer has no address.
-pub(crate) fn refresh(
+pub(crate) async fn refresh(
     mesh: &Arc<MeshState>,
     endpoint_id: [u8; 32],
     conn: &iroh::endpoint::Connection,
 ) {
     let Some(observed) = observed_addr(conn) else {
-        return; // learned nothing — keep what we have
+        return; // relay-only or nothing open — keep what we have
     };
-    let mesh = mesh.clone();
+    // Under `reload_lock`, like EVERY other peer-store read-modify-write in this daemon
+    // (`rename_peer`, `add_peer`, the pairing writes). The first version took no lock; a
+    // concurrent rename was demonstrably reverted AND a verified `user_id` downgraded to `None`,
+    // which the pairing path explicitly declares must never happen (#124 review).
+    let _guard = mesh.reload_lock.lock().await;
+    let mesh2 = mesh.clone();
     // The redb read+write blocks; keep it off the runtime (the fs house rule).
-    tokio::task::spawn_blocking(move || write_if_changed(&mesh, endpoint_id, observed));
+    let _ =
+        tokio::task::spawn_blocking(move || write_if_changed(&mesh2, endpoint_id, observed)).await;
 }
 
 /// The store half of [`refresh`], separated so the rules are testable without a live connection:
@@ -65,19 +71,36 @@ fn write_if_changed(mesh: &Arc<MeshState>, endpoint_id: [u8; 32], observed: Stri
     }
 }
 
-/// The remote's addresses as this connection actually sees them, serialized the way
+/// The remote's DIRECT address as this connection sees it, serialized the way
 /// [`crate::allowlist::PeerEntry::last_addr`] stores them.
 ///
-/// `None` when the snapshot is empty or serialization fails — both mean "learned nothing", which
-/// the caller must treat as leave-alone rather than clear.
+/// **Filters to IP paths, and returns `None` when only a relay path is open (#124 review).** The
+/// first version took every path unfiltered, which is actively harmful: a hint is *replacing* the
+/// bare-id dial, so persisting a relay URL leaves the direct-candidate set EMPTY. Measured — a
+/// seeded direct hint was overwritten with a relay URL and stayed that way for the rest of the
+/// session — and it manufactures in production exactly the state this repo's own tests seed
+/// deliberately to force a relayed session. A relay URL must never become a dial hint.
+///
+/// `None` (empty snapshot, no IP path, or a serialize failure) means "learned nothing", which the
+/// caller treats as leave-alone rather than clear.
 fn observed_addr(conn: &iroh::endpoint::Connection) -> Option<String> {
-    let addrs: Vec<iroh::TransportAddr> = conn
-        .paths()
+    let paths = conn.paths();
+    // Prefer the SELECTED direct path — the one actually carrying application data (#64's rule).
+    // Fall back to any open IP path: still a validated 4-tuple we reached the peer at, which is
+    // what a dial hint wants, even if iroh has since chosen differently.
+    let addrs: Vec<iroh::TransportAddr> = paths
         .iter()
+        .filter(|p| p.is_ip() && p.is_selected())
         .map(|p| p.remote_addr().clone())
+        .chain(
+            paths
+                .iter()
+                .filter(|p| p.is_ip() && !p.is_selected())
+                .map(|p| p.remote_addr().clone()),
+        )
         .collect();
     if addrs.is_empty() {
-        return None;
+        return None; // relay-only, or nothing open: keep whatever we already had
     }
     serde_json::to_string(&iroh::EndpointAddr::from_parts(conn.remote_id(), addrs)).ok()
 }
