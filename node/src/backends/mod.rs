@@ -111,15 +111,22 @@ where
                     // Per-identity rate limit: consult BEFORE forwarding a
                     // proxied REQUEST/notification (a method-bearing frame). FAIL-SAFE over-limit —
                     // DROP the request (never forward, never queue), reply -32053{retry_after_ms}
-                    // for a request id (silent-drop a notification), and CONTINUE the session
+                    // for a request id (a notification gets no reply but IS audited, #76), and CONTINUE the session
                     // (bounded backpressure, not a close).
                     if frame.get("method").is_some()
                         && let Err(retry_after_ms) = rate.admit()
                     {
-                        if let Some(id) = frame.get("id").filter(|v| !v.is_null()).cloned() {
-                            let _ = throttle_writer
-                                .send_value(synthesized_limited(id, retry_after_ms))
-                                .await;
+                        match frame.get("id").filter(|v| !v.is_null()).cloned() {
+                            Some(id) => {
+                                let _ = throttle_writer
+                                    .send_value(synthesized_limited(id, retry_after_ms))
+                                    .await;
+                            }
+                            // #76: a notification has no reply channel, so the sender cannot be
+                            // told directly — but the loss must not be INVISIBLE. Recorded with
+                            // `status: "rate_limited"`, so it shows up in the audit log and the
+                            // subscribe stream instead of vanishing.
+                            None => auditor.on_dropped(&frame),
                         }
                         continue;
                     }
@@ -235,6 +242,91 @@ mod tests {
     /// The rate gate here is set to a budget of ONE and then exhausted by the inbound request, so
     /// an implementation that metered Direction B against the same per-identity budget would drop
     /// or -32053 this notification instead of forwarding it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rate_limited_notification_is_audited_rather_than_silently_dropped() {
+        timeout(Duration::from_secs(10), async {
+            let (mut peer_w, tr) = duplex(64 * 1024);
+            let (tw, _peer_r) = duplex(64 * 1024);
+            let mut transport = NdjsonTransport::new(tr, tw, MAX_FRAME_BYTES);
+            let (server_write, srv_stdin) = duplex(64 * 1024);
+            let (srv_stdout, server_read) = duplex(64 * 1024);
+
+            // Count what actually reaches the server, so "dropped" is observed, not assumed.
+            let server = tokio::spawn(async move {
+                let _keep = srv_stdout;
+                let mut reader = FrameReader::new(srv_stdin, MAX_FRAME_BYTES);
+                let mut seen = 0usize;
+                while let Ok(Some(Inbound::Frame(_))) = reader.next().await {
+                    seen += 1;
+                }
+                seen
+            });
+
+            // A budget of ONE, consumed by the first notification; the second is over-limit.
+            // Some(endpoint), NOT None — a None gate meters nothing and would make this vacuous
+            // (see the sibling test's note).
+            let rate = RateGate::new(
+                std::sync::Arc::new(RateLimiter::per_minute(1, 1)),
+                Some(mcpmesh_net::EndpointId::from_bytes([9u8; 32])),
+            );
+            let dir = tempfile::tempdir().unwrap();
+            let sink = AuditSink::new(crate::audit::log::AuditLog::spawn(dir.path().to_path_buf()));
+            let mut rx = sink.subscribe().expect("auditing enabled");
+            let auditor = RequestAuditor::new(sink.clone(), Some("bob".into()), "notes".into());
+
+            let pump = tokio::spawn(async move {
+                let _ = pump(
+                    json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+                    &mut transport,
+                    server_read,
+                    server_write,
+                    auditor,
+                    rate,
+                )
+                .await;
+            });
+
+            // Two notifications: the first fits the budget, the second does not.
+            for _ in 0..2 {
+                write_frame(
+                    &mut peer_w,
+                    &json!({"jsonrpc":"2.0","method":"notifications/progress","params":{}}),
+                )
+                .await
+                .unwrap();
+            }
+            drop(peer_w);
+
+            // The DROP must be observable. A notification has no reply channel, so nothing goes
+            // back on the wire — the audit stream is the only place the loss can surface, and
+            // before #76 it surfaced nowhere at all.
+            let mut statuses = Vec::new();
+            while let Ok(Ok(rec)) = timeout(Duration::from_secs(3), rx.recv()).await {
+                if rec.method.as_deref() == Some("notifications/progress") {
+                    statuses.push(rec.status.clone());
+                    if statuses.len() == 2 {
+                        break;
+                    }
+                }
+            }
+            assert!(
+                statuses.contains(&Some("rate_limited".into())),
+                "a notification dropped by the limiter must be recorded as rate_limited — \
+                 otherwise the loss is invisible to the sender AND to the operator, which is the \
+                 whole of #76. Saw: {statuses:?}"
+            );
+
+            let _ = pump.await;
+            let forwarded = server.await.unwrap();
+            assert!(
+                forwarded < 3,
+                "the over-limit notification must NOT have been forwarded: {forwarded}"
+            );
+        })
+        .await
+        .expect("dropped-notification audit test timed out");
+    }
+
     #[tokio::test]
     async fn a_server_initiated_notification_reaches_the_peer_unmetered() {
         timeout(Duration::from_secs(10), async {

@@ -7,7 +7,7 @@ named pipe on Windows. Anything that can open the endpoint and parse JSON can sp
 language — [`local-api/examples/status.py`](../local-api/examples/status.py) is a complete client
 in ~60 lines of dependency-free Python.
 
-> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.25`, `api_minor` `25`) and evolves
+> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.26`, `api_minor` `26`) and evolves
 > **additively** (see [Versioning](#versioning)), but until a stable release this document — like the
 > wire format itself — may change without a migration path. Pin the mcpmesh version you build
 > against. Source of truth is the Rust in [`local-api/`](../local-api/src/protocol.rs); where this
@@ -410,8 +410,8 @@ let a chatty local server exhaust the allowance of the peer it is talking to. So
 polling is not; budget accordingly.
 
 *(Contrast the inbound direction, which consults the limiter before forwarding a method-bearing
-frame, answers `-32053` with `retry_after_ms` for a request, and **silently drops** an over-limit
-notification — that silence is #76.)*
+frame, answers `-32053` with `retry_after_ms` for a request, and **drops** an over-limit
+notification with no reply — none is possible — but records it (#76).)*
 
 **Ordering is FIFO in the server's own output order.** Both directions write through the same
 mutex-guarded transport writer, and the outbound direction reads the server's stdout sequentially,
@@ -452,13 +452,13 @@ consumer always gets a well-formed answer rather than a hang:
 All carry `"data":{"source":"mcpmesh"}` to distinguish a mesh-synthesized error from one the remote
 server produced. A session severed mid-stream instead surfaces as a clean EOF.
 
-> **Rate-limited notifications are dropped silently — design for it.**
+> **Rate-limited notifications are dropped without a reply — but the drop is recorded.**
 >
 > The per-peer rate limiter is consulted before forwarding any method-bearing frame. Over the limit:
 >
 > - a **request** (an `id` present and non-null) is answered `-32053` with `retry_after_ms`, so the
 >   caller learns it was throttled and can back off;
-> - a **notification** (no `id`) is dropped with **no signal at all**.
+> - a **notification** (no `id`) is dropped with **no reply to the sender** (there is no reply channel for a notification), and recorded in the audit stream instead.
 >
 > JSON-RPC gives a notification no reply channel, so there is nowhere to put the refusal. The
 > consequence is that notification delivery is **not guaranteed under load**, and the loss is
@@ -787,7 +787,7 @@ Reference: [`cli/src/backends/spawn.rs`](../cli/src/backends/spawn.rs) (`run`),
 | `-32000` | operation failed — `message` carries the detail. One common instance: the daemon is in control-only mode with no mesh (e.g. `invite`/`pair` before a mesh exists) |
 | `-32055` | *(session only)* peer unreachable |
 | `-32054` | *(session only)* session refused |
-| `-32053` | *(session only)* rate-limited; carries `retry_after_ms`. **Requests only** — a rate-limited *notification* is dropped silently, see below |
+| `-32053` | *(session only)* rate-limited; carries `retry_after_ms`. **Requests only** — a rate-limited *notification* gets no reply (none is possible), but is recorded as `status: "rate_limited"` from `api_minor` 26, see below |
 
 `-32600` through `-32603` follow their JSON-RPC 2.0 meanings. Session errors (`-3205x`) appear
 inside a [session](#sessions), not as control-method responses, and carry `data.source = "mcpmesh"`.
