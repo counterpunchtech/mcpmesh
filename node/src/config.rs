@@ -148,6 +148,25 @@ pub struct LimitsCfg {
     pub rate_limit_per_min: u32,
     pub max_inflight: u32,
     pub max_sessions: u32,
+    /// Per-authenticated-endpoint app-blob BYTE budget, bytes per minute (#84a).
+    ///
+    /// **0 = unlimited, and that is the default**, so an existing deployment is unchanged on
+    /// upgrade. The pre-existing blob limiter counts CONNECTIONS, which cannot see one granted
+    /// peer re-pulling a 4 GB blob on each of 60 connections a minute; this bounds the bytes.
+    ///
+    /// A peer that exceeds it gets its transfer ABORTED (retryable), not paced — pacing holds the
+    /// request open and turns a bandwidth problem into an unbounded-concurrency one.
+    ///
+    /// **Use 0 or at least 32768** (two chunks); a value in `1..32768` is FLOORED to 32768.
+    ///
+    /// Admission reserves one chunk before any bytes and the transfer then meters its own chunks,
+    /// so a sub-floor budget does not fail closed — it silently caps every servable blob at
+    /// roughly `budget - 16384` bytes and truncates anything larger. Measured: 20480 serves a
+    /// 4 KiB blob and nothing bigger. Two earlier drafts of this comment got that wrong, first
+    /// recommending the bricking value and then claiming it failed closed.
+    ///
+    /// Requires a restart: the limiter and the provider's event mask are both built once at boot.
+    pub blob_bytes_per_min: u64,
 }
 impl Default for LimitsCfg {
     fn default() -> Self {
@@ -155,6 +174,7 @@ impl Default for LimitsCfg {
             rate_limit_per_min: 120,
             max_inflight: 16,
             max_sessions: 4,
+            blob_bytes_per_min: 0, // unlimited: opt-in, no behaviour change on upgrade
         }
     }
 }

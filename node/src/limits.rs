@@ -36,16 +36,29 @@ impl TokenBucket {
     /// empty, where `ms` is the ceil-milliseconds until the NEXT token (FAIL-SAFE deny — never a
     /// spend on empty, never negative). A zero refill rate reports a long, bounded wait.
     pub fn try_take(&mut self, now: Instant) -> Result<(), u64> {
+        self.try_take_cost(now, 1.0)
+    }
+
+    /// [`try_take`](Self::try_take) for a variable cost (#84a).
+    ///
+    /// A byte budget meters CHUNKS, not calls: iroh-blobs' `Throttle` event carries the chunk
+    /// `size` (usually 16 KiB), so a fixed cost of 1 would count events and let one peer move
+    /// unbounded bytes at a bounded event rate — the exact shape #84a reports.
+    ///
+    /// A cost above `capacity` can never be satisfied by waiting, so it is refused with the
+    /// full-refill wait rather than a deficit that under-reports. Costs are `f64` to match the
+    /// bucket's existing arithmetic; a chunk size is far inside the exact-integer range.
+    pub fn try_take_cost(&mut self, now: Instant, cost: f64) -> Result<(), u64> {
         let elapsed = now
             .saturating_duration_since(self.last_refill)
             .as_secs_f64();
         self.last_refill = now;
         self.tokens = (self.tokens + elapsed * self.refill_per_sec).min(self.capacity);
-        if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
+        if self.tokens >= cost {
+            self.tokens -= cost;
             Ok(())
         } else {
-            let deficit = 1.0 - self.tokens;
+            let deficit = cost - self.tokens;
             let secs = if self.refill_per_sec > 0.0 {
                 deficit / self.refill_per_sec
             } else {
@@ -78,6 +91,16 @@ pub struct RateLimiter {
 }
 
 impl RateLimiter {
+    /// [`per_minute`](Self::per_minute) with `f64` capacity, for a budget that exceeds `u32`
+    /// (`[limits].blob_bytes_per_min` is a byte count, #84a).
+    pub fn per_minute_f64(per_min: f64, burst: f64) -> Self {
+        Self {
+            capacity: burst.max(1.0),
+            refill_per_sec: per_min.max(1.0) / 60.0,
+            buckets: Mutex::new(HashMap::new()),
+        }
+    }
+
     /// Build from a per-minute rate (config `[limits].rate_limit_per_min`). `burst` = bucket
     /// capacity (the instantaneous allowance); sustained rate = `per_min / 60` tokens·s⁻¹.
     pub fn per_minute(per_min: u32, burst: u32) -> Self {
@@ -113,6 +136,29 @@ impl RateLimiter {
             .expect("present after the insert above");
         t.last_seen = now;
         t.bucket.try_take(now)
+    }
+
+    /// [`check`](Self::check) for a variable cost — the byte-budget path (#84a).
+    ///
+    /// Same per-endpoint map, same bounded-map `make_room` discipline; only the cost differs. A
+    /// second metering primitive would have meant a second unbounded map to get wrong.
+    pub fn check_cost(&self, endpoint: &EndpointId, now: Instant, cost: f64) -> Result<(), u64> {
+        let mut map = self.buckets.lock().expect("rate limiter mutex");
+        if !map.contains_key(endpoint) {
+            make_room(&mut map, now);
+            map.insert(
+                *endpoint,
+                Tracked {
+                    bucket: TokenBucket::new(self.capacity, self.refill_per_sec, now),
+                    last_seen: now,
+                },
+            );
+        }
+        let t = map
+            .get_mut(endpoint)
+            .expect("present after the insert above");
+        t.last_seen = now;
+        t.bucket.try_take_cost(now, cost)
     }
 
     /// Number of tracked buckets (the AC's bounded-memory assertion reads this).
@@ -169,6 +215,11 @@ const PAIR_ACCEPT_PER_MIN: u32 = 30;
 /// that churn per endpoint.
 const BLOB_CONN_PER_MIN: u32 = 60;
 
+/// The smallest USEFUL app-blob byte budget: two chunks (#84a). One chunk is reserved at request
+/// admission before any bytes, so a budget below this admits a request and then starves the
+/// transfer. A configured value in `1..MIN` is floored to this rather than honoured.
+pub const MIN_BLOB_BYTES_PER_MIN: u64 = 2 * 16 * 1024;
+
 /// The daemon's rate/concurrency limiter bundle, built ONCE from config and carried
 /// on `MeshState`. Bundled so `MeshState` gains ONE handle. Every map is bounded.
 pub struct MeshLimiters {
@@ -176,6 +227,10 @@ pub struct MeshLimiters {
     pub requests: Arc<RateLimiter>,
     /// A GLOBAL pair-ALPN accept bucket (bounds a distinct-id stranger flood).
     pair_accept: Mutex<TokenBucket>,
+    /// Per-authenticated-endpoint app-blob BYTE budget (`[limits].blob_bytes_per_min`, #84a).
+    /// `None` when the budget is 0 = unlimited, so the default deployment allocates nothing and
+    /// consults nothing — the feature is opt-in and changes no existing behaviour on upgrade.
+    blob_bytes: Option<Arc<RateLimiter>>,
     /// Per-authenticated-endpoint app-blob connection buckets.
     blob_conn: Arc<RateLimiter>,
 }
@@ -199,6 +254,18 @@ impl MeshLimiters {
                 BLOB_CONN_PER_MIN,
                 BLOB_CONN_PER_MIN,
             )),
+            // 0 = unlimited (the default): no bucket, no map, nothing consulted (#84a).
+            blob_bytes: (limits.blob_bytes_per_min > 0).then(|| {
+                // FLOOR at two chunks, the repo idiom (`max_sessions.max(1)`, daemon.rs). A budget
+                // between 1 and 32767 admits a request (reserving one chunk) and then silently
+                // caps every servable blob at `budget - 16384` bytes — measured. Documenting a
+                // floor and not enforcing it leaves an operator with a daemon that truncates
+                // large blobs and says nothing (#84a fourth review).
+                let per_min = limits.blob_bytes_per_min.max(MIN_BLOB_BYTES_PER_MIN);
+                // Capacity == the per-minute rate: the burst a peer may take instantly is one
+                // minute's worth, matching how `requests`/`blob_conn` are sized.
+                Arc::new(RateLimiter::per_minute_f64(per_min as f64, per_min as f64))
+            }),
         })
     }
 
@@ -213,6 +280,7 @@ impl MeshLimiters {
                 now,
             )),
             blob_conn: RateLimiter::unlimited_shared(),
+            blob_bytes: None,
         })
     }
 
@@ -228,6 +296,28 @@ impl MeshLimiters {
             .is_ok()
     }
 
+    /// Admit `bytes` of app-blob payload for `endpoint` (#84a).
+    ///
+    /// **FAIL-CLOSED on an unknown endpoint is the caller's job**, not this one: this answers only
+    /// "is there budget". A `Throttle` event names a CONNECTION, and a connection with no recorded
+    /// endpoint must be refused rather than metered against nobody — see `provider.rs`.
+    ///
+    /// `true` when no budget is configured (0 = unlimited), so the default path allocates nothing.
+    pub fn admit_blob_bytes(&self, endpoint: &EndpointId, bytes: u64) -> bool {
+        self.admit_blob_bytes_at(endpoint, bytes, Instant::now())
+    }
+    pub fn admit_blob_bytes_at(&self, endpoint: &EndpointId, bytes: u64, now: Instant) -> bool {
+        match &self.blob_bytes {
+            Some(l) => l.check_cost(endpoint, now, bytes as f64).is_ok(),
+            None => true,
+        }
+    }
+
+    /// Is a byte budget configured at all? Lets the provider skip arming the throttle intercept.
+    pub fn blob_bytes_enabled(&self) -> bool {
+        self.blob_bytes.is_some()
+    }
+
     /// Admit one app-blob connection from `endpoint` (FAIL-SAFE: `false` = over-limit → close).
     pub fn admit_blob_conn(&self, endpoint: &EndpointId) -> bool {
         self.admit_blob_conn_at(endpoint, Instant::now())
@@ -239,6 +329,83 @@ impl MeshLimiters {
 
 #[cfg(test)]
 mod tests {
+    /// #84a: the byte budget is PER ENDPOINT, and 0 means unlimited.
+    ///
+    /// Per-endpoint is the whole design. A `Throttle` event names a CONNECTION, so a budget keyed
+    /// on `connection_id` would give a peer a fresh allowance per connection — 60 connections a
+    /// minute, 60 budgets, which is exactly the bypass #84a reports.
+    #[test]
+    fn the_byte_budget_is_per_endpoint_and_zero_is_unlimited() {
+        use crate::config::LimitsCfg;
+        let a = EndpointId::from_bytes([1u8; 32]);
+        let b = EndpointId::from_bytes([2u8; 32]);
+        let t0 = Instant::now();
+
+        let cfg = LimitsCfg {
+            blob_bytes_per_min: 32_768, // == the enforced floor (two chunks)
+            ..Default::default()
+        };
+        let lim = MeshLimiters::from_config(&cfg);
+
+        // 32768 == two chunks, so two fit and the third does not.
+        assert!(lim.admit_blob_bytes_at(&a, 16_384, t0), "first chunk fits");
+        assert!(lim.admit_blob_bytes_at(&a, 16_384, t0), "second chunk fits");
+        assert!(
+            !lim.admit_blob_bytes_at(&a, 16_384, t0),
+            "the same endpoint must be refused once its own budget is spent"
+        );
+        assert!(
+            lim.admit_blob_bytes_at(&b, 16_384, t0),
+            "a DIFFERENT endpoint has its own budget — one peer must not starve another"
+        );
+
+        // 0 = unlimited is the default: nothing is consulted, however much is asked for.
+        let lim = MeshLimiters::from_config(&LimitsCfg::default());
+        assert!(!lim.blob_bytes_enabled(), "default must be off");
+        for _ in 0..100 {
+            assert!(
+                lim.admit_blob_bytes_at(&a, u64::MAX, t0),
+                "with no budget configured nothing is metered — upgrading must not start refusing"
+            );
+        }
+    }
+
+    /// #84a: a byte budget must meter BYTES, not calls.
+    ///
+    /// The existing blob limiter counts CONNECTIONS, so one granted peer can re-pull a 4 GB blob on
+    /// each of 60 connections a minute. iroh-blobs' `Throttle` event carries the chunk `size`
+    /// (usually 16 KiB), so a fixed cost of 1 per event would bound the event rate and leave the
+    /// byte rate unbounded — which is the bug, not the fix.
+    #[test]
+    fn a_bucket_can_meter_a_variable_cost() {
+        let t0 = Instant::now();
+        // 20 KiB of capacity, refilling slowly enough that the window does not matter here.
+        let mut b = TokenBucket::new(20_480.0, 1.0, t0);
+
+        assert!(
+            b.try_take_cost(t0, 16_384.0).is_ok(),
+            "the first 16 KiB chunk fits inside a 20 KiB budget"
+        );
+        assert!(
+            b.try_take_cost(t0, 16_384.0).is_err(),
+            "the SECOND must be refused — 32 KiB does not fit in 20 KiB. A limiter that counted \
+             calls would admit it, which is exactly #84a: bounded events, unbounded bytes"
+        );
+
+        // A cost larger than the whole bucket is unsatisfiable, not merely delayed-a-little.
+        let mut b = TokenBucket::new(1_024.0, 1.0, t0);
+        let wait = b
+            .try_take_cost(t0, 4_096.0)
+            .expect_err("a chunk larger than capacity cannot be admitted");
+        assert!(wait > 0, "a refusal must report a wait, not zero");
+
+        // And the cost-1 path is unchanged, so every existing caller keeps its semantics.
+        let mut b = TokenBucket::new(2.0, 1.0, t0);
+        assert!(b.try_take(t0).is_ok());
+        assert!(b.try_take(t0).is_ok());
+        assert!(b.try_take(t0).is_err(), "capacity 2 admits exactly two");
+    }
+
     use super::*;
     use std::time::{Duration, Instant};
 
@@ -320,6 +487,7 @@ mod tests {
             rate_limit_per_min: 5,
             max_inflight: 16,
             max_sessions: 4,
+            blob_bytes_per_min: 0,
         };
         let ml = MeshLimiters::from_config(&cfg);
         let t = Instant::now();
@@ -341,6 +509,7 @@ mod tests {
             rate_limit_per_min: 120,
             max_inflight: 16,
             max_sessions: 4,
+            blob_bytes_per_min: 0,
         });
         // The GLOBAL pair-accept bucket engages after its burst (bounds a distinct-id stranger flood).
         let mut admitted = 0;

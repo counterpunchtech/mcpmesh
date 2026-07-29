@@ -117,6 +117,7 @@ async fn serving_provider(
         gate,
         provider_ep,
         mcpmesh::audit::AuditSink::disabled(),
+        mcpmesh::limits::MeshLimiters::unlimited(),
     )
     .await
     .unwrap();

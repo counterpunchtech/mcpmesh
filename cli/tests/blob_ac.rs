@@ -124,6 +124,7 @@ pub(crate) async fn serving_provider(
         gate,
         provider_ep,
         mcpmesh::audit::AuditSink::disabled(),
+        mcpmesh::limits::MeshLimiters::unlimited(),
     )
     .await
     .unwrap();
@@ -404,6 +405,7 @@ async fn a_pairing_mode_daemon_serves_app_blobs() {
             gate,
             provider_ep.clone(),
             mcpmesh::audit::AuditSink::disabled(),
+            mcpmesh::limits::MeshLimiters::unlimited(),
         )
         .await
         .unwrap();

@@ -352,6 +352,10 @@ async fn boot_node(paths: NodePaths, config: Option<Config>) -> Result<BootedNod
                     mesh.gate.clone(),
                     mesh.endpoint.clone(),
                     audit.clone(),
+                    // The limiter built at boot, NOT `mesh.limits()` — that falls back to
+                    // `unlimited()` on a OnceCell miss, so a wiring mistake would silently disable
+                    // a security control. Fail closed, like everything else here (#84a review).
+                    limiters.clone(),
                 )
                 .await
                 {

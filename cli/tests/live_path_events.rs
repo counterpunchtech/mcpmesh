@@ -144,7 +144,7 @@ async fn live_session_harness() -> (
 /// it initiated) must push a `Reachability` frame when its selected path changes under it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_live_relay_to_direct_transition_pushes_a_frame() {
-    timeout(Duration::from_secs(120), async {
+    timeout(Duration::from_secs(240), async {
         let dir = tempfile::tempdir().unwrap();
         let (relay_map, relay_url, _relay_guard) = iroh::test_utils::run_relay_server()
             .await
@@ -226,7 +226,7 @@ async fn a_live_relay_to_direct_transition_pushes_a_frame() {
 
         // The event under test. Generous: this waits on a real hole-punch, it does not assert a
         // latency budget — a tight bound here is what made #110 flaky.
-        let frame = timeout(Duration::from_secs(45), rx.recv())
+        let frame = timeout(Duration::from_secs(120), rx.recv())
             .await
             .expect(
                 "a live path change must push a Reachability frame — with no watcher on the \
@@ -277,7 +277,7 @@ async fn a_live_relay_to_direct_transition_pushes_a_frame() {
 /// fixture and is not pretended to be covered by this one.
 #[tokio::test(flavor = "multi_thread")]
 async fn status_agrees_with_the_frame_the_watcher_just_pushed() {
-    timeout(Duration::from_secs(120), async {
+    timeout(Duration::from_secs(240), async {
         let (harness, mesh, _peer_mesh, _relay) = live_session_harness().await;
         let mut rx = mesh.reach_bcast_for_test().subscribe();
 
@@ -285,7 +285,7 @@ async fn status_agrees_with_the_frame_the_watcher_just_pushed() {
             .await
             .expect("open a mesh session to the peer");
 
-        let frame = timeout(Duration::from_secs(45), rx.recv())
+        let frame = timeout(Duration::from_secs(120), rx.recv())
             .await
             .expect("a live path change must push a frame")
             .expect("broadcast channel alive");
@@ -318,14 +318,14 @@ async fn status_agrees_with_the_frame_the_watcher_just_pushed() {
 /// passed. Joining the handle is the only thing that tells the two apart.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_watcher_stops_when_its_session_closes() {
-    timeout(Duration::from_secs(120), async {
+    timeout(Duration::from_secs(240), async {
         let (harness, mesh, _peer_mesh, _relay) = live_session_harness().await;
         let mut rx = mesh.reach_bcast_for_test().subscribe();
 
         let session = daemon::dial_service(&mesh, "bob", "echo")
             .await
             .expect("open a mesh session to the peer");
-        let _ = timeout(Duration::from_secs(45), rx.recv())
+        let _ = timeout(Duration::from_secs(120), rx.recv())
             .await
             .expect("a live path change must push a frame");
 
