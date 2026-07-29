@@ -66,7 +66,7 @@ async fn live_session_harness() -> (
     ),
     Arc<MeshState>,
     Arc<MeshState>,
-    (),
+    Arc<PeerStore>,
 ) {
     let dir = tempfile::tempdir().unwrap();
     let (relay_map, relay_url, relay_guard) = iroh::test_utils::run_relay_server()
@@ -130,9 +130,14 @@ async fn live_session_harness() -> (
 
     let our_cfg = dir.path().join("our.toml");
     std::fs::write(&our_cfg, "").unwrap();
-    let mesh = assemble(our_ep, our_store, our_cfg);
+    let mesh = assemble(our_ep, our_store.clone(), our_cfg);
 
-    ((dir, accept, Box::new(relay_guard)), mesh, peer_mesh, ())
+    (
+        (dir, accept, Box::new(relay_guard)),
+        mesh,
+        peer_mesh,
+        our_store,
+    )
 }
 
 /// A session we OPEN (the reported use case: an embedder rendering a privacy indicator for a call

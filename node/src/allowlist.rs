@@ -97,6 +97,43 @@ impl PeerStore {
         Ok(())
     }
 
+    /// Set `last_addr` on an EXISTING row, atomically, inside ONE write transaction (#124 review).
+    ///
+    /// `resolve` + mutate + [`add`](Self::add) is TWO transactions with a window between them, and
+    /// a lock does not close it: the pairing writes and `add_peer` take no lock, so a
+    /// `reload_lock`-guarded refresh excludes only `rename_peer`. Measured at a 33% rate, that
+    /// window let a hint refresh revert a concurrent re-pair and DOWNGRADE a verified `user_id` to
+    /// `None` — the one thing the pairing path declares must never happen.
+    ///
+    /// Reading and writing under a single redb write txn excludes every writer, not just the
+    /// polite ones. Returns `Ok(false)` when the peer is absent: a dial hint must never CREATE an
+    /// allowlist row, or a cache path becomes an authorization path.
+    pub fn set_last_addr(&self, endpoint_id: &[u8; 32], last_addr: &str) -> Result<bool> {
+        let txn = self.db.begin_write()?;
+        let changed = {
+            let mut table = txn.open_table(PEERS)?;
+            let Some(existing) = table.get(endpoint_id.as_slice())? else {
+                return Ok(false); // unknown peer — never invent one
+            };
+            let mut entry: PeerEntry = serde_json::from_slice(existing.value())?;
+            drop(existing);
+            if entry.last_addr.as_deref() == Some(last_addr) {
+                // Unchanged: ABORT rather than commit. Committing an empty txn still costs a
+                // ~6ms fsync and holds redb's global writer lock for it, blocking pairing, peer
+                // add and rename — measured 5.9ms vs 21us, ~280x (#124 third review). Dropping
+                // the txn uncommitted aborts it, which is redb's documented behaviour.
+                return Ok(false);
+            } else {
+                entry.last_addr = Some(last_addr.to_string());
+                let bytes = serde_json::to_vec(&entry)?;
+                table.insert(endpoint_id.as_slice(), bytes.as_slice())?;
+                true
+            }
+        };
+        txn.commit()?;
+        Ok(changed)
+    }
+
     /// Resolve a peer by its 32-byte endpoint_id, or `None` if not allowlisted.
     ///
     /// Fails CLOSED on a corrupt stored row: a row that will not deserialize (e.g. an
@@ -264,6 +301,65 @@ impl TrustGate for AllowlistGate {
 
 #[cfg(test)]
 mod tests {
+    /// #124: an UNCHANGED `set_last_addr` must abort its transaction, not commit an empty one.
+    ///
+    /// Committing costs a ~6ms fsync AND holds redb's process-global writer lock for it, so on a
+    /// busy mesh every `Selected` event would block pairing, peer add and rename. The earlier
+    /// version committed on both branches while three in-tree comments claimed it skipped — and
+    /// nothing could falsify them: the returned bool is `false` either way, so it proves "no
+    /// insert", not "no write".
+    ///
+    /// A wall-clock assertion is normally a bad idea in this repo (loaded machines have produced
+    /// confident-and-wrong diagnoses twice). It is right here only because the margin is enormous
+    /// — measured ~20ms vs ~5.9s for 1000 iterations, >100x — so the bound below is loose by two
+    /// orders of magnitude and still catches a regression.
+    #[test]
+    fn an_unchanged_set_last_addr_aborts_instead_of_committing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PeerStore::open(&dir.path().join("p.redb")).unwrap();
+        let eid = [5u8; 32];
+        let addr = r#"{"id":"x","addrs":[]}"#;
+        store
+            .add(PeerEntry {
+                endpoint_id: eid,
+                nickname: "bob".into(),
+                services: vec![],
+                paired_at: None,
+                user_id: None,
+                last_addr: Some(addr.to_string()),
+            })
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        for _ in 0..1000 {
+            assert!(
+                !store.set_last_addr(&eid, addr).unwrap(),
+                "an unchanged hint must report no write"
+            );
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "1000 unchanged refreshes took {elapsed:?} — committing an empty txn per call is a \
+             ~6ms fsync holding redb's GLOBAL writer lock, which blocks pairing and peer add on \
+             every path event (#124)"
+        );
+
+        // Still correct after 1000 aborts: the row survives and a real change still writes.
+        assert_eq!(
+            store.resolve(&eid).unwrap().unwrap().last_addr.as_deref(),
+            Some(addr)
+        );
+        assert!(
+            store
+                .set_last_addr(&eid, r#"{"id":"y","addrs":[]}"#)
+                .unwrap()
+        );
+        // An absent peer is never created, and that path aborts too.
+        assert!(!store.set_last_addr(&[7u8; 32], addr).unwrap());
+        assert!(store.resolve(&[7u8; 32]).unwrap().is_none());
+    }
+
     use super::*;
 
     fn entry(eid: [u8; 32], nickname: &str, services: &[&str]) -> PeerEntry {

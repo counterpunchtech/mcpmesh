@@ -121,8 +121,20 @@ pub(crate) fn spawn(
             let observed =
                 super::reach::settle(PATH_CHANGE_SETTLE, || super::reach::selected_path(&strong))
                     .await;
+            // #124: the selected path just settled, so THIS is the moment the connection knows
+            // the peer's real direct address — not accept time, when only the relay path exists.
+            // Refreshing here means the stored dial hint tracks reality instead of being written
+            // once at pairing and going permanently stale after a network change.
+            // Emit FIRST. #92's whole point is that a path change is reported WHEN IT HAPPENS, so
+            // the frame must not queue behind cache maintenance (#124 review).
+            let refreshed = super::dial_hint::observed_for(&strong);
             drop(strong);
             commit_observation(&mesh, endpoint_id, seq, &observed);
+            // #124: the selected path just settled, so this is the moment the connection knows the
+            // peer's real direct address — not accept time, when only the relay path exists.
+            if let Some(addr) = refreshed {
+                super::dial_hint::refresh(&mesh, endpoint_id, addr);
+            }
         }
     })
 }
