@@ -127,7 +127,15 @@ pub struct PeerReachability {
     pub name: String,    // the peer's nickname
     pub reachable: bool, // result of the last probe (false if never probed)
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rtt_ms: Option<u64>, // last measured round-trip, if reachable
+    /// Last measured round-trip, if reachable: dial + ping/pong, stamped AT THE PONG.
+    ///
+    /// It EXCLUDES the window the daemon spends afterwards determining which path the connection
+    /// settled on. Before 0.20.1 it included that window, so a relayed peer could never report
+    /// under 600ms and most of the figure was a deliberate wait rather than time on the wire —
+    /// an embedder read ~820ms across one LAN hop and reported it as a 66x latency regression
+    /// (#123). It is a wire-latency measurement now, so "relayed AND low rtt_ms" is a reachable
+    /// state and a usable diagnostic.
+    pub rtt_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub age_secs: Option<u64>, // None = never probed (consumer shows "checking…")
     /// The peer's OPTIONAL app metadata (#40) — the same opaque ≤256B blob #39 exposes via
@@ -1095,7 +1103,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   new methods, or a strictness change like params validation — bumped in the same change that
 ///   makes it. A client can guard with `api_minor >= N` for a feature it needs, or refuse a daemon
 ///   older than a minor it requires. It never resets except on a MAJOR bump.
-pub const API_VERSION: &str = "1.22";
+pub const API_VERSION: &str = "1.23";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -1122,7 +1130,7 @@ pub const API_VERSION: &str = "1.22";
 /// and of a published hash, so un-sharing a file no longer requires unpairing the person (#62); to
 /// 16 when the app-blob provider became available in PAIRING mode — the blob verbs previously
 /// errored on any daemon without an org root key, though their scope gate never needed one (#61).
-pub const API_MINOR: u32 = 22;
+pub const API_MINOR: u32 = 23;
 
 #[cfg(test)]
 mod tests {

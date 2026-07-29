@@ -7,7 +7,7 @@ named pipe on Windows. Anything that can open the endpoint and parse JSON can sp
 language — [`local-api/examples/status.py`](../local-api/examples/status.py) is a complete client
 in ~60 lines of dependency-free Python.
 
-> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.21`, `api_minor` `21`) and evolves
+> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.23`, `api_minor` `23`) and evolves
 > **additively** (see [Versioning](#versioning)), but until a stable release this document — like the
 > wire format itself — may change without a migration path. Pin the mcpmesh version you build
 > against. Source of truth is the Rust in [`local-api/`](../local-api/src/protocol.rs); where this
@@ -348,7 +348,9 @@ never the command or path.
 probe cache the daemon refreshes lazily. It is empty until the first probe completes. A `status`
 call kicks off a background refresh for any peer whose entry is stale or missing, but **never blocks
 on a probe**. Each entry is a **nickname** (`name`, never an endpoint-id), a `reachable` bool (the
-last probe result), `rtt_ms` (the last measured round-trip, present only when reachable), and
+last probe result), `rtt_ms` (the last measured round-trip — dial + ping/pong, stamped at the
+pong; it EXCLUDES the window the daemon spends determining the path, so a relayed peer can report
+under 600ms, #123 — present only when reachable), and
 `age_secs` (how long ago the entry was measured). `age_secs` is **absent** for a peer that has never
 been probed — render that as "checking…", not "offline".
 
@@ -599,6 +601,13 @@ it reports `relay` in that case. Overstating privacy is worse than understating 
 
 `path` is captured by the same probe that sets `reachable`/`rtt_ms`, so it shares their freshness —
 one TTL, one `age_secs`. `rtt_ms` is not a proxy for it: a fast relay beats a slow direct path.
+
+Through `api_minor` 22, `rtt_ms` also contained the daemon's own path-settle window, so a relayed
+peer could never report under 600ms and "relayed **and** fast" was unreachable by construction. From
+`api_minor` **23** the figure is stamped at the pong and excludes that window, so a health check may
+treat a relayed peer with a low `rtt_ms` as evidence that a direct path *should* have been available
+(#123). Guard on `api_minor >= 23` before building on it — an older daemon reports the inflated
+number with no way to tell from the value alone.
 
 **A first probe may report `unknown`.** A fresh connection starts on the relay and hole-punches in
 the background; the daemon waits briefly for the path to settle, but under load that can time out.
