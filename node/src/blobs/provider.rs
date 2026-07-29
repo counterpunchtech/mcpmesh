@@ -519,13 +519,47 @@ impl AppBlobs {
 ///
 /// Reserves [`IROH_CHUNK_BYTES`] rather than peeking: a zero-cost check always passes, and
 /// reserving makes an opened-but-undrained request cost the peer something.
+/// The full GET-admission decision: authz first, then budget (#84a review).
+///
+/// Exists because pinning `request_budget_ok` alone left the CRITICAL fix unpinned — deleting the
+/// budget check from the GET arm passed every test while a probe measured the full 94x regression.
+/// That is verbatim the critique this branch made of the event mask, and it applied to the fix
+/// itself.
+fn get_admission(
+    allow: bool,
+    endpoint: Option<&mcpmesh_net::EndpointId>,
+    limits: &crate::limits::MeshLimiters,
+) -> Result<(), AbortReason> {
+    if !allow {
+        return Err(AbortReason::Permission);
+    }
+    // An unattributable connection is an ATTRIBUTION failure, not a budget one — same rule and
+    // same reason code as `throttle_decision`. Reporting RateLimited here would tell a peer
+    // "try again later" about a condition that will never clear.
+    let Some(eid) = endpoint else {
+        return Err(AbortReason::Permission);
+    };
+    if !request_budget_ok(Some(eid), limits) {
+        return Err(AbortReason::RateLimited);
+    }
+    Ok(())
+}
+
 fn request_budget_ok(
     endpoint: Option<&mcpmesh_net::EndpointId>,
     limits: &crate::limits::MeshLimiters,
 ) -> bool {
-    endpoint.is_none_or(|eid| limits.admit_blob_bytes(eid, IROH_CHUNK_BYTES))
+    // FAIL CLOSED on an unattributable connection, matching `throttle_decision`. The first version
+    // used `is_none_or`, i.e. the inverse of its sibling's documented rule — masked today because
+    // the caller short-circuits on `!allow`, but a latent trap for the next edit (#84a review).
+    endpoint.is_some_and(|eid| limits.admit_blob_bytes(eid, IROH_CHUNK_BYTES))
 }
 
+/// The app-blob byte-budget decision for one CHUNK, mid-transfer (#84a).
+///
+/// The top-up to [`request_budget_ok`], not the gate: iroh-blobs writes the chunk before this
+/// runs, and a refusal resets only the stream. Pure, so both rules are testable without a live
+/// transfer; the async arm is a thin shell over it.
 fn throttle_decision(
     endpoint: Option<&mcpmesh_net::EndpointId>,
     size: u64,
@@ -571,6 +605,13 @@ fn spawn_gate_loop(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut conns: HashMap<u64, mcpmesh_net::EndpointId> = HashMap::new();
+        // #84a review: endpoints already audited for a budget refusal. A refusal is CHEAP —
+        // measured 2250 records/s — so recording every one trades an uplink DoS for an audit-log
+        // DoS, which is strictly worse because the attacker no longer has to move bytes. The spec
+        // said "first only, or a peer hammering the budget writes an unbounded audit log" (#88);
+        // that had not shipped. Cleared when the endpoint next fetches successfully, so a peer
+        // that recovers and re-offends is reported again.
+        let mut budget_reported: HashSet<mcpmesh_net::EndpointId> = HashSet::new();
         while let Some(msg) = rx.recv().await {
             match msg {
                 ProviderMessage::ClientConnected(msg) => {
@@ -640,30 +681,39 @@ fn spawn_gate_loop(
                     // (`tokens >= 0.0`), and reserving means a peer that opens many requests it
                     // never drains still pays for them. Evaluated ONCE — calling it twice would
                     // double-charge.
-                    let budget_ok =
-                        !allow || request_budget_ok(conns.get(&msg.connection_id), limits.as_ref());
-                    audit.record(AuditRecord::blob_fetch(
-                        now_ts(),
-                        peer,
-                        hash_hex,
-                        match (allow, budget_ok) {
-                            (false, _) => "denied".into(),
-                            // #84a: a refusal is REPORTED, not silent. The issue's complaint was
-                            // that mcpmesh "neither refuses it nor reports it happened"; a budget
-                            // that refuses silently fixes one half. Distinct from "denied" so an
-                            // operator can tell a bandwidth event from an authz failure.
-                            (true, false) => "rate_limited".into(),
-                            (true, true) => "ok".into(),
-                        },
-                    ));
-                    let res = if !allow {
-                        Err(AbortReason::Permission)
-                    } else if !budget_ok {
-                        Err(AbortReason::RateLimited)
-                    } else {
-                        Ok(())
+                    let decision =
+                        get_admission(allow, conns.get(&msg.connection_id), limits.as_ref());
+                    let budget_ok = !matches!(decision, Err(AbortReason::RateLimited));
+                    // #84a: a refusal is REPORTED, not silent — the issue's complaint was that
+                    // mcpmesh "neither refuses it nor reports it happened". But only the FIRST per
+                    // endpoint until it succeeds again: see `budget_reported`.
+                    let conn_eid = conns.get(&msg.connection_id).copied();
+                    let status = match (allow, budget_ok) {
+                        (false, _) => Some("denied"),
+                        (true, false) => {
+                            // Distinct from "denied" so an operator can tell a bandwidth event
+                            // from an authz failure.
+                            match conn_eid {
+                                Some(eid) if !budget_reported.insert(eid) => None, // already told
+                                _ => Some("rate_limited"),
+                            }
+                        }
+                        (true, true) => {
+                            if let Some(eid) = conn_eid {
+                                budget_reported.remove(&eid); // recovered: report a future refusal
+                            }
+                            Some("ok")
+                        }
                     };
-                    msg.tx.send(res).await.ok();
+                    if let Some(status) = status {
+                        audit.record(AuditRecord::blob_fetch(
+                            now_ts(),
+                            peer,
+                            hash_hex,
+                            status.into(),
+                        ));
+                    }
+                    msg.tx.send(decision).await.ok();
                 }
                 // Deny-by-default for every non-GET request type.
                 ProviderMessage::GetManyRequestReceived(msg) => {
@@ -686,6 +736,90 @@ fn spawn_gate_loop(
 
 #[cfg(test)]
 mod tests {
+    /// #84a review: GET admission must consult the budget, not only authz.
+    ///
+    /// This is THE critical fix, and nothing pinned it: deleting the budget check from the GET arm
+    /// passed every test while a probe measured 3 MB delivered against a 32 KiB/min budget (94x).
+    /// Testing `request_budget_ok` in isolation proved the helper worked, not that anything called
+    /// it — the same vacuity this branch called out in the event mask.
+    #[test]
+    fn get_admission_refuses_on_budget_as_well_as_authz() {
+        use crate::config::LimitsCfg;
+        use crate::limits::MeshLimiters;
+        use mcpmesh_net::EndpointId;
+
+        let eid = EndpointId::from_bytes([6u8; 32]);
+        let lim = MeshLimiters::from_config(&LimitsCfg {
+            blob_bytes_per_min: super::IROH_CHUNK_BYTES * 2,
+            ..Default::default()
+        });
+
+        // Authz denial wins and reports Permission, whatever the budget says.
+        assert!(matches!(
+            super::get_admission(false, Some(&eid), &lim),
+            Err(AbortReason::Permission)
+        ));
+
+        // An authorized caller is admitted until its budget is spent, then RateLimited — before
+        // any bytes. Two chunks of budget = two admissions.
+        assert!(super::get_admission(true, Some(&eid), &lim).is_ok());
+        assert!(super::get_admission(true, Some(&eid), &lim).is_ok());
+        assert!(
+            matches!(
+                super::get_admission(true, Some(&eid), &lim),
+                Err(AbortReason::RateLimited)
+            ),
+            "an over-budget REQUEST must be refused before any bytes — metering only per chunk \
+             let a peer take one free chunk per request forever"
+        );
+
+        // Unattributable: fail closed, and as an authz failure rather than a budget one.
+        assert!(matches!(
+            super::get_admission(true, None, &lim),
+            Err(AbortReason::Permission)
+        ));
+    }
+
+    /// #84a review: the documented floor must actually serve a blob.
+    ///
+    /// The first version of this doc told operators the minimum was 16384 — which admits a request
+    /// (reserving one chunk) and then has nothing left for the transfer's own chunks, so it serves
+    /// zero bytes. A doc that recommends the value it warns against is worse than no doc.
+    #[test]
+    fn the_documented_minimum_budget_admits_a_request_and_a_chunk() {
+        use crate::config::LimitsCfg;
+        use crate::limits::MeshLimiters;
+        use mcpmesh_net::EndpointId;
+
+        let eid = EndpointId::from_bytes([8u8; 32]);
+        const DOCUMENTED_MIN: u64 = 32_768;
+
+        let lim = MeshLimiters::from_config(&LimitsCfg {
+            blob_bytes_per_min: DOCUMENTED_MIN,
+            ..Default::default()
+        });
+        assert!(
+            super::request_budget_ok(Some(&eid), &lim),
+            "the documented minimum must admit a request"
+        );
+        assert!(
+            super::throttle_decision(Some(&eid), super::IROH_CHUNK_BYTES, &lim).is_ok(),
+            "and must still have budget for the first CHUNK — otherwise the value we tell \
+             operators to use serves zero bytes, which is the state the doc warns against"
+        );
+
+        // One chunk of budget is exactly the bricking case the doc now forbids.
+        let bricked = MeshLimiters::from_config(&LimitsCfg {
+            blob_bytes_per_min: super::IROH_CHUNK_BYTES,
+            ..Default::default()
+        });
+        assert!(super::request_budget_ok(Some(&eid), &bricked));
+        assert!(
+            super::throttle_decision(Some(&eid), super::IROH_CHUNK_BYTES, &bricked).is_err(),
+            "16384 admits then starves — this is why the floor is two chunks"
+        );
+    }
+
     /// #84a review: the default mask must be UNCHANGED, and the metered one must differ in
     /// exactly one field.
     ///
