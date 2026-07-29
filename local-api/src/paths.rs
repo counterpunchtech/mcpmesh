@@ -336,7 +336,7 @@ pub fn default_blobs_dir() -> std::io::Result<PathBuf> {
     Ok(data_dir()?.join("blobs"))
 }
 
-/// The persisted blob-scope sidecar (`<data_dir>/blob-scopes.json`). One JSON document:
+/// The persisted blob-scope keyed store (`<data_dir>/blob-scopes.redb`). Was one JSON document:
 /// `scope_name -> { hashes, grants }`, atomic-write single-writer.
 pub fn default_blob_scopes_path() -> std::io::Result<PathBuf> {
     Ok(data_dir()?.join("blob-scopes.redb"))
