@@ -27,47 +27,33 @@ use super::MeshState;
 /// redb write error — leaves the stored hint exactly as it was. A stale hint is a slow dial; a
 /// *wrong* write could be worse, so the bar for replacing one is a connection that is up.
 ///
-/// **Only writes on a CHANGE.** A dial per session times a redb write per session would put a
-/// blocking disk write on every connection for a value that changes approximately never.
+/// **Only writes on a CHANGE**, decided inside the store's write transaction. The value is not
+/// static — it flips as a session's open IP paths change, and across a restart — so this is a real
+/// reduction, not the "changes approximately never" an earlier version claimed.
 ///
 /// **Never downgrades `Some` to `None`**, matching the pairing path's rule: an empty path snapshot
 /// means we learned nothing, not that the peer has no address.
-pub(crate) async fn refresh(
-    mesh: &Arc<MeshState>,
-    endpoint_id: [u8; 32],
-    conn: &iroh::endpoint::Connection,
-) {
-    let Some(observed) = observed_addr(conn) else {
-        return; // relay-only or nothing open — keep what we have
-    };
-    // Under `reload_lock`, like EVERY other peer-store read-modify-write in this daemon
-    // (`rename_peer`, `add_peer`, the pairing writes). The first version took no lock; a
-    // concurrent rename was demonstrably reverted AND a verified `user_id` downgraded to `None`,
-    // which the pairing path explicitly declares must never happen (#124 review).
-    let _guard = mesh.reload_lock.lock().await;
-    let mesh2 = mesh.clone();
-    // The redb read+write blocks; keep it off the runtime (the fs house rule).
-    let _ =
-        tokio::task::spawn_blocking(move || write_if_changed(&mesh2, endpoint_id, observed)).await;
+pub(crate) fn refresh(mesh: &Arc<MeshState>, endpoint_id: [u8; 32], observed: String) {
+    let mesh = mesh.clone();
+    // Detached, and taking NO lock. The atomicity lives in the store's single write transaction —
+    // a lock here would exclude only `rename_peer`, since the pairing writes and `add_peer` take
+    // none. The caller is #92's path watcher, whose own job is to push a frame WHEN IT HAPPENS, so
+    // it must not queue behind cache maintenance. The redb work blocks: blocking pool (fs rule).
+    tokio::task::spawn_blocking(move || write_if_changed(&mesh, endpoint_id, observed));
 }
 
 /// The store half of [`refresh`], separated so the rules are testable without a live connection:
 /// replace a changed hint, skip an unchanged one, and never CREATE a peer.
 fn write_if_changed(mesh: &Arc<MeshState>, endpoint_id: [u8; 32], observed: String) {
-    let Ok(Some(mut entry)) = mesh.store.resolve(&endpoint_id) else {
-        return; // not a stored peer (a bare eid probe, say) — nothing to refresh
-    };
-    if entry.last_addr.as_deref() == Some(observed.as_str()) {
-        return; // unchanged, and the common case: no write
-    }
-    tracing::debug!(
-        peer = %entry.nickname,
-        "refreshing dial hint from a live connection (#124)"
-    );
-    entry.last_addr = Some(observed);
-    if let Err(e) = mesh.store.add(entry) {
+    // ONE redb write transaction does the read, the change-check and the write. A lock cannot
+    // substitute: the pairing writes and `add_peer` take none, so a `reload_lock`-guarded
+    // resolve-then-add excludes only `rename_peer` and still lost a verified `user_id` at a
+    // measured 33% under a concurrent re-pair (#124 review).
+    match mesh.store.set_last_addr(&endpoint_id, &observed) {
+        Ok(true) => tracing::debug!("refreshed the dial hint from a live connection (#124)"),
+        Ok(false) => {} // unchanged, or not a stored peer — both are no-ops by design
         // Cache maintenance: the session is already up and unaffected.
-        tracing::debug!(%e, "could not persist refreshed dial hint");
+        Err(e) => tracing::debug!(%e, "could not persist refreshed dial hint"),
     }
 }
 
@@ -83,21 +69,18 @@ fn write_if_changed(mesh: &Arc<MeshState>, endpoint_id: [u8; 32], observed: Stri
 ///
 /// `None` (empty snapshot, no IP path, or a serialize failure) means "learned nothing", which the
 /// caller treats as leave-alone rather than clear.
-fn observed_addr(conn: &iroh::endpoint::Connection) -> Option<String> {
+pub(crate) fn observed_for(conn: &iroh::endpoint::Connection) -> Option<String> {
     let paths = conn.paths();
-    // Prefer the SELECTED direct path — the one actually carrying application data (#64's rule).
-    // Fall back to any open IP path: still a validated 4-tuple we reached the peer at, which is
-    // what a dial hint wants, even if iroh has since chosen differently.
+    // EVERY open IP path, with no preference expressed — deliberately. An earlier version ordered
+    // selected-first, which reads like #64's rule but is dead code: `EndpointAddr::from_parts`
+    // collects into a `BTreeSet`, so ordering is discarded and the two forms serialize
+    // byte-identically (#124 review). Each open QUIC path is a validated 4-tuple we reached this
+    // peer at, so storing them all is correct for a dial hint; the canonical set ordering is also
+    // what makes the unchanged-check stable.
     let addrs: Vec<iroh::TransportAddr> = paths
         .iter()
-        .filter(|p| p.is_ip() && p.is_selected())
+        .filter(|p| p.is_ip())
         .map(|p| p.remote_addr().clone())
-        .chain(
-            paths
-                .iter()
-                .filter(|p| p.is_ip() && !p.is_selected())
-                .map(|p| p.remote_addr().clone()),
-        )
         .collect();
     if addrs.is_empty() {
         return None; // relay-only, or nothing open: keep whatever we already had
@@ -148,12 +131,23 @@ mod tests {
              dialed at a dead address forever and every session falls back to the relay"
         );
 
-        // Re-observing the SAME address must not rewrite the row: a redb write per session for a
-        // value that changes approximately never.
-        let before = mesh.store.resolve(&eid).unwrap().unwrap();
-        super::write_if_changed(&mesh, eid, fresh.clone());
-        let after = mesh.store.resolve(&eid).unwrap().unwrap();
-        assert_eq!(after.last_addr, before.last_addr);
+        // Re-observing the SAME address must SKIP the write. Asserting the value is unchanged
+        // would be vacuous — a rewrite stores an identical value (#124 review caught exactly that)
+        // — so assert on the store's own report of whether it wrote.
+        assert!(
+            !mesh
+                .store
+                .set_last_addr(&eid, &fresh)
+                .expect("store readable"),
+            "an unchanged observation must not write: every Selected event would otherwise cost a \
+             blocking redb write"
+        );
+        assert!(
+            mesh.store
+                .set_last_addr(&eid, r#"{"id":"newer","addrs":[]}"#)
+                .expect("store readable"),
+            "and a CHANGED observation must write"
+        );
 
         // An unknown peer is not invented — refresh is maintenance on a stored row, not a source
         // of trust. A bare-eid probe must never create an allowlist entry.

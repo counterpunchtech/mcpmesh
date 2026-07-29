@@ -97,6 +97,39 @@ impl PeerStore {
         Ok(())
     }
 
+    /// Set `last_addr` on an EXISTING row, atomically, inside ONE write transaction (#124 review).
+    ///
+    /// `resolve` + mutate + [`add`](Self::add) is TWO transactions with a window between them, and
+    /// a lock does not close it: the pairing writes and `add_peer` take no lock, so a
+    /// `reload_lock`-guarded refresh excludes only `rename_peer`. Measured at a 33% rate, that
+    /// window let a hint refresh revert a concurrent re-pair and DOWNGRADE a verified `user_id` to
+    /// `None` — the one thing the pairing path declares must never happen.
+    ///
+    /// Reading and writing under a single redb write txn excludes every writer, not just the
+    /// polite ones. Returns `Ok(false)` when the peer is absent: a dial hint must never CREATE an
+    /// allowlist row, or a cache path becomes an authorization path.
+    pub fn set_last_addr(&self, endpoint_id: &[u8; 32], last_addr: &str) -> Result<bool> {
+        let txn = self.db.begin_write()?;
+        let changed = {
+            let mut table = txn.open_table(PEERS)?;
+            let Some(existing) = table.get(endpoint_id.as_slice())? else {
+                return Ok(false); // unknown peer — never invent one
+            };
+            let mut entry: PeerEntry = serde_json::from_slice(existing.value())?;
+            drop(existing);
+            if entry.last_addr.as_deref() == Some(last_addr) {
+                false // unchanged: skip the write entirely
+            } else {
+                entry.last_addr = Some(last_addr.to_string());
+                let bytes = serde_json::to_vec(&entry)?;
+                table.insert(endpoint_id.as_slice(), bytes.as_slice())?;
+                true
+            }
+        };
+        txn.commit()?;
+        Ok(changed)
+    }
+
     /// Resolve a peer by its 32-byte endpoint_id, or `None` if not allowlisted.
     ///
     /// Fails CLOSED on a corrupt stored row: a row that will not deserialize (e.g. an
