@@ -621,14 +621,31 @@ the background; the daemon waits briefly for the path to settle, but under load 
 The next probe reports the settled answer. So treat `unknown` as "not yet known" and re-read, rather
 than as a stable property of the peer — and never as "private".
 
-A path change alone does **not** emit a `reachability` frame — only the `reachable` verdict flipping
-does. Hole-punching flaps by nature, and the stream stays quiet through it; read `status` if you
-need the current path.
+Emitted on a **transition**: the `reachable` verdict changed, **or `path` changed**, or this is the
+first probe of that peer. A refresh that re-confirms the same verdict *and* the same path emits
+nothing, so a peer that stays up does not produce a frame per cache refresh; `rtt_ms`/`meta` drift
+is advisory detail, not a transition. `age_secs` is `0` — the observation just completed.
 
-Emitted on a **transition** only: the `reachable` verdict changed, or this is the first probe of
-that peer. A refreshed probe that re-confirms the same verdict emits nothing, so a peer that stays
-up does not produce a frame per cache refresh; `rtt_ms`/`meta` drift is advisory detail, not a
-transition. `age_secs` is `0` — the probe just completed.
+**Do not treat this as an up/down toggle.** It carried that meaning through `api_minor` **20**
+(0.18.0), and this document said so — "a path change alone does not emit a frame" — all the way to
+`api_minor` 23. That stopped being true at **21** (0.19.0), when `path` joined the transition rule.
+Same-verdict frames have been reachable since.
+
+**Two producers, since `api_minor` 22:**
+
+| producer | when | `rtt_ms` |
+|---|---|---|
+| a completing **probe** | `status`/`subscribe` refreshes a stale entry | `Some` — a measured round trip |
+| a **live session** | its selected path changed under it (0.20.0) | `None` on first knowledge — never fabricated |
+
+The live producer is why `path` is trustworthy for a long-lived session: a call that degrades
+`direct` → `relay` says so **when it happens**, rather than staying silently mislabelled until
+something probes. Polling `status` for the current path is no longer the right pattern — subscribe.
+
+Hole-punching flaps by nature, and the stream still stays quiet through it: both producers damp a
+change before believing it (a ~600ms settle window), so a path that flaps and returns emits
+nothing. Excluding `path` from transitions was the *original* way that quiet was achieved; it is
+not how it works now.
 
 This is the **pairing-mode probe**. Roster-mode presence travels on the gossip topic and surfaces
 through `status`; it is not (yet) an event here.
