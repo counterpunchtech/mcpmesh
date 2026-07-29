@@ -701,7 +701,6 @@ fn spawn_gate_loop(
                                 _ => Some("rate_limited"),
                             }
                         }
-                        Err(_) => Some("denied"),
                         Ok(()) => {
                             if let Some(eid) = conn_eid {
                                 budget_reported.remove(&eid); // recovered: report a future refusal
