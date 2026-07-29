@@ -28,6 +28,22 @@ use mcpmesh_net::registry::ConnRegistry;
 use mcpmesh_net::{ALPN_MCP, ALPN_PING, TrustGate};
 use tokio::time::timeout;
 
+/// Serialize the tests in this binary (#138).
+///
+/// Each one stands up a relay plus two iroh endpoints and then waits on a REAL hole-punch. Run
+/// concurrently — cargo's default within a binary — that is three relays and six endpoints
+/// competing for CPU and sockets at exactly the moment each needs the network, on top of every
+/// other test binary cargo is running in parallel.
+///
+/// Measured: these tests pass in ~2.6s when the binary runs alone and time out at 120s inside a
+/// full `cargo test --workspace` run. Same machine, same commit, minutes apart. Widening the budget
+/// was tried first and did not help — 120s already failed under contention while 2.6s suffices
+/// without it, which is what pointed at contention rather than latency.
+///
+/// This does not remove cross-binary contention; it removes this binary's own threefold
+/// multiplication of it.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn assemble(
     endpoint: iroh::Endpoint,
     store: Arc<PeerStore>,
@@ -144,6 +160,7 @@ async fn live_session_harness() -> (
 /// it initiated) must push a `Reachability` frame when its selected path changes under it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_live_relay_to_direct_transition_pushes_a_frame() {
+    let _serial = SERIAL.lock().await;
     timeout(Duration::from_secs(240), async {
         let dir = tempfile::tempdir().unwrap();
         let (relay_map, relay_url, _relay_guard) = iroh::test_utils::run_relay_server()
@@ -277,6 +294,7 @@ async fn a_live_relay_to_direct_transition_pushes_a_frame() {
 /// fixture and is not pretended to be covered by this one.
 #[tokio::test(flavor = "multi_thread")]
 async fn status_agrees_with_the_frame_the_watcher_just_pushed() {
+    let _serial = SERIAL.lock().await;
     timeout(Duration::from_secs(240), async {
         let (harness, mesh, _peer_mesh, _relay) = live_session_harness().await;
         let mut rx = mesh.reach_bcast_for_test().subscribe();
@@ -318,6 +336,7 @@ async fn status_agrees_with_the_frame_the_watcher_just_pushed() {
 /// passed. Joining the handle is the only thing that tells the two apart.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_watcher_stops_when_its_session_closes() {
+    let _serial = SERIAL.lock().await;
     timeout(Duration::from_secs(240), async {
         let (harness, mesh, _peer_mesh, _relay) = live_session_harness().await;
         let mut rx = mesh.reach_bcast_for_test().subscribe();
