@@ -301,6 +301,65 @@ impl TrustGate for AllowlistGate {
 
 #[cfg(test)]
 mod tests {
+    /// #124: an UNCHANGED `set_last_addr` must abort its transaction, not commit an empty one.
+    ///
+    /// Committing costs a ~6ms fsync AND holds redb's process-global writer lock for it, so on a
+    /// busy mesh every `Selected` event would block pairing, peer add and rename. The earlier
+    /// version committed on both branches while three in-tree comments claimed it skipped — and
+    /// nothing could falsify them: the returned bool is `false` either way, so it proves "no
+    /// insert", not "no write".
+    ///
+    /// A wall-clock assertion is normally a bad idea in this repo (loaded machines have produced
+    /// confident-and-wrong diagnoses twice). It is right here only because the margin is enormous
+    /// — measured ~20ms vs ~5.9s for 1000 iterations, >100x — so the bound below is loose by two
+    /// orders of magnitude and still catches a regression.
+    #[test]
+    fn an_unchanged_set_last_addr_aborts_instead_of_committing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PeerStore::open(&dir.path().join("p.redb")).unwrap();
+        let eid = [5u8; 32];
+        let addr = r#"{"id":"x","addrs":[]}"#;
+        store
+            .add(PeerEntry {
+                endpoint_id: eid,
+                nickname: "bob".into(),
+                services: vec![],
+                paired_at: None,
+                user_id: None,
+                last_addr: Some(addr.to_string()),
+            })
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        for _ in 0..1000 {
+            assert!(
+                !store.set_last_addr(&eid, addr).unwrap(),
+                "an unchanged hint must report no write"
+            );
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "1000 unchanged refreshes took {elapsed:?} — committing an empty txn per call is a \
+             ~6ms fsync holding redb's GLOBAL writer lock, which blocks pairing and peer add on \
+             every path event (#124)"
+        );
+
+        // Still correct after 1000 aborts: the row survives and a real change still writes.
+        assert_eq!(
+            store.resolve(&eid).unwrap().unwrap().last_addr.as_deref(),
+            Some(addr)
+        );
+        assert!(
+            store
+                .set_last_addr(&eid, r#"{"id":"y","addrs":[]}"#)
+                .unwrap()
+        );
+        // An absent peer is never created, and that path aborts too.
+        assert!(!store.set_last_addr(&[7u8; 32], addr).unwrap());
+        assert!(store.resolve(&[7u8; 32]).unwrap().is_none());
+    }
+
     use super::*;
 
     fn entry(eid: [u8; 32], nickname: &str, services: &[&str]) -> PeerEntry {
