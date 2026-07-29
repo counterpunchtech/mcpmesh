@@ -56,6 +56,12 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 /// are on, #123). Writes the outcome into the in-memory
 /// `MeshState::reachability` cache and returns it. Reachable ⇔ a pong arrived within
 /// `PROBE_TIMEOUT`; a gate refusal (no pong) or any dial/IO failure is a clean `reachable:false`.
+///
+/// That equivalence is EXACT as of #128, and was not before: `PROBE_TIMEOUT` used to wrap the
+/// `PATH_SETTLE` classification too, so a relayed peer whose pong arrived at ~2.4s timed out while
+/// we were deciding which route it took, and was reported offline despite answering. The two
+/// questions now get separate deadlines, and a classification failure degrades `path` to
+/// `Unknown` rather than flipping `reachable`.
 pub async fn probe_peer(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> ReachEntry {
     // Ticket FIRST, before any await: ordering is by probe START, not completion.
     let seq = mesh
@@ -68,15 +74,19 @@ pub async fn probe_peer(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> ReachEn
     // unreachable peer reports `Unknown` rather than a stale route (#64 review). Reading it from
     // the endpoint's address map after the fact reported `Direct` for a peer that had just gone
     // away, because iroh leaves those entries Active for up to a minute after the connection dies.
-    let (reachable, meta, services, path, rtt_ms) = match outcome {
-        Ok(Ok((meta, services, path, rtt_ms))) => (true, meta, services, path, Some(rtt_ms)),
-        _ => (
-            false,
-            String::new(),
-            Vec::new(),
-            mcpmesh_local_api::PeerPath::Unknown,
-            None,
-        ),
+    // `reachable` is decided by the EXCHANGE alone (#128). Classifying the path costs up to
+    // `PATH_SETTLE`, and folding that into `PROBE_TIMEOUT` meant a relayed peer whose pong landed
+    // after ~2.4s timed out DURING classification and was reported offline — while it was
+    // answering. A liveness verdict must not depend on how long we choose to spend deciding which
+    // route the answer took; the two questions get separate deadlines.
+    let (reachable, meta, services, conn, rtt_ms) = match outcome {
+        Ok(Ok((meta, services, conn, rtt_ms))) => (true, meta, services, Some(conn), Some(rtt_ms)),
+        _ => (false, String::new(), Vec::new(), None, None),
+    };
+    // Failing to classify degrades `path` to `Unknown` — never `reachable` to false.
+    let path = match conn {
+        Some(conn) => settled_path(&conn).await,
+        None => mcpmesh_local_api::PeerPath::Unknown,
     };
     let entry = ReachEntry {
         reachable,
@@ -311,7 +321,7 @@ async fn probe_once(
     mesh: &Arc<MeshState>,
     endpoint_id: [u8; 32],
     started: tokio::time::Instant,
-) -> Result<(String, Vec<String>, mcpmesh_local_api::PeerPath, u64)> {
+) -> Result<(String, Vec<String>, iroh::endpoint::Connection, u64)> {
     let id = iroh::EndpointId::from_bytes(&endpoint_id)
         .map_err(|e| anyhow::anyhow!("invalid endpoint id: {e}"))?;
     // Attach the pairing-persisted `last_addr` hint, exactly as `dial::dial_service` does
@@ -354,30 +364,20 @@ async fn probe_once(
         // on any relay-enabled node — i.e. every real deployment — which is the opposite of the
         // truthful-locality-claim this field exists to support.
         Some(Inbound::Frame(v)) => {
-            // Stamp the RTT HERE, at the pong — BEFORE `settled_path` spends up to `PATH_SETTLE`
-            // deciding which path we are on (#123). Measuring after it meant a relayed peer could
-            // never report under 600ms, because most of the number was our own deliberate wait.
-            // An embedder read ~820ms on two machines one LAN hop apart and filed it as a 66x
-            // fleet latency degradation; ~73% of that figure was this window. `rtt_ms` now means
-            // what its name says: dial + round trip.
-            let (rtt_ms, path) = stamp_then_settle(started, settled_path(&conn)).await;
-            Ok((pong_meta(&v), pong_services(&v), path, rtt_ms))
+            // Stamp the RTT HERE, at the pong — before any classification work (#123). Measuring
+            // afterwards meant a relayed peer could never report under 600ms, because most of the
+            // number was our own deliberate wait. An embedder read ~820ms on two machines one LAN
+            // hop apart and filed it as a 66x fleet latency degradation; ~73% of that figure was
+            // the settle window. `rtt_ms` means what its name says: dial + round trip.
+            //
+            // The CONNECTION is returned rather than a classified path (#128): classifying it
+            // spends up to `PATH_SETTLE`, and that must happen OUTSIDE `PROBE_TIMEOUT` — see
+            // `probe_peer`.
+            let rtt_ms = started.elapsed().as_millis() as u64;
+            Ok((pong_meta(&v), pong_services(&v), conn, rtt_ms))
         }
         _ => anyhow::bail!("no pong from peer"),
     }
-}
-
-/// Stamp the RTT, THEN wait for the path to settle — in that order (#123).
-///
-/// A seam, not decoration: it is the only way to pin the ORDER without a live connection whose
-/// pong and hole-punch can be separated. Inlining these two lines at the call site restores the
-/// #123 bug with the whole suite green, which is exactly what happened before this existed.
-pub(crate) async fn stamp_then_settle(
-    started: tokio::time::Instant,
-    settle: impl std::future::Future<Output = mcpmesh_local_api::PeerPath>,
-) -> (u64, mcpmesh_local_api::PeerPath) {
-    let rtt_ms = started.elapsed().as_millis() as u64;
-    (rtt_ms, settle.await)
 }
 
 /// Extract the optional app metadata from a pong frame, applying the receive cap (#40): a
@@ -514,34 +514,40 @@ mod tests {
         }
     }
 
-    /// #123: the RTT is stamped at the PONG, BEFORE the settle window — pinned on the ORDER, on
-    /// tokio's paused clock, so it is deterministic and instant.
+    /// #128: the liveness verdict and the path classification have SEPARATE deadlines.
     ///
-    /// The first attempt at this test exercised `settle` in isolation and was a PROXY: moving the
-    /// stamp back after `settled_path` restored the bug with the whole suite green. The adversarial
-    /// review found the cheap pin I had claimed did not exist — `tokio::time::Instant` follows the
-    /// test clock while still measuring wall time in an unpaused runtime, so the seam can be driven
-    /// with no live connection and no wall-clock assertion.
+    /// `PROBE_TIMEOUT` used to wrap the settle window, so a relayed peer whose pong landed after
+    /// ~2.4s timed out DURING classification and was reported offline while it was answering —
+    /// wrong in the dangerous direction for a field that drives online/offline UI and
+    /// queue-flush-on-return.
+    ///
+    /// Pinned on the budgets rather than on wall-clock: a pong arriving inside `PROBE_TIMEOUT`
+    /// must survive, whatever the classification then costs.
     #[tokio::test(start_paused = true)]
-    async fn the_rtt_is_stamped_before_the_settle_window() {
+    async fn a_slow_pong_inside_the_budget_survives_the_settle_window() {
         use mcpmesh_local_api::PeerPath;
         use std::time::Duration;
 
-        let started = tokio::time::Instant::now();
-        tokio::time::sleep(Duration::from_millis(40)).await; // the pong arrives
-
-        // A genuinely relayed peer: no direct path ever appears, so the window runs in full.
-        let (rtt_ms, path) = super::stamp_then_settle(started, async {
-            tokio::time::sleep(super::PATH_SETTLE).await;
-            PeerPath::Relay { url: None }
+        // A pong landing late but INSIDE the exchange budget.
+        let late = super::PROBE_TIMEOUT - Duration::from_millis(200);
+        let exchange = tokio::time::timeout(super::PROBE_TIMEOUT, async {
+            tokio::time::sleep(late).await;
+            "pong"
         })
         .await;
+        assert!(
+            exchange.is_ok(),
+            "a pong inside PROBE_TIMEOUT must not time out — it is the reachability evidence"
+        );
 
+        // Classification then runs on its OWN budget. Under the old nesting this addition blew
+        // the deadline and flipped `reachable` to false; now it cannot, because the exchange has
+        // already returned its verdict.
+        let path = super::settle(super::PATH_SETTLE, || PeerPath::Relay { url: None }).await;
         assert_eq!(path, PeerPath::Relay { url: None });
-        assert_eq!(
-            rtt_ms, 40,
-            "the RTT must be time to the PONG, not pong + PATH_SETTLE — a relayed peer has to be \
-             able to report under 600ms, which is the whole of #123"
+        assert!(
+            late + super::PATH_SETTLE > super::PROBE_TIMEOUT,
+            "the fixture must actually exceed the old combined budget, or it proves nothing"
         );
     }
 
