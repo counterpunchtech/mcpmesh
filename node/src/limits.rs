@@ -375,7 +375,16 @@ mod tests {
             admitted <= 60,
             "a flooding peer is bounded at the per-minute rate: {admitted}"
         );
-        assert!(admitted > 0, "and a normal probe rate is admitted");
+        // LOWER bound too, not just upper. `admitted > 0` is satisfied by a cap of ONE, because
+        // `per_minute` floors capacity at `burst.max(1)` — so mutating PING_PER_MIN to 1 left this
+        // whole suite green while making every paired peer report offline within REACH_TTL_SECS.
+        // An honest peer probes on a 20s TTL (~3/min) and a client polling `status` at 1/s adds
+        // ~3/min more; the cap has to leave real headroom above that, not merely be non-zero.
+        assert!(
+            admitted >= 30,
+            "the cap must leave headroom for honest probing, not just be non-zero: {admitted} \
+             admitted from a 60/min bucket — a cap this low reports healthy peers as offline"
+        );
 
         // A DIFFERENT peer is unaffected — one noisy peer must not starve liveness for others.
         assert!(

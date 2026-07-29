@@ -852,14 +852,16 @@ pub(crate) async fn redeem(state: &DaemonState, invite_line: String) -> Result<P
 
 /// Handle a `peer_services` control request (#52): resolve `peer` to its endpoint, probe it
 /// over `mcpmesh/ping/1`, and return the services its pong reports the caller is admitted to.
-/// Authoritative + current (a fresh probe), only the caller's own admitted services.
+/// Only the caller's own admitted services. Reuses a cache entry younger than `REACH_TTL_SECS`
+/// rather than always probing (#89) — see `probe_peer_cached` for why an unconditional probe made
+/// this verb collide with the ping rate limiter and report healthy peers as offline.
 pub(crate) async fn peer_services(
     state: &DaemonState,
     peer: String,
 ) -> Result<mcpmesh_local_api::PeerServicesResult> {
     let mesh = state.mesh_required()?;
     let endpoint_id = resolve_peer_endpoint(mesh, &peer).await?;
-    let entry = crate::daemon::probe_peer(mesh, endpoint_id).await;
+    let entry = crate::daemon::reach::probe_peer_cached(mesh, endpoint_id).await;
     anyhow::ensure!(
         entry.reachable,
         "peer '{peer}' is unreachable — cannot fetch its shared services"

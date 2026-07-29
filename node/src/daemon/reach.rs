@@ -493,6 +493,34 @@ pub(crate) fn caller_admitted_services(
     out
 }
 
+/// Probe `endpoint_id` only if the cache has nothing fresher than [`REACH_TTL_SECS`] (#89).
+///
+/// `probe_peer` is unconditional, which made `peer_services` the one caller with no TTL: a client
+/// polling it faster than the ping limiter's sustained refill would be REFUSED, and a refusal is
+/// reported as `reachable: false` and written to the cache. That turns a rate limit into a fresh
+/// false "peer is offline" for the next [`REACH_TTL_SECS`] — a healthy, paired peer reported down,
+/// which is worse than the flood the limiter exists to stop. Reusing a fresh entry keeps the verb
+/// off the limiter entirely under any realistic poll rate, so the two cannot fight.
+///
+/// This trades the docstring's "a fresh probe" for "no staler than `status` would report", which is
+/// the same freshness contract every other consumer of this cache already gets.
+pub(crate) async fn probe_peer_cached(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> ReachEntry {
+    let fresh = {
+        let cache = mesh
+            .reachability
+            .lock()
+            .expect("reachability lock not poisoned");
+        cache.get(&endpoint_id).and_then(|e| {
+            let age = (epoch_now_i64() - e.probed_at).max(0);
+            (age <= REACH_TTL_SECS).then(|| e.clone())
+        })
+    };
+    match fresh {
+        Some(e) => e,
+        None => probe_peer(mesh, endpoint_id).await,
+    }
+}
+
 pub fn reachability_of(mesh: &Arc<MeshState>) -> Vec<mcpmesh_local_api::PeerReachability> {
     let now = epoch_now_i64();
     // (nickname, endpoint_id) for every paired peer — reuse the allowlist store's peer scan
