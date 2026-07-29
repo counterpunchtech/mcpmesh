@@ -1129,7 +1129,31 @@ pub const API_VERSION: &str = "1.24";
 /// (#60); to 15 with the `blob_revoke` / `blob_unpublish` verbs — per-scope withdrawal of a grant
 /// and of a published hash, so un-sharing a file no longer requires unpairing the person (#62); to
 /// 16 when the app-blob provider became available in PAIRING mode — the blob verbs previously
-/// errored on any daemon without an org root key, though their scope gate never needed one (#61).
+/// errored on any daemon without an org root key, though their scope gate never needed one (#61);
+/// to 17 when `status`/`peer_services` began reporting `services[].allow` from the LIVE registry
+/// rather than config + overlay, so a grant the accept path would refuse is no longer advertised —
+/// no wire shape changed, only the source of truth, which is exactly the class of change a
+/// downstream cannot see in a type diff (#100); to 18 with `blob_republish`, so a fetched blob can
+/// be re-served and every recipient becomes a source (#83); to 19 with durable blob revocation — an
+/// unpublish now survives a later republish via a per-scope withdrawal set, and
+/// [`ERR_BLOB_WITHDRAWN`] distinguishes "deliberately withdrawn" from "never had it" (#107); to 20
+/// with `blob_list` filters + paging AND a DEFAULT limit of 256 scopes — a daemon with more scopes
+/// than that previously answered with everything or killed the connection, so this is a behaviour
+/// change for existing callers, detectable via the new `total`/`truncated` (#84b); to 21 when a
+/// PATH change became a reachability transition — [`StreamFrame::Reachability`] stopped being an
+/// up/down toggle and same-verdict frames became possible (#92); to 22 with a SECOND producer for
+/// that frame: a live per-session watcher that pushes when a session's selected path changes,
+/// rather than waiting for a probe, at a cadence probes never had (#92); to 23 when
+/// [`PeerReachability::rtt_ms`] stopped including the path-settle window — a relayed peer could
+/// previously never report under 600ms, so "relayed AND fast" was unreachable by construction
+/// (#123); to 24 when `reachable` stopped sharing a deadline with path classification — a relayed
+/// peer whose pong arrived after ~2.4s was reported OFFLINE while it was answering (#128).
+///
+/// **Not every semantic change gets a minor, and that is the gap to watch (#122).** A minor marks a
+/// change to this *surface*. A change to behaviour BEHIND the surface — same fields, same shapes,
+/// different meaning — may not bump it, and is invisible to a type diff. 17 and 24 above happen to
+/// be that class and did bump; do not infer from them that every such change will. When bumping
+/// several minors at once, read this block end to end AND the release notes, not the diff.
 pub const API_MINOR: u32 = 24;
 
 #[cfg(test)]
