@@ -477,3 +477,73 @@ async fn probe_surfaces_the_services_the_peer_grants_the_caller() {
     .await
     .expect("peer-services probe test timed out");
 }
+
+/// #89: the ping accept arm METERS probes per endpoint — pinned at the ARM, not the limiter.
+///
+/// The limiter's own unit test proves the bucket meters per endpoint; it does not prove the accept
+/// arm consults it. Removing the call from the arm passed the entire suite, which is the seventh
+/// time this session a test pinned a helper rather than its call site. This drives real probes
+/// through `spawn_accept_loop` and asserts a flooding PAIRED peer is eventually refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_ping_arm_refuses_a_paired_peer_that_floods_probes() {
+    timeout(Duration::from_secs(120), async {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(&config, "").unwrap();
+
+        let a_ep = target_endpoint().await;
+        let a_id = *a_ep.id().as_bytes();
+        let a_addr = a_ep.addr();
+        let a_store = Arc::new(PeerStore::open(&dir.path().join("fa.redb")).unwrap());
+
+        let b_ep = dialer_endpoint().await;
+        let b_id = *b_ep.id().as_bytes();
+        seed_lookup(&b_ep, a_addr.clone());
+        let b_store = Arc::new(PeerStore::open(&dir.path().join("fb.redb")).unwrap());
+
+        // A trusts B, so every refusal below is the LIMITER, never the gate.
+        seed_peer(&a_store, b_id, "b");
+        seed_peer(&b_store, a_id, "a");
+
+        let a_mesh = assemble_mesh(a_ep, a_store, config.clone());
+        // MUST set limits explicitly: `MeshState::limits()` falls back to `unlimited()` on a
+        // OnceCell miss, so without this the accept arm consults an unlimited bucket and this test
+        // cannot distinguish a working limiter from an absent one. That fail-open accessor is worth
+        // fixing in its own right (flagged in #84a's review) — a security control defaulting to
+        // "no limits" on a wiring mistake.
+        a_mesh.set_limits(mcpmesh::limits::MeshLimiters::from_config(
+            &mcpmesh::config::LimitsCfg::default(),
+        ));
+        let b_mesh = assemble_mesh(b_ep, b_store, config.clone());
+        let _accept = spawn_accept_loop(
+            a_mesh.clone(),
+            Arc::new(build_services(&Config::from_toml_str("").unwrap())),
+        );
+
+        // Probe well past the per-minute cap. A refused probe is closed with no pong, which the
+        // prober reports as unreachable — so "some probe came back unreachable" IS the metering.
+        let mut reachable = 0usize;
+        let mut refused = 0usize;
+        for _ in 0..90 {
+            if probe_peer(&b_mesh, a_id).await.reachable {
+                reachable += 1;
+            } else {
+                refused += 1;
+            }
+        }
+
+        assert!(
+            reachable > 0,
+            "an honest probe rate must still be answered — a limiter that refuses everything is \
+             worse than none, since a refusal reads as 'peer offline'"
+        );
+        assert!(
+            refused > 0,
+            "a paired peer flooding past the cap must eventually be REFUSED (#89). Without the \
+             limiter in the accept arm every one of 90 probes is answered, which is the unmetered \
+             pong-flood this issue reports. reachable={reachable} refused={refused}"
+        );
+    })
+    .await
+    .expect("ping flood test timed out");
+}
