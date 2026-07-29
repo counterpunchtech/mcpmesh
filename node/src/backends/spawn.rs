@@ -194,7 +194,7 @@ impl SpawnBackend {
             self.service.clone(),
             // #73: the STABLE device principal, so a live-session row is keyed on something
             // that cannot collide. `peer` above is a display name and two devices can share it.
-            identity.as_ref().map(|id| id.endpoint.principal()),
+            super::session_principal(identity.as_ref()),
         );
         let auditor = RequestAuditor::new(self.audit.clone(), peer.clone(), self.service.clone());
 

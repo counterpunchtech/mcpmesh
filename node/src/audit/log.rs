@@ -400,9 +400,10 @@ impl RequestAuditor {
 mod tests {
     /// #73: a live-session row carries the STABLE principal, not just a display nickname.
     ///
-    /// Two devices under one nickname were indistinguishable in `status.active_sessions`, so
+    /// Two devices under one nickname were indistinguishable in the subscribe snapshot's
+    /// `active_sessions`, so
     /// per-peer session counts and any UI that acts on a session (revoke, disconnect, inspect)
-    /// were keyed on a collidable string. Same argument as #41/#42/#57.
+    /// were keyed on a collidable string. Same argument as #41/#42.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_live_session_is_keyed_on_the_principal_not_the_nickname() {
         let dir = tempfile::tempdir().unwrap();

@@ -1002,8 +1002,15 @@ pub struct ActiveSession {
     /// service right now", per-peer session counts, and any UI that lets a user act on a live
     /// session (revoke, disconnect, inspect) were all keyed on a collidable string.
     ///
-    /// Same argument and same shape as [`PeerInfo`] (#41), [`PeerReachability`] (#42) and
-    /// [`AuditRecord`] (#57). Nicknames NEVER authorize; this is the value to key on.
+    /// Same argument and same shape as [`PeerInfo`] (#41) and [`PeerReachability`] (#42).
+    /// Nicknames NEVER authorize; this is the value to key on.
+    ///
+    /// **Snapshot only, for now.** `ActiveSession` appears in [`StreamFrame::Snapshot`] — there is
+    /// no `active_sessions` on `StatusResult`. A client that keeps its view current by applying
+    /// subsequent `session_open`/`session_close` events still has a collision problem: those are
+    /// [`AuditRecord`]s and carry no principal (#57, unmerged). So the snapshot distinguishes two
+    /// same-nickname devices and the next `session_close` for that nickname does not say which row
+    /// to drop. Re-subscribe for an authoritative view until #57 lands.
     ///
     /// Always present for a real row — `Option` only so an older client round-trips. Additive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1363,6 +1370,32 @@ mod tests {
         let back: PeerInfo = serde_json::from_value(serde_json::to_value(&full).unwrap()).unwrap();
         assert_eq!(back.user_id.as_deref(), Some("b64u:BOB"));
         assert_eq!(back.principal.as_deref(), Some("eid:0707"));
+    }
+
+    #[test]
+    fn active_session_principal_is_additive() {
+        // An OLD payload (no `principal`) must still deserialize — #73 is additive.
+        let old: ActiveSession =
+            serde_json::from_str(r#"{"peer":"bob","service":"notes","opened_at":7}"#).unwrap();
+        assert_eq!(old.principal, None, "serde(default) supplies it");
+
+        // And a `None` must not serialize, so an old client sees the shape it expects.
+        let json = serde_json::to_string(&old).unwrap();
+        assert!(
+            !json.contains("principal"),
+            "skip_serializing_if must omit it: {json}"
+        );
+
+        // A real row round-trips the principal.
+        let new = ActiveSession {
+            peer: "bob".into(),
+            service: "notes".into(),
+            opened_at: 7,
+            principal: Some("eid:1f0a".into()),
+        };
+        let back: ActiveSession =
+            serde_json::from_str(&serde_json::to_string(&new).unwrap()).unwrap();
+        assert_eq!(back.principal.as_deref(), Some("eid:1f0a"));
     }
 
     #[test]
