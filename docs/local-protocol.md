@@ -7,7 +7,7 @@ named pipe on Windows. Anything that can open the endpoint and parse JSON can sp
 language — [`local-api/examples/status.py`](../local-api/examples/status.py) is a complete client
 in ~60 lines of dependency-free Python.
 
-> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.24`, `api_minor` `24`) and evolves
+> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.25`, `api_minor` `25`) and evolves
 > **additively** (see [Versioning](#versioning)), but until a stable release this document — like the
 > wire format itself — may change without a migration path. Pin the mcpmesh version you build
 > against. Source of truth is the Rust in [`local-api/`](../local-api/src/protocol.rs); where this
@@ -499,14 +499,24 @@ immediately without replaying history. It carries the currently-open sessions an
 ```json
 {
   "type": "snapshot",
-  "active_sessions": [{"peer": "bob", "service": "notes", "opened_at": 1751760000}],
+  "active_sessions": [{"peer": "bob", "service": "notes", "opened_at": 1751760000, "principal": "eid:1f0a…"}],
   "reachability": [{"name": "bob", "reachable": true, "rtt_ms": 42, "age_secs": 3}]
 }
 ```
 
 Each `active_sessions` entry is one live session: the caller's nickname/`user_id` (`peer`), the
-mounted `service`, and `opened_at` (epoch seconds). This list is the starting state — a client keeps
-its session view current by applying subsequent `session_open`/`session_close` events to it. Only a
+mounted `service`, `opened_at` (epoch seconds), and — from `api_minor` **25** — `principal`, the
+caller's stable `eid:<hex>` device principal (#73).
+
+**Key on `principal`, not `peer`.** Two devices under one nickname, or two contacts sharing a
+display name, produce identical `peer` values, so per-peer session counts and any UI that acts on a
+session (revoke, disconnect, inspect) need the principal. Nicknames never authorize.
+
+This list is the starting state — a client keeps its session view current by applying subsequent
+`session_open`/`session_close` events to it. **Those events carry no principal** (they are
+`AuditRecord`s; #57 is not yet merged), so the delta path cannot distinguish two same-nickname
+sessions even though the snapshot can. Until #57 lands, re-subscribe when that ambiguity matters
+rather than resolving it from the event stream. Only a
 `session_open` **without** an error status opens a real session: a `session_open` carrying
 `status: "error"` is a terminal *attempted-and-failed* marker (a failed dial — see below)
 that never pairs with a `session_close`, so a client must **not** add it to the active view — doing so

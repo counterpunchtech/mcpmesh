@@ -186,6 +186,18 @@ where
     Ok(())
 }
 
+/// The STABLE device principal for a live-session row (#73).
+///
+/// Shared by both backends so they cannot diverge: `ActiveSession.principal` exists precisely
+/// because `peer` is a display nickname and collides, and a backend quietly passing the nickname —
+/// or `None` — reintroduces the bug in half the wiring. One definition, one place to get wrong.
+///
+/// `None` only on the no-identity path, which production never takes (`net` always passes
+/// `Some(identity)`).
+pub(crate) fn session_principal(identity: Option<&mcpmesh_net::PeerIdentity>) -> Option<String> {
+    identity.map(|id| id.endpoint.principal())
+}
+
 #[cfg(test)]
 mod tests {
     //! Pins the pump's TEARDOWN DISCIPLINE (issue #25): transport EOF ends only the

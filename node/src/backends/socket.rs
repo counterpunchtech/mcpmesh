@@ -128,9 +128,13 @@ impl SocketBackend {
         // Session lifecycle via the RAII guard: it emits `session_open` now and, on drop (every exit
         // path — EOF, error, panic), emits `session_close` and removes the live-table row. Held for
         // the whole session scope, so it MUST outlive the pump below.
-        let _session = self
-            .audit
-            .session(peer.clone().unwrap_or_default(), self.service.clone());
+        let _session = self.audit.session(
+            peer.clone().unwrap_or_default(),
+            self.service.clone(),
+            // #73: the STABLE device principal, so a live-session row is keyed on something
+            // that cannot collide. `peer` above is a display name and two devices can share it.
+            super::session_principal(identity.as_ref()),
+        );
         // The per-request-line auditor: hashes each caller request's args and correlates
         // the response. Threaded into the shared pump.
         let auditor = RequestAuditor::new(self.audit.clone(), peer.clone(), self.service.clone());
@@ -798,7 +802,7 @@ mod tests {
                 limiter: crate::limits::RateLimiter::unlimited_shared(),
             };
             let identity = Some(PeerIdentity {
-                endpoint: [0u8; 32].into(),
+                endpoint: [7u8; 32].into(),
                 name: "bob".into(),
                 user_id: None,
                 groups: vec![],
@@ -829,6 +833,19 @@ mod tests {
             assert_eq!(live.len(), 1, "one live session while open");
             assert_eq!(live[0].peer, "bob");
             assert_eq!(live[0].service, "notes");
+            // #73: the row must carry the STABLE device principal, not just the nickname. Pinned
+            // HERE, at the backend, because asserting it on a hand-built AuditSink::session call
+            // proves the struct carries what you hand it — not that the backend hands it the right
+            // thing. Passing `identity.name` here instead reintroduces #73 exactly.
+            assert_eq!(
+                live[0].principal.as_deref(),
+                Some(
+                    mcpmesh_net::EndpointId::from_bytes([7u8; 32])
+                        .principal()
+                        .as_str()
+                ),
+                "the live row must be keyed on eid:<hex>, not the collidable nickname (#73)"
+            );
 
             // Drive one tools/call so the stub's exchange completes cleanly before teardown.
             client

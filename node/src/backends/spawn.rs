@@ -189,9 +189,13 @@ impl SpawnBackend {
         // Session lifecycle via the RAII guard: it emits `session_open` now and, on drop (every exit
         // path — EOF, error, panic), emits `session_close` and removes the live-table row. Held for
         // the whole session scope, so it MUST outlive the pump below.
-        let _session = self
-            .audit
-            .session(peer.clone().unwrap_or_default(), self.service.clone());
+        let _session = self.audit.session(
+            peer.clone().unwrap_or_default(),
+            self.service.clone(),
+            // #73: the STABLE device principal, so a live-session row is keyed on something
+            // that cannot collide. `peer` above is a display name and two devices can share it.
+            super::session_principal(identity.as_ref()),
+        );
         let auditor = RequestAuditor::new(self.audit.clone(), peer.clone(), self.service.clone());
 
         // Pump the two directions concurrently until either side EOFs/closes (shared
