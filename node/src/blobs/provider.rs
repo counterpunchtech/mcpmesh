@@ -503,22 +503,6 @@ impl AppBlobs {
     }
 }
 
-/// The app-blob byte-budget decision for one chunk (#84a).
-///
-/// Pure, so the two rules that matter are testable without a live transfer; the async arm is a
-/// thin shell over it.
-///
-/// `endpoint` is the connection's authenticated endpoint from the loop-local map, or `None` when
-/// the connection has no `ClientConnected` record.
-/// Is there budget to ADMIT a new GET request (#84a review)?
-///
-/// Separate from [`throttle_decision`] because the per-chunk hook is not sufficient on its own:
-/// iroh-blobs writes the chunk BEFORE the hook runs, and a refusal resets only the stream, so a
-/// peer that ignores the abort collects one free chunk per request forever. This is the gate that
-/// runs before any bytes.
-///
-/// Reserves [`IROH_CHUNK_BYTES`] rather than peeking: a zero-cost check always passes, and
-/// reserving makes an opened-but-undrained request cost the peer something.
 /// The full GET-admission decision: authz first, then budget (#84a review).
 ///
 /// Exists because pinning `request_budget_ok` alone left the CRITICAL fix unpinned — deleting the
@@ -545,6 +529,19 @@ fn get_admission(
     Ok(())
 }
 
+/// Is there budget to ADMIT a new GET request (#84a review)?
+///
+/// Separate from [`throttle_decision`] because the per-chunk hook is not sufficient on its own:
+/// iroh-blobs writes the chunk BEFORE the hook runs, and a refusal resets only the stream, so a
+/// peer that ignores the abort collects one free chunk per request forever. This is the gate that
+/// runs before any bytes.
+///
+/// Reserves [`IROH_CHUNK_BYTES`] rather than peeking: a zero-cost check always passes, and
+/// reserving makes an opened-but-undrained request cost the peer something. The side effect worth
+/// knowing: the budget therefore also caps GETs at about `blob_bytes_per_min / 16384` per minute
+/// REGARDLESS of blob size — a 4 MiB/min budget is ~256 fetches/min even for 100-byte blobs.
+///
+/// **Fails CLOSED** on `None` (no `ClientConnected` record), matching [`throttle_decision`].
 fn request_budget_ok(
     endpoint: Option<&mcpmesh_net::EndpointId>,
     limits: &crate::limits::MeshLimiters,
@@ -683,22 +680,29 @@ fn spawn_gate_loop(
                     // double-charge.
                     let decision =
                         get_admission(allow, conns.get(&msg.connection_id), limits.as_ref());
-                    let budget_ok = !matches!(decision, Err(AbortReason::RateLimited));
                     // #84a: a refusal is REPORTED, not silent — the issue's complaint was that
                     // mcpmesh "neither refuses it nor reports it happened". But only the FIRST per
                     // endpoint until it succeeds again: see `budget_reported`.
                     let conn_eid = conns.get(&msg.connection_id).copied();
-                    let status = match (allow, budget_ok) {
-                        (false, _) => Some("denied"),
-                        (true, false) => {
+                    // Derived from the DECISION, not by excluding one variant. The first version
+                    // computed `budget_ok = !matches!(decision, Err(RateLimited))`, so a GET
+                    // refused with `Permission` — an unattributable connection — was audited as a
+                    // successful fetch. The wire answer was right; the audit trail lied, which is
+                    // the surface an operator investigates with (#84a third review).
+                    let status = match &decision {
+                        Err(AbortReason::Permission) => Some("denied"),
+                        Err(AbortReason::RateLimited) => {
                             // Distinct from "denied" so an operator can tell a bandwidth event
-                            // from an authz failure.
+                            // from an authz failure. Reported ONCE per endpoint until it succeeds:
+                            // a refusal is cheap, so recording every one trades an uplink DoS for
+                            // an audit-log DoS.
                             match conn_eid {
                                 Some(eid) if !budget_reported.insert(eid) => None, // already told
                                 _ => Some("rate_limited"),
                             }
                         }
-                        (true, true) => {
+                        Err(_) => Some("denied"),
+                        Ok(()) => {
                             if let Some(eid) = conn_eid {
                                 budget_reported.remove(&eid); // recovered: report a future refusal
                             }
