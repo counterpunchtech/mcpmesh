@@ -498,25 +498,9 @@ impl AppBlobs {
     }
 }
 
-/// The request-time scope Intercept drain loop (the security core). Single-consumer: this
-/// task owns `rx`, so the `connection_id → endpoint_id` map is loop-local with NO lock
-/// — FIFO delivery guarantees `ClientConnected(conn)` precedes any
-/// `GetRequestReceived(conn)` on that connection. SECURITY-CRITICAL:
-///  - `ClientConnected`: record the AUTHENTICATED `endpoint_id` (QUIC/TLS) → reply `Ok(())` to admit
-///    (the accept-time gate already vetted the endpoint; the GET hook is the per-hash boundary). A
-///    missing endpoint id (never on an authenticated conn) is denied defensively.
-///  - `GetRequestReceived`: resolve the endpoint via the trust gate to its identity and ALLOW iff a
-///    scope contains the hash AND grants one of the caller's principals — `groups ∪ {eid} ∪
-///    {user_id}`, the shared `principal_set` (nicknames excluded, #38) — else `Permission`,
-///    BEFORE any bytes (the Intercept path blocks the transfer on the provider's `rx.await??`).
-///  - get_many/observe/push (all routed through `mask.get`): DENY
-///    explicitly — deny-by-default, the store is not a general filesystem surface. Belt-and-suspenders
-///    with `APP_BLOB_EVENT_MASK`, which ALSO pins these types (get_many/push = `Disabled`, observe =
-///    `Intercept`): if a future iroh-blobs delivers them as events instead of refusing at the mask,
-///    they are still denied here.
-/// Should this chunk be sent (#84a)?
+/// The app-blob byte-budget decision for one chunk (#84a).
 ///
-/// Pure, so the two rules that matter are testable without a live transfer — the async arm is a
+/// Pure, so the two rules that matter are testable without a live transfer; the async arm is a
 /// thin shell over it.
 ///
 /// `endpoint` is the connection's authenticated endpoint from the loop-local map, or `None` when
@@ -541,6 +525,22 @@ fn throttle_decision(
     }
 }
 
+/// The request-time scope Intercept drain loop (the security core). Single-consumer: this
+/// task owns `rx`, so the `connection_id → endpoint_id` map is loop-local with NO lock
+/// — FIFO delivery guarantees `ClientConnected(conn)` precedes any
+/// `GetRequestReceived(conn)` on that connection. SECURITY-CRITICAL:
+///  - `ClientConnected`: record the AUTHENTICATED `endpoint_id` (QUIC/TLS) → reply `Ok(())` to admit
+///    (the accept-time gate already vetted the endpoint; the GET hook is the per-hash boundary). A
+///    missing endpoint id (never on an authenticated conn) is denied defensively.
+///  - `GetRequestReceived`: resolve the endpoint via the trust gate to its identity and ALLOW iff a
+///    scope contains the hash AND grants one of the caller's principals — `groups ∪ {eid} ∪
+///    {user_id}`, the shared `principal_set` (nicknames excluded, #38) — else `Permission`,
+///    BEFORE any bytes (the Intercept path blocks the transfer on the provider's `rx.await??`).
+///  - get_many/observe/push (all routed through `mask.get`): DENY
+///    explicitly — deny-by-default, the store is not a general filesystem surface. Belt-and-suspenders
+///    with `APP_BLOB_EVENT_MASK`, which ALSO pins these types (get_many/push = `Disabled`, observe =
+///    `Intercept`): if a future iroh-blobs delivers them as events instead of refusing at the mask,
+///    they are still denied here.
 fn spawn_gate_loop(
     mut rx: tokio::sync::mpsc::Receiver<ProviderMessage>,
     gate: Arc<dyn TrustGate>,
