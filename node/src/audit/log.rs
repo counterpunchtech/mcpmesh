@@ -136,7 +136,7 @@ impl AuditLog {
     /// Emit `session_open`, insert the session into the live table, and return its id (the RAII
     /// [`SessionGuard`] holds it to remove exactly this row on drop). The lock is released before
     /// return and never held across an `.await`.
-    fn open_tracked(&self, peer: String, service: String) -> u64 {
+    fn open_tracked(&self, peer: String, service: String, principal: Option<String>) -> u64 {
         let id = self.seq.fetch_add(1, Ordering::Relaxed);
         self.record(AuditRecord::session_open(
             now_ts(),
@@ -149,6 +149,7 @@ impl AuditLog {
                 peer,
                 service,
                 opened_at: crate::util::epoch_now_i64(),
+                principal,
             },
         );
         id
@@ -196,10 +197,15 @@ impl AuditSink {
     /// Begin a tracked session: emits `session_open` and tracks it in the live table. Drop the
     /// returned [`SessionGuard`] to close it (emits `session_close` + table removal). A disabled sink
     /// returns a no-op guard that does nothing on drop.
-    pub fn session(&self, peer: String, service: String) -> SessionGuard {
+    pub fn session(
+        &self,
+        peer: String,
+        service: String,
+        principal: Option<String>,
+    ) -> SessionGuard {
         match &self.0 {
             Some(log) => SessionGuard {
-                id: log.open_tracked(peer, service),
+                id: log.open_tracked(peer, service, principal),
                 log: Some(log.clone()),
             },
             None => SessionGuard { log: None, id: 0 },
@@ -392,6 +398,38 @@ impl RequestAuditor {
 
 #[cfg(test)]
 mod tests {
+    /// #73: a live-session row carries the STABLE principal, not just a display nickname.
+    ///
+    /// Two devices under one nickname were indistinguishable in `status.active_sessions`, so
+    /// per-peer session counts and any UI that acts on a session (revoke, disconnect, inspect)
+    /// were keyed on a collidable string. Same argument as #41/#42/#57.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_live_session_is_keyed_on_the_principal_not_the_nickname() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = AuditSink::new(AuditLog::spawn(dir.path().to_path_buf()));
+        // TWO devices sharing one display nickname — the collision the issue is about.
+        let a = "eid:aa".to_string();
+        let b = "eid:bb".to_string();
+        let _s1 = sink.session("laptop".into(), "notes".into(), Some(a.clone()));
+        let _s2 = sink.session("laptop".into(), "notes".into(), Some(b.clone()));
+
+        let live = sink.active_sessions();
+        assert_eq!(live.len(), 2, "two sessions");
+        assert_eq!(
+            live[0].peer, live[1].peer,
+            "the fixture must actually collide on the nickname, or this proves nothing"
+        );
+
+        let mut principals: Vec<_> = live.iter().filter_map(|s| s.principal.clone()).collect();
+        principals.sort();
+        assert_eq!(
+            principals,
+            vec![a, b],
+            "each session must carry its own device principal — without it the two rows are \
+             indistinguishable and a caller cannot act on one of them (#73)"
+        );
+    }
+
     use super::*;
     use crate::audit::record::{AuditRecord, args_hash};
     use serde_json::json;
@@ -596,7 +634,7 @@ mod tests {
         let sink = AuditSink::new(AuditLog::spawn(dir.path().to_path_buf()));
         assert!(sink.active_sessions().is_empty());
         {
-            let _s = sink.session("bob".into(), "notes".into());
+            let _s = sink.session("bob".into(), "notes".into(), Some("eid:bob".into()));
             let live = sink.active_sessions();
             assert_eq!(live.len(), 1);
             assert_eq!(live[0].peer, "bob");
@@ -612,8 +650,8 @@ mod tests {
         // leaving concurrent (overlapping-lifetime) sessions untouched.
         let dir = tempfile::tempdir().unwrap();
         let sink = AuditSink::new(AuditLog::spawn(dir.path().to_path_buf()));
-        let a = sink.session("alice".into(), "notes".into());
-        let b = sink.session("bob".into(), "notes".into());
+        let a = sink.session("alice".into(), "notes".into(), None);
+        let b = sink.session("bob".into(), "notes".into(), None);
         assert_eq!(sink.active_sessions().len(), 2);
         // Drop A → only B survives.
         drop(a);
@@ -628,7 +666,7 @@ mod tests {
     #[test]
     fn disabled_sink_session_is_a_noop() {
         let sink = AuditSink::disabled();
-        let _s = sink.session("bob".into(), "notes".into());
+        let _s = sink.session("bob".into(), "notes".into(), None);
         assert!(sink.active_sessions().is_empty()); // no panic, no tracking
     }
 

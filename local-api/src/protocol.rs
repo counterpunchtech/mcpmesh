@@ -995,6 +995,19 @@ pub struct ActiveSession {
     pub peer: String,
     pub service: String,
     pub opened_at: i64,
+    /// The caller's STABLE device principal, `eid:<hex>` (#73).
+    ///
+    /// `peer` is a display nickname and collides: two devices under one nickname, or two contacts
+    /// sharing a display name, are indistinguishable in the live-session view. So "who is using my
+    /// service right now", per-peer session counts, and any UI that lets a user act on a live
+    /// session (revoke, disconnect, inspect) were all keyed on a collidable string.
+    ///
+    /// Same argument and same shape as [`PeerInfo`] (#41), [`PeerReachability`] (#42) and
+    /// [`AuditRecord`] (#57). Nicknames NEVER authorize; this is the value to key on.
+    ///
+    /// Always present for a real row — `Option` only so an older client round-trips. Additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
 }
 
 /// One frame of the [`Request::Subscribe`] stream (pairing liveness & health telemetry). Tagged on
@@ -1108,7 +1121,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   twenty-four have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.24";
+pub const API_VERSION: &str = "1.25";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -1156,7 +1169,10 @@ pub const API_VERSION: &str = "1.24";
 /// [`PeerReachability::rtt_ms`] stopped including the path-settle window — a relayed peer could
 /// previously never report under 600ms, so "relayed AND fast" was unreachable by construction
 /// (#123); to 24 when `reachable` stopped sharing a deadline with path classification — a relayed
-/// peer whose pong arrived after ~2.4s was reported OFFLINE while it was answering (#128).
+/// peer whose pong arrived after ~2.4s was reported OFFLINE while it was answering (#128); to 25
+/// with [`ActiveSession::principal`] — the live-session view was keyed on a display nickname, so
+/// two devices under one nickname were indistinguishable and any UI acting on a session (revoke,
+/// disconnect, inspect) keyed on a collidable string (#73).
 ///
 /// **Not every semantic change gets a minor, and that is the gap to watch (#122).** A minor marks a
 /// change to this *surface*. A change to behaviour BEHIND the surface — same fields, same shapes,
@@ -1167,7 +1183,7 @@ pub const API_VERSION: &str = "1.24";
 /// That class is bigger than it looks: **10, 17, 21, 22, 23 and 24 all shipped with no change to
 /// any type in this file** — they moved meaning, not shape. Six of the twenty-four. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 24;
+pub const API_MINOR: u32 = 25;
 
 #[cfg(test)]
 mod tests {
@@ -2048,6 +2064,7 @@ mod tests {
                 peer: "bob".into(),
                 service: "notes".into(),
                 opened_at: 1_751_760_000,
+                principal: None,
             }],
             reachability: vec![PeerReachability {
                 name: "bob".into(),

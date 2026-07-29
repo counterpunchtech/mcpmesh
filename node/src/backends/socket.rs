@@ -128,9 +128,13 @@ impl SocketBackend {
         // Session lifecycle via the RAII guard: it emits `session_open` now and, on drop (every exit
         // path — EOF, error, panic), emits `session_close` and removes the live-table row. Held for
         // the whole session scope, so it MUST outlive the pump below.
-        let _session = self
-            .audit
-            .session(peer.clone().unwrap_or_default(), self.service.clone());
+        let _session = self.audit.session(
+            peer.clone().unwrap_or_default(),
+            self.service.clone(),
+            // #73: the STABLE device principal, so a live-session row is keyed on something
+            // that cannot collide. `peer` above is a display name and two devices can share it.
+            identity.as_ref().map(|id| id.endpoint.principal()),
+        );
         // The per-request-line auditor: hashes each caller request's args and correlates
         // the response. Threaded into the shared pump.
         let auditor = RequestAuditor::new(self.audit.clone(), peer.clone(), self.service.clone());

@@ -989,6 +989,7 @@ mod tests {
                         peer: "bob".into(),
                         service: "notes".into(),
                         opened_at: 7,
+                        principal: Some("eid:bob".into()),
                     }],
                     reachability: vec![PeerReachability {
                         name: "bob".into(),
