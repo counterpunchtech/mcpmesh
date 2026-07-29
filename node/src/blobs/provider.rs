@@ -514,6 +514,31 @@ impl AppBlobs {
 ///    with `APP_BLOB_EVENT_MASK`, which ALSO pins these types (get_many/push = `Disabled`, observe =
 ///    `Intercept`): if a future iroh-blobs delivers them as events instead of refusing at the mask,
 ///    they are still denied here.
+/// Should this chunk be sent (#84a)? Pure, so the two rules that matter are testable without a
+/// live transfer — the async arm is a thin shell over it.
+///
+/// `endpoint` is the connection's authenticated endpoint from the loop-local map, or `None` when
+/// the connection has no `ClientConnected` record.
+fn throttle_decision(
+    endpoint: Option<&mcpmesh_net::EndpointId>,
+    size: u64,
+    limits: &crate::limits::MeshLimiters,
+) -> Result<(), AbortReason> {
+    match endpoint {
+        // FAIL CLOSED. A chunk for a connection we cannot attribute must not be metered against
+        // nobody — that is the same bypass as metering per connection, by another route.
+        // `ClientConnected` already refuses an endpoint-less connection, so reaching here means
+        // something is wrong and the safe answer is to refuse.
+        None => Err(AbortReason::Permission),
+        // Over budget: RateLimited, never Permission. The peer IS authorized; pacing failed.
+        // Conflating them would make a bandwidth event read as an authz denial in the audit trail,
+        // and iroh-blobs documents RateLimited as "OK to try again later" — which is true here and
+        // false for a permission failure.
+        Some(eid) if !limits.admit_blob_bytes(eid, size) => Err(AbortReason::RateLimited),
+        Some(_) => Ok(()),
+    }
+}
+
 fn spawn_gate_loop(
     mut rx: tokio::sync::mpsc::Receiver<ProviderMessage>,
     gate: Arc<dyn TrustGate>,
@@ -543,20 +568,8 @@ fn spawn_gate_loop(
                 // map `ClientConnected` populates — metering per connection would hand a peer a
                 // fresh budget per connection, which IS the bypass.
                 ProviderMessage::Throttle(msg) => {
-                    let res = match conns.get(&msg.connection_id) {
-                        // Over budget: RateLimited, never Permission. The peer is authorized and
-                        // pacing failed; conflating them would make a bandwidth event read as an
-                        // authz denial. iroh-blobs documents RateLimited as "OK to try again".
-                        Some(eid) if !limits.admit_blob_bytes(eid, msg.size) => {
-                            Err(AbortReason::RateLimited)
-                        }
-                        Some(_) => Ok(()),
-                        // FAIL CLOSED. A chunk for a connection we have no `ClientConnected`
-                        // record for cannot be attributed, and metering it against nobody is the
-                        // same bypass by another route. `ClientConnected` already refuses an
-                        // endpoint-less connection, so reaching here means something is wrong.
-                        None => Err(AbortReason::Permission),
-                    };
+                    let res =
+                        throttle_decision(conns.get(&msg.connection_id), msg.size, limits.as_ref());
                     msg.tx.send(res).await.ok();
                 }
                 ProviderMessage::GetRequestReceived(msg) => {
@@ -627,6 +640,55 @@ fn spawn_gate_loop(
 
 #[cfg(test)]
 mod tests {
+    /// #84a: the two rules that decide whether a chunk goes out.
+    ///
+    /// Extracted as a pure function because the live path is an async irpc arm firing per ~16 KiB
+    /// chunk — pinning these through a real transfer is how a test ends up asserting nothing.
+    #[test]
+    fn a_chunk_is_refused_over_budget_and_when_it_cannot_be_attributed() {
+        use crate::config::LimitsCfg;
+        use crate::limits::MeshLimiters;
+        use mcpmesh_net::EndpointId;
+
+        let eid = EndpointId::from_bytes([1u8; 32]);
+        let lim = MeshLimiters::from_config(&LimitsCfg {
+            blob_bytes_per_min: 20_480,
+            ..Default::default()
+        });
+
+        assert!(
+            super::throttle_decision(Some(&eid), 16_384, &lim).is_ok(),
+            "the first chunk is inside the budget"
+        );
+        assert!(
+            matches!(
+                super::throttle_decision(Some(&eid), 16_384, &lim),
+                Err(AbortReason::RateLimited)
+            ),
+            "over budget must be RateLimited — the peer IS authorized and pacing failed, so \
+             reporting Permission would put a bandwidth event in the audit trail as an authz denial"
+        );
+
+        // FAIL CLOSED: a chunk we cannot attribute is refused, not waved through.
+        assert!(
+            matches!(
+                super::throttle_decision(None, 16_384, &lim),
+                Err(AbortReason::Permission)
+            ),
+            "an unattributable chunk must be REFUSED — metering it against nobody is the same \
+             bypass as metering per connection"
+        );
+
+        // With no budget configured nothing is metered, but an unattributable chunk is STILL
+        // refused: fail-closed is about attribution, not about the budget being on.
+        let off = MeshLimiters::from_config(&LimitsCfg::default());
+        assert!(super::throttle_decision(Some(&eid), u64::MAX, &off).is_ok());
+        assert!(
+            super::throttle_decision(None, 1, &off).is_err(),
+            "fail-closed does not depend on a budget being configured"
+        );
+    }
+
     use super::*;
     use crate::blobs::APP_BLOB_ALPN;
     use crate::blobs::scope::ScopeStore;
