@@ -182,6 +182,16 @@ pub fn spawn_accept_loop(mesh: Arc<MeshState>, services: Arc<Services>) -> JoinH
                             conn.close(mcpmesh_net::CLOSE_UNAUTHORIZED.into(), b"unauthorized");
                             return;
                         };
+                        // #89: meter the probe per authenticated endpoint. The arm was gated but
+                        // UNMETERED, so a paired peer could pong-flood and the only bound was its
+                        // own politeness. AFTER the gate, so an unpaired scanner still allocates
+                        // nothing (SECURITY invariant 4: strangers stay cheap). Refused the same
+                        // way a stranger is — closed with NO pong — so a flooding peer learns
+                        // nothing from the refusal that it did not already know.
+                        if !mesh.limits().admit_ping(&remote) {
+                            conn.close(mcpmesh_net::CLOSE_UNAUTHORIZED.into(), b"unauthorized");
+                            return;
+                        }
                         // The dialer opens the bi-stream and sends one ping frame (which is what
                         // makes `accept_bi` resolve — a silent QUIC stream is invisible to the peer);
                         // we ignore its content and write the single pong. `finish()` + `stopped()`
