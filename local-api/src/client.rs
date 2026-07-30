@@ -635,6 +635,7 @@ mod tests {
             recent_pairings: vec![],
             reachability: vec![],
             self_nickname: String::new(),
+            storage: None,
         };
         write_frame(
             &mut writer,

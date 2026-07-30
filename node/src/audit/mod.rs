@@ -138,6 +138,77 @@ pub fn prune_before(dir: &Path, before: &str) -> std::io::Result<Vec<String>> {
     Ok(deleted)
 }
 
+/// Is `s` a well-formed zero-padded `YYYY-MM` month key? The `audit_prune` verb validates with
+/// this up front (#88): `prune_before`'s string comparison is CORRECT for well-formed keys and
+/// silently matches nothing for garbage, so a typo'd month would otherwise report a clean
+/// empty prune instead of an error.
+pub fn valid_month_key(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    s.len() == 7
+        && bytes[4] == b'-'
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[5..].iter().all(u8::is_ascii_digit)
+        && ("01"..="12").contains(&&s[5..])
+}
+
+/// One filtered, paged read over the monthly files (#88's `audit_list`). Month-range bounds are
+/// applied to the FILE list (the rotation unit), so an out-of-range month is skipped without
+/// parsing a line of it; `kind`/`peer` then filter records. `total` counts every match;
+/// `records` pages by `offset`/`limit`. Chronological: oldest month first, in-file order within
+/// a month (the append order).
+pub fn list_page(
+    dir: &Path,
+    since: Option<&str>,
+    until: Option<&str>,
+    kind: Option<AuditKind>,
+    peer: Option<&str>,
+    limit: usize,
+    offset: usize,
+) -> std::io::Result<mcpmesh_local_api::AuditListResult> {
+    let mut total: u64 = 0;
+    let mut records = Vec::new();
+    let mut to_skip = offset;
+    for (month, path, _) in list_month_files(dir)? {
+        if since.is_some_and(|s| month.as_str() < s) || until.is_some_and(|u| month.as_str() > u) {
+            continue;
+        }
+        for rec in read_records(&path)? {
+            if kind.is_some_and(|k| rec.kind != k) {
+                continue;
+            }
+            if peer.is_some_and(|p| rec.peer.as_deref() != Some(p)) {
+                continue;
+            }
+            total += 1;
+            if to_skip > 0 {
+                to_skip -= 1;
+            } else if records.len() < limit {
+                records.push(rec);
+            }
+        }
+    }
+    Ok(mcpmesh_local_api::AuditListResult { records, total })
+}
+
+/// The oldest month to KEEP under a retention of `retain_months`, given the current `YYYY-MM`
+/// (#88): the current month counts as month 1, so `retain_months = 2` in `2026-07` keeps
+/// `2026-06` and `2026-07` and returns `"2026-06"` — the `before` argument for
+/// [`prune_before`]. `None` when `retain_months` is 0 (keep forever) or `current` is malformed.
+/// Pure (year, month) arithmetic — no date crate, the repo idiom.
+pub fn retention_cutoff(current: &str, retain_months: u32) -> Option<String> {
+    if retain_months == 0 || !valid_month_key(current) {
+        return None;
+    }
+    let year: i64 = current[..4].parse().ok()?;
+    let month: i64 = current[5..7].parse().ok()?;
+    // Zero-based total months, minus (N - 1) to land on the oldest KEPT month.
+    let total = year * 12 + (month - 1) - i64::from(retain_months - 1);
+    if total < 0 {
+        return None; // a window reaching before year 0 keeps everything representable
+    }
+    Some(format!("{:04}-{:02}", total / 12, total % 12 + 1))
+}
+
 /// Parse a kind filter string from the porcelain (`--kind request`) into an [`AuditKind`].
 pub fn parse_kind(s: &str) -> Option<AuditKind> {
     match s {
@@ -330,5 +401,41 @@ mod tests {
             summary.per_service,
             vec![("kb".to_string(), 1), ("notes".to_string(), 3)]
         );
+    }
+
+    /// #88: the retention window's boundary arithmetic, exactly. The e2e boot test proves boot
+    /// CALLS the prune; the year-2020 file it seeds is far outside any window, so an off-by-one
+    /// here would pass it — the boundary itself is pinned only by these.
+    #[test]
+    fn retention_cutoff_counts_the_current_month_as_month_one() {
+        // retain 2 in July keeps June+July → the oldest KEPT month (prune_before's arg) is June.
+        assert_eq!(retention_cutoff("2026-07", 2).as_deref(), Some("2026-06"));
+        // retain 1 keeps only the current month.
+        assert_eq!(retention_cutoff("2026-07", 1).as_deref(), Some("2026-07"));
+        // The window crosses a year boundary with zero-padded rendering.
+        assert_eq!(retention_cutoff("2026-01", 3).as_deref(), Some("2025-11"));
+        // 0 = keep forever; malformed input keeps everything rather than guessing.
+        assert_eq!(retention_cutoff("2026-07", 0), None);
+        assert_eq!(retention_cutoff("garbage", 2), None);
+    }
+
+    /// #88: the `audit_prune` input validation — well-formed months only, including the 01..=12
+    /// month-number range (a "2026-13" would otherwise string-compare plausibly).
+    #[test]
+    fn month_key_validation_rejects_malformed_and_out_of_range() {
+        assert!(valid_month_key("2026-07"));
+        assert!(valid_month_key("1999-12"));
+        assert!(valid_month_key("2026-01"));
+        for bad in [
+            "garbage",
+            "2026-13",
+            "2026-00",
+            "2026-7",
+            "202607",
+            "2026-07-01",
+            "",
+        ] {
+            assert!(!valid_month_key(bad), "must reject {bad:?}");
+        }
     }
 }

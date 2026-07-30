@@ -34,7 +34,7 @@ mod sever;
 mod status;
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use mcpmesh_net::registry::ConnRegistry;
@@ -277,6 +277,9 @@ pub struct MeshState {
     /// backends) and the trust-event hooks. `OnceLock` — set-once, lock-free reads, no async.
     /// Empty (→ `AuditSink::disabled()`) in a control-only test daemon.
     pub(crate) audit: std::sync::OnceLock<AuditSink>,
+    /// The on-disk app-blob store directory (#88), set once at boot when one exists — read by
+    /// `status.storage.blobs_bytes`. Same set-once discipline as `audit`/`limits`.
+    pub(crate) blobs_dir: std::sync::OnceLock<PathBuf>,
     /// The process rate/concurrency limiters. Set ONCE by `serve_forever` before
     /// serving (like `audit`); read by the reload sites (rebuilt backends re-thread it) and the
     /// accept loop. Empty (→ an unlimited default) in a control-only test daemon.
@@ -403,6 +406,7 @@ impl MeshState {
             presence_table: Arc::new(crate::roster::presence::PresenceTable::new()),
             app_metadata: Arc::new(std::sync::RwLock::new(String::new())),
             app_blobs: tokio::sync::Mutex::new(None),
+            blobs_dir: std::sync::OnceLock::new(),
             audit: std::sync::OnceLock::new(),
             limits: std::sync::OnceLock::new(),
             roster_addr_book: std::sync::OnceLock::new(),
@@ -639,6 +643,18 @@ impl MeshState {
 
     pub fn set_audit(&self, sink: AuditSink) {
         let _ = self.audit.set(sink);
+    }
+
+    /// Record the on-disk app-blob store directory, once, at boot (#88) — alongside
+    /// [`set_app_blobs`](Self::set_app_blobs), so `status.storage.blobs_bytes` can walk it
+    /// synchronously. Never set on a node without an on-disk blob store (blobs_bytes reads 0).
+    pub fn set_blobs_dir(&self, dir: PathBuf) {
+        let _ = self.blobs_dir.set(dir);
+    }
+
+    /// The recorded blob-store directory, if this node has one.
+    pub(crate) fn blobs_dir(&self) -> Option<&Path> {
+        self.blobs_dir.get().map(PathBuf::as_path)
     }
 
     /// The audit sink, or the disabled no-op sink if none was installed (control-only test daemon).
