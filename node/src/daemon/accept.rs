@@ -144,7 +144,13 @@ pub fn spawn_accept_loop(mesh: Arc<MeshState>, services: Arc<Services>) -> JoinH
                         // gets `Unknown` → refused — so per-invite expiry/burn stays authoritative
                         // there, and this is a cheap front-door close, not the security boundary.
                         if mesh.invites.count() == 0 {
-                            conn.close(0u32.into(), b"no pairing in progress");
+                            // The shared constant (#87b): the redeemer matches these bytes off
+                            // `close_reason()` to say "expired / used / inviter restarted"
+                            // instead of a bare connection failure.
+                            conn.close(
+                                0u32.into(),
+                                crate::pairing::rendezvous::NO_LIVE_INVITE_CLOSE,
+                            );
                             return;
                         }
                         // Per-connection rate-limit of the by-design-open pair ALPN.

@@ -127,6 +127,18 @@ impl LiveInvites {
         self.guard().insert(invite.secret, invite);
     }
 
+    /// Is `secret` a LIVE invite at `now_epoch`, without redeeming it? NON-MUTATING — never
+    /// burns, never reaps. The #87 collision pre-check runs behind this so a nickname collision
+    /// can be refused BEFORE [`try_redeem`](Self::try_redeem) spends the secret: the check is
+    /// only reached by a caller holding a live secret, so answering it is not an oracle, and
+    /// the invite survives for a retry under a different name. Advisory only — `try_redeem`
+    /// stays the authoritative (and racing-safe) redemption.
+    pub fn peek_live(&self, secret: &[u8; 32], now_epoch: u64) -> bool {
+        self.guard()
+            .get(secret)
+            .is_some_and(|inv| inv.expires_at_epoch >= now_epoch)
+    }
+
     /// Redeem `secret` at `now_epoch`. Unknown secret → [`Redeem::Unknown`] (no state
     /// change). Known but expired → [`Redeem::Expired`] (removed). Known + live → SUCCESS:
     /// the invite is BURNED (removed) and returned as [`Redeem::Ok`].
