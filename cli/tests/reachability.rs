@@ -36,6 +36,12 @@ use mcpmesh_net::registry::ConnRegistry;
 use mcpmesh_net::{ALPN_MCP, ALPN_PAIR, ALPN_PING, TrustGate};
 use tokio::time::timeout;
 
+/// Serializes the timing-sensitive tests in this binary (the #138 idiom): the flood test races
+/// 90 real dials against `PROBE_TIMEOUT`, and the cache-freshness test races its teardown +
+/// control round-trip against `REACH_TTL_SECS`. Both assert booleans, not latencies, but both
+/// lose their margins under parallel-test contention.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// The target endpoint: advertises the mesh + pair + PING ALPNs (mirrors `build_endpoint`'s list
 /// once `ALPN_PING` is added), so the daemon's own accept loop can serve the ping arm in-process.
 async fn target_endpoint() -> iroh::Endpoint {
@@ -488,13 +494,25 @@ async fn probe_surfaces_the_services_the_peer_grants_the_caller() {
 ///    (same `seq`), so "some probe came back stale" is the enforcement — removing `admit_ping`
 ///    from the arm, or ignoring its verdict, answers all 90 with fresh pongs and fails the
 ///    stale-count assertion.
-/// 2. **A refusal never reports a healthy peer offline** (PR #142 gate, HIGH). The arm closes
-///    with the distinguishable `b"ping rate limited"` and the prober commits NOTHING for it —
-///    no cache write, no transition. Reverting the close reason to `b"unauthorized"`, or
-///    dropping the prober-side throttle check, writes `reachable: false` for a live paired peer
-///    and fails the all-reachable assertion.
+/// 2. **A refusal with a warm cache never reports a healthy peer offline** (PR #142 gate, HIGH).
+///    The arm closes with the distinguishable `b"ping rate limited"` and the prober commits
+///    NOTHING for it — no cache write, no transition. Reverting the close reason to
+///    `b"unauthorized"`, or dropping the prober-side throttle check, writes `reachable: false`
+///    for a live paired peer and fails the all-reachable assertion.
+///
+/// "Warm cache" is a real bound, not hedging: a throttled probe with NO previous entry returns
+/// an uncommitted `reachable: false` row (never cached, never broadcast), so a caller CAN see a
+/// transient "unreachable" for a live peer in the cold-cache + pre-drained-bucket corner — e.g.
+/// a daemon restart inside the responder bucket's 600s idle TTL. Bounded (retry after refill
+/// succeeds; nothing is poisoned) and accepted; this test's first probe is always admitted, so
+/// it deliberately does not exercise that corner.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_throttled_probe_is_refused_but_never_reports_the_peer_offline() {
+    // Serialized (the #138 idiom): 90 sequential real dials against a 3s per-probe deadline —
+    // ONE admitted probe blowing PROBE_TIMEOUT under parallel-test contention would commit a
+    // real `reachable: false` and fail the all-reachable assertion for a reason this test is
+    // not about.
+    let _serial = SERIAL.lock().await;
     timeout(Duration::from_secs(120), async {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.toml");
@@ -556,11 +574,11 @@ async fn a_throttled_probe_is_refused_but_never_reports_the_peer_offline() {
              count here means a refusal wrote `reachable: false` (PR #142 gate, HIGH). \
              reachable={reachable} fresh={fresh} stale={stale}"
         );
-        assert!(
-            fresh > 0,
-            "an honest probe rate must still be answered with real pongs — a limiter that refuses \
-             everything is worse than none. fresh={fresh} stale={stale}"
-        );
+        // No separate `fresh > 0` assertion: it cannot test "real pongs were admitted" — the
+        // first iteration always counts fresh (`last_seq == None`), and a refuse-everything
+        // limiter over a cold cache yields fresh=90 (every uncommitted fallback row carries a
+        // new seq). The refuse-everything mutation is caught by `reachable == 90` instead: with
+        // nothing ever admitted the cache never warms, so every probe reports unreachable.
         assert!(
             stale > 0,
             "a paired peer flooding past the cap must eventually be REFUSED (#89), observable as \
@@ -571,7 +589,7 @@ async fn a_throttled_probe_is_refused_but_never_reports_the_peer_offline() {
         assert!(
             a_limits.pings_refused() > 0,
             "the responder must COUNT its refusals (#89 defect 3: unmetered AND unrecorded) — \
-             a production false-offline caused by the limiter must be diagnosable"
+             the count is the refusal's only footprint besides the debug log"
         );
     })
     .await
@@ -589,6 +607,9 @@ async fn a_throttled_probe_is_refused_but_never_reports_the_peer_offline() {
 /// report healthy peers offline.
 #[tokio::test(flavor = "multi_thread")]
 async fn peer_services_answers_from_the_fresh_cache_without_probing() {
+    // Serialized (the #138 idiom): everything from the priming probe to the verb call must fit
+    // inside REACH_TTL_SECS, and contention eats that margin.
+    let _serial = SERIAL.lock().await;
     timeout(Duration::from_secs(60), async {
         let dir = tempfile::tempdir().unwrap();
 
@@ -627,25 +648,24 @@ async fn peer_services_answers_from_the_fresh_cache_without_probing() {
             "precondition: the cached entry carries the granted service"
         );
 
+        // Stand up B's control server and client BEFORE taking A down, so the TTL margin is
+        // spent only on the teardown + one verb round-trip, not on socket setup too.
+        let socket = dir.path().join("control.sock");
+        let listener = mcpmesh::ipc::bind_control_socket(&socket).await.unwrap();
+        let state = Arc::new(DaemonState::with_mesh(STACK_VERSION, b_mesh.clone()));
+        let control = tokio::spawn(serve_control(listener, state));
+        let mut client = connect_control(&socket).await.expect("connect B control");
+
         // Take A DOWN. The cache entry is still younger than REACH_TTL_SECS.
         accept.abort();
         a_ep_handle.close().await;
 
         // The real control verb must answer from the cache — a probe here would dial a dead
         // endpoint, time out, and fail the verb for a peer the caller was just told is fine.
-        let socket = dir.path().join("control.sock");
-        let listener = mcpmesh::ipc::bind_control_socket(&socket).await.unwrap();
-        let state = Arc::new(DaemonState::with_mesh(STACK_VERSION, b_mesh.clone()));
-        let control = tokio::spawn(serve_control(listener, state));
-        let services = connect_control(&socket)
-            .await
-            .expect("connect B control")
-            .peer_services("alice")
-            .await
-            .expect(
-                "peer_services must answer from the fresh cache rather than probing — an \
+        let services = client.peer_services("alice").await.expect(
+            "peer_services must answer from the fresh cache rather than probing — an \
                  unconditional probe is the #142-gate shape that reported healthy peers offline",
-            );
+        );
         assert_eq!(services, vec!["shared".to_string()]);
 
         control.abort();

@@ -244,9 +244,10 @@ pub struct MeshLimiters {
     blob_conn: Arc<RateLimiter>,
     /// Per-authenticated-endpoint reachability-probe buckets (#89).
     ping: Arc<RateLimiter>,
-    /// Probes REFUSED by the ping bucket (#89 gate): the refusal is otherwise invisible — no
-    /// session, no audit row — so a production false-offline caused by throttling would be
-    /// undiagnosable without this count.
+    /// Probes REFUSED by the ping bucket (#89 gate): a probe is not a session, so a refusal
+    /// leaves no audit row — this count and the accept arm's debug line are its only footprint.
+    /// RESPONDER-side by nature (the refuser is the only party that knows), and not yet surfaced
+    /// by any verb; wiring it into `status`/diagnostics is #89 follow-up work.
     ping_refused: std::sync::atomic::AtomicU64,
 }
 
@@ -352,8 +353,8 @@ impl MeshLimiters {
         admitted
     }
 
-    /// How many probes the ping bucket has refused since boot (#89 gate) — the refusal's only
-    /// footprint besides the debug log, since a probe is not a session and never reaches audit.
+    /// How many probes the ping bucket has refused since boot (#89 gate). Read by the flood
+    /// test today; not yet surfaced to operators (see the field doc).
     pub fn pings_refused(&self) -> u64 {
         self.ping_refused.load(std::sync::atomic::Ordering::Relaxed)
     }

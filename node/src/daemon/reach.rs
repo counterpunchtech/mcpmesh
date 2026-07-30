@@ -109,6 +109,16 @@ pub async fn probe_peer(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> ReachEn
     // previous entry if one exists (the refusal proves the peer is up, but the entry stays
     // honest about when it was actually probed), else an UNCOMMITTED unreachable row — never
     // cached, so it cannot poison anything.
+    //
+    // Two accepted bounds (#142 second gate), stated rather than fixed:
+    // - A hostile PAIRED peer that answers every probe with the throttle close keeps its entry
+    //   permanently stale, so every `reachability_of` read re-spawns a refresh — no 20s
+    //   quiescence, one dial per read, until it pongs or goes down. Bounded by our own poll
+    //   rate, costs the peer a connection each time, and it can only pin ITS OWN row (whose
+    //   meta/path/rtt it already controls); a probe backoff belongs with #89's follow-up work.
+    // - The check below matches `Ok(Err(_))` only: a refusal whose CONNECTION_CLOSE arrives
+    //   after PROBE_TIMEOUT surfaces as `Elapsed` and commits `reachable: false` normally — a
+    //   lost close frame is indistinguishable from a dead peer, so that is the honest verdict.
     if let Ok(Err(e)) = &outcome
         && e.downcast_ref::<ProbeThrottled>().is_some()
     {
