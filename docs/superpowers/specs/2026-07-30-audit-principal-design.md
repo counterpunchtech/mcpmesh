@@ -22,7 +22,7 @@ and update the sentence.** Rationale:
   explicitly wants the join ("an audit log keyed on a display string is the one remaining place
   where our own records cannot be joined to our own policy").
 
-## Changes (`API_MINOR 28 → 29`; additive → PATCH `0.23.6 → 0.23.7`)
+## Changes (`API_MINOR 28 → 29`; MINOR `0.23.6 → 0.24.0` — pub constructor arity changed in published crates)
 
 1. `AuditRecord.principal: Option<String>` — serde default + skip-if-none (the record is
    published wire vocabulary riding `StreamFrame::Event` AND the on-disk JSONL).
@@ -51,12 +51,13 @@ and update the sentence.** Rationale:
 - `audit_e2e`: the real-session flow asserts `principal` on session_open / request /
   session_close lines (same `eid:` as the caller endpoint), and that open/close agree.
 - Blob-fetch: the served-GET audit test asserts the fetcher's principal.
-- Trust: a real pairing's `pair` record carries the redeemer's `eid:`; unpair stays `None`.
+- Trust: a real pairing's `pair` record carries the allow-list principal (`b64u:` when bound,
+  else `eid:`); unpair stays `None`.
 - Mutations: drop the principal from any single producer → its named assertion fails (the
   explicit-parameter shape makes each producer independently breakable).
 
 ## Non-goals
 
 Backfilling principal into existing on-disk records (they predate the field; `audit_list`
-consumers must treat absent principal as "recorded before 0.23.7"), and any change to what is
+consumers must treat absent principal as "recorded before 0.24.0"), and any change to what is
 hashed or counted.

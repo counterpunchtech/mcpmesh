@@ -548,10 +548,10 @@ display name, produce identical `peer` values, so per-peer session counts and an
 session (revoke, disconnect, inspect) need the principal. Nicknames never authorize.
 
 This list is the starting state — a client keeps its session view current by applying subsequent
-`session_open`/`session_close` events to it. **Those events carry no principal** (they are
-`AuditRecord`s; #57 is not yet merged), so the delta path cannot distinguish two same-nickname
-sessions even though the snapshot can. Until #57 lands, re-subscribe when that ambiguity matters
-rather than resolving it from the event stream. Only a
+`session_open`/`session_close` events to it. Since `api_minor >= 29` (#57) those events carry the
+same `principal` the snapshot rows do, so the delta path distinguishes two same-nickname sessions
+without re-subscribing — key the projection on `principal`, fall back to `peer` only for records
+from an older daemon. Only a
 `session_open` **without** an error status opens a real session: a `session_open` carrying
 `status: "error"` is a terminal *attempted-and-failed* marker (a failed dial — see below)
 that never pairs with a `session_close`, so a client must **not** add it to the active view — doing so
@@ -584,6 +584,10 @@ an RFC3339-millis UTC timestamp. Every field beyond `ts` and `kind` is optional 
 when it applies:
 
 - `peer` — the caller's nickname/`user_id` (absent on a local-only event with no remote peer).
+- `principal` — the subject's stable principal (`api_minor >= 29`, #57): `eid:<hex>` on
+  session/request/blob records (the exact authenticated device, like `ActiveSession`), the
+  allow-list value (`b64u:` when bound, else `eid:`) on a trust `pair`. Deliberately absent on
+  `unpair`/`roster_install`/the failed-dial record, and on records written before 0.24.0.
 - `service` — the mounted service name.
 - On a `request` (one proxied MCP line): `method` (the MCP method, e.g. `tools/call`), `tool` (the
   tool **name** only, for a `tools/call`), `args_hash` (a `"blake3:…"` digest of the arguments —
@@ -605,8 +609,8 @@ one sanctioned identity form, the same value the rest of the API has keyed on si
 it is a public *identifier* (it is how peers dial you, and it already sits in every `allow` list
 on the same disk), not a secret. `principal` is deliberately absent on `unpair` (may tear down
 several devices — no single subject), `roster_install` (purely local), the failed-dial record
-(our own dial), and every record written before 0.23.7 — treat an absent `principal` as
-"unattributable or pre-0.23.7", never as an error.
+(our own dial), and every record written before 0.24.0 — treat an absent `principal` as
+"unattributable or pre-0.24.0", never as an error.
 
 **`reachability`** — a peer's reachability OR its network path changed (`api_minor >= 12`, #58;
 `path` joined the rule at 21, #92). Not an up/down toggle — see below. Pushed so work queued for an

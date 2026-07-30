@@ -136,10 +136,11 @@ async fn real_session_audits_with_hashed_args_and_all_event_classes() {
         // Session lifecycle present.
         assert!(body.contains("\"kind\":\"session_open\""));
         assert!(body.contains("\"kind\":\"session_close\""));
-        // #57: EVERY line of this session carries the caller's STABLE principal alongside the
-        // display name — the same eid: the gate resolved, so the stream/log joins to policy
-        // without nickname matching. open + request + close must all agree (the close reads the
-        // stored session row), so the count pins all three producers at once.
+        // #57: EVERY line of this session carries the caller's STABLE device principal
+        // alongside the display name — the same eid: the gate resolved (session/request/blob
+        // records key the DEVICE; a bound peer's b64u: appears on the trust record and joins
+        // via the status peers list). open + request + close must all agree (the close reads
+        // the stored session row), so the count pins all three producers at once.
         assert_eq!(
             body.matches(&format!("\"principal\":\"{caller_eid}\""))
                 .count(),

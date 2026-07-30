@@ -292,9 +292,7 @@ pub struct SelfNetwork {
     pub last_change_epoch: Option<i64>,
 }
 
-/// One home relay's connection state (#90); to 29 with [`AuditRecord::principal`] — stable identity on the event stream and the
-/// on-disk log, resolving #57's parked docs conflict in favour of the #41/#42/#73 line (the
-/// audit surface bans secrets and raw hex, not the prefixed principal rendering). No latency — per-relay RTT needs iroh's
+/// One home relay's connection state (#90). No latency — per-relay RTT needs iroh's
 /// `net_report`, which is unstable-feature-gated as of 1.0.3; `connected` is the stable truth.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelayInfo {
@@ -1018,16 +1016,21 @@ pub struct AuditRecord {
     /// nickname or `org/serial` (`Trust`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
-    /// The subject's STABLE principal (`eid:<hex>` / `b64u:<pk>`), from the same gate
-    /// resolution that produced `peer` (#57, `api_minor >= 29`). `peer` is a display name and
-    /// collides — two devices under one nickname were indistinguishable in the stream and the
-    /// on-disk log, so records could not be joined to the (principal-keyed, #38) policy that
-    /// admitted them. Same argument and shape as `PeerInfo` (#41), `PeerReachability` (#42),
-    /// and `ActiveSession` (#73).
+    /// The subject's STABLE principal, from the same gate resolution that produced `peer`
+    /// (#57, `api_minor >= 29`). `peer` is a display name and collides — two devices under one
+    /// nickname were indistinguishable in the stream and the on-disk log. Same argument and
+    /// shape as `PeerInfo` (#41), `PeerReachability` (#42), and `ActiveSession` (#73).
+    ///
+    /// TWO NAMESPACES, deliberately: session/request/blob records attribute the DEVICE
+    /// (`eid:<hex>`, like `ActiveSession` — the exact authenticated endpoint), while the trust
+    /// `pair` record carries the value the grant appended to the allow (`b64u:<pk>` when the
+    /// device presented a user binding, else `eid:`, #38). Joining a bound peer's sessions to
+    /// its allow entry therefore goes through the `status` peers list (which carries BOTH the
+    /// device principal and the `user_id`), not string equality on this field alone.
     ///
     /// Deliberately absent on: `unpair` (may tear down several devices — no single subject),
     /// `roster_install` (purely local), and the failed-outbound-dial session record (our own
-    /// dial, not a gate-resolved caller). Absent on every record written before 0.23.7.
+    /// dial, not a gate-resolved caller). Absent on every record written before 0.24.0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub principal: Option<String>,
 }
