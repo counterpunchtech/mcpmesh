@@ -283,8 +283,12 @@ Nickname UNIQUENESS is still enforced, for display/routing clarity only (outboun
   holds the invite's suggested nickname under a different endpoint (your own dials to that name
   would become ambiguous).
 - **Inviter side** — symmetrically, a redeemer self-asserting a name already belonging to a
-  different endpoint is refused with the generic `pairing refused` (no detail about which names
-  exist).
+  different endpoint is refused. Since #87 the collision is checked **before** the invite is
+  burned, so the refusal names the collision, states the invite was NOT consumed, and the
+  redeemer can `set_nickname` and redeem the **same** invite again. This is not an oracle: the
+  distinguishable reason is only ever sent to a caller that proved possession of a live invite
+  secret — an unproven dialer (wrong/expired secret) still gets the generic `pairing refused`
+  with no detail about which names exist.
 - **`peer_rename`** — refuses a target name another contact already holds; it is a pure display
   mutation (no grant is touched, no serving reload happens).
 

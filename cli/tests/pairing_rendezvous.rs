@@ -527,9 +527,12 @@ async fn collision_guard_allows_same_peer_additional_service() {
     .expect("additional-service re-pair test timed out");
 }
 
-/// Case 4 — impersonation: a peer "carol" (a DIFFERENT endpoint_id) already exists; a redeemer
-/// that names itself "carol" is REFUSED (blocks assuming another peer's identity/access). No
-/// entry is written under the redeemer's id and no grant happens; the invite is consumed.
+/// Case 4 — collision: a peer "carol" (a DIFFERENT endpoint_id) already exists; a redeemer that
+/// names itself "carol" is REFUSED (blocks assuming another peer's display identity). No entry
+/// is written under the redeemer's id and no grant happens — and since #87 the invite SURVIVES
+/// (the collision is checked via `peek` BEFORE `try_redeem` burns the secret) with a
+/// distinguishable reason, because in the field this is two same-hostname machines on their
+/// FIRST pairing attempt, not an attack worth spending the invite on.
 #[tokio::test]
 async fn collision_guard_refuses_impersonating_an_existing_peer() {
     timeout(Duration::from_secs(60), async {
@@ -546,25 +549,113 @@ async fn collision_guard_refuses_impersonating_an_existing_peer() {
         let reply =
             drive_redeemer(&redeemer, addr, hello_frame(&secret, &redeemer_id, "carol")).await;
 
-        // Generic refusal reason (no oracle), no entry under the redeemer's id, no grant.
         assert_eq!(
             reply["result"], "refused",
-            "impersonation must be refused: {reply}"
+            "a colliding nickname must be refused: {reply}"
         );
-        assert_eq!(reply["reason"], "pairing refused");
+        // Distinguishable, actionable reason (#87): the caller proved possession of a live
+        // secret, so naming the collision is not an oracle — and it must say the invite
+        // survived, because that is what makes the refusal recoverable without a new ceremony.
+        let reason = reply["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("carol") && reason.contains("already taken"),
+            "the reason must name the colliding nickname (#87 — a generic refusal left \
+             first-time pairs of same-hostname machines undiagnosable): {reason}"
+        );
         assert!(
             store.resolve(&redeemer_id).unwrap().is_none(),
-            "no entry may be written under the impersonator's id"
+            "no entry may be written under the colliding redeemer's id"
         );
         let cfg = Config::load(&config_path).unwrap();
         assert!(
             cfg.services.get("notes").unwrap().allow.is_empty(),
-            "no grant may be applied for an impersonation attempt"
+            "no grant may be applied for a refused pairing"
         );
-        assert_eq!(invites.count(), 0, "the burned invite is not preserved");
+        assert_eq!(
+            invites.count(),
+            1,
+            "the invite must SURVIVE a nickname collision (#87): the collision is checked \
+             before the burn, so the redeemer can rename and redeem the same invite again"
+        );
     })
     .await
-    .expect("impersonation test timed out");
+    .expect("collision test timed out");
+}
+
+/// #87 end to end: after a collision refusal, the SAME invite redeems successfully under a
+/// different nickname — the recovery path the non-burning check exists for. Restoring the old
+/// burn-before-check order fails this at the second redeem (`Unknown` → refused).
+#[tokio::test]
+async fn collision_refusal_preserves_the_invite_for_a_retry_under_a_new_name() {
+    timeout(Duration::from_secs(60), async {
+        let (redeemer, addr, store, invites, inviter_id) = setup().await;
+        let redeemer_id = *redeemer.id().as_bytes();
+        let carol_id = [0xC0u8; 32];
+        seed_peer(&store, carol_id, "carol", &[]);
+
+        let secret = [25u8; 32];
+        invites.mint(make_invite(secret, inviter_id, &[], FUTURE));
+
+        // First attempt collides and is refused…
+        let reply = drive_redeemer(
+            &redeemer,
+            addr.clone(),
+            hello_frame(&secret, &redeemer_id, "carol"),
+        )
+        .await;
+        assert_eq!(reply["result"], "refused", "{reply}");
+
+        // …and the SAME secret then redeems under a unique name.
+        let reply =
+            drive_redeemer(&redeemer, addr, hello_frame(&secret, &redeemer_id, "dave")).await;
+        assert_eq!(
+            reply["result"], "ok",
+            "the same invite must redeem after a rename — the collision refusal must not have \
+             burned it (#87): {reply}"
+        );
+        let entry = store
+            .resolve(&redeemer_id)
+            .unwrap()
+            .expect("the retry writes the trust entry");
+        assert_eq!(entry.nickname, "dave");
+        assert_eq!(invites.count(), 0, "the successful redeem burns the invite");
+    })
+    .await
+    .expect("collision-retry test timed out");
+}
+
+/// The no-oracle boundary of the distinguishable reason (#87): the collision check must not run
+/// — and must not answer — for a caller that has NOT proven possession of a live secret. A
+/// stranger probing a colliding nickname with a garbage secret gets exactly the generic
+/// refusal, or the distinguishable reason becomes a store-contents oracle.
+#[tokio::test]
+async fn a_wrong_secret_with_a_colliding_nickname_gets_only_the_generic_refusal() {
+    timeout(Duration::from_secs(60), async {
+        let (redeemer, addr, store, invites, inviter_id) = setup().await;
+        let redeemer_id = *redeemer.id().as_bytes();
+        let carol_id = [0xC0u8; 32];
+        seed_peer(&store, carol_id, "carol", &[]);
+
+        // A live invite exists (the accept gate is open), but the dialer sends a WRONG secret
+        // while claiming the colliding name.
+        invites.mint(make_invite([26u8; 32], inviter_id, &[], FUTURE));
+        let reply = drive_redeemer(
+            &redeemer,
+            addr,
+            hello_frame(&[27u8; 32], &redeemer_id, "carol"),
+        )
+        .await;
+
+        assert_eq!(reply["result"], "refused", "{reply}");
+        assert_eq!(
+            reply["reason"], "pairing refused",
+            "an unproven caller must get the GENERIC reason — a nickname-specific answer here \
+             is a store-contents oracle for anyone who can dial: {reply}"
+        );
+        assert_eq!(invites.count(), 1, "the real invite is untouched");
+    })
+    .await
+    .expect("collision-oracle test timed out");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -802,6 +893,49 @@ async fn redeem_refuses_an_invite_squatting_an_existing_peers_nickname() {
     })
     .await
     .expect("redeemer-side squatting test timed out");
+}
+
+/// #87(b): a dial against an inviter with NO live invite must explain itself. The accept gate
+/// fast-closes with `b"no pairing in progress"`, and the redeemer used to surface that as a bare
+/// "no reply from the inviter" — indistinguishable from a network problem, when the actual
+/// causes are: the invite expired, was already used, or the inviter's daemon restarted (invites
+/// do not survive restarts). Dropping the close-reason match reverts to the bare error and
+/// fails the message assertion.
+#[tokio::test]
+async fn a_dead_invite_dial_reports_the_cause_not_a_bare_connection_failure() {
+    timeout(Duration::from_secs(60), async {
+        // Accept loop up, NOTHING minted — the state every outstanding invite is in after the
+        // inviter's daemon restarts, and what a redeemer holding yesterday's invite dials into.
+        let (redeemer, addr, _store, _invites, inviter_id, _cfg) = setup_full("").await;
+
+        let invite = Invite {
+            secret: [28u8; 32],
+            inviter_id,
+            inviter_addr_json: serde_json::to_string(&addr).unwrap(),
+            nickname: "alice".into(),
+            services: vec![],
+            expires_at_epoch: FUTURE, // the LINE still advertises a live TTL — that is the bug
+            app_label: None,
+        };
+        let err = redeem_invite(
+            redeemer,
+            "bob".into(),
+            invite.encode(),
+            Arc::new(PeerStore::open(&tempfile::tempdir().unwrap().keep().join("b.redb")).unwrap()),
+            None,
+            None,
+        )
+        .await
+        .expect_err("a dead invite must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no longer live") && msg.contains("restart"),
+            "the error must name the dead-invite causes (expired / already used / inviter \
+             daemon restarted) instead of presenting as a connection failure (#87b): {msg}"
+        );
+    })
+    .await
+    .expect("dead-invite dial test timed out");
 }
 
 /// **The load-bearing seam, end to end (M2b T6 Step 5).** A REAL redeemer (`redeem_invite`) pairs

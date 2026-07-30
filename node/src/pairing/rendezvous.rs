@@ -66,6 +66,56 @@ const REASON_REFUSED: &str = "pairing refused";
 const REASON_MALFORMED: &str = "malformed request";
 const REASON_ID_MISMATCH: &str = "id mismatch";
 
+/// The accept gate's fast-close reason when NO invite is live (#87b) — ONE constant for both
+/// sides: the daemon's `ALPN_PAIR` accept arm writes it, [`redeem_invite`] matches it off
+/// `close_reason()` and turns it into an actionable error instead of a bare connection failure.
+pub(crate) const NO_LIVE_INVITE_CLOSE: &[u8] = b"no pairing in progress";
+
+/// The distinguishable nickname-collision refusal (#87). Only ever sent to a caller that proved
+/// possession of a live secret (the peek pre-check) or spent one (the post-redeem race guard) —
+/// never to an unproven dialer, or it becomes a store-contents oracle. `invite_survived` selects
+/// the recovery guidance: the pre-check path preserves the invite, the race-guard path burned it.
+fn reason_nickname_taken(nickname: &str, invite_survived: bool) -> String {
+    let recovery = if invite_survived {
+        "the invite was NOT consumed — pick a different nickname (set_nickname) and redeem the \
+         same invite again"
+    } else {
+        "ask the inviter for a fresh invite"
+    };
+    format!("nickname '{nickname}' is already taken by another paired peer; {recovery}")
+}
+
+/// Did the inviter close this connection with the accept gate's no-live-invite reason (#87b)?
+/// The `redeem_invite` mirror of the #89 probe-throttle detection: read off the CONNECTION, not
+/// parsed out of whichever stream error surfaced first.
+fn no_live_invite_close(conn: &iroh::endpoint::Connection) -> bool {
+    matches!(
+        conn.close_reason(),
+        Some(iroh::endpoint::ConnectionError::ApplicationClosed(ac))
+            if ac.reason.as_ref() == NO_LIVE_INVITE_CLOSE
+    )
+}
+
+/// The shared #87 collision check: resolve any EXISTING entry for the TLS-authenticated
+/// redeemer id, and whether its self-asserted nickname collides with a DIFFERENT stored peer.
+/// ONE helper for the pre-burn check and the post-redeem race guard, so the two cannot drift.
+/// Blocking (redb read) → spawn_blocking.
+async fn resolve_and_check_collision(
+    store: &Arc<PeerStore>,
+    nickname: &str,
+    tls_id: [u8; 32],
+) -> anyhow::Result<(Option<PeerEntry>, bool)> {
+    let store_c = store.clone();
+    let nickname_c = nickname.to_string();
+    tokio::task::spawn_blocking(move || {
+        let existing = store_c.resolve(&tls_id)?;
+        let collides = existing.is_none() && nickname_collision(&store_c, &nickname_c, &tls_id)?;
+        anyhow::Ok((existing, collides))
+    })
+    .await
+    .context("join nickname collision check")?
+}
+
 /// The redeemer's first (and only) frame: the secret it is redeeming plus its self-claimed id
 /// and suggested nickname. `[u8; 32]` fields serde-round-trip as JSON arrays (same as `Invite`).
 /// The claimed `redeemer_id` is NOT trusted — the TLS-authenticated `conn.remote_id()` is
@@ -240,6 +290,35 @@ pub async fn handle_inviter_side(
     }
 
     let now = epoch_now();
+
+    // #87: collision pre-check BEFORE the burn — but ONLY behind a live-secret peek. Order is
+    // the whole design: checking the nickname first for every caller would let a stranger with
+    // a garbage secret probe which names exist in the store, so the unproven path must stay on
+    // the generic `try_redeem` refusals below, byte-for-byte. A caller that proves possession
+    // of a live secret may be told the truth: the name is taken, the invite was NOT consumed,
+    // rename and redeem it again — which turns two same-hostname machines' first pairing from
+    // a burned invite plus a generic refusal into a self-service retry.
+    if ctx.invites.peek_live(&hello.secret, now) {
+        let (_, collides) =
+            resolve_and_check_collision(&ctx.store, &hello.redeemer_nickname, tls_id).await?;
+        if collides {
+            // Logged SERVER-side with the nickname (a pairing artifact, not a surface leak) —
+            // NO endpoint id, NO secret.
+            tracing::warn!(
+                nickname = %hello.redeemer_nickname,
+                "pairing refused: nickname collision (invite preserved)"
+            );
+            let _ = send_reply(
+                &mut send,
+                &PairReply::Refused {
+                    reason: reason_nickname_taken(&hello.redeemer_nickname, true),
+                },
+            )
+            .await;
+            return Ok(());
+        }
+    }
+
     match ctx.invites.try_redeem(&hello.secret, now) {
         Redeem::Ok(invite) => {
             // Resolve any EXISTING entry for the TLS-authenticated redeemer id FIRST — a same-id
@@ -247,38 +326,31 @@ pub async fn handle_inviter_side(
             // once, so our entry for them carries a real dial directory). The merge rules below
             // preserve what that entry already knows instead of replace-clobbering it.
             //
-            // Display-uniqueness guard — BEFORE any write/grant, and only for a NEW peer. The
-            // redeemer's self-asserted nickname becomes its resolved DISPLAY identity (the gate
-            // maps endpoint_id → nickname); grants are principal-keyed (#38), so no access can
-            // derive from the name — but a duplicate display name would make this inviter's own
-            // records/routing ambiguous, so a name held by a DIFFERENT store peer is refused.
-            // For an EXISTING same-id entry the self-suggested name is DISCARDED entirely (the
-            // stored nickname is preserved below) — same-id re-pairs keep passing.
-            // Blocking (redb read) → spawn_blocking.
-            let store_c = ctx.store.clone();
-            let nickname_c = hello.redeemer_nickname.clone();
-            let (existing, collides) = tokio::task::spawn_blocking(move || {
-                let existing = store_c.resolve(&tls_id)?;
-                let collides =
-                    existing.is_none() && nickname_collision(&store_c, &nickname_c, &tls_id)?;
-                anyhow::Ok((existing, collides))
-            })
-            .await
-            .context("join nickname collision check")??;
+            // Display-uniqueness guard — the AUTHORITATIVE re-run of the #87 pre-check above,
+            // AFTER winning the burn: two racing redeemers claiming the same NEW nickname can
+            // both pass the pre-check (neither stored yet), so the loser must be caught here,
+            // post-write-ordering. Burning in that race is rare and acceptable. Same shared
+            // helper as the pre-check so the two cannot drift; no seam exists to interleave a
+            // store write between peek and burn in a test, so this arm is a stated gap pinned
+            // only through the helper (see the spec).
+            //
+            // The redeemer's self-asserted nickname becomes its resolved DISPLAY identity (the
+            // gate maps endpoint_id → nickname); grants are principal-keyed (#38), so no access
+            // can derive from the name — but a duplicate display name would make this inviter's
+            // own records/routing ambiguous, so a name held by a DIFFERENT store peer is
+            // refused. For an EXISTING same-id entry the self-suggested name is DISCARDED
+            // entirely (the stored nickname is preserved below) — same-id re-pairs keep passing.
+            let (existing, collides) =
+                resolve_and_check_collision(&ctx.store, &hello.redeemer_nickname, tls_id).await?;
             if collides {
-                // Generic wire reason (no oracle — same as every other failure); the specific
-                // cause is logged SERVER-side with the nickname (a pairing artifact, not a
-                // surface leak) — NO endpoint id, NO secret. The invite is already burned by
-                // try_redeem; a deliberate collision attack does not deserve preservation, and an
-                // accidental collision is rare + re-mintable.
                 tracing::warn!(
                     nickname = %hello.redeemer_nickname,
-                    "pairing refused: nickname collision"
+                    "pairing refused: nickname collision (post-redeem race guard; invite burned)"
                 );
                 let _ = send_reply(
                     &mut send,
                     &PairReply::Refused {
-                        reason: REASON_REFUSED.into(),
+                        reason: reason_nickname_taken(&hello.redeemer_nickname, false),
                     },
                 )
                 .await;
@@ -546,10 +618,23 @@ pub async fn redeem_invite(
 
     // Read exactly ONE reply frame (same cap as the inviter side).
     let mut reader = FrameReader::new(BufReader::new(recv), MAX_PAIR_FRAME);
-    let reply: PairReply = match reader.next().await? {
-        Some(Inbound::Frame(v)) => {
+    let reply: PairReply = match reader.next().await {
+        Ok(Some(Inbound::Frame(v))) => {
             serde_json::from_value(v).context("inviter reply is not a PairReply")?
         }
+        // No reply frame. If the inviter's accept gate fast-closed us (#87b), say what that
+        // MEANS — the invite line in hand may still advertise a live TTL, but invites are
+        // in-memory on the inviter, so this is the everyday shape of "expired, already used,
+        // or the inviter's daemon restarted", not a network problem. Read off `close_reason()`
+        // (the close races our write/read, so either arm can be the failure site).
+        _ if no_live_invite_close(&conn) => {
+            bail!(
+                "the invite is no longer live on the inviter: it expired, was already \
+                 redeemed, or the inviter's daemon restarted since minting it (invites do \
+                 not survive a restart) — ask for a fresh invite"
+            );
+        }
+        Err(e) => return Err(e).context("read the pairing reply"),
         _ => bail!("no reply from the inviter (connection closed before a reply)"),
     };
     // On Ok, verify the inviter's presented binding against `invite.inviter_id` (which we proved
