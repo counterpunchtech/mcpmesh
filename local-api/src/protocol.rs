@@ -1263,7 +1263,9 @@ pub const API_VERSION: &str = "1.27";
 /// peer whose pong arrived after ~2.4s was reported OFFLINE while it was answering (#128); to 25
 /// with [`ActiveSession::principal`] — the live-session view was keyed on a display nickname, so
 /// two devices under one nickname were indistinguishable and any UI acting on a session (revoke,
-/// disconnect, inspect) keyed on a collidable string (#73); to 27 with the `audit_prune` /
+/// disconnect, inspect) keyed on a collidable string (#73); to 26 when a
+/// rate-limited inbound NOTIFICATION stopped being silently dropped and became a recorded audit
+/// event — no type changed; the observable audit stream did (#76, #139); to 27 with the `audit_prune` /
 /// `audit_list` verbs, `StatusResult::storage`, and the opt-in `[limits].audit_retain_months`
 /// boot retention — the audit log stopped being a permanent, unbounded, unreadable record (#88).
 ///

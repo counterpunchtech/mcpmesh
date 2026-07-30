@@ -156,6 +156,13 @@ pub fn valid_month_key(s: &str) -> bool {
 /// parsing a line of it; `kind`/`peer` then filter records. `total` counts every match;
 /// `records` pages by `offset`/`limit`. Chronological: oldest month first, in-file order within
 /// a month (the append order).
+///
+/// STREAMS each file line by line rather than materializing it (#88 gate): month-file size is
+/// driven by inbound peer traffic, so `read_records`'s whole-file `String` + full `Vec` made
+/// peak memory on the owner's own query proportional to how chatty its peers are. Here peak
+/// memory is one line + the (limit-bounded) page. `total` still requires scanning every
+/// in-range line — a count needs a pass, not retention. Unparseable lines are skipped with a
+/// warning, same contract as [`read_records`].
 pub fn list_page(
     dir: &Path,
     since: Option<&str>,
@@ -165,6 +172,7 @@ pub fn list_page(
     limit: usize,
     offset: usize,
 ) -> std::io::Result<mcpmesh_local_api::AuditListResult> {
+    use std::io::BufRead;
     let mut total: u64 = 0;
     let mut records = Vec::new();
     let mut to_skip = offset;
@@ -172,7 +180,18 @@ pub fn list_page(
         if since.is_some_and(|s| month.as_str() < s) || until.is_some_and(|u| month.as_str() > u) {
             continue;
         }
-        for rec in read_records(&path)? {
+        for line in std::io::BufReader::new(std::fs::File::open(&path)?).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let rec = match serde_json::from_str::<AuditRecord>(&line) {
+                Ok(rec) => rec,
+                Err(e) => {
+                    tracing::warn!(%e, "skipping unparseable audit line");
+                    continue;
+                }
+            };
             if kind.is_some_and(|k| rec.kind != k) {
                 continue;
             }

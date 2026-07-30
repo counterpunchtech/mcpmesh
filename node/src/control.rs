@@ -717,11 +717,16 @@ pub(crate) async fn handle_request(req: &Value, state: &DaemonState) -> Value {
             }
         }
         Some("audit_prune") => {
-            // #88: delete audit months strictly older than `before`. Same dir resolution and
-            // spawn_blocking discipline as audit_summary. The month shape is validated FIRST —
-            // `prune_before` string-compares, so a malformed key would otherwise report a clean
-            // empty prune instead of the loud error a typo deserves. Destructive but owner-only:
-            // the control socket is the daemon owner's.
+            // #88: delete audit months strictly older than `before`. The month shape is
+            // validated FIRST — `prune_before` string-compares, so a malformed key would
+            // otherwise report a clean empty prune instead of the loud error a typo deserves.
+            // Destructive but owner-only: the control socket is the daemon owner's.
+            //
+            // FAIL-CLOSED dir resolution, unlike audit_summary's env-default fallback (#88
+            // gate): this verb DELETES. A control-only state, or a mesh whose sink was never
+            // installed, has no writer-owned dir — falling back to the env default there would
+            // let a hermetic test or embedder silently delete the real user's audit history.
+            // A read verb answering the env default is a quirk; a delete doing it is a footgun.
             let sink_dir = state
                 .mesh
                 .as_ref()
@@ -732,17 +737,15 @@ pub(crate) async fn handle_request(req: &Value, state: &DaemonState) -> Value {
                     "before must be a zero-padded YYYY-MM month key, got '{}'",
                     p.before
                 );
-                tokio::task::spawn_blocking(move || {
-                    let dir = match sink_dir {
-                        Some(d) => d,
-                        None => mcpmesh_trust::paths::default_audit_dir()?,
-                    };
-                    crate::audit::prune_before(&dir, &p.before)
-                })
-                .await
-                .map_err(|e| anyhow::anyhow!("audit_prune task failed: {e}"))?
-                .map(|deleted_months| mcpmesh_local_api::AuditPruneResult { deleted_months })
-                .map_err(anyhow::Error::from)
+                let dir = sink_dir.context(
+                    "audit_prune requires a daemon with a live audit writer — refusing to \
+                     guess a directory for a destructive operation",
+                )?;
+                tokio::task::spawn_blocking(move || crate::audit::prune_before(&dir, &p.before))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("audit_prune task failed: {e}"))?
+                    .map(|deleted_months| mcpmesh_local_api::AuditPruneResult { deleted_months })
+                    .map_err(anyhow::Error::from)
             })
             .await;
             respond(id, "audit_prune", r)
@@ -757,6 +760,18 @@ pub(crate) async fn handle_request(req: &Value, state: &DaemonState) -> Value {
                 .as_ref()
                 .and_then(|m| m.audit().dir().map(std::path::Path::to_path_buf));
             let r = with_params(&params, move |p: AuditListParams| async move {
+                // Month bounds validated like `audit_prune.before` (#88 gate): a non-padded
+                // typo (`"2026-7"`) lexicographically excludes EVERY month, so the verb would
+                // answer "nothing is held about X" on a typo — the silent-underclaim this
+                // dispatch already makes a loud error for `kind`.
+                for (name, bound) in [("since", &p.since), ("until", &p.until)] {
+                    if let Some(m) = bound {
+                        anyhow::ensure!(
+                            crate::audit::valid_month_key(m),
+                            "{name} must be a zero-padded YYYY-MM month key, got '{m}'"
+                        );
+                    }
+                }
                 let kind = match &p.kind {
                     Some(s) => Some(crate::audit::parse_kind(s).ok_or_else(|| {
                         anyhow::anyhow!(

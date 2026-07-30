@@ -142,6 +142,54 @@ async fn audit_prune_deletes_strictly_older_months_and_validates_its_input() {
     .expect("audit_prune test timed out");
 }
 
+/// `audit_prune` FAILS CLOSED without a writer-owned audit dir (#88 gate): a mesh whose sink
+/// was never installed must error, never fall back to the ENV-DEFAULT dir — that fallback would
+/// let a hermetic test or embedder silently delete the real user's audit history. (The
+/// read-only verbs keep `audit_summary`'s env-default precedent; deletion does not.)
+#[tokio::test(flavor = "multi_thread")]
+async fn audit_prune_refuses_to_guess_a_directory_without_a_live_sink() {
+    timeout(Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(PeerStore::open(&dir.path().join("state.redb")).unwrap());
+        let gate: Arc<dyn TrustGate> = Arc::new(AllowlistGate::new(store.clone()));
+        let ep = local_endpoint().await;
+        let mesh = MeshState::new(
+            ep,
+            gate,
+            store,
+            Arc::new(LiveInvites::new()),
+            "self".into(),
+            dir.path().join("config.toml"),
+            Arc::new(RosterGate::empty()),
+            Arc::new(ConnRegistry::new()),
+            None,
+            None,
+            None,
+            None,
+        );
+        // Deliberately NO set_audit: the sink defaults to disabled (dir() == None).
+        let socket = dir.path().join("control.sock");
+        let listener = mcpmesh::ipc::bind_control_socket(&socket).await.unwrap();
+        let state = Arc::new(DaemonState::with_mesh(STACK_VERSION, mesh));
+        let control = tokio::spawn(serve_control(listener, state));
+        let err = connect_control(&socket)
+            .await
+            .expect("connect control")
+            .request(Request::AuditPrune(AuditPruneParams {
+                before: "2100-01".into(),
+            }))
+            .await
+            .expect_err("a destructive verb must not guess a directory");
+        assert!(
+            err.to_string().contains("audit writer"),
+            "the refusal names the missing writer, not a generic failure: {err}"
+        );
+        control.abort();
+    })
+    .await
+    .expect("fail-closed prune test timed out");
+}
+
 /// `audit_list` filters by month range / kind / peer, reports the TOTAL match count, and pages
 /// with limit+offset — both sides pinned: `total` must not shrink under pagination, and
 /// `records` must not exceed the limit.
@@ -254,10 +302,21 @@ async fn audit_list_filters_and_pages_with_an_honest_total() {
         client
             .request(list(AuditListParams {
                 kind: Some("sesion_open".into()),
-                ..base
+                ..base.clone()
             }))
             .await
             .expect_err("an unknown kind string must be refused");
+
+        // A malformed month bound is the SAME class (#88 gate): "2026-7" lexicographically
+        // excludes every zero-padded month, so without validation the verb answers "nothing is
+        // held" on a typo — a silent UNDERCLAIM, worse than the kind case's overclaim.
+        client
+            .request(list(AuditListParams {
+                since: Some("2026-7".into()),
+                ..base
+            }))
+            .await
+            .expect_err("a malformed since month must be refused, not silently match nothing");
 
         control.abort();
     })
@@ -350,7 +409,16 @@ async fn boot_prunes_audit_months_older_than_the_configured_retention() {
             )
             .unwrap();
 
-            let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_mcpmesh"))
+            // Kill guard (#88 gate): an assertion panic below must not leak a live daemon —
+            // without this, a failing run leaves a real `internal daemon` process behind.
+            struct KillOnDrop(std::process::Child);
+            impl Drop for KillOnDrop {
+                fn drop(&mut self) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+            let child = std::process::Command::new(env!("CARGO_BIN_EXE_mcpmesh"))
                 .args(["internal", "daemon"])
                 .env("XDG_RUNTIME_DIR", &runtime)
                 .env("XDG_CONFIG_HOME", &config_home)
@@ -361,6 +429,7 @@ async fn boot_prunes_audit_months_older_than_the_configured_retention() {
                 .stderr(std::process::Stdio::null())
                 .spawn()
                 .expect("spawn daemon");
+            let mut child = KillOnDrop(child);
 
             // Wait for the daemon to come up (socket answers), then inspect the dir.
             let socket = runtime.join("mcpmesh").join("mcpmesh.sock");
@@ -399,7 +468,7 @@ async fn boot_prunes_audit_months_older_than_the_configured_retention() {
             );
 
             let _ = client.request_value(&json!({"method": "shutdown"})).await;
-            let _ = child.wait();
+            let _ = child.0.wait();
         }
     })
     .await
