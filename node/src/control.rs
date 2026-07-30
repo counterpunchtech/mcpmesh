@@ -19,11 +19,11 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use mcpmesh_local_api::transport::{LocalListener, LocalStream};
 use mcpmesh_local_api::{
-    API_NAME, API_VERSION, BlobFetchParams, BlobGrantParams, BlobPublishParams,
-    BlobRepublishParams, BlobRevokeParams, BlobUnpublishParams, Hello, InviteParams,
-    OpenSessionParams, OrgJoinParams, PairParams, PeerServicesParams, RosterInstallParams,
-    ServiceAllowParams, SetAppMetadataParams, SetNicknameParams, SetRelaysParams,
-    SetRosterUrlParams, StatusResult, UnregisterServiceParams, method_of,
+    API_NAME, API_VERSION, AuditListParams, AuditPruneParams, BlobFetchParams, BlobGrantParams,
+    BlobPublishParams, BlobRepublishParams, BlobRevokeParams, BlobUnpublishParams, Hello,
+    InviteParams, OpenSessionParams, OrgJoinParams, PairParams, PeerServicesParams,
+    RosterInstallParams, ServiceAllowParams, SetAppMetadataParams, SetNicknameParams,
+    SetRelaysParams, SetRosterUrlParams, StatusResult, UnregisterServiceParams, method_of,
 };
 use mcpmesh_net::framing::{FrameReader, Inbound, write_frame};
 use serde_json::{Value, json};
@@ -716,6 +716,95 @@ pub(crate) async fn handle_request(req: &Value, state: &DaemonState) -> Value {
                 Err(e) => error(id, -32000, format!("audit_summary task failed: {e}")),
             }
         }
+        Some("audit_prune") => {
+            // #88: delete audit months strictly older than `before`. The month shape is
+            // validated FIRST — `prune_before` string-compares, so a malformed key would
+            // otherwise report a clean empty prune instead of the loud error a typo deserves.
+            // Destructive but owner-only: the control socket is the daemon owner's.
+            //
+            // FAIL-CLOSED dir resolution, unlike audit_summary's env-default fallback (#88
+            // gate): this verb DELETES. A control-only state, or a mesh whose sink was never
+            // installed, has no writer-owned dir — falling back to the env default there would
+            // let a hermetic test or embedder silently delete the real user's audit history.
+            // A read verb answering the env default is a quirk; a delete doing it is a footgun.
+            let sink_dir = state
+                .mesh
+                .as_ref()
+                .and_then(|m| m.audit().dir().map(std::path::Path::to_path_buf));
+            let r = with_params(&params, move |p: AuditPruneParams| async move {
+                anyhow::ensure!(
+                    crate::audit::valid_month_key(&p.before),
+                    "before must be a zero-padded YYYY-MM month key, got '{}'",
+                    p.before
+                );
+                let dir = sink_dir.context(
+                    "audit_prune requires a daemon with a live audit writer — refusing to \
+                     guess a directory for a destructive operation",
+                )?;
+                tokio::task::spawn_blocking(move || crate::audit::prune_before(&dir, &p.before))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("audit_prune task failed: {e}"))?
+                    .map(|deleted_months| mcpmesh_local_api::AuditPruneResult { deleted_months })
+                    .map_err(anyhow::Error::from)
+            })
+            .await;
+            respond(id, "audit_prune", r)
+        }
+        Some("audit_list") => {
+            // #88: the filtered, paged read — "show me everything you hold about me". The kind
+            // string is parsed BEFORE the fs work: an unknown kind errors rather than silently
+            // matching everything, which would make that answer overclaim. The limit clamp is
+            // load-bearing (one JSON response frame; blob_list's minor-20 lesson).
+            let sink_dir = state
+                .mesh
+                .as_ref()
+                .and_then(|m| m.audit().dir().map(std::path::Path::to_path_buf));
+            let r = with_params(&params, move |p: AuditListParams| async move {
+                // Month bounds validated like `audit_prune.before` (#88 gate): a non-padded
+                // typo (`"2026-7"`) lexicographically excludes EVERY month, so the verb would
+                // answer "nothing is held about X" on a typo — the silent-underclaim this
+                // dispatch already makes a loud error for `kind`.
+                for (name, bound) in [("since", &p.since), ("until", &p.until)] {
+                    if let Some(m) = bound {
+                        anyhow::ensure!(
+                            crate::audit::valid_month_key(m),
+                            "{name} must be a zero-padded YYYY-MM month key, got '{m}'"
+                        );
+                    }
+                }
+                let kind = match &p.kind {
+                    Some(s) => Some(crate::audit::parse_kind(s).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "unknown kind '{s}' — one of session_open, session_close, request, \
+                             blob_fetch, trust"
+                        )
+                    })?),
+                    None => None,
+                };
+                let limit = p.limit.unwrap_or(500).min(1000) as usize;
+                let offset = p.offset.unwrap_or(0) as usize;
+                tokio::task::spawn_blocking(move || {
+                    let dir = match sink_dir {
+                        Some(d) => d,
+                        None => mcpmesh_trust::paths::default_audit_dir()?,
+                    };
+                    crate::audit::list_page(
+                        &dir,
+                        p.since.as_deref(),
+                        p.until.as_deref(),
+                        kind,
+                        p.peer.as_deref(),
+                        limit,
+                        offset,
+                    )
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("audit_list task failed: {e}"))?
+                .map_err(anyhow::Error::from)
+            })
+            .await;
+            respond(id, "audit_list", r)
+        }
         _ => dispatch(req, state),
     }
 }
@@ -862,6 +951,30 @@ pub(crate) fn status_result(state: &DaemonState) -> Result<StatusResult> {
         .mesh()
         .map(crate::daemon::reachability_of)
         .unwrap_or_default();
+    // #88: the on-disk footprint, computed LIVE per call (the test pins that a new audit month
+    // moves the number on the next status). Inline fs stats/walks, matching this fn's existing
+    // inline redb reads (`store.list()` above); the audit dir holds at most a handful of month
+    // files and the blob walk is bounded by the store's own contents. `None` without a mesh.
+    let storage = state.mesh().map(|mesh| {
+        let audit_bytes = mesh
+            .audit()
+            .dir()
+            .and_then(|d| crate::audit::list_month_files(d).ok())
+            .map(|files| files.iter().map(|(_, _, size)| size).sum())
+            .unwrap_or(0);
+        let redb_bytes = std::fs::metadata(mesh.store.path())
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let blobs_bytes = mesh
+            .blobs_dir()
+            .map(crate::util::dir_size_bytes)
+            .unwrap_or(0);
+        mcpmesh_local_api::StorageInfo {
+            audit_bytes,
+            redb_bytes,
+            blobs_bytes,
+        }
+    });
     Ok(StatusResult {
         stack_version: state.stack_version.clone(),
         services,
@@ -877,6 +990,7 @@ pub(crate) fn status_result(state: &DaemonState) -> Result<StatusResult> {
             .mesh()
             .map(|mesh| mesh.self_nickname())
             .unwrap_or_default(),
+        storage,
     })
 }
 

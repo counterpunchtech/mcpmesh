@@ -825,6 +825,7 @@ mod tests {
             recent_pairings: Vec::new(),
             reachability: Vec::new(),
             self_nickname: String::new(),
+            storage: None,
         }
     }
 

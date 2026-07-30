@@ -243,6 +243,25 @@ pub struct StatusResult {
     /// skip-if-empty so an older payload round-trips.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub self_nickname: String,
+    /// On-disk footprint of this node's own state (#88), so an embedder can warn a user before
+    /// ENOSPC rather than after — the audit log's write rate is driven by inbound peer traffic,
+    /// and it shares a filesystem with `state.redb` and the device key. A LIVE read (computed
+    /// per `status` call), not a boot-time snapshot. `None` only in mesh-less control-only mode.
+    /// Additive: default + skip-if-none so an older payload round-trips.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<StorageInfo>,
+}
+
+/// The `status.storage` block (#88): bytes actually on disk, by subsystem. Counts, never
+/// content. Additive-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageInfo {
+    /// Summed sizes of the monthly audit files (`<state>/audit/*.jsonl`).
+    pub audit_bytes: u64,
+    /// Size of the peer/trust state store (`state.redb`).
+    pub redb_bytes: u64,
+    /// Total size under the app-blob store directory; 0 when no blob store exists.
+    pub blobs_bytes: u64,
 }
 
 /// Params of [`Request::RegisterService`]: the `[services.*]` entry to write/update.
@@ -639,6 +658,14 @@ pub enum Request {
     /// the server dispatches on the `method` string. Tag `"audit_summary"` (snake_case);
     /// `method_of` reads the `method` string generically (no per-variant arm).
     AuditSummary,
+    /// Delete audit months strictly older than `before` (#88) — the retention lever the log
+    /// never had. Local-only and owner-only (the control socket is the daemon owner's). Answers
+    /// [`AuditPruneResult`]. Tag `"audit_prune"`.
+    AuditPrune(AuditPruneParams),
+    /// Read this node's LOCAL audit records, filtered and paged (#88) — the "show me everything
+    /// you hold about me" verb. Local-only; nothing is transmitted. Answers
+    /// [`AuditListResult`]. Tag `"audit_list"`.
+    AuditList(AuditListParams),
     /// Open a live event stream (pairing liveness & health telemetry). Like `open_session`, the
     /// connection STOPS being request/response after this call and becomes a one-way push stream
     /// of `StreamFrame`s. Parameterless. Tag `"subscribe"`.
@@ -739,6 +766,63 @@ pub struct BlobScopeList {
 pub struct BlobFetchResult {
     pub hash: String,
     pub bytes_len: u64,
+}
+
+/// Params of [`Request::AuditPrune`] (#88): delete monthly audit files STRICTLY older than
+/// `before` (that month itself is kept — delete-before, not delete-including). Rejects unknown
+/// fields, and the daemon validates the `YYYY-MM` shape up front: a malformed month errors
+/// loudly instead of string-comparing to nothing and reporting a clean no-op.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditPruneParams {
+    /// A zero-padded `YYYY-MM` month key.
+    pub before: String,
+}
+
+/// Result of [`Request::AuditPrune`]: the month keys actually deleted, ascending. Empty when
+/// nothing was older than `before` (idempotent).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditPruneResult {
+    pub deleted_months: Vec<String>,
+}
+
+/// Params of [`Request::AuditList`] (#88). All filters optional and AND-combined; every field
+/// absent lists everything (paged). Rejects unknown fields — a typo'd filter that silently
+/// matched everything would let a "what do you hold about X" answer overclaim.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditListParams {
+    /// Inclusive `YYYY-MM` lower bound — month-file granularity (the rotation unit), so an
+    /// out-of-range month is skipped without parsing it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+    /// Inclusive `YYYY-MM` upper bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<String>,
+    /// One of the wire kind strings (`session_open` / `session_close` / `request` /
+    /// `blob_fetch` / `trust`). An UNKNOWN string is an error, never silently-all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// The record's attributed peer nickname.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer: Option<String>,
+    /// Page size, default 500, clamped to 1000 — a month file can be arbitrarily large and the
+    /// response is ONE JSON frame under the transport's frame cap, so the clamp is load-bearing
+    /// (the same lesson as `blob_list`'s, minor 20).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// Records to skip (after filtering), for paging.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u32>,
+}
+
+/// Result of [`Request::AuditList`]: one page of matching records in chronological order
+/// (oldest month first, in-file order within a month), plus the TOTAL match count so a caller
+/// can page without a second counting call. `total` counts ALL matches, not the page.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuditListResult {
+    pub records: Vec<AuditRecord>,
+    pub total: u64,
 }
 
 /// Result of [`Request::AuditSummary`]: LOCAL per-peer / per-service session counts
@@ -1128,7 +1212,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   twenty-four have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.26";
+pub const API_VERSION: &str = "1.27";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -1179,7 +1263,11 @@ pub const API_VERSION: &str = "1.26";
 /// peer whose pong arrived after ~2.4s was reported OFFLINE while it was answering (#128); to 25
 /// with [`ActiveSession::principal`] — the live-session view was keyed on a display nickname, so
 /// two devices under one nickname were indistinguishable and any UI acting on a session (revoke,
-/// disconnect, inspect) keyed on a collidable string (#73).
+/// disconnect, inspect) keyed on a collidable string (#73); to 26 when a
+/// rate-limited inbound NOTIFICATION stopped being silently dropped and became a recorded audit
+/// event — no type changed; the observable audit stream did (#76, #139); to 27 with the `audit_prune` /
+/// `audit_list` verbs, `StatusResult::storage`, and the opt-in `[limits].audit_retain_months`
+/// boot retention — the audit log stopped being a permanent, unbounded, unreadable record (#88).
 ///
 /// **Not every semantic change gets a minor, and that is the gap to watch (#122).** A minor marks a
 /// change to this *surface*. A change to behaviour BEHIND the surface — same fields, same shapes,
@@ -1190,7 +1278,7 @@ pub const API_VERSION: &str = "1.26";
 /// That class is bigger than it looks: **10, 17, 21, 22, 23 and 24 all shipped with no change to
 /// any type in this file** — they moved meaning, not shape. Six of the twenty-four. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 26;
+pub const API_MINOR: u32 = 27;
 
 #[cfg(test)]
 mod tests {
@@ -1866,6 +1954,7 @@ mod tests {
             recent_pairings: vec![],
             reachability: vec![],
             self_nickname: String::new(),
+            storage: None,
         };
         let v = serde_json::to_value(&s).unwrap();
         assert_eq!(v["services"][0]["backend"], "run");
@@ -1932,6 +2021,7 @@ mod tests {
             recent_pairings: vec![],
             reachability: vec![],
             self_nickname: String::new(),
+            storage: None,
         };
         let v = serde_json::to_value(&s).unwrap();
         assert_eq!(v["roster"]["org_id"], "acme");
@@ -1969,6 +2059,7 @@ mod tests {
             }],
             reachability: vec![],
             self_nickname: String::new(),
+            storage: None,
         };
         let v = serde_json::to_value(&s).unwrap();
         assert_eq!(v["recent_pairings"][0]["peer_nickname"], "bob");

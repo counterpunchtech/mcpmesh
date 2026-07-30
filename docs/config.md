@@ -92,6 +92,7 @@ nothing is detectably wrong at config time.
 |---|---|---|
 | `rate_limit_per_min` | `120` | Per-peer request rate (token bucket; this value is also the burst allowance). An over-limit **request** is refused with a `-32053` retry hint — never served. An over-limit **notification** is dropped **silently**, since JSON-RPC gives it no reply channel: notification delivery is not guaranteed under load and the loss is undetectable by the sender (see `docs/local-protocol.md`). |
 | `blob_bytes_per_min` | `0` | Per-peer **app-blob byte budget**, bytes per minute. `0` = unlimited (the default), so upgrading changes nothing. The other blob limiter counts *connections*, which cannot see one granted peer re-pulling a 4 GB blob on each of 60 connections a minute; this bounds the bytes. A peer that exceeds it has its transfer **aborted** (retryable — `RateLimited`, not a permission failure), not paced: pacing holds the request open and turns a bandwidth problem into an unbounded-concurrency one. **The consequence is a partial transfer**, so size the budget above the largest blob you expect a peer to fetch in a minute. Setting it non-zero also arms a per-chunk intercept (~16 KiB granularity), which costs an in-process round trip per chunk — that cost is not paid at the default. **Requires a daemon restart** (the mask and the limiter are built once at boot), and **use 0 or at least 32768** (two chunks) — a value in `1..32768` is **floored to 32768**. Admission reserves one chunk before any bytes, so a sub-floor budget would not fail closed: it would silently cap every servable blob at about `budget - 16384` bytes and truncate anything larger (measured: 20480 serves a 4 KiB blob and nothing bigger). Note the budget also caps GETs at roughly `blob_bytes_per_min / 16384` per minute regardless of blob size. |
+| `audit_retain_months` | `0` | Audit-log retention window in calendar months (#88). **`0` = keep forever (the default)** — upgrading changes nothing. `N > 0` deletes monthly audit files older than the last `N` months **at daemon boot** (the current month counts as month 1); a long-running daemon prunes on its next start, and the `audit_prune` control verb covers live needs. The audit log grows with **inbound peer traffic** and shares a filesystem with `state.redb` and the device key — watch it via `status.storage.audit_bytes`. |
 | `max_sessions` | `4` | Per-service cap on concurrently spawned sessions for a `run` service (a `socket` service is one warm process that manages its own concurrency). `0` is floored to `1`. |
 | `max_inflight` | `16` | Reserved: parsed and accepted, not yet enforced at this release. |
 
@@ -145,6 +146,7 @@ discovery_urls = ["https://dns.acme.com/pkarr"]
 [limits]
 rate_limit_per_min = 120
 blob_bytes_per_min = 0   # 0 = unlimited; see the table above before raising
+audit_retain_months = 0  # 0 = keep the audit log forever; N > 0 prunes older months at boot
 
 [roster]                   # roster mode only — pinned by `join`, tunables hand-editable
 url = "https://intranet.acme.com/mcpmesh-roster.json"

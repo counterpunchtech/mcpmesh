@@ -571,6 +571,7 @@ mod tests {
             max_inflight: 16,
             max_sessions: 4,
             blob_bytes_per_min: 0,
+            audit_retain_months: 0,
         };
         let ml = MeshLimiters::from_config(&cfg);
         let t = Instant::now();
@@ -593,6 +594,7 @@ mod tests {
             max_inflight: 16,
             max_sessions: 4,
             blob_bytes_per_min: 0,
+            audit_retain_months: 0,
         });
         // The GLOBAL pair-accept bucket engages after its burst (bounds a distinct-id stranger flood).
         let mut admitted = 0;

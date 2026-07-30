@@ -149,6 +149,30 @@ async fn boot_node(paths: NodePaths, config: Option<Config>) -> Result<BootedNod
         None => Config::load(&config_path)
             .with_context(|| format!("config error in {}", config_path.display()))?,
     };
+
+    // 1a. Audit retention (#88): with `[limits].audit_retain_months = N > 0`, delete monthly
+    //     audit files older than the last N months. Boot-time only (a long-running daemon prunes
+    //     on next start; the `audit_prune` verb covers live needs), BEFORE serving so a caller
+    //     never reads a month the config says is out of window. Best-effort like the writer: a
+    //     prune failure is a warning, never a failed boot — refusing to start over an
+    //     undeletable old log file would be worse than keeping it. Default 0 deletes nothing.
+    if let Some(cutoff) =
+        crate::audit::retention_cutoff(&crate::audit::now_ts()[..7], cfg.limits.audit_retain_months)
+    {
+        let dir = paths.audit_dir.clone();
+        match blocking("join audit retention prune", move || {
+            crate::audit::prune_before(&dir, &cutoff)
+        })
+        .await
+        {
+            Ok(Ok(deleted)) if !deleted.is_empty() => {
+                tracing::info!(?deleted, "audit retention pruned old months");
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::warn!(%e, "audit retention prune failed"),
+            Err(e) => tracing::warn!(%e, "audit retention prune failed"),
+        }
+    };
     let key_path = match cfg.identity.device_key.clone() {
         Some(p) => p,
         None => paths.device_key_path.clone(),
@@ -364,6 +388,9 @@ async fn boot_node(paths: NodePaths, config: Option<Config>) -> Result<BootedNod
                         // (bounded) for the relay handshake before minting. Only here — see
                         // `enable_relay_wait`.
                         provider.enable_relay_wait();
+                        // #88: record the on-disk store dir alongside the provider, so
+                        // `status.storage.blobs_bytes` walks the dir that actually holds bytes.
+                        mesh.set_blobs_dir(paths.blobs_dir.clone());
                         mesh.set_app_blobs(provider).await
                     }
                     Err(e) => tracing::warn!(%e, "app-blob provider disabled (build failed)"),

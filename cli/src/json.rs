@@ -173,6 +173,7 @@ mod tests {
             recent_pairings: vec![],
             reachability: vec![],
             self_nickname: String::new(),
+            storage: None,
         };
         let v = status_json("fp-words", &hello, &status);
         assert_eq!(v["api"], "mcpmesh-local/1");

@@ -67,6 +67,8 @@ pub struct PeerEntry {
 /// dir lives.
 pub struct PeerStore {
     db: Database,
+    /// The path `open` was given, retained for `status.storage.redb_bytes` (#88).
+    path: std::path::PathBuf,
 }
 
 impl PeerStore {
@@ -81,7 +83,15 @@ impl PeerStore {
         // open_table creates the table if absent; commit persists the (empty) schema.
         txn.open_table(PEERS)?;
         txn.commit()?;
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// The on-disk path this store was opened at — `status.storage.redb_bytes` stats it (#88).
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Insert or replace the entry for its `endpoint_id` (idempotent upsert). One atomic

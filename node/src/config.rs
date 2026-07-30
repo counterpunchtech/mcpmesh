@@ -167,6 +167,12 @@ pub struct LimitsCfg {
     ///
     /// Requires a restart: the limiter and the provider's event mask are both built once at boot.
     pub blob_bytes_per_min: u64,
+    /// Audit-log retention window in calendar months (#88). **0 = keep forever, and that is the
+    /// default** — flipping today's keep-everything behavior to auto-deletion is a product call,
+    /// deliberately not made here. When N > 0, boot deletes monthly audit files older than the
+    /// last N months (the current month counts as month 1). Boot-time only: a long-running
+    /// daemon prunes on its next start; the `audit_prune` verb covers live needs.
+    pub audit_retain_months: u32,
 }
 impl Default for LimitsCfg {
     fn default() -> Self {
@@ -175,6 +181,7 @@ impl Default for LimitsCfg {
             max_inflight: 16,
             max_sessions: 4,
             blob_bytes_per_min: 0, // unlimited: opt-in, no behaviour change on upgrade
+            audit_retain_months: 0, // keep forever: opt-in, no behaviour change on upgrade
         }
     }
 }

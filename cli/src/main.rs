@@ -873,6 +873,12 @@ fn run_internal_audit(command: AuditCmd, json: bool) -> anyhow::Result<()> {
             }
         }
         AuditCmd::Prune { before } => {
+            // Same validation as the control verb (#88): `prune_before` string-compares, so a
+            // malformed month would print "Nothing to prune" instead of erroring on the typo.
+            anyhow::ensure!(
+                audit::valid_month_key(&before),
+                "--before must be a zero-padded YYYY-MM month key, got '{before}'"
+            );
             let deleted = audit::prune_before(&dir, &before)?;
             if json {
                 println!("{}", serde_json::json!({"pruned": deleted}));

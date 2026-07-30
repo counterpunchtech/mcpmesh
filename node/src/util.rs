@@ -104,6 +104,27 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Total bytes of regular files under `dir`, recursively (#88's `status.storage`). Best-effort
+/// by design: a missing dir is 0 (the subsystem has written nothing yet), and an entry that
+/// errors mid-walk is skipped rather than failing the read — this feeds an advisory display
+/// number, not an invariant. Blocking (fs walk): call from a blocking context or accept the
+/// stall like the status path's other inline redb reads.
+pub fn dir_size_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        if meta.is_dir() {
+            total += dir_size_bytes(&entry.path());
+        } else {
+            total += meta.len();
+        }
+    }
+    total
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
