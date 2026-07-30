@@ -584,10 +584,16 @@ pub fn render_frame(frame: &StreamFrame) -> String {
         StreamFrame::Snapshot {
             active_sessions,
             reachability,
+            self_network,
         } => format!(
-            "snapshot: {} active session(s), {} peer(s) known",
+            "snapshot: {} active session(s), {} peer(s) known{}",
             active_sessions.len(),
             reachability.len(),
+            match self_network {
+                Some(n) if n.online => " — online",
+                Some(_) => " — no relay connection",
+                None => "",
+            }
         ),
         // #58: a liveness transition. Renders the nickname and the new state only — the row also
         // carries the `eid:` principal for programmatic joins, but the DISPLAY surface stays
@@ -597,6 +603,14 @@ pub fn render_frame(frame: &StreamFrame) -> String {
             peer.name,
             if peer.reachable { "online" } else { "offline" }
         ),
+        // #90: this node's own posture changed. Display the decision-relevant facts only.
+        StreamFrame::SelfNetwork { self_network } => {
+            match (&self_network.online, &self_network.home_relay) {
+                (true, Some(relay)) => format!("[self] online via {relay}"),
+                (true, None) => "[self] online".to_string(),
+                (false, _) => "[self] relay connection lost — LAN/direct paths only".to_string(),
+            }
+        }
         StreamFrame::Event { record } => {
             let peer = record
                 .peer
@@ -826,6 +840,7 @@ mod tests {
             reachability: Vec::new(),
             self_nickname: String::new(),
             storage: None,
+            self_network: None,
         }
     }
 

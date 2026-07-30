@@ -174,6 +174,7 @@ mod tests {
             reachability: vec![],
             self_nickname: String::new(),
             storage: None,
+            self_network: None,
         };
         let v = status_json("fp-words", &hello, &status);
         assert_eq!(v["api"], "mcpmesh-local/1");

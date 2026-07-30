@@ -401,6 +401,12 @@ async fn boot_node(paths: NodePaths, config: Option<Config>) -> Result<BootedNod
             }
         }
     }
+    // #90: the self-network posture watcher — pushes a StreamFrame::SelfNetwork when this
+    // node's own reachability changes (relay connected/lost, home relay moved) and stamps
+    // `last_change_epoch` for `status`. Every mode, including relay-disabled (where it simply
+    // never observes a relay and never emits): the projection is what `status` reads either way.
+    background.push(crate::daemon::spawn_self_net_watch(mesh.clone()));
+
     let accept_task = spawn_accept_loop(mesh.clone(), services);
     mesh.set_accept_task(accept_task).await;
 

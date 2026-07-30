@@ -20,6 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             StreamFrame::Snapshot {
                 active_sessions,
                 reachability,
+                ..
             } => println!(
                 "snapshot: {} active session(s), {} peer(s) probed",
                 active_sessions.len(),

@@ -365,9 +365,20 @@ async fn run_subscription(
     // The reachability ring (#58) is registered BEFORE the snapshot for the same reason the audit
     // one is: a transition landing in the gap would otherwise be absent from both.
     let mut reach_rx = mesh.map(|m| m.reach_bcast.subscribe());
+    // The self-network ring (#90), registered before the snapshot for the same gap-loss reason.
+    let mut self_rx = mesh.map(|m| m.self_net_bcast.subscribe());
     let snapshot = StreamFrame::Snapshot {
         active_sessions: audit.active_sessions(),
         reachability: mesh.map(crate::daemon::reachability_of).unwrap_or_default(),
+        // #90: live-computed, so a fresh subscriber renders posture without a status poll —
+        // and without waiting for the watcher to observe a change.
+        self_network: mesh.map(|m| {
+            let stamp = *m
+                .self_net_change
+                .lock()
+                .expect("self_net_change lock not poisoned");
+            crate::daemon::self_network_now(m, stamp)
+        }),
     };
     write_frame(&mut w, &serde_json::to_value(&snapshot)?).await?;
 
@@ -376,9 +387,6 @@ async fn run_subscription(
     // not also switch liveness off — they are independent signals. Only when NEITHER tap exists
     // (a control-only daemon with no mesh) does the snapshot stand alone.
     let mut rx = rx;
-    if rx.is_none() && reach_rx.is_none() {
-        return Ok(());
-    }
     use tokio::sync::broadcast::error::RecvError;
 
     /// Map an audit-ring result to a frame; `None` (with `closed` set) means this tap is finished.
@@ -413,23 +421,50 @@ async fn run_subscription(
         }
     }
 
-    let (mut closed_audit, mut closed_reach) = (false, false);
+    /// The self-network-ring equivalent (#90).
+    fn self_net_frame(
+        r: Result<mcpmesh_local_api::SelfNetwork, RecvError>,
+        closed: &mut bool,
+    ) -> Option<StreamFrame> {
+        match r {
+            Ok(self_network) => Some(StreamFrame::SelfNetwork { self_network }),
+            Err(RecvError::Lagged(n)) => Some(StreamFrame::Lagged { dropped: n }),
+            Err(RecvError::Closed) => {
+                *closed = true;
+                None
+            }
+        }
+    }
+
+    /// Await the next value from an optional tap; an absent tap pends forever, so `select!`
+    /// simply never picks it. Replaced the per-combination match when the third ring arrived
+    /// (#90) — eight arms was where that shape stopped scaling.
+    async fn tap<T: Clone>(
+        rx: &mut Option<tokio::sync::broadcast::Receiver<T>>,
+    ) -> Result<T, RecvError> {
+        match rx {
+            Some(rx) => rx.recv().await,
+            None => std::future::pending().await,
+        }
+    }
+
+    let (mut closed_audit, mut closed_reach, mut closed_self) = (false, false, false);
     loop {
-        // Two independent rings — audit records and reachability transitions (#58) — merged here
-        // rather than at the source, so the audit broadcast (which is the same call that appends to
-        // the on-disk log) keeps its schema untouched. Lag on EITHER ring reports the same `Lagged`
-        // frame and never drops the subscriber.
-        let frame = match (&mut rx, &mut reach_rx) {
-            (Some(audit_rx), Some(reach)) => tokio::select! {
-                r = audit_rx.recv() => audit_frame(r, &mut closed_audit),
-                r = reach.recv() => reach_frame(r, &mut closed_reach),
-            },
-            (Some(audit_rx), None) => audit_frame(audit_rx.recv().await, &mut closed_audit),
-            (None, Some(reach)) => reach_frame(reach.recv().await, &mut closed_reach),
-            (None, None) => return Ok(()),
+        // Three independent rings — audit records, peer-reachability transitions (#58), and
+        // self-network transitions (#90) — merged here rather than at the source, so the audit
+        // broadcast (which is the same call that appends to the on-disk log) keeps its schema
+        // untouched. Lag on ANY ring reports the same `Lagged` frame and never drops the
+        // subscriber.
+        if rx.is_none() && reach_rx.is_none() && self_rx.is_none() {
+            return Ok(());
+        }
+        let frame = tokio::select! {
+            r = tap(&mut rx) => audit_frame(r, &mut closed_audit),
+            r = tap(&mut reach_rx) => reach_frame(r, &mut closed_reach),
+            r = tap(&mut self_rx) => self_net_frame(r, &mut closed_self),
         };
-        // A tap whose sender is gone is dropped rather than ending the stream — the OTHER tap may
-        // still be healthy. When both are gone the match arm above returns.
+        // A tap whose sender is gone is dropped rather than ending the stream — the OTHERS may
+        // still be healthy. When all are gone the check at the loop top returns.
         if closed_audit {
             rx = None;
             closed_audit = false;
@@ -437,6 +472,10 @@ async fn run_subscription(
         if closed_reach {
             reach_rx = None;
             closed_reach = false;
+        }
+        if closed_self {
+            self_rx = None;
+            closed_self = false;
         }
         let Some(frame) = frame else { continue };
         if write_frame(&mut w, &serde_json::to_value(&frame)?)
@@ -975,6 +1014,15 @@ pub(crate) fn status_result(state: &DaemonState) -> Result<StatusResult> {
             blobs_bytes,
         }
     });
+    // #90: THIS node's own reachability posture — live point reads off the endpoint's stable
+    // watcher surface, merged with the boot watcher's last-change stamp. None without a mesh.
+    let self_network = state.mesh().map(|mesh| {
+        let stamp = *mesh
+            .self_net_change
+            .lock()
+            .expect("self_net_change lock not poisoned");
+        crate::daemon::self_network_now(mesh, stamp)
+    });
     Ok(StatusResult {
         stack_version: state.stack_version.clone(),
         services,
@@ -991,6 +1039,7 @@ pub(crate) fn status_result(state: &DaemonState) -> Result<StatusResult> {
             .map(|mesh| mesh.self_nickname())
             .unwrap_or_default(),
         storage,
+        self_network,
     })
 }
 
