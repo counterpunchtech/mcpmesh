@@ -182,6 +182,25 @@ pub fn spawn_accept_loop(mesh: Arc<MeshState>, services: Arc<Services>) -> JoinH
                             conn.close(mcpmesh_net::CLOSE_UNAUTHORIZED.into(), b"unauthorized");
                             return;
                         };
+                        // #89: meter the probe per authenticated endpoint. The arm was gated but
+                        // UNMETERED, so a paired peer could pong-flood and the only bound was its
+                        // own politeness. AFTER the gate, so an unpaired scanner still allocates
+                        // nothing (SECURITY invariant 4: strangers stay cheap). The refusal is
+                        // DISTINGUISHABLE from the gate's (`PING_THROTTLE_CLOSE`, sibling idiom of
+                        // the pair/blob limiters) so the prober can treat it as non-evidence rather
+                        // than writing a false "peer offline" (#142 gate, HIGH). This leaks nothing:
+                        // only an authenticated PAIRED peer can reach the limiter, and a flooding
+                        // one interleaves refusals with real pongs as the bucket refills, so it
+                        // already holds proof it is paired. An unpaired scanner still gets
+                        // `unauthorized` above, unchanged.
+                        if !mesh.limits().admit_ping(&remote) {
+                            // No endpoint id in the log (surface-leak discipline); the count lives
+                            // on `MeshLimiters::pings_refused` — a probe is not a session, so this
+                            // is its only footprint besides the close itself.
+                            tracing::debug!("ping probe refused: rate limited");
+                            conn.close(0u32.into(), crate::daemon::reach::PING_THROTTLE_CLOSE);
+                            return;
+                        }
                         // The dialer opens the bi-stream and sends one ping frame (which is what
                         // makes `accept_bi` resolve — a silent QUIC stream is invisible to the peer);
                         // we ignore its content and write the single pong. `finish()` + `stopped()`

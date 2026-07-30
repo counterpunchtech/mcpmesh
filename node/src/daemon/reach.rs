@@ -47,6 +47,37 @@ pub const REACH_TTL_SECS: i64 = 20;
 /// reported unreachable. No retries/backoff/persistence (YAGNI); reachable ⇔ a pong in time.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// The ping arm's rate-limit close reason (#89 gate) — the sibling idiom of `b"pair rate
+/// limited"` / `b"blob rate limited"`. ONE constant for both sides so responder and prober
+/// cannot drift: the accept arm writes it, [`probe_once`] matches it, and the match is what lets
+/// a throttled probe be treated as non-evidence instead of a false "peer offline".
+pub(crate) const PING_THROTTLE_CLOSE: &[u8] = b"ping rate limited";
+
+/// Marker error: the probe was REFUSED by the peer's ping rate limiter (#89 gate). A refusal is
+/// not evidence of unreachability in either direction — [`probe_peer`] commits nothing for it.
+#[derive(Debug)]
+struct ProbeThrottled;
+
+impl std::fmt::Display for ProbeThrottled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "probe refused: ping rate limited")
+    }
+}
+
+impl std::error::Error for ProbeThrottled {}
+
+/// Did the peer close this connection with the ping limiter's reason? Read off the CONNECTION
+/// rather than parsed out of whichever stream error surfaced first — the refusal races our
+/// `open_bi`/write/read, so any of them can be the failure site, and all of them leave the
+/// application close on `close_reason()`.
+fn throttle_closed(conn: &iroh::endpoint::Connection) -> bool {
+    matches!(
+        conn.close_reason(),
+        Some(iroh::endpoint::ConnectionError::ApplicationClosed(ac))
+            if ac.reason.as_ref() == PING_THROTTLE_CLOSE
+    )
+}
+
 /// Probe one peer over [`ALPN_PING`] and cache the result. Dials the peer by id WITH its stored
 /// `last_addr` hint attached when usable, exactly like `dial::dial_service`'s single-nickname
 /// fallback (discovery still resolves/merges addresses; hermetic localhost tests seed a
@@ -72,6 +103,41 @@ pub async fn probe_peer(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> ReachEn
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let started = tokio::time::Instant::now();
     let outcome = tokio::time::timeout(PROBE_TIMEOUT, probe_once(mesh, endpoint_id, started)).await;
+    // #89 gate (HIGH): a probe REFUSED by the peer's rate limiter is not evidence the peer is
+    // down — commit NOTHING for it. Writing `reachable: false` here gave a live, paired peer a
+    // fresh false offline for a full TTL and broadcast the transition. The caller gets the
+    // previous entry if one exists (the refusal proves the peer is up, but the entry stays
+    // honest about when it was actually probed), else an UNCOMMITTED unreachable row — never
+    // cached, so it cannot poison anything.
+    //
+    // Two accepted bounds (#142 second gate), stated rather than fixed:
+    // - A hostile PAIRED peer that answers every probe with the throttle close keeps its entry
+    //   permanently stale, so every `reachability_of` read re-spawns a refresh — no 20s
+    //   quiescence, one dial per read, until it pongs or goes down. Bounded by our own poll
+    //   rate, costs the peer a connection each time, and it can only pin ITS OWN row (whose
+    //   meta/path/rtt it already controls); a probe backoff belongs with #89's follow-up work.
+    // - The check below matches `Ok(Err(_))` only: a refusal whose CONNECTION_CLOSE arrives
+    //   after PROBE_TIMEOUT surfaces as `Elapsed` and commits `reachable: false` normally — a
+    //   lost close frame is indistinguishable from a dead peer, so that is the honest verdict.
+    if let Ok(Err(e)) = &outcome
+        && e.downcast_ref::<ProbeThrottled>().is_some()
+    {
+        let previous = mesh
+            .reachability
+            .lock()
+            .expect("reachability lock not poisoned")
+            .get(&endpoint_id)
+            .cloned();
+        return previous.unwrap_or(ReachEntry {
+            reachable: false,
+            rtt_ms: None,
+            probed_at: epoch_now_i64(),
+            meta: String::new(),
+            services: Vec::new(),
+            seq,
+            path: mcpmesh_local_api::PeerPath::Unknown,
+        });
+    }
     // `probe_once` returns the peer's (already length-capped) metadata on a reachable pong.
     // `path` rides the probe OUTCOME, so it is exactly as fresh as `reachable`/`rtt_ms` and an
     // unreachable peer reports `Unknown` rather than a stale route (#64 review). Reading it from
@@ -334,6 +400,27 @@ async fn probe_once(
         .and_then(|e| e.last_addr);
     let addr = super::dial::stored_dial_addr(last_addr.as_deref(), id);
     let conn = mesh.endpoint.connect(addr, ALPN_PING).await?;
+    let exchanged = exchange(&conn, started).await;
+    // A limiter refusal (#89 gate) surfaces as whichever stream error lost the race with the
+    // peer's close; the close reason on the CONNECTION is the reliable signal. Rewrite it to the
+    // marker so `probe_peer` can refuse to treat it as evidence. Checked only on failure: a
+    // successful exchange got a pong, throttled or not.
+    match exchanged {
+        Ok((meta, services, rtt_ms)) => Ok((meta, services, conn, rtt_ms)),
+        Err(e) if throttle_closed(&conn) => Err(e.context(ProbeThrottled)),
+        Err(e) => Err(e),
+    }
+}
+
+/// The stream half of [`probe_once`], over an established connection: open the bi-stream, send
+/// one ping frame, read the pong. Split from the dial so its failure can be classified against
+/// the connection's close reason ([`throttle_closed`]) at ONE site rather than per stream call.
+/// `started` is the PROBE's start — before the dial — so `rtt_ms` keeps meaning dial + round
+/// trip (#123), not just this stream half.
+async fn exchange(
+    conn: &iroh::endpoint::Connection,
+    started: tokio::time::Instant,
+) -> Result<(String, Vec<String>, u64)> {
     // We open the bi-stream and send one ping frame — the write is what makes the responder's
     // `accept_bi` resolve (a silent QUIC stream is invisible to the peer). We say nothing
     // meaningful; the responder speaks the pong. `finish()` closes our (empty) send direction.
@@ -369,7 +456,7 @@ async fn probe_once(
             // spends up to `PATH_SETTLE`, and that must happen OUTSIDE `PROBE_TIMEOUT` — see
             // `probe_peer`.
             let rtt_ms = started.elapsed().as_millis() as u64;
-            Ok((pong_meta(&v), pong_services(&v), conn, rtt_ms))
+            Ok((pong_meta(&v), pong_services(&v), rtt_ms))
         }
         _ => anyhow::bail!("no pong from peer"),
     }
@@ -491,6 +578,34 @@ pub(crate) fn caller_admitted_services(
         .collect();
     out.sort();
     out
+}
+
+/// Probe `endpoint_id` only if the cache has nothing fresher than [`REACH_TTL_SECS`] (#89).
+///
+/// `probe_peer` is unconditional, which made `peer_services` the one caller with no TTL: a client
+/// polling it faster than the ping limiter's sustained refill would be REFUSED, and a refusal is
+/// reported as `reachable: false` and written to the cache. That turns a rate limit into a fresh
+/// false "peer is offline" for the next [`REACH_TTL_SECS`] — a healthy, paired peer reported down,
+/// which is worse than the flood the limiter exists to stop. Reusing a fresh entry keeps the verb
+/// off the limiter entirely under any realistic poll rate, so the two cannot fight.
+///
+/// This trades the docstring's "a fresh probe" for "no staler than `status` would report", which is
+/// the same freshness contract every other consumer of this cache already gets.
+pub(crate) async fn probe_peer_cached(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> ReachEntry {
+    let fresh = {
+        let cache = mesh
+            .reachability
+            .lock()
+            .expect("reachability lock not poisoned");
+        cache.get(&endpoint_id).and_then(|e| {
+            let age = (epoch_now_i64() - e.probed_at).max(0);
+            (age <= REACH_TTL_SECS).then(|| e.clone())
+        })
+    };
+    match fresh {
+        Some(e) => e,
+        None => probe_peer(mesh, endpoint_id).await,
+    }
 }
 
 pub fn reachability_of(mesh: &Arc<MeshState>) -> Vec<mcpmesh_local_api::PeerReachability> {

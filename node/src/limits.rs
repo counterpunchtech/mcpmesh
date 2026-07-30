@@ -215,6 +215,15 @@ const PAIR_ACCEPT_PER_MIN: u32 = 30;
 /// that churn per endpoint.
 const BLOB_CONN_PER_MIN: u32 = 60;
 
+/// Per-authenticated-endpoint reachability-probe (`mcpmesh/ping/1`) rate (#89).
+///
+/// The probe arm was trust-gated but UNMETERED: a paired peer could pong-flood at will, and the
+/// only bound was the peer's own politeness. Generous — a healthy peer probes on a 20s TTL, so a
+/// handful per minute is normal and this only bites a peer probing orders of magnitude harder.
+/// Per-endpoint rather than global: one noisy peer must not deny liveness for everyone else, which
+/// is the mistake the pair-accept bucket makes deliberately (there, ids are attacker-chosen).
+const PING_PER_MIN: u32 = 60;
+
 /// The smallest USEFUL app-blob byte budget: two chunks (#84a). One chunk is reserved at request
 /// admission before any bytes, so a budget below this admits a request and then starves the
 /// transfer. A configured value in `1..MIN` is floored to this rather than honoured.
@@ -233,6 +242,13 @@ pub struct MeshLimiters {
     blob_bytes: Option<Arc<RateLimiter>>,
     /// Per-authenticated-endpoint app-blob connection buckets.
     blob_conn: Arc<RateLimiter>,
+    /// Per-authenticated-endpoint reachability-probe buckets (#89).
+    ping: Arc<RateLimiter>,
+    /// Probes REFUSED by the ping bucket (#89 gate): a probe is not a session, so a refusal
+    /// leaves no audit row — this count and the accept arm's debug line are its only footprint.
+    /// RESPONDER-side by nature (the refuser is the only party that knows), and not yet surfaced
+    /// by any verb; wiring it into `status`/diagnostics is #89 follow-up work.
+    ping_refused: std::sync::atomic::AtomicU64,
 }
 
 impl MeshLimiters {
@@ -254,6 +270,8 @@ impl MeshLimiters {
                 BLOB_CONN_PER_MIN,
                 BLOB_CONN_PER_MIN,
             )),
+            ping: Arc::new(RateLimiter::per_minute(PING_PER_MIN, PING_PER_MIN)),
+            ping_refused: std::sync::atomic::AtomicU64::new(0),
             // 0 = unlimited (the default): no bucket, no map, nothing consulted (#84a).
             blob_bytes: (limits.blob_bytes_per_min > 0).then(|| {
                 // FLOOR at two chunks, the repo idiom (`max_sessions.max(1)`, daemon.rs). A budget
@@ -280,6 +298,8 @@ impl MeshLimiters {
                 now,
             )),
             blob_conn: RateLimiter::unlimited_shared(),
+            ping: RateLimiter::unlimited_shared(),
+            ping_refused: std::sync::atomic::AtomicU64::new(0),
             blob_bytes: None,
         })
     }
@@ -318,6 +338,27 @@ impl MeshLimiters {
         self.blob_bytes.is_some()
     }
 
+    /// Admit one reachability probe from `endpoint` (#89). FAIL-SAFE: `false` = over-limit → close
+    /// with no pong, which is the same answer an unpaired scanner gets, so a flooding peer learns
+    /// nothing new from being refused.
+    pub fn admit_ping(&self, endpoint: &EndpointId) -> bool {
+        self.admit_ping_at(endpoint, Instant::now())
+    }
+    pub fn admit_ping_at(&self, endpoint: &EndpointId, now: Instant) -> bool {
+        let admitted = self.ping.check(endpoint, now).is_ok();
+        if !admitted {
+            self.ping_refused
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        admitted
+    }
+
+    /// How many probes the ping bucket has refused since boot (#89 gate). Read by the flood
+    /// test today; not yet surfaced to operators (see the field doc).
+    pub fn pings_refused(&self) -> u64 {
+        self.ping_refused.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Admit one app-blob connection from `endpoint` (FAIL-SAFE: `false` = over-limit → close).
     pub fn admit_blob_conn(&self, endpoint: &EndpointId) -> bool {
         self.admit_blob_conn_at(endpoint, Instant::now())
@@ -329,6 +370,48 @@ impl MeshLimiters {
 
 #[cfg(test)]
 mod tests {
+    /// #89: the reachability probe is metered PER ENDPOINT.
+    ///
+    /// The arm was trust-gated but unmetered, so a paired peer could pong-flood with no bound but
+    /// its own politeness. Per-endpoint, not global: one noisy peer must not deny liveness for
+    /// every other peer, which is the opposite trade from the pair-accept bucket (where ids are
+    /// attacker-chosen, so a global bound is the only one that works).
+    #[test]
+    fn the_reachability_probe_is_metered_per_endpoint() {
+        let lim = MeshLimiters::from_config(&crate::config::LimitsCfg::default());
+        let a = EndpointId::from_bytes([1u8; 32]);
+        let b = EndpointId::from_bytes([2u8; 32]);
+        let t0 = Instant::now();
+
+        let mut admitted = 0;
+        for _ in 0..500 {
+            if lim.admit_ping_at(&a, t0) {
+                admitted += 1;
+            }
+        }
+        assert!(
+            admitted <= 60,
+            "a flooding peer is bounded at the per-minute rate: {admitted}"
+        );
+        // LOWER bound too, not just upper. `admitted > 0` is satisfied by a cap of ONE, because
+        // `per_minute` floors capacity at `burst.max(1)` — so mutating PING_PER_MIN to 1 left this
+        // whole suite green while making every paired peer report offline within REACH_TTL_SECS.
+        // An honest peer probes on a 20s TTL (~3/min) and a client polling `status` at 1/s adds
+        // ~3/min more; the cap has to leave real headroom above that, not merely be non-zero.
+        assert!(
+            admitted >= 30,
+            "the cap must leave headroom for honest probing, not just be non-zero: {admitted} \
+             admitted from a 60/min bucket — a cap this low reports healthy peers as offline"
+        );
+
+        // A DIFFERENT peer is unaffected — one noisy peer must not starve liveness for others.
+        assert!(
+            lim.admit_ping_at(&b, t0),
+            "a second endpoint has its own budget; a global bucket would let one peer deny \
+             reachability for the whole mesh"
+        );
+    }
+
     /// #84a: the byte budget is PER ENDPOINT, and 0 means unlimited.
     ///
     /// Per-endpoint is the whole design. A `Throttle` event names a CONNECTION, so a budget keyed
