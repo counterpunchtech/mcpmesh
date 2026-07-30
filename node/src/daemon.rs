@@ -28,7 +28,7 @@ mod dial;
 mod dial_hint;
 mod handlers;
 mod path_watch;
-mod reach;
+pub(crate) mod reach;
 mod roster_install;
 mod sever;
 mod status;

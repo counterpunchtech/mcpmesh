@@ -244,6 +244,10 @@ pub struct MeshLimiters {
     blob_conn: Arc<RateLimiter>,
     /// Per-authenticated-endpoint reachability-probe buckets (#89).
     ping: Arc<RateLimiter>,
+    /// Probes REFUSED by the ping bucket (#89 gate): the refusal is otherwise invisible — no
+    /// session, no audit row — so a production false-offline caused by throttling would be
+    /// undiagnosable without this count.
+    ping_refused: std::sync::atomic::AtomicU64,
 }
 
 impl MeshLimiters {
@@ -266,6 +270,7 @@ impl MeshLimiters {
                 BLOB_CONN_PER_MIN,
             )),
             ping: Arc::new(RateLimiter::per_minute(PING_PER_MIN, PING_PER_MIN)),
+            ping_refused: std::sync::atomic::AtomicU64::new(0),
             // 0 = unlimited (the default): no bucket, no map, nothing consulted (#84a).
             blob_bytes: (limits.blob_bytes_per_min > 0).then(|| {
                 // FLOOR at two chunks, the repo idiom (`max_sessions.max(1)`, daemon.rs). A budget
@@ -293,6 +298,7 @@ impl MeshLimiters {
             )),
             blob_conn: RateLimiter::unlimited_shared(),
             ping: RateLimiter::unlimited_shared(),
+            ping_refused: std::sync::atomic::AtomicU64::new(0),
             blob_bytes: None,
         })
     }
@@ -338,7 +344,18 @@ impl MeshLimiters {
         self.admit_ping_at(endpoint, Instant::now())
     }
     pub fn admit_ping_at(&self, endpoint: &EndpointId, now: Instant) -> bool {
-        self.ping.check(endpoint, now).is_ok()
+        let admitted = self.ping.check(endpoint, now).is_ok();
+        if !admitted {
+            self.ping_refused
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        admitted
+    }
+
+    /// How many probes the ping bucket has refused since boot (#89 gate) — the refusal's only
+    /// footprint besides the debug log, since a probe is not a session and never reaches audit.
+    pub fn pings_refused(&self) -> u64 {
+        self.ping_refused.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Admit one app-blob connection from `endpoint` (FAIL-SAFE: `false` = over-limit → close).

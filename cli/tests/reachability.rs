@@ -478,14 +478,23 @@ async fn probe_surfaces_the_services_the_peer_grants_the_caller() {
     .expect("peer-services probe test timed out");
 }
 
-/// #89: the ping accept arm METERS probes per endpoint — pinned at the ARM, not the limiter.
+/// #89: the ping accept arm METERS probes per endpoint — pinned at the ARM — and a throttled
+/// probe is NOT evidence the peer is down.
 ///
-/// The limiter's own unit test proves the bucket meters per endpoint; it does not prove the accept
-/// arm consults it. Removing the call from the arm passed the entire suite, which is the seventh
-/// time this session a test pinned a helper rather than its call site. This drives real probes
-/// through `spawn_accept_loop` and asserts a flooding PAIRED peer is eventually refused.
+/// Two properties, deliberately in one flood because each is the other's failure mode:
+///
+/// 1. **Metering, pinned at the call site.** The limiter's unit test proves the bucket; it does
+///    not prove the arm consults it. A refused probe now returns the prober's CACHED entry
+///    (same `seq`), so "some probe came back stale" is the enforcement — removing `admit_ping`
+///    from the arm, or ignoring its verdict, answers all 90 with fresh pongs and fails the
+///    stale-count assertion.
+/// 2. **A refusal never reports a healthy peer offline** (PR #142 gate, HIGH). The arm closes
+///    with the distinguishable `b"ping rate limited"` and the prober commits NOTHING for it —
+///    no cache write, no transition. Reverting the close reason to `b"unauthorized"`, or
+///    dropping the prober-side throttle check, writes `reachable: false` for a live paired peer
+///    and fails the all-reachable assertion.
 #[tokio::test(flavor = "multi_thread")]
-async fn the_ping_arm_refuses_a_paired_peer_that_floods_probes() {
+async fn a_throttled_probe_is_refused_but_never_reports_the_peer_offline() {
     timeout(Duration::from_secs(120), async {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.toml");
@@ -511,39 +520,137 @@ async fn the_ping_arm_refuses_a_paired_peer_that_floods_probes() {
         // cannot distinguish a working limiter from an absent one. That fail-open accessor is worth
         // fixing in its own right (flagged in #84a's review) — a security control defaulting to
         // "no limits" on a wiring mistake.
-        a_mesh.set_limits(mcpmesh::limits::MeshLimiters::from_config(
-            &mcpmesh::config::LimitsCfg::default(),
-        ));
+        let a_limits =
+            mcpmesh::limits::MeshLimiters::from_config(&mcpmesh::config::LimitsCfg::default());
+        a_mesh.set_limits(a_limits.clone());
         let b_mesh = assemble_mesh(b_ep, b_store, config.clone());
         let _accept = spawn_accept_loop(
             a_mesh.clone(),
             Arc::new(build_services(&Config::from_toml_str("").unwrap())),
         );
 
-        // Probe well past the per-minute cap. A refused probe is closed with no pong, which the
-        // prober reports as unreachable — so "some probe came back unreachable" IS the metering.
+        // Probe well past the per-minute cap. An ADMITTED probe writes a fresh cache entry (new
+        // `seq`); a REFUSED one returns the previous entry untouched — so `seq` staying put is the
+        // observable for "the arm refused us and the prober treated it as non-evidence".
         let mut reachable = 0usize;
-        let mut refused = 0usize;
+        let mut fresh = 0usize;
+        let mut stale = 0usize;
+        let mut last_seq: Option<u64> = None;
         for _ in 0..90 {
-            if probe_peer(&b_mesh, a_id).await.reachable {
+            let entry = probe_peer(&b_mesh, a_id).await;
+            if entry.reachable {
                 reachable += 1;
-            } else {
-                refused += 1;
             }
+            if last_seq == Some(entry.seq) {
+                stale += 1;
+            } else {
+                fresh += 1;
+            }
+            last_seq = Some(entry.seq);
         }
 
-        assert!(
-            reachable > 0,
-            "an honest probe rate must still be answered — a limiter that refuses everything is \
-             worse than none, since a refusal reads as 'peer offline'"
+        assert_eq!(
+            reachable, 90,
+            "a rate-limit refusal is not evidence the peer is down: every probe of a live, paired \
+             peer must report reachable — the refused ones from the still-fresh cache. A false \
+             count here means a refusal wrote `reachable: false` (PR #142 gate, HIGH). \
+             reachable={reachable} fresh={fresh} stale={stale}"
         );
         assert!(
-            refused > 0,
-            "a paired peer flooding past the cap must eventually be REFUSED (#89). Without the \
-             limiter in the accept arm every one of 90 probes is answered, which is the unmetered \
-             pong-flood this issue reports. reachable={reachable} refused={refused}"
+            fresh > 0,
+            "an honest probe rate must still be answered with real pongs — a limiter that refuses \
+             everything is worse than none. fresh={fresh} stale={stale}"
+        );
+        assert!(
+            stale > 0,
+            "a paired peer flooding past the cap must eventually be REFUSED (#89), observable as \
+             the cached entry returned unchanged. Zero stale answers means the accept arm never \
+             consulted the limiter — the unmetered pong-flood this issue reports. \
+             fresh={fresh} stale={stale}"
+        );
+        assert!(
+            a_limits.pings_refused() > 0,
+            "the responder must COUNT its refusals (#89 defect 3: unmetered AND unrecorded) — \
+             a production false-offline caused by the limiter must be diagnosable"
         );
     })
     .await
     .expect("ping flood test timed out");
+}
+
+/// PR #142 gate (21df648's stated gap): `peer_services` answers from the FRESH cache rather than
+/// probing unconditionally — pinned at the call site, through the real control verb.
+///
+/// B probes A while A is up (cache populated, carrying the service A grants B), then A goes DOWN,
+/// then B's `peer_services` runs inside `REACH_TTL_SECS`. It must succeed from the cache: the
+/// verb's freshness contract is "no staler than `status` would report", not "a fresh probe".
+/// Reverting `probe_peer_cached` to `probe_peer` in the handler probes the dead peer and fails
+/// the verb — which is also the shape that made the verb collide with the ping limiter and
+/// report healthy peers offline.
+#[tokio::test(flavor = "multi_thread")]
+async fn peer_services_answers_from_the_fresh_cache_without_probing() {
+    timeout(Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+
+        let a_ep = target_endpoint().await;
+        let a_id = *a_ep.id().as_bytes();
+        let a_addr = a_ep.addr();
+        let a_ep_handle = a_ep.clone();
+
+        let b_ep = dialer_endpoint().await;
+        let b_id = *b_ep.id().as_bytes();
+        let b_eid = format!("eid:{}", b_ep.id());
+        seed_lookup(&b_ep, a_addr.clone());
+        let b_store = Arc::new(PeerStore::open(&dir.path().join("b.redb")).unwrap());
+        seed_peer(&b_store, a_id, "alice");
+
+        // A grants B the `shared` service (the #52 arrangement), and trusts B at the ping gate.
+        let config = dir.path().join("a-config.toml");
+        std::fs::write(
+            &config,
+            format!("[services.shared]\nsocket = \"/run/s.sock\"\nallow = [\"{b_eid}\"]\n"),
+        )
+        .unwrap();
+        let a_store = Arc::new(PeerStore::open(&dir.path().join("a.redb")).unwrap());
+        seed_peer(&a_store, b_id, "beacon-b");
+        let a_cfg = Config::load(&config).expect("A's config parses");
+        let a_mesh = assemble_mesh(a_ep, a_store, config);
+        let b_mesh = assemble_mesh(b_ep, b_store, dir.path().join("b-config.toml"));
+        let accept = spawn_accept_loop(a_mesh.clone(), Arc::new(build_services(&a_cfg)));
+
+        // Populate B's cache with a real probe while A is up.
+        let entry = probe_peer(&b_mesh, a_id).await;
+        assert!(entry.reachable, "precondition: A must probe reachable");
+        assert_eq!(
+            entry.services,
+            vec!["shared".to_string()],
+            "precondition: the cached entry carries the granted service"
+        );
+
+        // Take A DOWN. The cache entry is still younger than REACH_TTL_SECS.
+        accept.abort();
+        a_ep_handle.close().await;
+
+        // The real control verb must answer from the cache — a probe here would dial a dead
+        // endpoint, time out, and fail the verb for a peer the caller was just told is fine.
+        let socket = dir.path().join("control.sock");
+        let listener = mcpmesh::ipc::bind_control_socket(&socket).await.unwrap();
+        let state = Arc::new(DaemonState::with_mesh(STACK_VERSION, b_mesh.clone()));
+        let control = tokio::spawn(serve_control(listener, state));
+        let services = connect_control(&socket)
+            .await
+            .expect("connect B control")
+            .peer_services("alice")
+            .await
+            .expect(
+                "peer_services must answer from the fresh cache rather than probing — an \
+                 unconditional probe is the #142-gate shape that reported healthy peers offline",
+            );
+        assert_eq!(services, vec!["shared".to_string()]);
+
+        control.abort();
+        std::mem::forget(dir);
+    })
+    .await
+    .expect("peer_services cache-freshness test timed out");
 }
