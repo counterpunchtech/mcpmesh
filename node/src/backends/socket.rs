@@ -137,7 +137,14 @@ impl SocketBackend {
         );
         // The per-request-line auditor: hashes each caller request's args and correlates
         // the response. Threaded into the shared pump.
-        let auditor = RequestAuditor::new(self.audit.clone(), peer.clone(), self.service.clone());
+        let auditor = RequestAuditor::new(
+            self.audit.clone(),
+            peer.clone(),
+            self.service.clone(),
+            // #57: the same stable principal the session guard stamps — every proxied line of
+            // this session joins to policy without nickname matching.
+            super::session_principal(identity.as_ref()),
+        );
 
         // Split the endpoint: the read half is consumed by the pump's outbound direction
         // (its FrameReader), the write half by the inbound direction. Both are owned

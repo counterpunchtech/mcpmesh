@@ -596,9 +596,17 @@ when it applies:
 A **failed dial** surfaces as a `session_open` with `status: "error"` — it reached no backend, so it
 is otherwise never session-audited; this frame records the attempted-and-failed reach.
 
-Upholding the surface discipline: a record carries names, counts, and a status — a nickname/`user_id`,
-a service name, a method/tool name, an argument **digest**, and byte/latency **numbers** — never raw
-arguments, response content, endpoint-ids, or keys.
+Upholding the surface discipline: a record carries identities, counts, and a status — a
+nickname/`user_id` (`peer`, the display rendering), the subject's **stable principal**
+(`principal`, `eid:<hex>`/`b64u:<pk>`, `api_minor >= 29`, #57), a service name, a method/tool
+name, an argument **digest**, and byte/latency **numbers** — never raw arguments, response
+content, keys, or **raw un-prefixed hex endpoint ids**. The prefixed principal rendering is the
+one sanctioned identity form, the same value the rest of the API has keyed on since #41/#42/#73:
+it is a public *identifier* (it is how peers dial you, and it already sits in every `allow` list
+on the same disk), not a secret. `principal` is deliberately absent on `unpair` (may tear down
+several devices — no single subject), `roster_install` (purely local), the failed-dial record
+(our own dial), and every record written before 0.23.7 — treat an absent `principal` as
+"unattributable or pre-0.23.7", never as an error.
 
 **`reachability`** — a peer's reachability OR its network path changed (`api_minor >= 12`, #58;
 `path` joined the rule at 21, #92). Not an up/down toggle — see below. Pushed so work queued for an

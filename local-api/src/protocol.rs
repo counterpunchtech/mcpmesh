@@ -292,7 +292,9 @@ pub struct SelfNetwork {
     pub last_change_epoch: Option<i64>,
 }
 
-/// One home relay's connection state (#90). No latency — per-relay RTT needs iroh's
+/// One home relay's connection state (#90); to 29 with [`AuditRecord::principal`] — stable identity on the event stream and the
+/// on-disk log, resolving #57's parked docs conflict in favour of the #41/#42/#73 line (the
+/// audit surface bans secrets and raw hex, not the prefixed principal rendering). No latency — per-relay RTT needs iroh's
 /// `net_report`, which is unstable-feature-gated as of 1.0.3; `connected` is the stable truth.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelayInfo {
@@ -1016,6 +1018,18 @@ pub struct AuditRecord {
     /// nickname or `org/serial` (`Trust`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
+    /// The subject's STABLE principal (`eid:<hex>` / `b64u:<pk>`), from the same gate
+    /// resolution that produced `peer` (#57, `api_minor >= 29`). `peer` is a display name and
+    /// collides — two devices under one nickname were indistinguishable in the stream and the
+    /// on-disk log, so records could not be joined to the (principal-keyed, #38) policy that
+    /// admitted them. Same argument and shape as `PeerInfo` (#41), `PeerReachability` (#42),
+    /// and `ActiveSession` (#73).
+    ///
+    /// Deliberately absent on: `unpair` (may tear down several devices — no single subject),
+    /// `roster_install` (purely local), and the failed-outbound-dial session record (our own
+    /// dial, not a gate-resolved caller). Absent on every record written before 0.23.7.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
 }
 
 impl AuditRecord {
@@ -1033,13 +1047,24 @@ impl AuditRecord {
             latency_ms: None,
             event: None,
             target: None,
+            principal: None,
         }
     }
 
-    pub fn session_open(ts: String, peer: Option<String>, service: String) -> Self {
+    /// `principal` is an EXPLICIT parameter on every constructor (#57, kept from the original
+    /// #72 design): a builder would let a call site silently omit it and reintroduce the
+    /// collapsed-identity bug for that one event class. Pass `None` only for the documented
+    /// no-single-subject records (see the field doc).
+    pub fn session_open(
+        ts: String,
+        peer: Option<String>,
+        service: String,
+        principal: Option<String>,
+    ) -> Self {
         let mut r = Self::base(ts, AuditKind::SessionOpen);
         r.peer = peer;
         r.service = Some(service);
+        r.principal = principal;
         r
     }
 
@@ -1052,10 +1077,16 @@ impl AuditRecord {
         self
     }
 
-    pub fn session_close(ts: String, peer: Option<String>, service: String) -> Self {
+    pub fn session_close(
+        ts: String,
+        peer: Option<String>,
+        service: String,
+        principal: Option<String>,
+    ) -> Self {
         let mut r = Self::base(ts, AuditKind::SessionClose);
         r.peer = peer;
         r.service = Some(service);
+        r.principal = principal;
         r
     }
 
@@ -1073,6 +1104,7 @@ impl AuditRecord {
         bytes_out: u64,
         status: String,
         latency_ms: u64,
+        principal: Option<String>,
     ) -> Self {
         let mut r = Self::base(ts, AuditKind::Request);
         r.peer = peer;
@@ -1083,6 +1115,7 @@ impl AuditRecord {
         r.bytes_out = Some(bytes_out);
         r.status = Some(status);
         r.latency_ms = Some(latency_ms);
+        r.principal = principal;
         r
     }
 
@@ -1095,6 +1128,7 @@ impl AuditRecord {
         method: String,
         tool: Option<String>,
         args_hash: String,
+        principal: Option<String>,
     ) -> Self {
         let mut r = Self::base(ts, AuditKind::Request);
         r.peer = peer;
@@ -1102,21 +1136,35 @@ impl AuditRecord {
         r.method = Some(method);
         r.tool = tool;
         r.args_hash = Some(args_hash);
+        r.principal = principal;
         r
     }
 
-    pub fn blob_fetch(ts: String, peer: Option<String>, hash: String, status: String) -> Self {
+    pub fn blob_fetch(
+        ts: String,
+        peer: Option<String>,
+        hash: String,
+        status: String,
+        principal: Option<String>,
+    ) -> Self {
         let mut r = Self::base(ts, AuditKind::BlobFetch);
         r.peer = peer;
         r.target = Some(hash);
         r.status = Some(status);
+        r.principal = principal;
         r
     }
 
-    pub fn trust(ts: String, event: String, target: Option<String>) -> Self {
+    pub fn trust(
+        ts: String,
+        event: String,
+        target: Option<String>,
+        principal: Option<String>,
+    ) -> Self {
         let mut r = Self::base(ts, AuditKind::Trust);
         r.event = Some(event);
         r.target = target;
+        r.principal = principal;
         r
     }
 }
@@ -1273,7 +1321,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   twenty-four have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.28";
+pub const API_VERSION: &str = "1.29";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -1331,7 +1379,9 @@ pub const API_VERSION: &str = "1.28";
 /// boot retention — the audit log stopped being a permanent, unbounded, unreadable record (#88);
 /// to 28 with `StatusResult::self_network` / `StreamFrame::SelfNetwork` / the snapshot's copy —
 /// the node's OWN reachability posture, previously unanswerable from either side of the API
-/// (#90).
+/// (#90); to 29 with [`AuditRecord::principal`] — stable identity on the event stream and the
+/// on-disk log, resolving #57's parked docs conflict in favour of the #41/#42/#73 line (the
+/// audit surface bans secrets and raw hex, not the prefixed principal rendering).
 ///
 /// **Not every semantic change gets a minor, and that is the gap to watch (#122).** A minor marks a
 /// change to this *surface*. A change to behaviour BEHIND the surface — same fields, same shapes,
@@ -1342,7 +1392,7 @@ pub const API_VERSION: &str = "1.28";
 /// That class is bigger than it looks: **10, 17, 21, 22, 23 and 24 all shipped with no change to
 /// any type in this file** — they moved meaning, not shape. Six of the twenty-four. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 28;
+pub const API_MINOR: u32 = 29;
 
 #[cfg(test)]
 mod tests {
@@ -2307,6 +2357,7 @@ mod tests {
                 "2026-07-03T14:02:11.480Z".into(),
                 Some("bob".into()),
                 "notes".into(),
+                None,
             )),
         };
         let v = serde_json::to_value(&event).unwrap();

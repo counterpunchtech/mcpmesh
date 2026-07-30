@@ -254,6 +254,7 @@ mod tests {
                 "2026-06-30T23:59:59.000Z".into(),
                 "pair".into(),
                 Some("bob".into()),
+                None,
             ),
         )
         .unwrap();
@@ -263,6 +264,7 @@ mod tests {
                 "2026-07-01T00:00:00.000Z".into(),
                 Some("bob".into()),
                 "notes".into(),
+                None,
             ),
         )
         .unwrap();
@@ -275,6 +277,7 @@ mod tests {
                 "tools/list".into(),
                 None,
                 "blake3:deadbeef".into(),
+                None,
             ),
         )
         .unwrap();
@@ -287,6 +290,7 @@ mod tests {
                 "tools/call".into(),
                 Some("read_file".into()),
                 "blake3:cafe".into(),
+                None,
             ),
         )
         .unwrap();
@@ -344,6 +348,7 @@ mod tests {
                 "2026-06-30T10:00:00.000Z".into(),
                 Some("bob".into()),
                 "notes".into(),
+                None,
             ),
         )
         .unwrap();
@@ -353,6 +358,7 @@ mod tests {
                 "2026-07-01T10:00:00.000Z".into(),
                 Some("bob".into()),
                 "notes".into(),
+                None,
             ),
         )
         .unwrap();
@@ -362,12 +368,13 @@ mod tests {
                 "2026-07-01T11:00:00.000Z".into(),
                 Some("alice".into()),
                 "notes".into(),
+                None,
             ),
         )
         .unwrap();
         crate::audit::log::append_record(
             dir.path(),
-            &AuditRecord::session_open("2026-07-01T12:00:00.000Z".into(), None, "kb".into()),
+            &AuditRecord::session_open("2026-07-01T12:00:00.000Z".into(), None, "kb".into(), None),
         )
         .unwrap();
         crate::audit::log::append_record(
@@ -379,6 +386,7 @@ mod tests {
                 "tools/list".into(),
                 None,
                 "blake3:x".into(),
+                None,
             ),
         )
         .unwrap();
@@ -388,6 +396,7 @@ mod tests {
                 "2026-07-01T14:00:00.000Z".into(),
                 "pair".into(),
                 Some("carol".into()),
+                None,
             ),
         )
         .unwrap();

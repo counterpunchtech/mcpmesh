@@ -727,6 +727,11 @@ fn spawn_gate_loop(
                             peer,
                             hash_hex,
                             status.into(),
+                            // #57 second surface: the record of who fetched which BYTES is the
+                            // one where two-devices-one-nickname is most likely the actual
+                            // question — attribute the authenticated endpoint, not the display
+                            // name alone.
+                            conn_eid.map(|eid| eid.principal()),
                         ));
                     }
                     msg.tx.send(decision).await.ok();
@@ -1845,9 +1850,13 @@ mod tests {
             let file = audit_dir.join(format!("{month}.jsonl"));
             let mut ok = false;
             for _ in 0..50 {
+                let alice_eid = format!("eid:{}", alice_ep.id());
                 if let Ok(b) = std::fs::read_to_string(&file)
                     && b.contains("\"kind\":\"blob_fetch\"")
                     && b.contains("\"peer\":\"alice\"")
+                    // #57 second surface: who fetched which BYTES is the record where
+                    // two-devices-one-nickname is most likely the actual question.
+                    && b.contains(&format!("\"principal\":\"{alice_eid}\""))
                     && b.contains(&hash_hex)
                 {
                     ok = true;

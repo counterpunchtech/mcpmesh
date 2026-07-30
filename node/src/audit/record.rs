@@ -107,6 +107,7 @@ mod tests {
             6210,
             "ok".into(),
             41,
+            None,
         );
         let line = serde_json::to_string(&rec).unwrap();
         assert!(
@@ -124,6 +125,7 @@ mod tests {
             "2026-07-03T14:02:11.480Z".into(),
             Some("bob".into()),
             "notes".into(),
+            None,
         );
         let sline = serde_json::to_string(&s).unwrap();
         assert!(sline.contains("\"kind\":\"session_open\""));
@@ -140,6 +142,7 @@ mod tests {
             "2026-07-03T14:02:11.480Z".into(),
             "pair".into(),
             Some("bob".into()),
+            None,
         );
         let line = serde_json::to_string(&rec).unwrap();
         let back: AuditRecord = serde_json::from_str(&line).unwrap();
