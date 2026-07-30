@@ -347,13 +347,29 @@ Do not build on either — they may change or disappear without an `api_version`
   "recent_pairings": [{"peer_nickname":"bob","sas_code":"tango-fig-cabbage","paired_at_epoch":1751760000}],
   "reachability": [{"name":"bob","reachable":true,"rtt_ms":42,"age_secs":3,"meta":"v=1.2.3","principal":"eid:…"}],
   "self_nickname": "workbench",
-  "storage": {"audit_bytes": 18234, "redb_bytes": 1069056, "blobs_bytes": 0}
+  "storage": {"audit_bytes": 18234, "redb_bytes": 1069056, "blobs_bytes": 0},
+  "self_network": {"online": true, "home_relay": "https://relay.example:443",
+                   "relays": [{"url": "https://relay.example:443", "connected": true}],
+                   "direct_addrs": ["192.168.1.20:53420"], "last_change_epoch": 1753842000}
 }
 ```
 
 `roster`, `presence`, `self_user_id`, and `recent_pairings` are optional — absent on a pure-pairing
 daemon with no roster and no user key. `backend` reports the *kind* (`"run"` \| `"socket"`) only,
 never the command or path.
+
+`self_network` (`api_minor >= 28`, #90) is THIS node's own reachability posture — the first
+question in every "my message never arrived" investigation. `online` uses **iroh's semantics**: a
+home-relay connection is established. In `relay_mode = "disabled"` it is always `false` with an
+empty `relays` list — that is a *configuration* (LAN-only), not an outage; do not render it as a
+health warning. `home_relay` is the connected relay, sanitized to scheme+host+port (operator relay
+URLs can carry credentials). `direct_addrs` are the node's own dialable coordinates (the same ones
+its invites embed). `last_change_epoch` is when the daemon's watcher last saw the block change —
+`null` until the first change after boot. No per-relay latency: iroh's `net_report` is
+unstable-feature-gated as of 1.0.3; `connected` is the stable truth. A change of `online`, the
+home relay, or any relay's connection state also pushes a `self_network` frame on `subscribe`
+(and the subscribe snapshot carries the block), so an embedder learns "you just went unreachable"
+without polling — the signal `set_relays` (#53) never had.
 
 `storage` (`api_minor >= 27`, #88) is this node's own on-disk footprint — counts, never content:
 the summed monthly audit files, the `state.redb` trust store, and the app-blob store directory
@@ -508,7 +524,7 @@ socket **stops being request/response** after this call. The client sends:
 newline-delimited frames — a live view of the mesh for an embedding UI to render — until the client
 disconnects. There is no request channel back; to stop, close the connection.
 
-Every frame is a JSON object tagged by a `"type"` field, in one of three shapes.
+Every frame is a JSON object tagged by a `"type"` field, in one of four shapes.
 
 **`snapshot`** — always the **first** frame: a point-in-time picture, so a fresh subscriber renders
 immediately without replaying history. It carries the currently-open sessions and the paired-peer
@@ -518,7 +534,8 @@ immediately without replaying history. It carries the currently-open sessions an
 {
   "type": "snapshot",
   "active_sessions": [{"peer": "bob", "service": "notes", "opened_at": 1751760000, "principal": "eid:1f0a…"}],
-  "reachability": [{"name": "bob", "reachable": true, "rtt_ms": 42, "age_secs": 3}]
+  "reachability": [{"name": "bob", "reachable": true, "rtt_ms": 42, "age_secs": 3}],
+  "self_network": {"online": true, "home_relay": "https://relay.example:443", "relays": [{"url": "https://relay.example:443", "connected": true}], "direct_addrs": ["192.168.1.20:53420"]}
 }
 ```
 
@@ -605,6 +622,22 @@ probe that produces these frames (see below).
 
 `peer` is a whole `PeerReachability` row — the same shape the opening `snapshot`'s `reachability`
 list carries, so both project through one code path.
+
+**`self_network`** — THIS node's own posture changed (`api_minor >= 28`, #90): `online` flipped,
+the home relay moved, or a relay's connection state changed. `direct_addrs` drift alone does not
+emit (address churn is chatty and not a decision point; it rides the next frame). The payload is
+the same `SelfNetwork` block `status` and the snapshot carry — see
+[`StatusResult`](#statusresult). One frame is also pushed shortly after boot when the endpoint
+first connects to a relay ("came online" is genuinely news — the moment invites and WAN dials
+become viable).
+
+```json
+{
+  "type": "self_network",
+  "self_network": {"online": false, "relays": [{"url": "https://relay.example:443", "connected": false}],
+                   "direct_addrs": ["192.168.1.20:53420"], "last_change_epoch": 1753842000}
+}
+```
 
 ### `path` — direct or relayed (`api_minor >= 13`, #64)
 

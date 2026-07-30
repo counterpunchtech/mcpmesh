@@ -250,6 +250,55 @@ pub struct StatusResult {
     /// Additive: default + skip-if-none so an older payload round-trips.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage: Option<StorageInfo>,
+    /// THIS node's own reachability posture (#90) — see [`SelfNetwork`]. Computed live per
+    /// call; `None` in mesh-less control-only mode. Additive: default + skip-if-none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_network: Option<SelfNetwork>,
+}
+
+/// The `status.self_network` block (#90): THIS node's own reachability posture — the first
+/// question in every "my message never arrived" investigation, previously unanswerable from
+/// either side of the API. Self-facing only: everything here is the node's own information
+/// (relay URLs come from its own config, sanitized; direct addresses already ride its invites).
+///
+/// `online` is iroh's own semantics — a home-relay connection is established. In
+/// `relay_mode = "disabled"` it is ALWAYS `false` with an empty `relays` list: that is a
+/// configuration, not an outage — render it as "LAN-only", never as a health warning.
+///
+/// Additive-only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelfNetwork {
+    /// A home-relay connection is established (iroh's `online` definition). The signal #53's
+    /// `set_relays` never had: when this goes false on a relay-enabled node, the relay set is
+    /// the thing to look at.
+    pub online: bool,
+    /// The CONNECTED home relay's URL, sanitized to scheme + host + port (operator-supplied
+    /// relay URLs can carry userinfo tokens; `status` output gets screenshotted). `None` when
+    /// no relay is connected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_relay: Option<String>,
+    /// Every known home relay and its current connection state. Empty when no relays are
+    /// configured, or before the endpoint has selected any.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relays: Vec<RelayInfo>,
+    /// This endpoint's direct (non-relay) socket addresses — its own dialable coordinates.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub direct_addrs: Vec<String>,
+    /// When the daemon's watcher last observed a TRANSITION (epoch seconds) — a change of
+    /// `online`, `home_relay`, or a relay's connection state; `direct_addrs` drift alone does
+    /// not stamp (nor emit a frame). OMITTED (not `null`) until the first observed transition
+    /// after boot, and from a point-in-time computation with no watcher running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_change_epoch: Option<i64>,
+}
+
+/// One home relay's connection state (#90). No latency — per-relay RTT needs iroh's
+/// `net_report`, which is unstable-feature-gated as of 1.0.3; `connected` is the stable truth.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayInfo {
+    /// Sanitized (scheme + host + port), like `home_relay`.
+    pub url: String,
+    pub connected: bool,
 }
 
 /// The `status.storage` block (#88): bytes actually on disk, by subsystem. Counts, never
@@ -1119,6 +1168,11 @@ pub enum StreamFrame {
     Snapshot {
         active_sessions: Vec<ActiveSession>,
         reachability: Vec<PeerReachability>,
+        /// THIS node's own reachability posture (#90), so a fresh subscriber renders it without
+        /// a `status` poll. `None` in mesh-less control-only mode. Additive: default +
+        /// skip-if-none so an older payload round-trips.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        self_network: Option<SelfNetwork>,
     },
     /// A live audit event (session open/close, request, blob fetch, trust) — the tap on the hub.
     /// Boxed so this (much larger) variant does not bloat every frame; serde delegates through the
@@ -1151,6 +1205,13 @@ pub enum StreamFrame {
     /// mislabelled until something probes. `path` is a truth claim about where user data went, so
     /// `Unknown` means "we do not know" and must never be rendered as private.
     Reachability { peer: PeerReachability },
+    /// THIS node's own network posture CHANGED (#90): `online` flipped, the home relay moved,
+    /// or a relay's connection state changed — pushed so an embedder learns "you just went
+    /// unreachable" the moment it happens instead of on a poll tick, and so #53's `set_relays`
+    /// finally has a signal telling someone to use it. `direct_addrs` drift alone does not
+    /// emit (address churn is chatty and not a decision point; it rides the next frame).
+    /// `api_minor >= 28`.
+    SelfNetwork { self_network: SelfNetwork },
     /// The subscriber fell `dropped` records behind the broadcast ring; the stream continues (a
     /// fresh reconnect would re-`Snapshot`). Never drops the subscriber — lag is reported, never fatal.
     Lagged { dropped: u64 },
@@ -1212,7 +1273,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   twenty-four have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.27";
+pub const API_VERSION: &str = "1.28";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -1267,7 +1328,10 @@ pub const API_VERSION: &str = "1.27";
 /// rate-limited inbound NOTIFICATION stopped being silently dropped and became a recorded audit
 /// event — no type changed; the observable audit stream did (#76, #139); to 27 with the `audit_prune` /
 /// `audit_list` verbs, `StatusResult::storage`, and the opt-in `[limits].audit_retain_months`
-/// boot retention — the audit log stopped being a permanent, unbounded, unreadable record (#88).
+/// boot retention — the audit log stopped being a permanent, unbounded, unreadable record (#88);
+/// to 28 with `StatusResult::self_network` / `StreamFrame::SelfNetwork` / the snapshot's copy —
+/// the node's OWN reachability posture, previously unanswerable from either side of the API
+/// (#90).
 ///
 /// **Not every semantic change gets a minor, and that is the gap to watch (#122).** A minor marks a
 /// change to this *surface*. A change to behaviour BEHIND the surface — same fields, same shapes,
@@ -1278,7 +1342,7 @@ pub const API_VERSION: &str = "1.27";
 /// That class is bigger than it looks: **10, 17, 21, 22, 23 and 24 all shipped with no change to
 /// any type in this file** — they moved meaning, not shape. Six of the twenty-four. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 27;
+pub const API_MINOR: u32 = 28;
 
 #[cfg(test)]
 mod tests {
@@ -1350,6 +1414,33 @@ mod tests {
             v["peer"]["age_secs"], 0,
             "a transition frame is fresh by construction: {v}"
         );
+        let back: StreamFrame = serde_json::from_value(v).unwrap();
+        assert_eq!(back, frame);
+    }
+
+    /// #90: the self-network frame tags as `{"type":"self_network","self_network":{…}}` — the
+    /// SAME block `status` and the snapshot carry. Pinned explicitly (like the reachability
+    /// tag) so a variant rename cannot slip past a suite whose two ends share the type while
+    /// breaking every doc-following third-party client.
+    #[test]
+    fn self_network_frame_tags_and_round_trips() {
+        let frame = StreamFrame::SelfNetwork {
+            self_network: SelfNetwork {
+                online: true,
+                home_relay: Some("https://relay.example:443".into()),
+                relays: vec![RelayInfo {
+                    url: "https://relay.example:443".into(),
+                    connected: true,
+                }],
+                direct_addrs: vec!["192.168.1.2:4444".into()],
+                last_change_epoch: Some(1_753_842_000),
+            },
+        };
+        let v = serde_json::to_value(&frame).unwrap();
+        assert_eq!(v["type"], "self_network");
+        assert_eq!(v["self_network"]["online"], true);
+        assert_eq!(v["self_network"]["home_relay"], "https://relay.example:443");
+        assert_eq!(v["self_network"]["relays"][0]["connected"], true);
         let back: StreamFrame = serde_json::from_value(v).unwrap();
         assert_eq!(back, frame);
     }
@@ -1955,6 +2046,7 @@ mod tests {
             reachability: vec![],
             self_nickname: String::new(),
             storage: None,
+            self_network: None,
         };
         let v = serde_json::to_value(&s).unwrap();
         assert_eq!(v["services"][0]["backend"], "run");
@@ -2022,6 +2114,7 @@ mod tests {
             reachability: vec![],
             self_nickname: String::new(),
             storage: None,
+            self_network: None,
         };
         let v = serde_json::to_value(&s).unwrap();
         assert_eq!(v["roster"]["org_id"], "acme");
@@ -2060,6 +2153,7 @@ mod tests {
             reachability: vec![],
             self_nickname: String::new(),
             storage: None,
+            self_network: None,
         };
         let v = serde_json::to_value(&s).unwrap();
         assert_eq!(v["recent_pairings"][0]["peer_nickname"], "bob");
@@ -2184,6 +2278,7 @@ mod tests {
     #[test]
     fn stream_frames_roundtrip_with_the_documented_tags() {
         let snap = StreamFrame::Snapshot {
+            self_network: None,
             active_sessions: vec![ActiveSession {
                 peer: "bob".into(),
                 service: "notes".into(),

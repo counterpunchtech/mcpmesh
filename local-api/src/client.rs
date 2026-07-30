@@ -636,6 +636,7 @@ mod tests {
             reachability: vec![],
             self_nickname: String::new(),
             storage: None,
+            self_network: None,
         };
         write_frame(
             &mut writer,
@@ -986,6 +987,7 @@ mod tests {
             assert_eq!(req["method"], "subscribe");
             for frame in [
                 StreamFrame::Snapshot {
+                    self_network: None,
                     active_sessions: vec![ActiveSession {
                         peer: "bob".into(),
                         service: "notes".into(),
@@ -1025,6 +1027,7 @@ mod tests {
             StreamFrame::Snapshot {
                 active_sessions,
                 reachability,
+                ..
             } => {
                 assert_eq!(active_sessions[0].peer, "bob");
                 assert_eq!(reachability[0].rtt_ms, Some(42));

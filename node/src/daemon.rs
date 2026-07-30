@@ -30,6 +30,7 @@ mod handlers;
 mod path_watch;
 pub(crate) mod reach;
 mod roster_install;
+mod self_net;
 mod sever;
 mod status;
 
@@ -92,6 +93,8 @@ pub fn admitted_services_for_test(
     caller_admitted_services(mesh, identity)
 }
 pub use reach::{REACH_TTL_SECS, ReachEntry, probe_peer, reachability_of};
+pub(crate) use self_net::read_current as self_network_now;
+pub use self_net::spawn_self_net_watch;
 
 /// Live path-watcher tasks (#92 review). `#[doc(hidden)]` — a TEST SEAM for the #61-shaped
 /// lifetime regression: a leaked watcher emits nothing, so only a count distinguishes it from a
@@ -280,6 +283,14 @@ pub struct MeshState {
     /// The on-disk app-blob store directory (#88), set once at boot when one exists — read by
     /// `status.storage.blobs_bytes`. Same set-once discipline as `audit`/`limits`.
     pub(crate) blobs_dir: std::sync::OnceLock<PathBuf>,
+    /// Self-network transition ring (#90) — `subscribe`'s third tap, fed by
+    /// [`spawn_self_net_watch`](self_net::spawn_self_net_watch). A SEPARATE ring from
+    /// `reach_bcast` for the same reason that one is separate from audit: the frames have
+    /// different shapes and different producers, and merging happens at the subscription.
+    pub(crate) self_net_bcast: tokio::sync::broadcast::Sender<mcpmesh_local_api::SelfNetwork>,
+    /// When the self-net watcher last observed a posture change (#90, epoch seconds) — merged
+    /// into `status.self_network.last_change_epoch`. A std Mutex, never held across an await.
+    pub(crate) self_net_change: std::sync::Mutex<Option<i64>>,
     /// The process rate/concurrency limiters. Set ONCE by `serve_forever` before
     /// serving (like `audit`); read by the reload sites (rebuilt backends re-thread it) and the
     /// accept loop. Empty (→ an unlimited default) in a control-only test daemon.
@@ -414,6 +425,9 @@ impl MeshState {
             recent_pairings: std::sync::Mutex::new(std::collections::VecDeque::new()),
             reachability: std::sync::Mutex::new(std::collections::HashMap::new()),
             reach_bcast: tokio::sync::broadcast::channel(REACH_BROADCAST_DEPTH).0,
+            // Same depth as the reachability ring: posture transitions are rarer still.
+            self_net_bcast: tokio::sync::broadcast::channel(REACH_BROADCAST_DEPTH).0,
+            self_net_change: std::sync::Mutex::new(None),
             probe_seq: std::sync::atomic::AtomicU64::new(0),
             ephemeral_services: std::sync::Mutex::new(std::collections::HashMap::new()),
         })

@@ -63,10 +63,11 @@ pub use protocol::{
     ERR_BLOB_WITHDRAWN, ERR_NO_SUCH_BLOB, ERR_NO_SUCH_SERVICE, Hello, InviteParams, InviteResult,
     OpenSessionParams, OrgJoinParams, OrgJoinResult, PairParams, PairResult, PeerAddParams,
     PeerInfo, PeerPath, PeerReachability, PeerRemoveParams, PeerRenameParams, PeerServicesParams,
-    PeerServicesResult, PresencePeer, RecentPairing, RegisterServiceParams, Request,
-    RosterInstallParams, RosterInstallResult, RosterStatus, ScopeInfo, ServiceAllowParams,
-    ServiceInfo, SetAppMetadataParams, SetNicknameParams, SetRelaysParams, SetRelaysResult,
-    SetRosterUrlParams, StatusResult, StorageInfo, StreamFrame, UnregisterServiceParams, method_of,
+    PeerServicesResult, PresencePeer, RecentPairing, RegisterServiceParams, RelayInfo, Request,
+    RosterInstallParams, RosterInstallResult, RosterStatus, ScopeInfo, SelfNetwork,
+    ServiceAllowParams, ServiceInfo, SetAppMetadataParams, SetNicknameParams, SetRelaysParams,
+    SetRelaysResult, SetRosterUrlParams, StatusResult, StorageInfo, StreamFrame,
+    UnregisterServiceParams, method_of,
 };
 
 #[cfg(feature = "client")]

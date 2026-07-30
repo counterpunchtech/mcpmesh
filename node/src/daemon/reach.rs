@@ -295,7 +295,7 @@ pub(crate) fn selected_path(conn: &iroh::endpoint::Connection) -> mcpmesh_local_
 /// `https://user:token@relay.internal/` would otherwise ship that token to every local-API client.
 /// Scheme + host + port only: enough to name which relay is in use, carrying no credential and no
 /// path/query.
-fn sanitize_relay_url(url: &iroh::RelayUrl) -> String {
+pub(crate) fn sanitize_relay_url(url: &iroh::RelayUrl) -> String {
     let u: &url::Url = url; // RelayUrl derefs to Url
     match (u.host_str(), u.port()) {
         (Some(host), Some(port)) => format!("{}://{host}:{port}", u.scheme()),
