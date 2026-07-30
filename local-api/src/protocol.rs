@@ -284,9 +284,10 @@ pub struct SelfNetwork {
     /// This endpoint's direct (non-relay) socket addresses — its own dialable coordinates.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub direct_addrs: Vec<String>,
-    /// When the daemon's watcher last observed this block CHANGE (epoch seconds). `None` until
-    /// the first observed change after boot. Absent from a point-in-time computation with no
-    /// watcher running.
+    /// When the daemon's watcher last observed a TRANSITION (epoch seconds) — a change of
+    /// `online`, `home_relay`, or a relay's connection state; `direct_addrs` drift alone does
+    /// not stamp (nor emit a frame). OMITTED (not `null`) until the first observed transition
+    /// after boot, and from a point-in-time computation with no watcher running.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_change_epoch: Option<i64>,
 }
@@ -1413,6 +1414,33 @@ mod tests {
             v["peer"]["age_secs"], 0,
             "a transition frame is fresh by construction: {v}"
         );
+        let back: StreamFrame = serde_json::from_value(v).unwrap();
+        assert_eq!(back, frame);
+    }
+
+    /// #90: the self-network frame tags as `{"type":"self_network","self_network":{…}}` — the
+    /// SAME block `status` and the snapshot carry. Pinned explicitly (like the reachability
+    /// tag) so a variant rename cannot slip past a suite whose two ends share the type while
+    /// breaking every doc-following third-party client.
+    #[test]
+    fn self_network_frame_tags_and_round_trips() {
+        let frame = StreamFrame::SelfNetwork {
+            self_network: SelfNetwork {
+                online: true,
+                home_relay: Some("https://relay.example:443".into()),
+                relays: vec![RelayInfo {
+                    url: "https://relay.example:443".into(),
+                    connected: true,
+                }],
+                direct_addrs: vec!["192.168.1.2:4444".into()],
+                last_change_epoch: Some(1_753_842_000),
+            },
+        };
+        let v = serde_json::to_value(&frame).unwrap();
+        assert_eq!(v["type"], "self_network");
+        assert_eq!(v["self_network"]["online"], true);
+        assert_eq!(v["self_network"]["home_relay"], "https://relay.example:443");
+        assert_eq!(v["self_network"]["relays"][0]["connected"], true);
         let back: StreamFrame = serde_json::from_value(v).unwrap();
         assert_eq!(back, frame);
     }

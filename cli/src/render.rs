@@ -591,6 +591,9 @@ pub fn render_frame(frame: &StreamFrame) -> String {
             reachability.len(),
             match self_network {
                 Some(n) if n.online => " — online",
+                // Empty relay list = relay_mode "disabled": a CONFIGURATION (LAN-only), not an
+                // outage — the docs forbid rendering it as a health warning.
+                Some(n) if n.relays.is_empty() => "",
                 Some(_) => " — no relay connection",
                 None => "",
             }
@@ -603,12 +606,15 @@ pub fn render_frame(frame: &StreamFrame) -> String {
             peer.name,
             if peer.reachable { "online" } else { "offline" }
         ),
-        // #90: this node's own posture changed. Display the decision-relevant facts only.
+        // #90: this node's own posture changed. Word only, never the relay URL — the same
+        // pinned discipline as the status renderer (the URL belongs in --json). A frame with
+        // `online: false` implies relays ARE configured (the watcher never emits in
+        // relay_mode=disabled, where the posture never changes), so "lost" is accurate here.
         StreamFrame::SelfNetwork { self_network } => {
-            match (&self_network.online, &self_network.home_relay) {
-                (true, Some(relay)) => format!("[self] online via {relay}"),
-                (true, None) => "[self] online".to_string(),
-                (false, _) => "[self] relay connection lost — LAN/direct paths only".to_string(),
+            if self_network.online {
+                "[self] online via relay".to_string()
+            } else {
+                "[self] relay connection lost — LAN/direct paths only".to_string()
             }
         }
         StreamFrame::Event { record } => {

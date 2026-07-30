@@ -103,7 +103,10 @@ pub fn spawn_self_net_watch(mesh: Arc<MeshState>) -> tokio::task::JoinHandle<()>
                 previous = current;
             }
             if watcher.updated().await.is_err() {
-                // The endpoint is gone (last clone dropped) — the daemon is shutting down.
+                // Backstop only: iroh's watcher disconnects when the LAST endpoint clone drops,
+                // and this task's own Arc<MeshState> holds one — so in practice the loop ends
+                // via its JoinHandle (aborted in shutdown_booted for embedded nodes; dropped
+                // with the process for the daemon shell), not through this arm.
                 return;
             }
         }
