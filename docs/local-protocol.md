@@ -288,7 +288,11 @@ Nickname UNIQUENESS is still enforced, for display/routing clarity only (outboun
   redeemer can `set_nickname` and redeem the **same** invite again. This is not an oracle: the
   distinguishable reason is only ever sent to a caller that proved possession of a live invite
   secret — an unproven dialer (wrong/expired secret) still gets the generic `pairing refused`
-  with no detail about which names exist.
+  with no detail about which names exist. Known trade: because the refusal no longer burns, a
+  live-invite HOLDER can retry names and enumerate which display names exist on the inviter —
+  someone the inviter deliberately invited, learning names only (never ids or grants; grants
+  are principal-keyed), bounded by the pair limiter, and each attempt is warn-logged on the
+  inviter.
 - **`peer_rename`** — refuses a target name another contact already holds; it is a pure display
   mutation (no grant is touched, no serving reload happens).
 

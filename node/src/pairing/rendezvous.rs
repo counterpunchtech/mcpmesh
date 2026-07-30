@@ -600,7 +600,14 @@ pub async fn redeem_invite(
 
     // We (the redeemer) OPEN the bi-stream; the inviter `accept_bi`s. Send the hello proving the
     // secret. `redeemer_id` is our own TLS id (the inviter re-verifies it against remote_id).
-    let (mut send, recv) = conn.open_bi().await.context("open the pairing bi-stream")?;
+    //
+    // The whole open→write→read exchange is ONE async block so its failure is classified against
+    // `close_reason()` at ONE site (the #89 `exchange()` shape): the accept gate's fast-close
+    // races all three stream calls, and on a real link the close can land before `open_bi` or
+    // the hello write completes — a first version guarded only the read arm, which the second
+    // #142-style gate caught as an intermittent recurrence of the bare-connection-failure UX
+    // this exists to remove. On localhost the read always loses the race, so only the
+    // single-site SHAPE guarantees the other two; the dead-invite test pins this site.
     let (redeemer_pk, redeemer_sig) = match self_binding {
         Some(b) => (Some(b.user_pk), Some(b.sig)),
         None => (None, None),
@@ -612,30 +619,34 @@ pub async fn redeem_invite(
         user_pk: redeemer_pk,
         binding_sig: redeemer_sig,
     };
-    write_frame(&mut send, &serde_json::to_value(&hello)?)
-        .await
-        .context("send the pairing hello")?;
-
-    // Read exactly ONE reply frame (same cap as the inviter side).
-    let mut reader = FrameReader::new(BufReader::new(recv), MAX_PAIR_FRAME);
-    let reply: PairReply = match reader.next().await {
-        Ok(Some(Inbound::Frame(v))) => {
-            serde_json::from_value(v).context("inviter reply is not a PairReply")?
+    let exchange = async {
+        let (mut send, recv) = conn.open_bi().await.context("open the pairing bi-stream")?;
+        write_frame(&mut send, &serde_json::to_value(&hello)?)
+            .await
+            .context("send the pairing hello")?;
+        // Read exactly ONE reply frame (same cap as the inviter side).
+        let mut reader = FrameReader::new(BufReader::new(recv), MAX_PAIR_FRAME);
+        match reader.next().await.context("read the pairing reply")? {
+            Some(Inbound::Frame(v)) => {
+                serde_json::from_value::<PairReply>(v).context("inviter reply is not a PairReply")
+            }
+            _ => bail!("no reply from the inviter (connection closed before a reply)"),
         }
-        // No reply frame. If the inviter's accept gate fast-closed us (#87b), say what that
-        // MEANS — the invite line in hand may still advertise a live TTL, but invites are
+    };
+    let reply: PairReply = match exchange.await {
+        Ok(reply) => reply,
+        // The exchange failed. If the inviter's accept gate fast-closed us (#87b), say what
+        // that MEANS — the invite line in hand may still advertise a live TTL, but invites are
         // in-memory on the inviter, so this is the everyday shape of "expired, already used,
-        // or the inviter's daemon restarted", not a network problem. Read off `close_reason()`
-        // (the close races our write/read, so either arm can be the failure site).
-        _ if no_live_invite_close(&conn) => {
+        // or the inviter's daemon restarted", not a network problem.
+        Err(_) if no_live_invite_close(&conn) => {
             bail!(
                 "the invite is no longer live on the inviter: it expired, was already \
                  redeemed, or the inviter's daemon restarted since minting it (invites do \
                  not survive a restart) — ask for a fresh invite"
             );
         }
-        Err(e) => return Err(e).context("read the pairing reply"),
-        _ => bail!("no reply from the inviter (connection closed before a reply)"),
+        Err(e) => return Err(e),
     };
     // On Ok, verify the inviter's presented binding against `invite.inviter_id` (which we proved
     // equals the TLS-authenticated id above) → its PROVEN user_id, or `None` if it presented none.
