@@ -272,7 +272,8 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let sink = AuditSink::new(crate::audit::log::AuditLog::spawn(dir.path().to_path_buf()));
             let mut rx = sink.subscribe().expect("auditing enabled");
-            let auditor = RequestAuditor::new(sink.clone(), Some("bob".into()), "notes".into());
+            let auditor =
+                RequestAuditor::new(sink.clone(), Some("bob".into()), "notes".into(), None);
 
             let pump = tokio::spawn(async move {
                 let _ = pump(
@@ -375,7 +376,12 @@ mod tests {
                     &mut transport,
                     server_read,
                     server_write,
-                    RequestAuditor::new(AuditSink::disabled(), Some("bob".into()), "echo".into()),
+                    RequestAuditor::new(
+                        AuditSink::disabled(),
+                        Some("bob".into()),
+                        "echo".into(),
+                        None,
+                    ),
                     rate,
                 )
                 .await
@@ -487,6 +493,7 @@ mod tests {
                             AuditSink::disabled(),
                             Some("bob".into()),
                             "echo".into(),
+                            None,
                         ),
                         RateGate::new(RateLimiter::unlimited_shared(), None),
                     )

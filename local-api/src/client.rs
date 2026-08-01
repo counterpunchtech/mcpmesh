@@ -1009,6 +1009,7 @@ mod tests {
                         "2026-07-03T14:02:11.480Z".into(),
                         Some("bob".into()),
                         "notes".into(),
+                        None,
                     )),
                 },
                 StreamFrame::Lagged { dropped: 12 },

@@ -331,7 +331,7 @@ async fn trust_mutations_emit_audit_events() {
         let mesh = MeshState::new(
             server,
             gate,
-            store,
+            store.clone(),
             Arc::new(LiveInvites::new()),
             "server".into(),
             config_path.clone(),
@@ -370,9 +370,13 @@ async fn trust_mutations_emit_audit_events() {
             body.contains("\"target\":\"bob\""),
             "the audit record targets the DISPLAY nickname, got: {body}"
         );
+        // #57 (Option A): the pair record now ALSO carries the redeemer's stable principal —
+        // the docs' endpoint-id sentence was rewritten to ban secrets and raw hex, not the
+        // prefixed principal rendering the rest of the API has keyed on since #41. Two devices
+        // pairing under one display name are now distinguishable in the trust history.
         assert!(
-            !body.contains("b64u:BOB"),
-            "the stable principal must not leak into the audit record, got: {body}"
+            body.contains("\"principal\":\"b64u:BOB\""),
+            "the pair record carries the stable principal (#57): {body}"
         );
 
         // The config side of the split: `allow` gained the stable principal, not the nickname.
@@ -384,6 +388,49 @@ async fn trust_mutations_emit_audit_events() {
         assert!(
             !cfg_body.contains("\"bob\""),
             "the display nickname must never land in the allow, got: {cfg_body}"
+        );
+
+        // The unpair record deliberately carries NO principal (#72's design, kept): an unpair
+        // may tear down several devices, so there is no single subject to attribute. Seed the
+        // identity row first — remove_peer refuses a never-paired nickname (no phantom unpair).
+        store
+            .add(mcpmesh::allowlist::PeerEntry {
+                endpoint_id: [0xB0u8; 32],
+                nickname: "bob".into(),
+                services: vec![],
+                paired_at: None,
+                user_id: Some("b64u:BOB".into()),
+                last_addr: None,
+            })
+            .unwrap();
+        let state = mcpmesh::control::DaemonState::with_mesh("test", mesh.clone());
+        mcpmesh::daemon::remove_peer(
+            &state,
+            mcpmesh_local_api::PeerRemoveParams {
+                nickname: "bob".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let mut unpair = 0;
+        for _ in 0..50 {
+            if let Ok(b) = std::fs::read_to_string(&file) {
+                unpair = b.matches("\"event\":\"unpair\"").count();
+                if unpair >= 1 {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(unpair, 1, "the unpair recorded one trust event");
+        let body = std::fs::read_to_string(&file).unwrap();
+        let unpair_line = body
+            .lines()
+            .find(|l| l.contains("\"event\":\"unpair\""))
+            .expect("unpair line present");
+        assert!(
+            !unpair_line.contains("principal"),
+            "unpair has no single subject — no principal (#57): {unpair_line}"
         );
     })
     .await

@@ -196,7 +196,14 @@ impl SpawnBackend {
             // that cannot collide. `peer` above is a display name and two devices can share it.
             super::session_principal(identity.as_ref()),
         );
-        let auditor = RequestAuditor::new(self.audit.clone(), peer.clone(), self.service.clone());
+        let auditor = RequestAuditor::new(
+            self.audit.clone(),
+            peer.clone(),
+            self.service.clone(),
+            // #57: the same stable principal the session guard stamps — every proxied line of
+            // this session joins to policy without nickname matching.
+            super::session_principal(identity.as_ref()),
+        );
 
         // Pump the two directions concurrently until either side EOFs/closes (shared
         // with the socket backend — one codec, one pump, no full-duplex deadlock); the

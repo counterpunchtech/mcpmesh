@@ -89,7 +89,11 @@ pub fn filter_records<'a>(
     records
         .iter()
         .filter(|r| kind.is_none_or(|k| r.kind == k))
-        .filter(|r| peer.is_none_or(|p| r.peer.as_deref() == Some(p)))
+        // `peer` matches the display name OR the stable principal (#57 gate): the one identity
+        // the docs now say to key on must be selectable from `internal audit tail --peer`.
+        .filter(|r| {
+            peer.is_none_or(|p| r.peer.as_deref() == Some(p) || r.principal.as_deref() == Some(p))
+        })
         .collect()
 }
 
@@ -254,6 +258,7 @@ mod tests {
                 "2026-06-30T23:59:59.000Z".into(),
                 "pair".into(),
                 Some("bob".into()),
+                None,
             ),
         )
         .unwrap();
@@ -263,6 +268,7 @@ mod tests {
                 "2026-07-01T00:00:00.000Z".into(),
                 Some("bob".into()),
                 "notes".into(),
+                None,
             ),
         )
         .unwrap();
@@ -275,6 +281,7 @@ mod tests {
                 "tools/list".into(),
                 None,
                 "blake3:deadbeef".into(),
+                None,
             ),
         )
         .unwrap();
@@ -287,6 +294,7 @@ mod tests {
                 "tools/call".into(),
                 Some("read_file".into()),
                 "blake3:cafe".into(),
+                None,
             ),
         )
         .unwrap();
@@ -317,6 +325,22 @@ mod tests {
         let alice = filter_records(&all, None, Some("alice"));
         assert_eq!(alice.len(), 1);
         assert_eq!(alice[0].tool.as_deref(), Some("read_file"));
+        // #57: the same flag matches the STABLE principal — the identity the docs say to key
+        // on must be selectable, not just the collidable display name.
+        let mut with_principal = AuditRecord::session_open(
+            "2026-07-02T00:00:00.000Z".into(),
+            Some("alice".into()),
+            "notes".into(),
+            Some("eid:a11ce".into()),
+        );
+        with_principal.principal = Some("eid:a11ce".into());
+        let all2 = [&all[..], &[with_principal]].concat();
+        let by_eid = filter_records(&all2, None, Some("eid:a11ce"));
+        assert_eq!(
+            by_eid.len(),
+            1,
+            "a principal string selects the record its display name would hide among collisions"
+        );
     }
 
     #[test]
@@ -344,6 +368,7 @@ mod tests {
                 "2026-06-30T10:00:00.000Z".into(),
                 Some("bob".into()),
                 "notes".into(),
+                None,
             ),
         )
         .unwrap();
@@ -353,6 +378,7 @@ mod tests {
                 "2026-07-01T10:00:00.000Z".into(),
                 Some("bob".into()),
                 "notes".into(),
+                None,
             ),
         )
         .unwrap();
@@ -362,12 +388,13 @@ mod tests {
                 "2026-07-01T11:00:00.000Z".into(),
                 Some("alice".into()),
                 "notes".into(),
+                None,
             ),
         )
         .unwrap();
         crate::audit::log::append_record(
             dir.path(),
-            &AuditRecord::session_open("2026-07-01T12:00:00.000Z".into(), None, "kb".into()),
+            &AuditRecord::session_open("2026-07-01T12:00:00.000Z".into(), None, "kb".into(), None),
         )
         .unwrap();
         crate::audit::log::append_record(
@@ -379,6 +406,7 @@ mod tests {
                 "tools/list".into(),
                 None,
                 "blake3:x".into(),
+                None,
             ),
         )
         .unwrap();
@@ -388,6 +416,7 @@ mod tests {
                 "2026-07-01T14:00:00.000Z".into(),
                 "pair".into(),
                 Some("carol".into()),
+                None,
             ),
         )
         .unwrap();

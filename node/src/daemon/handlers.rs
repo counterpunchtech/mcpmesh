@@ -561,6 +561,9 @@ pub async fn remove_peer(state: &DaemonState, params: PeerRemoveParams) -> Resul
         now_ts(),
         "unpair".into(),
         Some(nickname.clone()),
+        // #57: deliberately NO principal — an unpair may tear down several devices under one
+        // person, so there is no single subject to attribute.
+        None,
     ));
     Ok(())
 }
@@ -1149,6 +1152,9 @@ pub async fn grant_service_access(
         now_ts(),
         "pair".into(),
         Some(display_nickname.to_string()),
+        // #57: the redeemer's stable principal — the same value the grant just appended to the
+        // allow, so the trust history joins to the policy it created.
+        Some(principal.to_string()),
     ));
     Ok(())
 }
@@ -1595,8 +1601,15 @@ where
             // stream shows the attempted-and-failed reach. `peer` is the caller's
             // nickname/user_id, never an endpoint-id.
             mesh.audit().record(
-                AuditRecord::session_open(now_ts(), Some(peer.to_string()), service.to_string())
-                    .with_status("error"),
+                // #57: deliberately NO principal — this is OUR outbound dial that failed, not a
+                // gate-resolved caller; there is no authenticated subject to attribute.
+                AuditRecord::session_open(
+                    now_ts(),
+                    Some(peer.to_string()),
+                    service.to_string(),
+                    None,
+                )
+                .with_status("error"),
             );
             // Dial establishment failed: hand the proxy a well-formed -32055 (not a hang),
             // which it relays to the AI client. The error id is null — the AI

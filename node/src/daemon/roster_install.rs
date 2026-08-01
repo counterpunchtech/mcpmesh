@@ -106,6 +106,9 @@ pub fn install_roster_view_and_sever(
         now_ts(),
         "roster_install".into(),
         Some(format!("{org_id}/{serial}")),
+        // #57: deliberately NO principal — a roster install is a purely local act (manual verb
+        // or automatic convergence), not attributable to any remote subject.
+        None,
     ));
     severed
 }

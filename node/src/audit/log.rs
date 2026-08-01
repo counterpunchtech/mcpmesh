@@ -142,6 +142,8 @@ impl AuditLog {
             now_ts(),
             Some(peer.clone()),
             service.clone(),
+            // #57: the same #73 principal the live-session row keys on — record and row agree.
+            principal.clone(),
         ));
         self.live.lock().expect("audit live lock").insert(
             id,
@@ -164,6 +166,8 @@ impl AuditLog {
                 now_ts(),
                 Some(s.peer),
                 s.service,
+                // #57: read back from the stored row, so open and close CANNOT disagree.
+                s.principal,
             ));
         }
     }
@@ -278,6 +282,9 @@ struct RequestAuditorInner {
     sink: AuditSink,
     peer: Option<String>,
     service: String,
+    /// The caller's stable principal (#57) — stamped on every proxied request/notification
+    /// record, same source as the session guard's.
+    principal: Option<String>,
     pending: Mutex<HashMap<String, Pending>>,
     /// Has a dropped notification already been reported for this session (#76 review)? Cleared by
     /// the next delivered line, so a peer that recovers and is throttled again is reported again.
@@ -286,12 +293,18 @@ struct RequestAuditorInner {
 }
 
 impl RequestAuditor {
-    pub fn new(sink: AuditSink, peer: Option<String>, service: String) -> Self {
+    pub fn new(
+        sink: AuditSink,
+        peer: Option<String>,
+        service: String,
+        principal: Option<String>,
+    ) -> Self {
         Self {
             inner: Some(Arc::new(RequestAuditorInner {
                 sink,
                 peer,
                 service,
+                principal,
                 pending: Mutex::new(HashMap::new()),
                 drop_reported: AtomicBool::new(false),
             })),
@@ -342,6 +355,7 @@ impl RequestAuditor {
             method.to_string(),
             tool,
             args_hash(frame.get("params").unwrap_or(&Value::Null)),
+            inner.principal.clone(),
         );
         rec.status = Some("rate_limited".into());
         inner.sink.record(rec);
@@ -393,6 +407,7 @@ impl RequestAuditor {
                     method.to_string(),
                     tool,
                     ah,
+                    inner.principal.clone(),
                 ));
             }
         }
@@ -445,6 +460,7 @@ impl RequestAuditor {
             bytes_out,
             status.to_string(),
             latency_ms,
+            inner.principal.clone(),
         ));
     }
 }
@@ -462,7 +478,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sink = AuditSink::new(AuditLog::spawn(dir.path().to_path_buf()));
         let mut rx = sink.subscribe().expect("auditing enabled");
-        let auditor = RequestAuditor::new(sink.clone(), Some("bob".into()), "notes".into());
+        let auditor = RequestAuditor::new(sink.clone(), Some("bob".into()), "notes".into(), None);
 
         let note = serde_json::json!({"method": "notifications/progress", "params": {"p": 1}});
 
@@ -550,6 +566,7 @@ mod tests {
             42,
             "ok".into(),
             7,
+            None,
         );
         append_record(dir.path(), &rec).unwrap();
 
@@ -566,8 +583,12 @@ mod tests {
         assert!(body.contains("blake3:"));
 
         // A second record in a DIFFERENT month lands in its own file (monthly rotation).
-        let rec2 =
-            AuditRecord::session_open("2026-08-01T00:00:00.000Z".into(), None, "notes".into());
+        let rec2 = AuditRecord::session_open(
+            "2026-08-01T00:00:00.000Z".into(),
+            None,
+            "notes".into(),
+            None,
+        );
         append_record(dir.path(), &rec2).unwrap();
         assert!(dir.path().join("2026-08.jsonl").exists());
         // The July file still has exactly one line (append, not overwrite).
@@ -585,6 +606,7 @@ mod tests {
                 format!("2026-07-03T14:02:1{i}.000Z"),
                 Some("bob".into()),
                 "notes".into(),
+                None,
             ));
         }
         // The writer task drains asynchronously; poll the file until the records land.
@@ -610,6 +632,7 @@ mod tests {
             "2026-07-03T14:02:11.480Z".into(),
             "pair".into(),
             None,
+            None,
         ));
         // Nothing observable to assert beyond "did not panic / no file created"; the call returns.
     }
@@ -619,7 +642,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let audit_dir = dir.path().to_path_buf();
         let sink = AuditSink::new(AuditLog::spawn(audit_dir.clone()));
-        let auditor = RequestAuditor::new(sink, Some("bob".into()), "notes".into());
+        let auditor = RequestAuditor::new(sink, Some("bob".into()), "notes".into(), None);
 
         let secret = "sensitive-search-query-xyzzy";
         // Direction A: a tools/call request with a sensitive argument. The auditor sees the raw args
@@ -672,7 +695,7 @@ mod tests {
     async fn server_initiated_request_does_not_corrupt_client_correlation() {
         let dir = tempfile::tempdir().unwrap();
         let sink = AuditSink::new(AuditLog::spawn(dir.path().to_path_buf()));
-        let auditor = RequestAuditor::new(sink, Some("bob".into()), "notes".into());
+        let auditor = RequestAuditor::new(sink, Some("bob".into()), "notes".into(), None);
         // Client sends request id=1 (tools/call).
         auditor.on_request(&json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -720,6 +743,7 @@ mod tests {
             now_ts(),
             Some("bob".into()),
             "notes".into(),
+            None,
         ));
         let got = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
             .await
@@ -775,7 +799,7 @@ mod tests {
     async fn request_auditor_marks_error_responses() {
         let dir = tempfile::tempdir().unwrap();
         let sink = AuditSink::new(AuditLog::spawn(dir.path().to_path_buf()));
-        let auditor = RequestAuditor::new(sink, Some("bob".into()), "notes".into());
+        let auditor = RequestAuditor::new(sink, Some("bob".into()), "notes".into(), None);
         auditor
             .on_request(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}));
         auditor.on_response(
