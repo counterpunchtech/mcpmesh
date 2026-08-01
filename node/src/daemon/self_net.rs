@@ -27,6 +27,7 @@ pub(crate) fn project(
     relays: impl IntoIterator<Item = (String, bool)>,
     direct_addrs: Vec<String>,
     last_change_epoch: Option<i64>,
+    identity_conflict_epoch: Option<i64>,
 ) -> SelfNetwork {
     let relays: Vec<RelayInfo> = relays
         .into_iter()
@@ -40,6 +41,7 @@ pub(crate) fn project(
         relays,
         direct_addrs,
         last_change_epoch,
+        identity_conflict_epoch,
     }
 }
 
@@ -64,7 +66,13 @@ pub(crate) fn read_current(mesh: &MeshState, last_change_epoch: Option<i64>) -> 
             _ => None,
         })
         .collect();
-    project(relays, direct_addrs, last_change_epoch)
+    // #134: the last duplicate-identity observation, if any layer is installed to make one.
+    project(
+        relays,
+        direct_addrs,
+        last_change_epoch,
+        mesh.identity_conflict.last_seen_epoch(),
+    )
 }
 
 /// Spawn the posture watcher (#90): loop on `home_relay_status().updated()`, re-project, and on
@@ -85,7 +93,7 @@ pub fn spawn_self_net_watch(mesh: Arc<MeshState>) -> tokio::task::JoinHandle<()>
         let mut watcher = mesh.endpoint.home_relay_status();
         // The offline-empty baseline (see above). Compared WITHOUT `direct_addrs` or the
         // stamp — see `signature`.
-        let mut previous = project(std::iter::empty(), Vec::new(), None);
+        let mut previous = project(std::iter::empty(), Vec::new(), None, None);
         loop {
             let current = read_current(&mesh, None);
             if signature(&current) != signature(&previous) {
@@ -116,7 +124,11 @@ pub fn spawn_self_net_watch(mesh: Arc<MeshState>) -> tokio::task::JoinHandle<()>
 /// What counts as a transition (#90): `online`, the home relay, and the relay list — NOT
 /// `direct_addrs` (chatty, advisory) and NOT the stamp itself (comparing it would make every
 /// emission differ from its successor by construction).
-fn signature(net: &SelfNetwork) -> (bool, Option<&str>, Vec<(&str, bool)>) {
+/// What the watcher compares tick to tick — `online`, the home relay, every relay's state, and
+/// (since #134) the duplicate-identity stamp. Named because it outgrew a readable tuple.
+type Posture<'a> = (bool, Option<&'a str>, Vec<(&'a str, bool)>, Option<i64>);
+
+fn signature(net: &SelfNetwork) -> Posture<'_> {
     (
         net.online,
         net.home_relay.as_deref(),
@@ -124,6 +136,11 @@ fn signature(net: &SelfNetwork) -> (bool, Option<&str>, Vec<(&str, bool)>) {
             .iter()
             .map(|r| (r.url.as_str(), r.connected))
             .collect(),
+        // #134: a NEW duplicate-identity observation is a posture change worth pushing. The stamp
+        // is sticky and only moves when the relay reports again, so this emits once per report
+        // rather than once per tick. Including it here is what turns "peers went unreachable with
+        // no explanation" into a frame that names the cause at the moment it happens.
+        net.identity_conflict_epoch,
     )
 }
 
@@ -143,6 +160,7 @@ mod tests {
             ],
             vec!["192.168.1.2:4444".into()],
             None,
+            None,
         );
         assert!(net.online);
         assert_eq!(net.home_relay.as_deref(), Some("https://b.example:443"));
@@ -152,13 +170,54 @@ mod tests {
             [("https://a.example:443".to_string(), false)],
             Vec::new(),
             None,
+            None,
         );
         assert!(!net.online, "a known-but-disconnected relay is not online");
         assert_eq!(net.home_relay, None);
 
-        let net = project(std::iter::empty::<(String, bool)>(), Vec::new(), None);
+        let net = project(std::iter::empty::<(String, bool)>(), Vec::new(), None, None);
         assert!(!net.online, "no relays configured (relay_mode=disabled)");
         assert!(net.relays.is_empty());
+    }
+
+    /// #134: a NEW duplicate-identity observation is a transition, so it PUSHES a frame rather
+    /// than waiting to be polled.
+    ///
+    /// This is the difference between "peers went unreachable and nothing said why" — the reported
+    /// experience — and learning the cause at the moment the relay reports it. A sticky stamp that
+    /// was excluded from the signature would still show up in `status`, but only if someone
+    /// thought to look, which is exactly what nobody knew to do.
+    #[test]
+    fn a_duplicate_identity_observation_is_a_transition() {
+        let with = |conflict| {
+            project(
+                [("https://a.example:443".to_string(), true)],
+                vec!["10.0.0.1:1".into()],
+                None,
+                conflict,
+            )
+        };
+        let clean = with(None);
+        assert_eq!(
+            clean.identity_conflict_epoch, None,
+            "a node with a unique identity reports nothing"
+        );
+        assert_ne!(
+            signature(&clean),
+            signature(&with(Some(1_753_000_000))),
+            "the first observation must emit — otherwise the fact exists only for a poller"
+        );
+        assert_ne!(
+            signature(&with(Some(1_753_000_000))),
+            signature(&with(Some(1_753_000_900))),
+            "a LATER report is news too: it says the duplicate is still out there"
+        );
+        assert_eq!(
+            signature(&with(Some(1_753_000_000))),
+            signature(&with(Some(1_753_000_000))),
+            "an unchanged stamp must not emit on every tick — the stamp is sticky, so this is \
+             what stops one observation becoming a frame per loop iteration forever"
+        );
     }
 
     /// The transition rule: `direct_addrs` drift alone is NOT a change; each of `online` /
@@ -170,10 +229,12 @@ mod tests {
             [("https://a.example:443".to_string(), true)],
             vec!["10.0.0.1:1".into()],
             None,
+            None,
         );
         let addr_churn = project(
             [("https://a.example:443".to_string(), true)],
             vec!["10.0.0.2:2".into()],
+            None,
             None,
         );
         assert_eq!(
@@ -184,6 +245,7 @@ mod tests {
         let relay_down = project(
             [("https://a.example:443".to_string(), false)],
             vec!["10.0.0.1:1".into()],
+            None,
             None,
         );
         assert_ne!(
@@ -203,6 +265,7 @@ mod tests {
             ],
             vec!["10.0.0.1:1".into()],
             None,
+            None,
         );
         let secondary_down = project(
             [
@@ -210,6 +273,7 @@ mod tests {
                 ("https://b.example:443".to_string(), false),
             ],
             vec!["10.0.0.1:1".into()],
+            None,
             None,
         );
         assert_ne!(

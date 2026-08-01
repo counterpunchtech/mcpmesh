@@ -57,6 +57,9 @@ pub mod config;
 pub mod control;
 #[doc(hidden)]
 pub mod daemon;
+/// Node-level conditions that are observable but have no API to observe them through (#134) —
+/// currently the relay's duplicate-endpoint-id report, which iroh 1.0.3 only `warn!`s.
+pub mod diag;
 #[doc(hidden)]
 pub mod ipc;
 #[doc(hidden)]

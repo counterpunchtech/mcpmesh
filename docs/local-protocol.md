@@ -702,9 +702,47 @@ become viable).
 {
   "type": "self_network",
   "self_network": {"online": false, "relays": [{"url": "https://relay.example:443", "connected": false}],
-                   "direct_addrs": ["192.168.1.20:53420"], "last_change_epoch": 1753842000}
+                   "direct_addrs": ["192.168.1.20:53420"], "last_change_epoch": 1753842000,
+                   "identity_conflict_epoch": 1753841880}
 }
 ```
+
+### `identity_conflict_epoch` — someone else is using this identity (`api_minor >= 32`, #134)
+
+Two nodes booted from **copies** of one mesh root present the same endpoint id. A relay can serve
+only one of them, so the displaced node's peers simply go unreachable — with nothing, anywhere,
+saying why. That is the failure this field exists to name.
+
+`self_network.identity_conflict_epoch` is the epoch second at which the relay last reported that
+another endpoint is presenting this node's identity, and is **absent** if it never has. A new
+observation is a posture change, so it also pushes a `self_network` frame — you learn it when it
+happens rather than on a poll.
+
+**Sticky, and a timestamp rather than a flag.** The relay announces the condition once, as the
+displaced connection is dropped; it is not a state that keeps being reported. A flag that cleared
+itself would read `false` by the time anyone called `status`, so judge staleness from the epoch the
+way you would `last_change_epoch`.
+
+**Absence is not proof of uniqueness.** iroh exposes this condition only as a log line, so detection
+requires an `IdentityConflictLayer` in the process's `tracing` subscriber. The standalone `mcpmesh`
+daemon installs one at boot. An **embedded** node cannot — a subscriber is global and your
+application owns it — so it reports `null` until you compose the layer into yours:
+
+```rust
+use tracing_subscriber::prelude::*;
+let conflict = std::sync::Arc::new(mcpmesh_node::diag::IdentityConflict::default());
+tracing_subscriber::registry()
+    .with(your_fmt_layer)
+    .with(mcpmesh_node::diag::IdentityConflictLayer::new(conflict.clone()))
+    .init();
+```
+
+Never render an absent value as "identity verified unique" — it means "not observed", and on an
+embedded node with no layer installed it means "not observable".
+
+The remedy is always the same: stop the duplicate, or give it its own identity. mcpmesh does not
+refuse either node, deliberately — with two live endpoints there is no principled way to tell the
+impostor from the original, and a wrong refusal takes down the legitimate node.
 
 ### `path` — direct or relayed (`api_minor >= 13`, #64)
 
@@ -986,7 +1024,8 @@ things:
   and `StatusResult.self_nickname` are `api_minor >= 2` (#37); STABLE-principal `allow`
   strings + `ServiceInfo.allow_display` are `api_minor >= 3` (#38); the `reachability` frame's
   `source` — which of the two producers observed the transition (#150) — is `api_minor >= 30`;
-  the branchable nickname-collision refusal `-32043` (#147) is `api_minor >= 31`.
+  the branchable nickname-collision refusal `-32043` (#147) is `api_minor >= 31`;
+  `SelfNetwork.identity_conflict_epoch` (#134) is `api_minor >= 32`.
   `api_minor` is itself additive: a pre-1.1 daemon omits it and it reads as `0`.
 
 Changes remain **additive within a major**: new response fields are optional (absent-tolerant), so a

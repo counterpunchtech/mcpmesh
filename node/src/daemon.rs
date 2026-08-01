@@ -293,6 +293,11 @@ pub struct MeshState {
     /// `reach_bcast` for the same reason that one is separate from audit: the frames have
     /// different shapes and different producers, and merging happens at the subscription.
     pub(crate) self_net_bcast: tokio::sync::broadcast::Sender<mcpmesh_local_api::SelfNetwork>,
+    /// The duplicate-identity observation (#134), shared with whatever
+    /// [`IdentityConflictLayer`](crate::diag::IdentityConflictLayer) is installed — by the
+    /// standalone daemon at boot, or by an embedder into the subscriber it owns. Never observed
+    /// on a node whose identity is unique, which is the overwhelmingly common case.
+    pub(crate) identity_conflict: Arc<crate::diag::IdentityConflict>,
     /// When the self-net watcher last observed a posture change (#90, epoch seconds) — merged
     /// into `status.self_network.last_change_epoch`. A std Mutex, never held across an await.
     pub(crate) self_net_change: std::sync::Mutex<Option<i64>>,
@@ -433,6 +438,7 @@ impl MeshState {
             self_binding: std::sync::OnceLock::new(),
             recent_pairings: std::sync::Mutex::new(std::collections::VecDeque::new()),
             reachability: std::sync::Mutex::new(std::collections::HashMap::new()),
+            identity_conflict: Arc::new(crate::diag::IdentityConflict::default()),
             reach_bcast: tokio::sync::broadcast::channel(REACH_BROADCAST_DEPTH).0,
             // Same depth as the reachability ring: posture transitions are rarer still.
             self_net_bcast: tokio::sync::broadcast::channel(REACH_BROADCAST_DEPTH).0,

@@ -407,6 +407,17 @@ async fn boot_node(paths: NodePaths, config: Option<Config>) -> Result<BootedNod
     // never observes a relay and never emits): the projection is what `status` reads either way.
     background.push(crate::daemon::spawn_self_net_watch(mesh.clone()));
 
+    // #134: install the duplicate-identity detector. iroh reports the relay's
+    // `SameEndpointIdConnected` as a `warn!` and nothing else, so a `tracing` layer is the only
+    // way to observe it — see `crate::diag`.
+    //
+    // BEST EFFORT, and deliberately so. A subscriber is global and can only be set once: this
+    // succeeds in the standalone daemon (which sets none of its own) and correctly FAILS in an
+    // EMBEDDED node, where the host application owns the subscriber. An embedder that wants the
+    // detection composes `IdentityConflictLayer` into its own — see the module docs. Failing to
+    // install must never be fatal; the node is fully functional without the diagnostic.
+    install_identity_conflict_layer(&mesh);
+
     let accept_task = spawn_accept_loop(mesh.clone(), services);
     mesh.set_accept_task(accept_task).await;
 
@@ -485,6 +496,29 @@ async fn boot_node(paths: NodePaths, config: Option<Config>) -> Result<BootedNod
 
 /// How this daemon's endpoint resolves peer addresses: the n0 defaults
 /// (pkarr publish + DNS lookup against n0's servers — what `presets::N0` wires), or
+/// Compose [`IdentityConflictLayer`](crate::diag::IdentityConflictLayer) into the process's global
+/// `tracing` subscriber (#134), returning quietly if one is already installed.
+///
+/// The layer only RECORDS — it emits nothing and filters nothing — so a daemon that previously ran
+/// with no subscriber still prints nothing. Registering it is what lets `status` answer "another
+/// endpoint is presenting this identity" instead of leaving an operator with peers that went
+/// unreachable for no stated reason.
+fn install_identity_conflict_layer(mesh: &Arc<MeshState>) {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let layer = crate::diag::IdentityConflictLayer::new(mesh.identity_conflict.clone());
+    let subscriber = tracing_subscriber::registry().with(layer);
+    if tracing::subscriber::set_global_default(subscriber).is_err() {
+        // An embedder owns the subscriber. Expected, not an error — but say so once, through the
+        // host's own logging, so "why is identity_conflict_epoch always None?" has an answer.
+        tracing::debug!(
+            "a tracing subscriber is already installed, so mcpmesh's duplicate-identity detector \
+             was NOT registered; compose mcpmesh_node::diag::IdentityConflictLayer into your own \
+             subscriber to populate status.self_network.identity_conflict_epoch (#134)"
+        );
+    }
+}
+
 /// self-hosted pkarr relay URLs used for BOTH publish and resolve (`discovery_mode =
 /// "custom"` + `discovery_urls`).
 #[derive(Debug)]

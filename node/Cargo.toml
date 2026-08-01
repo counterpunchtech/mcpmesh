@@ -32,6 +32,15 @@ thiserror.workspace = true
 # tokio::process::Command with async stdin/stdout handles (the workspace tokio omits it).
 tokio = { workspace = true, features = ["process"] }
 tracing.workspace = true
+# #134: the ONLY channel iroh 1.0.3 offers for the relay's duplicate-endpoint-id signal is a
+# `warn!` — no event, no Endpoint state, no watcher. `IdentityConflictLayer` is a Layer an
+# EMBEDDER installs into the subscriber it already owns (a subscriber is global, so an embedded
+# node cannot install its own); the standalone daemon installs it itself.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
+# Same issue: the match needle is built from `Status::SameEndpointIdConnected`'s own Display, so an
+# upstream rewording changes both sides together instead of silently disabling detection. Already
+# in the lock via iroh.
+iroh-relay = { version = "1", default-features = false }
 mcpmesh-trust.workspace = true
 mcpmesh-net.workspace = true
 # `service` (implies `client`): the control server consumes the seam's hardened local
