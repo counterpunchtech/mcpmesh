@@ -31,15 +31,25 @@ pub struct Hello {
 /// The kind of backend answering a service — the two valid values, enforced at the
 /// type level and kept in lockstep with `BackendSpec`'s variants. Status reports the
 /// kind only, never the command/path (no transport vocabulary).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// **`Default` is a construction convenience, not a claim (#148).** Neither value means "no
+/// backend" — a service has one or the other — so `Run` is chosen because it is the common config
+/// shape, and for no deeper reason. It exists so [`ServiceInfo`] can derive `Default` and a
+/// downstream test fixture stops breaking on every additive field we add.
+///
+/// It cannot mislead a reader of live data: the daemon sets `backend` explicitly on every
+/// `ServiceInfo` it builds, so a defaulted value only ever exists in a fixture whose author
+/// wrote it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendKind {
+    #[default]
     Run,
     Socket,
 }
 
 /// A registered service as reported by `status` (no transport vocabulary).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceInfo {
     pub name: String,
     pub allow: Vec<String>, // STABLE principals (b64u:/eid:) or roster names (#38) — never nicknames
@@ -58,7 +68,7 @@ pub struct ServiceInfo {
 }
 
 /// A known peer as reported by `status` (nickname only — never the EndpointId).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerInfo {
     pub name: String,
     pub services: Vec<String>,
@@ -122,7 +132,7 @@ pub enum PeerPath {
 /// bool, latency/age NUMBERS, the stable `eid:` principal (#42), and since #64 the PATH KIND —
 /// direct vs relay, plus the relay URL when relayed. Never a socket address, an IP, or a key: the
 /// path field says WHICH KIND of route is in use, never where the peer is.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerReachability {
     pub name: String,    // the peer's nickname
     pub reachable: bool, // result of the last probe (false if never probed)
@@ -279,7 +289,7 @@ impl<'de> Deserialize<'de> for ReachabilitySource {
 /// Roster-mode status. Surface-clean roster VOCABULARY only: org_id, serial, a plain
 /// state word, and the pinned org-root FINGERPRINT in short words — never raw keys/EndpointIds/serials-
 /// as-transport-vocab. Absent in a pure-pairing daemon.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RosterStatus {
     pub org_id: String,
     pub serial: u64,
@@ -291,7 +301,7 @@ pub struct RosterStatus {
 /// ADVISORY — this is a display convenience, never an authorization surface. Surface-clean:
 /// FLAT vocabulary ONLY — a `user_id`, a human `device_label`, its `role` word, and an `online`
 /// boolean. It carries NO EndpointId / pubkey / hash / ALPN or any transport vocabulary.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PresencePeer {
     pub user_id: String,
     pub device_label: String,
@@ -312,7 +322,7 @@ pub struct PresencePeer {
 /// ceremony state: held in-memory by the daemon (a small ring), lost on restart, NEVER an
 /// authorization input or trust data. Surface-clean: a nickname + the SAS wordlist words +
 /// an epoch — never an EndpointId.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecentPairing {
     /// The peer's nickname as stored by the inviter (its local name for the redeemer).
     pub peer_nickname: String,
@@ -323,7 +333,7 @@ pub struct RecentPairing {
     pub paired_at_epoch: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusResult {
     pub stack_version: String,
     pub services: Vec<ServiceInfo>,
@@ -382,7 +392,14 @@ pub struct StatusResult {
 /// configuration, not an outage — render it as "LAN-only", never as a health warning.
 ///
 /// Additive-only.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// **`Default` is `{online: false, relays: []}` — which is exactly the shape above meaning
+/// "deliberately LAN-only" (#148).** The porcelain reads it that way and SUPPRESSES the "no relay
+/// connection" line for it. So a fixture built with `..Default::default()` claims a healthy
+/// LAN-only posture, not an unknown one. There is no third value for a `bool`; the honest way to
+/// say "nobody looked" is `StatusResult.self_network: None`, which is what a defaulted
+/// `StatusResult` gives you.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SelfNetwork {
     /// A home-relay connection is established (iroh's `online` definition). The signal #53's
     /// `set_relays` never had: when this goes false on a relay-enabled node, the relay set is
@@ -410,7 +427,7 @@ pub struct SelfNetwork {
 
 /// One home relay's connection state (#90). No latency — per-relay RTT needs iroh's
 /// `net_report`, which is unstable-feature-gated as of 1.0.3; `connected` is the stable truth.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelayInfo {
     /// Sanitized (scheme + host + port), like `home_relay`.
     pub url: String,
@@ -419,7 +436,11 @@ pub struct RelayInfo {
 
 /// The `status.storage` block (#88): bytes actually on disk, by subsystem. Counts, never
 /// content. Additive-only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// **`Default` is all zeros, which reads as "measured, and found empty" (#148).** It is here so a
+/// fixture can build one field and elide the rest; it is not a way to say "unmeasured". For that,
+/// leave `StatusResult.storage` as `None` — a defaulted `StatusResult` does exactly that.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageInfo {
     /// Summed sizes of the monthly audit files (`<state>/audit/*.jsonl`).
     pub audit_bytes: u64,
@@ -1679,6 +1700,147 @@ mod tests {
         };
         assert_eq!(source, ReachabilitySource::Unknown);
         assert!(peer.reachable, "the rest of the frame survives");
+    }
+
+    /// #148: a defaulted status is EMPTY and honest — the fixture ergonomic an embedder gets in
+    /// exchange for us adding fields.
+    ///
+    /// Its content is the load-bearing part. A downstream test that omits a field must not thereby
+    /// assert something: no phantom peers or services, and the optional blocks absent rather than
+    /// zeroed. `storage: Some(StorageInfo::default())` would read as "0 bytes on disk", which is a
+    /// measurement nobody took.
+    #[test]
+    fn a_defaulted_status_is_empty_and_claims_nothing() {
+        let d = StatusResult::default();
+        assert!(d.peers.is_empty() && d.services.is_empty(), "{d:?}");
+        assert!(d.reachability.is_empty() && d.presence.is_empty(), "{d:?}");
+        assert!(d.recent_pairings.is_empty(), "{d:?}");
+        assert_eq!(d.roster, None, "no roster is not an empty roster");
+        assert_eq!(d.storage, None, "absent, not 0 bytes — nobody measured");
+        assert_eq!(d.self_network, None, "absent, not offline — nobody looked");
+        assert_eq!(d.self_user_id, None);
+        assert!(
+            d.stack_version.is_empty() && d.self_nickname.is_empty(),
+            "{d:?}"
+        );
+
+        // The pattern the issue actually asks for: additive growth stops breaking fixtures.
+        let fixture = StatusResult {
+            peers: vec![PeerInfo {
+                name: "bob".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(fixture.peers[0].name, "bob");
+        assert!(fixture.services.is_empty());
+
+        // A default round-trips, so the elide-vs-null discipline holds for one too.
+        let v = serde_json::to_value(&d).unwrap();
+        assert!(v.get("roster").is_none(), "elided, not null: {v}");
+        assert!(v.get("storage").is_none(), "elided, not null: {v}");
+        let back: StatusResult = serde_json::from_value(v).unwrap();
+        assert_eq!(back, d);
+    }
+
+    /// #148: a defaulted reachability row is NOT reachable and makes NO path claim.
+    ///
+    /// This is the one default where a wrong choice would be a false guarantee rather than a
+    /// harmless placeholder — the same trap `PeerPath`'s `#[default] Unknown` exists to avoid
+    /// (#64), now reachable through a second door. A fixture that forgot to set `path` must not
+    /// thereby assert the peer was reached directly, and one that forgot `reachable` must not
+    /// claim it was up.
+    #[test]
+    fn a_defaulted_reachability_row_asserts_nothing_about_the_peer() {
+        let d = PeerReachability::default();
+        assert!(!d.reachable, "an unset row must not claim the peer is up");
+        assert_eq!(
+            d.path,
+            PeerPath::Unknown,
+            "an unset path must never read as Direct — that is a privacy claim no one made"
+        );
+        assert_eq!(d.rtt_ms, None, "no measurement was taken");
+        assert_eq!(d.age_secs, None, "never probed");
+        assert_eq!(d.principal, None);
+        assert!(d.name.is_empty() && d.meta.is_empty());
+    }
+
+    /// #148 gate: the REST of the new defaults, which the first pass left entirely unasserted —
+    /// moving `BackendKind`'s `#[default]` to `Socket` failed nothing across the whole workspace.
+    ///
+    /// Each assertion below is the conservative reading of a field that could otherwise let a
+    /// fixture assert something by omission.
+    #[test]
+    fn the_remaining_defaults_are_conservative() {
+        let s = ServiceInfo::default();
+        assert!(
+            s.allow.is_empty(),
+            "an unset allow must admit NOBODY — empty is deny (the gate's `any()` is false on an \
+             empty list), and a permissive default here would be an authz hole reachable from a \
+             fixture"
+        );
+        assert!(s.allow_display.is_empty() && s.name.is_empty());
+        assert!(
+            !s.ephemeral,
+            "persistent is the conservative reading, and matches the wire default"
+        );
+        assert_eq!(
+            s.backend,
+            BackendKind::Run,
+            "the documented choice — a convenience, not a claim; pinned so it cannot drift \
+             silently out of step with its own rustdoc"
+        );
+        assert_eq!(BackendKind::default(), BackendKind::Run);
+
+        let p = PeerInfo::default();
+        assert!(p.name.is_empty() && p.services.is_empty());
+        assert_eq!(p.user_id, None, "no identity was proven");
+        assert_eq!(p.principal, None);
+
+        // The gate's finding: this default is the documented "deliberately LAN-only" posture,
+        // which the porcelain renders as healthy and NOT as a warning. It is unavoidable (a bool
+        // has no third state) but it must stay deliberate, so it is pinned rather than left to
+        // be rediscovered by whoever writes the next fixture.
+        let n = SelfNetwork::default();
+        assert!(!n.online, "no relay connection is established");
+        assert!(
+            n.relays.is_empty() && n.home_relay.is_none(),
+            "and none are known — which the renderer reads as LAN-BY-CONFIGURATION, not as an \
+             outage; say 'nobody looked' with StatusResult.self_network: None instead"
+        );
+        assert_eq!(n.last_change_epoch, None, "no transition was observed");
+
+        let r = RelayInfo::default();
+        assert!(
+            !r.connected,
+            "an unset relay must not claim a live connection"
+        );
+
+        let st = StorageInfo::default();
+        assert_eq!(
+            (st.audit_bytes, st.redb_bytes, st.blobs_bytes),
+            (0, 0, 0),
+            "zeros read as MEASURED-and-empty; `StatusResult.storage: None` is 'unmeasured'"
+        );
+
+        let ro = RosterStatus::default();
+        assert!(
+            ro.state.is_empty(),
+            "not a valid state word, deliberately — `doctor` warns on an unknown state rather \
+             than reporting a healthy roster"
+        );
+        assert_eq!(ro.serial, 0);
+
+        let pp = PresencePeer::default();
+        assert!(
+            !pp.online,
+            "an unset presence row must not claim the device is up"
+        );
+        assert!(pp.role.is_empty() && pp.user_id.is_empty());
+
+        let rp = RecentPairing::default();
+        assert_eq!(rp.paired_at_epoch, 0);
+        assert!(rp.sas_code.is_empty(), "no ceremony produced a code");
     }
 
     /// #150 gate: "an unrecognized value reads as `unknown`" must hold for any VALUE, not just an
