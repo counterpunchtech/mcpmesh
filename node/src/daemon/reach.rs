@@ -313,13 +313,27 @@ pub(crate) fn selected_path(conn: &iroh::endpoint::Connection) -> mcpmesh_local_
 /// `https://user:token@relay.internal/` would otherwise ship that token to every local-API client.
 /// Scheme + host + port only: enough to name which relay is in use, carrying no credential and no
 /// path/query.
-pub(crate) fn sanitize_relay_url(url: &iroh::RelayUrl) -> String {
+pub fn sanitize_relay_url(url: &iroh::RelayUrl) -> String {
     let u: &url::Url = url; // RelayUrl derefs to Url
     match (u.host_str(), u.port()) {
         (Some(host), Some(port)) => format!("{}://{host}:{port}", u.scheme()),
         (Some(host), None) => format!("{}://{host}", u.scheme()),
         (None, _) => u.scheme().to_string(),
     }
+}
+
+/// Normalize a relay URL STRING to the same rendering [`sanitize_relay_url`] produces, so a raw
+/// operator-configured value can be compared with a live [`RelayInfo`](mcpmesh_local_api::RelayInfo)
+/// URL. `None` when it does not parse as a relay URL at all.
+///
+/// Exists so the PORCELAIN can do that comparison (#125's `doctor` relay check) without taking a
+/// runtime dependency on iroh — the shipped `mcpmesh` binary reaches iroh through this crate on
+/// purpose. Sharing the one function is also what stops the two renderings drifting: a prefix-match
+/// substitute reported a dead relay as connected whenever it was a strict prefix of a healthy one.
+pub fn normalize_relay_url(raw: &str) -> Option<String> {
+    raw.parse::<iroh::RelayUrl>()
+        .ok()
+        .map(|u| sanitize_relay_url(&u))
 }
 
 /// Did this probe CHANGE what a subscriber already believes (#58)?

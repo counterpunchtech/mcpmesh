@@ -41,7 +41,24 @@ const INVITE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// fixed wait: production returns the instant the relay handshake completes (~1s). On the
 /// relay-disabled localhost preset `online()` never completes, so this fires and we mint
 /// with the direct-address-only addr (dialable on localhost/LAN — sufficient for tests).
-pub(crate) const RELAY_READY_TIMEOUT: Duration = Duration::from_secs(3);
+///
+/// **It must EXCEED iroh's own probe window, and 3s did not (#125).** `online()` cannot resolve
+/// until iroh's net-report picks a home relay, and that report waits for its slowest probe under
+/// `net_report::defaults::PROBES_TIMEOUT` — which is `Duration::from_secs(3)` in iroh 1.0.3, the
+/// value this constant used to hold exactly.
+///
+/// Measured on a custom relay list containing one blackholed entry: `online()` resolved at
+/// 3007–3021ms in every sample, i.e. just past a 3000ms deadline. So a node whose pinned relay was
+/// dead lost that race essentially always and minted invites carrying only direct addresses — the
+/// relay URL a WAN redeemer bootstraps from was silently absent, on a node that WAS online via the
+/// healthy relays behind the dead one. That is a far worse outcome than a slow mint, and it is a
+/// candidate mechanism for the multi-minute mesh-up #125 reported.
+///
+/// 5s clears iroh's window with margin. The cost is paid ONLY when no relay answers at all, where
+/// the mint was already going to be relay-less; a healthy node returns in ~200ms either way. If a
+/// future iroh raises `PROBES_TIMEOUT`, raise this with it — `cli/tests/relay_race.rs` pins the
+/// ordering.
+pub const RELAY_READY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Handle a `blob_publish` control request: add a LOCAL file into a scope on the gated
 /// app-blob store, returning the ticket + hash. Requires roster mode (the provider is built only

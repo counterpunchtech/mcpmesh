@@ -25,15 +25,27 @@ than an unroutable address. Five samples per case, one process, `Endpoint::onlin
 | 4× blackhole FIRST | 5 | 3008 ms | **3017 ms** | 3019 ms | yes |
 | unroutable FIRST | 5 | 3012 ms | **3013 ms** | 3018 ms | yes |
 
-Three conclusions, each directly supported:
+**Correction to the 4× row (gate finding).** It was not four relays. `RelayMap` is a `BTreeMap`
+keyed by URL, so four clones of one blackhole collapsed to a single entry and silently re-measured
+the 1× case. Re-run with four *distinct* listeners: one dead 3007 ms, four dead 3008 ms. The
+conclusion holds; the original evidence for it did not.
 
-1. **The relays are raced, not walked.** The cost is identical whether the dead entry is first or
-   last. The reporter's central inference does not hold on this pin.
-2. **The cost does not scale with the number of dead relays.** Four blackholes cost the same as one.
-3. **The residual is a flat ~2.8 s**, and the node still comes online every time.
+That same fact retires the position question outright, and far more strongly than any timing could:
+configured ORDER is **structurally discarded** before iroh sees it, because `net_plan` hands
+`RelayMode::Custom` that same URL-keyed `BTreeMap`. "Where the dead relay sits" is not a property
+this system has — so the positional walk the report infers is impossible by construction, and a
+timing test of it can never fail. The first version of the regression test was exactly that test.
 
-So requested fix (1) is already the upstream behaviour, and fix (2) — a bounded per-relay deadline —
-already exists in effect: the observed penalty is bounded and position-independent.
+Conclusions:
+
+1. **A positional walk is not representable.** Config order does not survive into iroh.
+2. **Cost does not scale with the number of dead relays** — measured with distinct entries.
+3. **The residual is a flat ~3.0 s**, and the node still comes online every time. That figure is
+   iroh's `PROBES_TIMEOUT`: the net-report waits for its slowest probe before a home relay can be
+   picked.
+
+So requested fix (1) is already the upstream behaviour, and fix (2) already holds in effect: the
+penalty is bounded and independent of both position and count.
 
 ## What this does NOT explain
 
@@ -50,11 +62,20 @@ for a re-measure on 0.25.4 with the new diagnostic below.
 
 No relay-selection change: it is iroh's, and it already does the requested thing.
 
-### 1. `doctor` reports live relay health (the actual gap)
+### 1. `doctor` reports live relay health
 
-`status.self_network.relays[]` has carried `{url, connected}` since #90, and nothing surfaces it. A
-node whose pinned relay is dead pays the penalty silently and the operator has no way to see why —
-which is the part of this report that IS ours.
+`status --json` has carried `self_network.relays[].connected` since #90, but no HUMAN surface did —
+not the `status` line, not `doctor` — so it was available only to an embedder that already knew to
+look. A node whose pinned relay is dead pays the penalty with nothing pointing at the cause.
+
+Emitted for `relay_mode = "custom"` ONLY. `relay_urls` is ignored in every other mode and nothing
+rejects leftovers, so gating on the list alone told a healthy node on the default relays that it
+had "no relay path right now" (gate finding).
+
+URL matching is EXACT, over the daemon's own `sanitize_relay_url` — shared, not reimplemented, so
+the two renderings cannot drift. The first version prefix-matched and reported a dead relay as
+connected whenever it was a strict prefix of a healthy one (`https://relay.acme.com` masked by
+`https://relay.acme.com:8443`), which is precisely the failure the check exists to prevent.
 
 `check_relays(configured, live) -> Verdict`, pure and table-tested like every other doctor check:
 
@@ -68,15 +89,19 @@ which is the part of this report that IS ours.
 Wired through `probe_daemon`, which already opens a control connection and reads `status`; it gains
 the `self_network.relays` list alongside the roster state it already extracts.
 
-### 2. A regression test pinning the raced behaviour
+### 2. Regression tests with actual teeth
 
-The measurement above becomes a permanent test asserting a dead relay's cost is **position- and
-count-independent**, with generous absolute bounds (it asserts the *shape*, not a latency budget —
-a tight bound here is what made #110 flaky).
+Three, none asserting a latency budget — a tight wall-clock bound is what made #110 flaky, and the
+absolute figure is iroh's to change:
 
-This is the durable value: it guards the property on every future `iroh` bump, which the maintainer
-loop files automatically. If a future iroh regresses to a sequential walk, this fails instead of a
-downstream re-discovering it in production.
+- config order is discarded before iroh sees it (a property, not a timing);
+- a dead relay's cost does not grow with their NUMBER, using distinct listeners, with an assertion
+  that the map did not collapse them;
+- `RELAY_READY_TIMEOUT` outlasts a measured `online()` under a dead relay — see below.
+
+The durable value is the iroh-bump path: the maintainer loop files a bump on every new stable
+release, and relay selection is exactly the internal behaviour a minor bump can change with no type
+diff.
 
 ## Versioning
 
@@ -85,13 +110,36 @@ downstream re-discovering it in production.
 
 ## Testing
 
-1. `check_relays` table: unconfigured, daemon-down, all-connected, partial, none-connected.
+1. `check_relays` table: daemon-down, all-connected, partial, none-connected.
 2. The partial case NAMES the dead URL — an operator must be able to act on it.
-3. The raced-behaviour regression test (position and count independence).
+3. A dead relay is not masked by a healthy one it prefixes; a re-spelling of one relay is not read
+   as a second, dead one.
+4. The finding is emitted for `custom` mode only.
+5. Cost independent of the number of dead relays (distinct listeners, collapse guarded).
+6. `RELAY_READY_TIMEOUT` exceeds a measured `online()` by real margin.
 
-Mutation: making the partial case return `Ok` must fail 1; dropping the URL from the message must
-fail 2; a sequential walk would fail 3.
+Mutation: the partial case returning `Ok` fails 1; counting instead of naming fails 2; restoring
+the 3 s deadline fails 6.
+
+## The finding the first draft missed
+
+`RELAY_READY_TIMEOUT` was **3 s** — the same value as iroh's `net_report::defaults::PROBES_TIMEOUT`,
+which is what `online()` is waiting on. Every dead-relay sample above lands at 3007–3021 ms, i.e.
+*just past* a 3000 ms deadline. So `mint_invite` and `BlobProvider::ticket_for` lost that race
+essentially always and produced an address with **no relay URL** — on a node that was perfectly
+online via the healthy relays behind the dead one. A WAN redeemer bootstraps from that URL.
+
+That is a candidate mechanism for the multi-minute mesh-up actually reported, and unlike relay
+selection it is entirely ours. Raised to **5 s**, which clears iroh's window with margin. The extra
+wait is paid only when no relay answers at all — where the mint was already going to be relay-less;
+a healthy node returns in ~200 ms either way.
+
+Pinned by asserting the ORDERING against a *measured* `online()`, not a hardcoded number, so it
+stays honest when iroh changes its constant — which is exactly what the iroh-bump path needs.
+
+The first draft declared this out of scope on the premise that 3 s was "already bounded". It was
+bounded and wrong: the bound sat exactly on the value it needed to exceed.
 
 ## Out of scope
 
-Relay selection itself, and any change to `RELAY_READY_TIMEOUT` (already 3 s and already bounded).
+Relay selection itself — it is iroh's, and it already does the requested thing.
