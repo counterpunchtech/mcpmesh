@@ -187,32 +187,6 @@ Methods split into two groups by audience:
 > serving from here", never as "unshare from everyone".
 >
 > *(Before `api_minor` 19 the following applied, and is why #107 existed:)*
-> **Removing an allow entry no other path will strip (#149).** `service_allow_revoke` matches the
-> exact string, so it is the remedy for an entry that has outlived its meaning — most often a bare
-> nickname left in an allow list by a pre-#38 config.
->
-> Two neighbouring paths deliberately will NOT do it, and reading them together suggests such an
-> entry is permanent. It is not:
->
-> - **`peer_remove` (unpair)** strips the peer's stable principals but never bare strings, on
->   purpose: post-#38 a bare entry is roster vocabulary, and a nickname-keyed strip could collide
->   with a group name and revoke a whole roster group.
-> - **`register_service`** unions the incoming allow with what is on disk, so re-registering cannot
->   drop an entry either.
->
-> `service_allow_revoke` sidesteps that hazard because the caller names a **literal** rather than a
-> name to resolve — there is no group-vs-nickname guessing to get wrong. The corollary: it is
-> exactly as literal as it sounds. Revoking `b64u:<user>` removes that entry outright, without the
-> multi-device protection unpairing applies (which keeps a shared `b64u:` while another paired
-> device still carries it).
->
-> **Reading which entries are stale:** `status`'s `services[].allow_display` is index-aligned with
-> `allow`, and renders an unresolvable `eid:` as `unpaired-device` and an unresolvable `b64u:` as
-> `unpaired-peer`. A bare entry renders verbatim — the daemon cannot tell a live roster group from
-> dead legacy vocabulary, because in pairing mode there is no roster to check against. An
-> unresolvable entry admits nobody either way (the gate resolves the peer first), so this is
-> hygiene, not an access question.
-
 > **`blob_republish` can undo a `blob_unpublish`.** Unpublish removes reachability, not bytes
 > (there is no reclaim — #80), so the blob stays complete in the local store indefinitely and
 > `blob_republish` will happily re-add it to the same scope, whose grants unpublish never touched.
@@ -293,6 +267,55 @@ well-behaved peer one reconnect.
 Roster principals ARE covered: a bare roster `user_id` or a GROUP name in an `allow` resolves
 through the installed roster view to that user's or group's devices. Roster-mode revocation by
 roster INSTALL is unchanged and independent (`roster_install` reports `severed`).
+
+### Removing an allow entry no other path will strip (#149)
+
+`service_allow_revoke` matches `principal` as an **exact string** — it is never resolved — so any
+literal already in the list is a valid target, **including a bare entry**: a nickname left behind by
+a pre-#38 config, a roster group name, anything. That is the remedy for an entry that has outlived
+its meaning.
+
+Two neighbouring paths deliberately will not do it, and reading them together suggests such an entry
+is permanent. It is not:
+
+- **`peer_remove` (unpair)** strips the peer's stable principals but never bare strings, on purpose:
+  post-#38 a bare entry is roster vocabulary, and a nickname-keyed strip could collide with a group
+  name and revoke a whole roster group.
+- **`register_service`** unions the incoming allow with what is on disk, so re-registering cannot
+  drop an entry either.
+
+Naming a literal has no group-vs-nickname hazard *for the strip*, which is why it is allowed where
+resolving a name is not: exactly one line goes, and it is the one you named.
+
+**The sever is a different matter, and is the one thing to be careful about.** After the strip,
+revocation is immediate (above) — live connections for the revoked principal are cut, and THAT
+lookup does resolve, through roster `user_id`s and group membership. So revoking a bare literal that
+happens to match a live roster group severs every device in that group, including their sessions to
+*other* services. Access elsewhere is unchanged and clients reconnect, so this is bluntness rather
+than a security problem — but if you are pruning dead vocabulary on a roster node, check the string
+is not also a live group name first.
+
+The other corollary: an exact match is exactly as literal as it sounds. Revoking `b64u:<user>`
+removes that entry outright, **without** the multi-device protection unpairing applies (which keeps
+a shared `b64u:` while another paired device still carries it). You named the string, so the string
+goes.
+
+**Reading which entries are stale.** `status`'s `services[].allow_display` is index-aligned with
+`allow`: an `eid:` with no matching peer entry renders `unpaired-device`, a `b64u:` with none
+renders `unpaired-peer`, and a bare entry renders verbatim.
+
+Two limits on reading it as "this entry is dead":
+
+- The daemon cannot classify a bare entry at all — it cannot tell a live roster group from dead
+  legacy vocabulary, because in **pairing** mode there is no roster to check against.
+- `allow_display` resolves against **paired-peer entries only, never the roster**. On a roster node
+  an `eid:` can render `unpaired-device` and still be admitted, because the roster gate authorizes
+  from the authenticated endpoint id without needing a `PeerEntry`. So `unpaired-*` means "no
+  display name available", NOT "admits nobody". In a pure-pairing daemon the two coincide; do not
+  carry that assumption onto a roster node.
+
+There is currently no CLI subcommand for this verb — it is control-API only, so an operator without
+an embedder still has no remedy but a config edit.
 
 ### Nicknames are display-only; principals authorize (#38, 0.8.0)
 

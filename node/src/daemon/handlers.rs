@@ -1330,6 +1330,14 @@ pub async fn grant_service_allow(
 /// `b64u:<user>` removes that entry outright, without the multi-device protection
 /// [`revoke_service_access`] applies (it keeps a shared `b64u:` while another stored peer carries
 /// it). Here the caller named the string, so the string goes.
+///
+/// **The SEVER that follows the strip is NOT literal, and that is the sharp edge.** Revocation is
+/// immediate post-#54: [`revoke_service_allow`] cuts the principal's live connections, and that
+/// lookup DOES resolve — through roster `user_id`s and group membership. So revoking a bare literal
+/// that also names a live roster group strips one allow line but severs every device in that group,
+/// including their sessions to OTHER services. Their access elsewhere is untouched and clients
+/// reconnect, so this is bluntness rather than an authorization defect — but the "no guessing"
+/// property belongs to the strip alone.
 pub(crate) async fn service_allow_revoke(
     state: &DaemonState,
     service: String,
@@ -1500,9 +1508,10 @@ async fn sever_principals(mesh: &Arc<MeshState>, principals: &[String]) -> Resul
 /// "bare entries are permanent", which is a fair reading of it and wrong about the system:
 /// [`revoke_service_allow`] strips by EXACT STRING, so
 /// `service_allow_revoke {service, principal: "<the literal>"}` removes any entry, bare included.
-/// The collision hazard above does not apply there, which is the point — the caller names a
-/// literal instead of a name to resolve, so there is no group-vs-nickname guessing to get wrong.
-/// What is unavailable is doing it as a SIDE EFFECT of unpairing, and that is deliberate.
+/// The collision hazard above does not apply to that STRIP, which is the point — the caller names
+/// a literal instead of a name to resolve, so exactly one line goes and it is the one named. (It
+/// does still apply to the sever that follows; see [`service_allow_revoke`].) What is unavailable
+/// is doing it as a SIDE EFFECT of unpairing, and that is deliberate.
 ///
 /// Serialized against [`register_service`] / [`grant_service_access`] via `mesh.reload_lock` (the
 /// SAME lock — a concurrent config mutation must not read the same base config and clobber this
@@ -1693,9 +1702,11 @@ mod tests {
     /// argument as a stable principal, and `remove_principal_from_service` compares `s !=
     /// principal`.
     ///
-    /// The collision hazard that rules out a nickname-keyed strip does not apply here, which is
-    /// the whole point: the caller names a LITERAL rather than a name to resolve, so there is no
-    /// group-vs-nickname guessing to get wrong.
+    /// The collision hazard that rules out a nickname-keyed strip does not apply to the STRIP,
+    /// which is the whole point: the caller names a LITERAL rather than a name to resolve, so
+    /// exactly one line goes and it is the one named. (The SEVER that follows does still resolve —
+    /// see `service_allow_revoke`'s rustdoc. This fixture has an empty store and no roster, so it
+    /// severs nothing and does not cover that.)
     ///
     /// Pinned across BOTH allow sources — a config entry and an ephemeral registration's
     /// in-memory allow — because "revocation must be fail-closed across every allow the name owns"
@@ -1764,6 +1775,67 @@ mod tests {
                 .allow,
             vec!["eid:beef".to_string()],
             "the ephemeral allow lost the bare entry and kept the principal"
+        );
+    }
+
+    /// #149 gate: the exact-match verb has NO multi-device protection, and now that the docs say
+    /// so it is pinned.
+    ///
+    /// `revoke_service_access` (unpair) keeps a shared `b64u:` while another stored peer still
+    /// carries it — revoking one device of a person must not revoke the person. This verb
+    /// deliberately does not: the caller named the literal, so the literal goes. That asymmetry is
+    /// newly documented, and a documented-but-unpinned behaviour is the same defect this whole
+    /// issue is about, one level up.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_exact_b64u_revoke_has_no_multi_device_protection() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[services.kb]\nsocket = \"/run/kb.sock\"\nallow = [\"b64u:alice\"]\n",
+        )
+        .unwrap();
+        let mesh = hermetic_mesh(config_path.clone()).await;
+        // TWO paired devices sharing one person's user_id — the exact fixture the unpair path's
+        // guard exists for.
+        for (i, nick) in [(7u8, "alice-laptop"), (8u8, "alice-phone")] {
+            mesh.store
+                .add(crate::allowlist::PeerEntry {
+                    endpoint_id: [i; 32],
+                    nickname: nick.into(),
+                    services: vec![],
+                    paired_at: None,
+                    user_id: Some("b64u:alice".into()),
+                    last_addr: None,
+                })
+                .unwrap();
+        }
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+        let allow = || {
+            crate::config::Config::load(&config_path)
+                .unwrap()
+                .services
+                .get("kb")
+                .unwrap()
+                .allow
+                .clone()
+        };
+
+        // Unpairing ONE device leaves the shared user_id alone — the person keeps access.
+        revoke_service_access(&mesh, "alice-laptop").await.unwrap();
+        assert_eq!(
+            allow(),
+            vec!["b64u:alice".to_string()],
+            "unpairing one device must never revoke the PERSON — the guard this verb lacks"
+        );
+
+        // The exact-match verb has no such guard. The caller named the string.
+        service_allow_revoke(&state, "kb".into(), "b64u:alice".into())
+            .await
+            .unwrap();
+        assert!(
+            allow().is_empty(),
+            "an exact literal revoke is exactly as literal as it sounds, shared or not"
         );
     }
 
