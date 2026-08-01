@@ -92,7 +92,10 @@ pub fn admitted_services_for_test(
 ) -> Vec<String> {
     caller_admitted_services(mesh, identity)
 }
-pub use reach::{REACH_TTL_SECS, ReachEntry, ReachTransition, probe_peer, reachability_of};
+pub use reach::{
+    REACH_TTL_SECS, ReachEntry, ReachTransition, normalize_relay_url, probe_peer, reachability_of,
+    sanitize_relay_url,
+};
 pub(crate) use self_net::read_current as self_network_now;
 pub use self_net::spawn_self_net_watch;
 
@@ -108,7 +111,9 @@ pub use roster_install::{
 };
 
 pub use boot::{NetPlan, net_plan};
-pub(crate) use handlers::RELAY_READY_TIMEOUT;
+/// The mint-path relay-readiness cap. `pub` so the #125 suite can pin it against a MEASURED
+/// `online()` rather than a hardcoded number — the ordering is the contract, not the value.
+pub use handlers::RELAY_READY_TIMEOUT;
 /// Symmetric with the already-public [`MeshState::register_ephemeral`]: drops in-memory
 /// registrations and reloads. Public so tests can exercise what happens to a name held by BOTH an
 /// ephemeral registration and `config.toml` once the overlay goes away (#55/#94).

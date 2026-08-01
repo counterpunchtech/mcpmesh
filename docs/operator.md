@@ -271,6 +271,7 @@ reports, per check, one of `OK` / `WARN` / `ERR` and exits non-zero if any check
 | `config` | `config.toml` parses; roster mode has `org_id`/`user_id`. |
 | `daemon` | the local daemon is reachable (WARN if not running — start it with any verb). |
 | `self-hosting` | the `[network]` posture: ERR if the config is one the daemon refuses (unknown mode, `custom` without URLs); WARN if exactly one of relay/discovery is self-hosted (§10.3) or if discovery knobs are set alongside the hermetic `relay_mode = "disabled"`; OK otherwise. |
+| `relays` | **`relay_mode = "custom"` only.** Which of your pinned relays are actually connected, read from the live daemon. WARN naming any that are not — the node keeps working over the healthy ones, but a dead entry costs a bounded penalty on every boot (#125). INFO when no mesh daemon is running to ask. |
 | `roster-url` | WARN if roster mode has no `[roster].url` (degrades to stale). |
 | `roster-freshness` | the roster's state (approved/degraded/stopped/pending) + last-confirmed age. |
 | `device.key` / `user.key` / `org-root.key` | ERR if group/world-writable, WARN if readable (must be 0600). |
@@ -278,3 +279,11 @@ reports, per check, one of `OK` / `WARN` / `ERR` and exits non-zero if any check
 
 `doctor` never changes anything — if it reports a key-permission problem, fix it yourself with
 `chmod 600 <path>`.
+
+**On the `relays` check.** Pinning your own relay with public ones behind it is a good resilience
+posture and it works: when yours goes down, traffic keeps flowing over the fallbacks. What it does
+not preserve is *startup* latency — a relay that blackholes (accepts the connection and never
+answers) costs a bounded wait on every boot, because the node cannot pick a home relay until the
+slowest probe gives up. The relays are raced, not walked, so the cost does not depend on where the
+dead entry sits in your list or on how many are dead; it is the same flat penalty either way. This
+check exists so you can see *which* entry is doing it instead of guessing.

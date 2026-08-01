@@ -133,6 +133,82 @@ pub fn check_network(net: &crate::config::NetworkCfg) -> Verdict {
     }
 }
 
+/// Report the LIVE connection state of each configured relay (#125).
+///
+/// `status --json` has carried `self_network.relays[].connected` since #90, but no HUMAN surface
+/// did — not the `status` line, not `doctor` — so it was there only for an embedder that already
+/// knew to look.
+/// A node whose pinned relay is dead keeps working — the healthy entries behind it carry traffic —
+/// but every boot pays a penalty, and the operator has no way to see why. That invisibility is the
+/// part of #125 that is ours: relay SELECTION is iroh's, and it already races the list (measured:
+/// a dead entry costs the same first or last, and four cost the same as one).
+///
+/// `live` is `None` when the daemon is not reachable — live state needs a running daemon, and
+/// saying so beats implying the relays are fine.
+///
+/// Only meaningful for `relay_mode = "custom"`: with no configured URLs there is nothing to name,
+/// and the caller omits the finding entirely.
+pub fn check_relays(
+    configured: &[String],
+    live: Option<&[mcpmesh_local_api::RelayInfo]>,
+) -> Verdict {
+    let Some(live) = live else {
+        // `None` covers three cases and must not name only one: the daemon is down, it answered
+        // without a `self_network` block (control-only, no mesh), or `status` errored. Saying
+        // "needs a running daemon" beside a green `daemon: OK` line was its own small lie.
+        return Verdict::info(format!(
+            "{} relay(s) configured — live connection state unavailable (no running mesh daemon \
+             to ask)",
+            configured.len()
+        ));
+    };
+    // Match on the URL the daemon REPORTS, which is sanitized to scheme+host+port (#90) and so may
+    // not be byte-identical to the configured string, so compare NORMALIZED — through the daemon's
+    // own `sanitize_relay_url`, the very function that produced `RelayInfo.url`, so the two cannot
+    // drift.
+    //
+    // Exact equality, deliberately. The first version prefix-matched, which reported a DEAD relay
+    // as connected whenever it was a strict prefix of a different healthy one
+    // (`https://relay.acme.com` masked by `https://relay.acme.com:8443`) — precisely the failure
+    // this check exists to prevent (#125 gate).
+    //
+    // A configured URL that does not parse, or that the daemon never mentions, counts as NOT
+    // connected: silence is the failure mode being fixed, so it must never read as healthy.
+    let norm = crate::daemon::normalize_relay_url;
+    let connected: std::collections::BTreeSet<String> = live
+        .iter()
+        .filter(|r| r.connected)
+        .map(|r| norm(&r.url).unwrap_or_else(|| r.url.clone()))
+        .collect();
+    let dead: Vec<&str> = configured
+        .iter()
+        .filter(|u| !norm(u).is_some_and(|n| connected.contains(&n)))
+        .map(String::as_str)
+        .collect();
+
+    if dead.is_empty() {
+        return Verdict::ok(format!(
+            "all {} configured relay(s) connected",
+            configured.len()
+        ));
+    }
+    if dead.len() == configured.len() {
+        return Verdict::warn(format!(
+            "NO configured relay is connected ({}) — this node has no relay path right now, so \
+             WAN peers are unreachable until one answers. LAN/direct paths are unaffected.",
+            dead.join(", ")
+        ));
+    }
+    Verdict::warn(format!(
+        "{} of {} configured relay(s) not connected ({}) — traffic still flows over the healthy \
+         ones, but every boot pays a bounded penalty waiting on the dead entry. Remove it, or fix \
+         it, to get that time back (#125).",
+        dead.len(),
+        configured.len(),
+        dead.join(", ")
+    ))
+}
+
 /// WARN when the node is roster-mode (`org_root_pinned`) but has no `[roster].url` — it
 /// degrades to stale after `max_staleness` with no authenticated channel to re-confirm
 /// currency. The full-diagnostic version of the hint the one-liner `status` already
@@ -421,31 +497,43 @@ struct DoctorInputs {
     staleness_secs: Option<i64>,
     daemon_reachable: bool,
     daemon_roster_state: Option<String>,
+    /// The daemon's LIVE relay connection states (#125), or `None` when it is unreachable or
+    /// mesh-less. Distinct from `network.relay_urls`, which is what the CONFIG asks for.
+    live_relays: Option<Vec<mcpmesh_local_api::RelayInfo>>,
 }
 
 /// Ping the local daemon over the control socket WITHOUT auto-starting it (read-only, local-only).
-/// Returns `(reachable, roster_state_word)`. A dead socket / any error → `(false, None)`.
-fn probe_daemon() -> (bool, Option<String>) {
+/// Returns `(reachable, roster_state_word, live_relays)`. A dead socket / any error →
+/// `(false, None, None)`.
+///
+/// `live_relays` is `Some` only when `status` answered AND carried a `self_network` block (#90) —
+/// `None` covers both an unreachable daemon and a mesh-less control-only one, and `check_relays`
+/// reports that honestly instead of implying the relays are fine (#125).
+fn probe_daemon() -> (
+    bool,
+    Option<String>,
+    Option<Vec<mcpmesh_local_api::RelayInfo>>,
+) {
     let Ok(socket) = mcpmesh_trust::paths::default_endpoint() else {
-        return (false, None);
+        return (false, None, None);
     };
     let Ok(rt) = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
     else {
-        return (false, None);
+        return (false, None, None);
     };
     rt.block_on(async move {
         match crate::client::connect_control(&socket).await {
-            Ok(mut client) => {
-                let state = client
-                    .status()
-                    .await
-                    .ok()
-                    .and_then(|s| s.roster.map(|r| r.state));
-                (true, state)
-            }
-            Err(_) => (false, None),
+            Ok(mut client) => match client.status().await {
+                Ok(s) => (
+                    true,
+                    s.roster.map(|r| r.state),
+                    s.self_network.map(|n| n.relays),
+                ),
+                Err(_) => (true, None, None),
+            },
+            Err(_) => (false, None, None),
         }
     })
 }
@@ -525,7 +613,7 @@ fn gather() -> DoctorInputs {
     .flatten()
     .map(|lc| epoch_now() - lc);
 
-    let (daemon_reachable, daemon_roster_state) = probe_daemon();
+    let (daemon_reachable, daemon_roster_state, live_relays) = probe_daemon();
 
     DoctorInputs {
         parse_ok,
@@ -554,6 +642,7 @@ fn gather() -> DoctorInputs {
         staleness_secs,
         daemon_reachable,
         daemon_roster_state,
+        live_relays,
     }
 }
 
@@ -592,6 +681,18 @@ fn findings(inp: &DoctorInputs) -> Vec<(&'static str, Verdict)> {
             ),
         ),
     ];
+    // #125: only for `relay_mode = "custom"`. `relay_urls` is IGNORED in every other mode
+    // (`net_plan` reads it only there) and nothing rejects leftovers, so gating on the list alone
+    // warned "NO configured relay is connected — this node has no relay path" at a perfectly
+    // healthy node running on the default relays, and flatly contradicted the hermetic finding
+    // under `relay_mode = "disabled"` (#125 gate). A confidently wrong line in a diagnostic costs
+    // more than a missing one.
+    if inp.network.relay_mode == "custom" && !inp.network.relay_urls.is_empty() {
+        out.push((
+            "relays",
+            check_relays(&inp.network.relay_urls, inp.live_relays.as_deref()),
+        ));
+    }
     if inp.perm_lints_apply {
         out.push((
             "device.key",
@@ -659,6 +760,183 @@ mod tests {
             discovery_urls: disc_urls.iter().map(|s| s.to_string()).collect(),
             relay_only: false,
         }
+    }
+
+    /// A minimal all-green `DoctorInputs` for tests that only care which findings are EMITTED.
+    fn base_inputs() -> DoctorInputs {
+        DoctorInputs {
+            parse_ok: true,
+            bare_allow_entries: Vec::new(),
+            org_root_pinned: false,
+            has_org_id: false,
+            network: net("default", &[], "default", &[]),
+            roster_url: None,
+            max_staleness_secs: 86_400,
+            device_key: (true, 0o600),
+            user_key: (true, 0o600),
+            org_root_key: (true, 0o600),
+            runtime_dir: (true, 0o700, 0),
+            our_uid: 0,
+            perm_lints_apply: false,
+            staleness_secs: None,
+            daemon_reachable: true,
+            daemon_roster_state: None,
+            live_relays: None,
+        }
+    }
+
+    fn relay(url: &str, connected: bool) -> mcpmesh_local_api::RelayInfo {
+        mcpmesh_local_api::RelayInfo {
+            url: url.into(),
+            connected,
+        }
+    }
+
+    /// #125: `doctor` names a configured relay that is not connected.
+    ///
+    /// This is the part of #125 that is ours. Relay SELECTION is iroh's and it already races the
+    /// list — measured on the pinned 1.0.3, a dead entry costs the same first or last and four cost
+    /// the same as one, which is the opposite of the sequential walk the report inferred. What was
+    /// missing is that while `status --json` has carried `self_network.relays[].connected` since
+    /// #90, no HUMAN surface did — so a node whose pinned relay is dead paid the penalty silently
+    /// unless an embedder already knew to look.
+    #[test]
+    fn relay_check_names_a_dead_relay() {
+        let urls = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // Live state needs a daemon. Say so — do not imply the relays are fine.
+        let v = check_relays(&urls(&["https://a.example"]), None);
+        assert_eq!(v.level, Level::Info, "{v:?}");
+        assert!(
+            v.message.contains("unavailable"),
+            "and must not imply the relays are fine: {}",
+            v.message
+        );
+
+        // All connected → Ok, and no noise.
+        let v = check_relays(
+            &urls(&["https://a.example", "https://b.example"]),
+            Some(&[
+                relay("https://a.example", true),
+                relay("https://b.example", true),
+            ]),
+        );
+        assert_eq!(v.level, Level::Ok, "{v:?}");
+
+        // The reporter's shape: one dead, healthy ones behind it. Must WARN and must NAME it —
+        // an operator cannot act on "a relay is down".
+        let v = check_relays(
+            &urls(&["https://dead.example", "https://ok.example"]),
+            Some(&[
+                relay("https://dead.example", false),
+                relay("https://ok.example", true),
+            ]),
+        );
+        assert_eq!(v.level, Level::Warn, "{v:?}");
+        assert!(
+            v.message.contains("https://dead.example"),
+            "the dead relay must be NAMED, not counted: {}",
+            v.message
+        );
+        assert!(
+            !v.message.contains("https://ok.example"),
+            "and the healthy one must not be blamed: {}",
+            v.message
+        );
+
+        // A configured relay the daemon does not mention at all counts as not connected —
+        // silence is the failure mode being fixed, so it must not read as healthy.
+        let v = check_relays(
+            &urls(&["https://ghost.example", "https://ok.example"]),
+            Some(&[relay("https://ok.example", true)]),
+        );
+        assert_eq!(v.level, Level::Warn, "{v:?}");
+        assert!(v.message.contains("https://ghost.example"), "{}", v.message);
+
+        // None connected is a different sentence: this node has no relay path at all.
+        let v = check_relays(
+            &urls(&["https://a.example"]),
+            Some(&[relay("https://a.example", false)]),
+        );
+        assert_eq!(v.level, Level::Warn, "{v:?}");
+        assert!(
+            v.message.contains("NO configured relay"),
+            "no-path is not the same finding as one-of-several down: {}",
+            v.message
+        );
+
+        // #125 gate: a DEAD relay must not be masked by a healthy one it is a prefix of. The first
+        // version matched with `starts_with` in both directions, so `https://relay.acme.com`
+        // (dead) was reported connected because `https://relay.acme.com:8443` (healthy) starts
+        // with it — the check silently answering "all connected" in exactly the situation it
+        // exists to catch.
+        let v = check_relays(
+            &urls(&["https://relay.acme.com", "https://relay.acme.com:8443"]),
+            Some(&[
+                relay("https://relay.acme.com", false),
+                relay("https://relay.acme.com:8443", true),
+            ]),
+        );
+        assert_eq!(
+            v.level,
+            Level::Warn,
+            "a dead relay must not be masked by a healthy one it prefixes: {v:?}"
+        );
+        assert!(
+            v.message.contains("https://relay.acme.com,")
+                || v.message.ends_with("relay.acme.com)")
+                || v.message.contains("(https://relay.acme.com)"),
+            "and the DEAD one is the one named: {}",
+            v.message
+        );
+
+        // Normalization, not string equality: the configured spelling and the daemon's sanitized
+        // rendering are rarely byte-identical (trailing slash, default port, host case).
+        let v = check_relays(
+            &urls(&["https://Relay.Example.COM/"]),
+            Some(&[relay("https://relay.example.com", true)]),
+        );
+        assert_eq!(
+            v.level,
+            Level::Ok,
+            "a re-spelling of the same relay must not read as a second, dead one: {v:?}"
+        );
+    }
+
+    /// #125 gate: the relay finding is for `relay_mode = "custom"` ONLY.
+    ///
+    /// `relay_urls` is ignored in every other mode — `net_plan` reads it only under `custom` — and
+    /// nothing rejects leftovers. Gating on the list alone told a perfectly healthy node running on
+    /// the DEFAULT relays that it had "no relay path right now", and contradicted the hermetic
+    /// finding under `relay_mode = "disabled"`.
+    #[test]
+    fn the_relay_finding_is_custom_mode_only() {
+        let labels = |n: crate::config::NetworkCfg| {
+            let mut inp = base_inputs();
+            inp.network = n;
+            findings(&inp)
+                .into_iter()
+                .map(|(l, _)| l)
+                .collect::<Vec<_>>()
+        };
+        let leftovers = &["https://stale.example"];
+        assert!(
+            !labels(net("default", leftovers, "default", &[])).contains(&"relays"),
+            "leftover relay_urls under relay_mode=default are IGNORED by the daemon — a finding \
+             about them is a confidently wrong line"
+        );
+        assert!(
+            !labels(net("disabled", leftovers, "default", &[])).contains(&"relays"),
+            "hermetic mode opens no relay path at all"
+        );
+        assert!(
+            labels(net("custom", leftovers, "default", &[])).contains(&"relays"),
+            "and custom mode — where the URLs are actually used — must report"
+        );
+        assert!(
+            !labels(net("custom", &[], "default", &[])).contains(&"relays"),
+            "custom with no URLs cannot boot a mesh; nothing to name"
+        );
     }
 
     /// #116: `doctor` must SAY when `relay_only` cannot be honoured.
@@ -1020,6 +1298,7 @@ mod tests {
             // (advisory) does not by itself flip the exit code below.
             daemon_reachable: true,
             daemon_roster_state: None,
+            live_relays: None,
         };
         let out = findings(&inp);
 
