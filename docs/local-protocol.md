@@ -869,10 +869,40 @@ Reference: [`cli/src/backends/spawn.rs`](../cli/src/backends/spawn.rs) (`run`),
 | `-32040` | no such service — the name is in neither `config.toml` nor the ephemeral registry (`service_allow_grant` / `service_allow_revoke`, `api_minor >= 11`) |
 | `-32041` | `blob_republish` — the blob is not held COMPLETE by this daemon (#83). Remedy: fetch it first. |
 | `-32042` | `blob_republish` — the blob was deliberately WITHDRAWN from that scope (#107). Remedy: `blob_publish {scope, path}` from the file if the re-share is intended. |
+| `-32043` | `pair` — the INVITER refused: the nickname is already held by a different peer it has paired, **and the invite survived** (#87, `api_minor >= 31`). The one refusal with a self-service remedy: **rename this node and redeem the same invite again**. Branch on this and write your own copy; see the note below (#147). |
 | `-32000` | operation failed — `message` carries the detail. One common instance: the daemon is in control-only mode with no mesh (e.g. `invite`/`pair` before a mesh exists) |
 | `-32055` | *(session only)* peer unreachable |
 | `-32054` | *(session only)* session refused |
 | `-32053` | *(session only)* rate-limited; carries `retry_after_ms`. **Requests only** — a rate-limited *notification* gets no reply (none is possible), but is recorded as `status: "rate_limited"` from `api_minor` 26, see below |
+
+**A refusal's prose is ours; its remedy is yours (#147, `api_minor >= 31`).** The nickname-collision
+message is built on the **inviter** and travels to the redeemer, so the embedder that displays it is
+not the one that could rewrite it into its own vocabulary — the only downstream fix was
+substring-matching our copy. Through `api_minor` 30 that message also named `set_nickname`, a
+control verb a GUI user cannot type, see, or find. It now states the action ("rename this node"), and
+more usefully the refusal carries `-32043`, so branch on the code and write the sentence naming
+*your* rename affordance.
+
+**The surviving invite is part of what `-32043` means**, not a detail of the prose. Two other
+`pair` failures are also nickname collisions and are deliberately NOT coded, because the remedy the
+code implies would be wrong for them:
+
+- the inviter's post-redeem **race guard** — two redeemers claiming the same new name, where the
+  loser's invite was already burned winning the race. Its reason says "ask the inviter for a fresh
+  invite", which is the correct advice; retrying the same invite would fail.
+- the **redeemer-side** squat check, which refuses adopting an invite's suggested nickname when you
+  already use that name for a different peer. That is a condition on *your* node, not the
+  inviter's, and its reason names its own remedy (unpair the existing peer first).
+
+Both answer `-32000` and carry a specific, actionable reason. So: branch on `-32043` for the
+rename-and-retry case, and render the message for everything else.
+
+Every remaining `pair` refusal stays `-32000`. The one guarding the invite secret is also
+deliberately **opaque** — it does not distinguish unknown-vs-expired-vs-wrong-secret, because a
+specific reason there would be a redemption oracle an attacker could probe, and a machine-readable
+code would rebuild that oracle in a form that is easier to script. `-32043` is safe to distinguish
+precisely because it is sent only to a caller that already proved possession of a live invite
+secret. (The malformed-frame and id-mismatch refusals name themselves; neither is a secret oracle.)
 
 `-32600` through `-32603` follow their JSON-RPC 2.0 meanings. Session errors (`-3205x`) appear
 inside a [session](#sessions), not as control-method responses, and carry `data.source = "mcpmesh"`.
@@ -906,7 +936,8 @@ things:
   is `api_minor >= 12`; the `set_nickname` verb
   and `StatusResult.self_nickname` are `api_minor >= 2` (#37); STABLE-principal `allow`
   strings + `ServiceInfo.allow_display` are `api_minor >= 3` (#38); the `reachability` frame's
-  `source` — which of the two producers observed the transition (#150) — is `api_minor >= 30`.
+  `source` — which of the two producers observed the transition (#150) — is `api_minor >= 30`;
+  the branchable nickname-collision refusal `-32043` (#147) is `api_minor >= 31`.
   `api_minor` is itself additive: a pre-1.1 daemon omits it and it reads as `0`.
 
 Changes remain **additive within a major**: new response fields are optional (absent-tolerant), so a

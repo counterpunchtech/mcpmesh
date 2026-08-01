@@ -1445,6 +1445,19 @@ pub const ERR_NO_SUCH_BLOB: i64 = -32041;
 /// [`ERR_NO_SUCH_BLOB`]: that means "fetch it first", this means "someone un-shared this on
 /// purpose — `blob_publish` from the file if the re-share is intended".
 pub const ERR_BLOB_WITHDRAWN: i64 = -32042;
+/// `pair` was refused because the redeemer's nickname is already held by a DIFFERENT paired peer
+/// (#87), so an embedder can branch on the one refusal that has a self-service remedy — rename and
+/// redeem the same invite again — without reading the prose (#147).
+///
+/// Reading the prose was the only option before this code, and it does not survive translation: the
+/// message is generated on the INVITER's side and travels to the redeemer, so the embedder that
+/// DISPLAYS it cannot rewrite it into its own vocabulary except by substring-matching our copy.
+/// Branch on this and write your own sentence naming your own rename affordance.
+///
+/// Deliberately narrow. It rides ONLY this refusal, which is sent exclusively to a caller that
+/// proved possession of a live invite secret. The generic refusal keeps `-32000` and its opaque
+/// reason: distinguishing unknown-vs-expired-vs-wrong-secret would be a redemption oracle.
+pub const ERR_NICKNAME_TAKEN: i64 = -32043;
 
 pub const API_NAME: &str = "mcpmesh-local/1";
 /// The protocol-compatibility version as `"MAJOR.MINOR"`, distinct from the crate/stack version.
@@ -1460,7 +1473,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   thirty have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.30";
+pub const API_VERSION: &str = "1.31";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -1524,7 +1537,12 @@ pub const API_VERSION: &str = "1.30";
 /// [`StreamFrame::Reachability`]'s `source` — the frame has had TWO producers since 22 with no way
 /// to tell them apart, so an embedder could not distinguish "a throwaway dial went via a relay"
 /// from "the link this call is on just degraded", and had to hedge every message down to the
-/// weaker claim. `rtt_ms: None` was never the discriminator the doc implied (#150).
+/// weaker claim. `rtt_ms: None` was never the discriminator the doc implied (#150); to 31 with
+/// [`ERR_NICKNAME_TAKEN`] — the nickname-collision `pair` refusal is branchable instead of
+/// `-32000`, so an embedder writes its own recovery copy rather than substring-matching ours. The
+/// prose changed with it: it named the `set_nickname` CONTROL VERB as the remedy, which a GUI user
+/// cannot type, and the refusal is generated inviter-side so the embedder displaying it could not
+/// rewrite it (#147).
 ///
 /// **Not every semantic change gets a minor, and that is the gap to watch (#122).** A minor marks a
 /// change to this *surface*. A change to behaviour BEHIND the surface — same fields, same shapes,
@@ -1535,7 +1553,7 @@ pub const API_VERSION: &str = "1.30";
 /// That class is bigger than it looks: **10, 17, 21, 22, 23 and 24 all shipped with no change to
 /// any type in this file** — they moved meaning, not shape. Six of the thirty. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 30;
+pub const API_MINOR: u32 = 31;
 
 #[cfg(test)]
 mod tests {
