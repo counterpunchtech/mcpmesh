@@ -60,14 +60,14 @@ pub use protocol::{
     AuditPruneParams, AuditPruneResult, AuditRecord, AuditSummaryResult, BackendKind, BackendSpec,
     BlobFetchParams, BlobFetchResult, BlobGrantParams, BlobListParams, BlobPublishParams,
     BlobPublishResult, BlobRepublishParams, BlobRevokeParams, BlobScopeList, BlobUnpublishParams,
-    ERR_BLOB_WITHDRAWN, ERR_NO_SUCH_BLOB, ERR_NO_SUCH_SERVICE, Hello, InviteParams, InviteResult,
-    OpenSessionParams, OrgJoinParams, OrgJoinResult, PairParams, PairResult, PeerAddParams,
-    PeerInfo, PeerPath, PeerReachability, PeerRemoveParams, PeerRenameParams, PeerServicesParams,
-    PeerServicesResult, PresencePeer, ReachabilitySource, RecentPairing, RegisterServiceParams,
-    RelayInfo, Request, RosterInstallParams, RosterInstallResult, RosterStatus, ScopeInfo,
-    SelfNetwork, ServiceAllowParams, ServiceInfo, SetAppMetadataParams, SetNicknameParams,
-    SetRelaysParams, SetRelaysResult, SetRosterUrlParams, StatusResult, StorageInfo, StreamFrame,
-    UnregisterServiceParams, method_of,
+    ERR_BLOB_WITHDRAWN, ERR_NICKNAME_TAKEN, ERR_NO_SUCH_BLOB, ERR_NO_SUCH_SERVICE, Hello,
+    InviteParams, InviteResult, OpenSessionParams, OrgJoinParams, OrgJoinResult, PairParams,
+    PairResult, PeerAddParams, PeerInfo, PeerPath, PeerReachability, PeerRemoveParams,
+    PeerRenameParams, PeerServicesParams, PeerServicesResult, PresencePeer, ReachabilitySource,
+    RecentPairing, RegisterServiceParams, RelayInfo, Request, RosterInstallParams,
+    RosterInstallResult, RosterStatus, ScopeInfo, SelfNetwork, ServiceAllowParams, ServiceInfo,
+    SetAppMetadataParams, SetNicknameParams, SetRelaysParams, SetRelaysResult, SetRosterUrlParams,
+    StatusResult, StorageInfo, StreamFrame, UnregisterServiceParams, method_of,
 };
 
 #[cfg(feature = "client")]

@@ -562,6 +562,26 @@ async fn collision_guard_refuses_impersonating_an_existing_peer() {
             "the reason must name the colliding nickname (#87 — a generic refusal left \
              first-time pairs of same-hostname machines undiagnosable): {reason}"
         );
+        // #147: the recovery clause names the ACTION, never a control verb. `set_nickname` is our
+        // API vocabulary — a GUI user cannot type it, see it, or find it, and because this string
+        // is built INVITER-side and travels to the redeemer, the embedder that displays it cannot
+        // rewrite it except by substring-matching our prose.
+        assert!(
+            !reason.contains("set_nickname"),
+            "the refusal must not name a control verb — an embedder's user cannot invoke one: \
+             {reason}"
+        );
+        assert!(
+            reason.contains("rename this node"),
+            "the recovery clause must state the action, the way its 'ask the inviter for a fresh \
+             invite' sibling already does: {reason}"
+        );
+        // #147: and it carries the machine-readable kind, so a redeemer raises a typed error
+        // rather than parsing the sentence above — which would break the moment we reword it.
+        assert_eq!(
+            reply["code"], "nickname_taken",
+            "the collision refusal must be branchable on the wire: {reply}"
+        );
         assert!(
             store.resolve(&redeemer_id).unwrap().is_none(),
             "no entry may be written under the colliding redeemer's id"
@@ -651,6 +671,16 @@ async fn a_wrong_secret_with_a_colliding_nickname_gets_only_the_generic_refusal(
             reply["reason"], "pairing refused",
             "an unproven caller must get the GENERIC reason — a nickname-specific answer here \
              is a store-contents oracle for anyone who can dial: {reply}"
+        );
+        // #147: and no CODE either. The refusal code exists so an embedder can branch instead of
+        // reading prose, which means it carries exactly the information the reason does — so
+        // stamping this path would rebuild the oracle the generic reason exists to prevent,
+        // machine-readably. Asserted on the real SEND SITE: a unit test over a hand-built
+        // PairReply pins the serializer, not the branch that chooses the code.
+        assert!(
+            reply.get("code").is_none(),
+            "an unproven caller must get NO refusal code — one here is the same store-contents \
+             oracle as a specific reason, just easier to script: {reply}"
         );
         assert_eq!(invites.count(), 1, "the real invite is untouched");
     })

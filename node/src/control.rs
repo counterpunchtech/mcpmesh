@@ -894,6 +894,20 @@ fn respond<T: serde::Serialize>(id: Value, method: &str, r: anyhow::Result<T>) -
             mcpmesh_local_api::ERR_NO_SUCH_BLOB,
             format!("{method} failed: {e}"),
         ),
+        // #147: the ONE `pair` refusal with a self-service remedy — rename and redeem the same
+        // invite again. It gets a code so a GUI embedder writes its own recovery copy naming its
+        // own rename affordance, instead of substring-matching prose that is generated on the
+        // INVITER's side and cannot be rewritten downstream. Every other refusal stays `-32000`.
+        Err(e)
+            if e.downcast_ref::<crate::pairing::rendezvous::NicknameTaken>()
+                .is_some() =>
+        {
+            error(
+                id,
+                mcpmesh_local_api::ERR_NICKNAME_TAKEN,
+                format!("{method} failed: {e}"),
+            )
+        }
         Err(e)
             if e.downcast_ref::<crate::daemon::NoSuchService>().is_some()
                 || e.downcast_ref::<crate::daemon::NoSuchBlobScope>().is_some() =>
