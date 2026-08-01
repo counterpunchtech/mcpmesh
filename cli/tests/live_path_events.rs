@@ -10,10 +10,16 @@
 //! drops the connection, so the transition happens on a connection nobody is watching. That is the
 //! whole reason this suite is separate from `peer_path.rs`.
 //!
-//! The assertion that makes this about LIVE signal rather than probing: `rtt_ms` must be `None`. A
-//! probe measures a round trip and reports `Some(rtt)`; the watcher observes a path and never
-//! fabricates a measurement. `probe_seq` is NOT the discriminator — the watcher shares that counter
-//! with `probe_peer` on purpose, so a correct implementation advances it.
+//! The assertion that makes this about LIVE signal rather than probing: `source` must be
+//! `Session` (#150). `probe_seq` is NOT the discriminator — the watcher shares that counter with
+//! `probe_peer` on purpose, so a correct implementation advances it.
+//!
+//! **And `rtt_ms` is not the discriminator either, however it may read below.** Until #150 this
+//! suite leaned on `rtt_ms: None`, which works HERE only because these fixtures seed the cache
+//! entry: no probe has run, so the watcher's `None` is visible. It does not generalize —
+//! `commit_observation`'s update arm leaves an already-probed peer's measured `rtt_ms` in place, so
+//! a session-sourced frame routinely carries `Some(..)`. That case is covered by a unit fixture in
+//! `node/src/daemon/path_watch.rs`. If you add a case here, assert `source`.
 
 use std::sync::Arc;
 use std::time::Duration;

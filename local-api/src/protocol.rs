@@ -191,13 +191,88 @@ pub enum ReachabilitySource {
 /// on an internally/adjacently tagged enum; this one is a plain string, so it is spelled out. The
 /// stakes are the same as there: without it, adding a third producer later would break every
 /// `Reachability` frame an older pinned client reads, not just the new field.
+///
+/// It accepts ANY input, not just an unrecognized string — `null`, a number, an object all read as
+/// `Unknown`. `#[serde(default)]` covers an ABSENT key and nothing else, so without this a proxy or
+/// non-Rust daemon that normalizes optional fields to `null` would fail every reachability frame
+/// while this module's doc promised the field could not break a parse. A degraded attribution is
+/// the fail-safe: `Unknown` already means "we do not know", which is exactly true of a value we
+/// could not read.
 impl<'de> Deserialize<'de> for ReachabilitySource {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        Ok(match String::deserialize(d)?.as_str() {
-            "probe" => Self::Probe,
-            "session" => Self::Session,
-            _ => Self::Unknown,
-        })
+        struct AnySource;
+
+        /// Every hook answers `Unknown` except `visit_str`, so a shape we do not model degrades
+        /// instead of erroring. `visit_map`/`visit_seq` must DRAIN their input — leaving it
+        /// unconsumed desynchronizes the parser and fails the enclosing frame, which is the
+        /// failure this impl exists to avoid.
+        impl<'de> serde::de::Visitor<'de> for AnySource {
+            type Value = ReachabilitySource;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a reachability producer name")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Self::Value, E> {
+                Ok(match s {
+                    "probe" => ReachabilitySource::Probe,
+                    "session" => ReachabilitySource::Session,
+                    _ => ReachabilitySource::Unknown,
+                })
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(ReachabilitySource::Unknown)
+            }
+
+            fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(ReachabilitySource::Unknown)
+            }
+
+            fn visit_some<D: serde::Deserializer<'de>>(
+                self,
+                d: D,
+            ) -> Result<Self::Value, D::Error> {
+                d.deserialize_any(AnySource)
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(ReachabilitySource::Unknown)
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(ReachabilitySource::Unknown)
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(ReachabilitySource::Unknown)
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(ReachabilitySource::Unknown)
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut m: A,
+            ) -> Result<Self::Value, A::Error> {
+                while m
+                    .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                    .is_some()
+                {}
+                Ok(ReachabilitySource::Unknown)
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut s: A,
+            ) -> Result<Self::Value, A::Error> {
+                while s.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(ReachabilitySource::Unknown)
+            }
+        }
+
+        d.deserialize_any(AnySource)
     }
 }
 
@@ -1382,7 +1457,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   than a minor it requires. It never resets except on a MAJOR bump.
 ///
 ///   It also bumps for a change to what a field MEANS with no change to its shape — six of the
-///   twenty-four have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
+///   thirty have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
 pub const API_VERSION: &str = "1.30";
@@ -1458,7 +1533,7 @@ pub const API_VERSION: &str = "1.30";
 /// several minors at once, read this block end to end AND the release notes, not the diff.
 ///
 /// That class is bigger than it looks: **10, 17, 21, 22, 23 and 24 all shipped with no change to
-/// any type in this file** — they moved meaning, not shape. Six of the twenty-four. A downstream
+/// any type in this file** — they moved meaning, not shape. Six of the thirty. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
 pub const API_MINOR: u32 = 30;
 
@@ -1586,6 +1661,39 @@ mod tests {
         };
         assert_eq!(source, ReachabilitySource::Unknown);
         assert!(peer.reachable, "the rest of the frame survives");
+    }
+
+    /// #150 gate: "an unrecognized value reads as `unknown`" must hold for any VALUE, not just an
+    /// unrecognized string.
+    ///
+    /// `#[serde(default)]` covers an absent key and nothing else, so `"source": null` — what a
+    /// proxy or non-Rust daemon that normalizes optional fields produces — went through the
+    /// deserializer and failed the WHOLE frame, silently dropping a liveness transition while the
+    /// protocol doc promised the field could not break a parse. The container shapes matter
+    /// separately: a visitor that answers without draining a map/seq desynchronizes the parser and
+    /// fails the frame anyway, which looks identical from outside.
+    #[test]
+    fn a_malformed_source_degrades_instead_of_failing_the_frame() {
+        let peer = serde_json::json!({"name": "bob", "reachable": true});
+        for bad in [
+            serde_json::Value::Null,
+            serde_json::json!(7),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!(true),
+            serde_json::json!({"kind": "probe", "nested": {"deep": [1, 2]}}),
+            serde_json::json!(["probe", "session"]),
+        ] {
+            let frame: StreamFrame = serde_json::from_value(
+                serde_json::json!({"type": "reachability", "peer": peer, "source": bad}),
+            )
+            .unwrap_or_else(|e| panic!("`source: {bad}` must not fail the whole frame: {e}"));
+            let StreamFrame::Reachability { source, peer } = frame else {
+                panic!("expected a reachability frame");
+            };
+            assert_eq!(source, ReachabilitySource::Unknown, "for source: {bad}");
+            assert!(peer.reachable, "the rest of the frame survives: {bad}");
+        }
     }
 
     /// #90: the self-network frame tags as `{"type":"self_network","self_network":{…}}` — the

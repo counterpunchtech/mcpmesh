@@ -739,8 +739,12 @@ discriminator and invited the ask; #150 was that ask, and `source` is the answer
 **Absent `source` means `unknown`, not `probe`.** An older daemon's frame omits the key, and any
 daemon from `api_minor` 22 on already has *both* producers — so an absent key genuinely does not say
 which one ran. Defaulting it to `probe` would assert the wrong producer for every session-sourced
-frame such a daemon emits. An unrecognized value also reads as `unknown`, so a future third producer
-will not break your parse.
+frame such a daemon emits.
+
+An **unreadable** value also reads as `unknown` — an unrecognized producer name, but also `null`, a
+number, or any other shape. So neither a future third producer nor a proxy that rewrites absent
+optional fields to `null` can break your parse of the frame; the worst case is a degraded
+attribution, which is what `unknown` already means.
 
 The live producer is why `path` is trustworthy for a long-lived session: a call that degrades
 `direct` → `relay` says so **when it happens**, rather than staying silently mislabelled until
