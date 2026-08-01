@@ -392,6 +392,13 @@ pub struct StatusResult {
 /// configuration, not an outage — render it as "LAN-only", never as a health warning.
 ///
 /// Additive-only.
+///
+/// **`Default` is `{online: false, relays: []}` — which is exactly the shape above meaning
+/// "deliberately LAN-only" (#148).** The porcelain reads it that way and SUPPRESSES the "no relay
+/// connection" line for it. So a fixture built with `..Default::default()` claims a healthy
+/// LAN-only posture, not an unknown one. There is no third value for a `bool`; the honest way to
+/// say "nobody looked" is `StatusResult.self_network: None`, which is what a defaulted
+/// `StatusResult` gives you.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SelfNetwork {
     /// A home-relay connection is established (iroh's `online` definition). The signal #53's
@@ -429,6 +436,10 @@ pub struct RelayInfo {
 
 /// The `status.storage` block (#88): bytes actually on disk, by subsystem. Counts, never
 /// content. Additive-only.
+///
+/// **`Default` is all zeros, which reads as "measured, and found empty" (#148).** It is here so a
+/// fixture can build one field and elide the rest; it is not a way to say "unmeasured". For that,
+/// leave `StatusResult.storage` as `None` — a defaulted `StatusResult` does exactly that.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageInfo {
     /// Summed sizes of the monthly audit files (`<state>/audit/*.jsonl`).
@@ -1752,6 +1763,84 @@ mod tests {
         assert_eq!(d.age_secs, None, "never probed");
         assert_eq!(d.principal, None);
         assert!(d.name.is_empty() && d.meta.is_empty());
+    }
+
+    /// #148 gate: the REST of the new defaults, which the first pass left entirely unasserted —
+    /// moving `BackendKind`'s `#[default]` to `Socket` failed nothing across the whole workspace.
+    ///
+    /// Each assertion below is the conservative reading of a field that could otherwise let a
+    /// fixture assert something by omission.
+    #[test]
+    fn the_remaining_defaults_are_conservative() {
+        let s = ServiceInfo::default();
+        assert!(
+            s.allow.is_empty(),
+            "an unset allow must admit NOBODY — empty is deny (the gate's `any()` is false on an \
+             empty list), and a permissive default here would be an authz hole reachable from a \
+             fixture"
+        );
+        assert!(s.allow_display.is_empty() && s.name.is_empty());
+        assert!(
+            !s.ephemeral,
+            "persistent is the conservative reading, and matches the wire default"
+        );
+        assert_eq!(
+            s.backend,
+            BackendKind::Run,
+            "the documented choice — a convenience, not a claim; pinned so it cannot drift \
+             silently out of step with its own rustdoc"
+        );
+        assert_eq!(BackendKind::default(), BackendKind::Run);
+
+        let p = PeerInfo::default();
+        assert!(p.name.is_empty() && p.services.is_empty());
+        assert_eq!(p.user_id, None, "no identity was proven");
+        assert_eq!(p.principal, None);
+
+        // The gate's finding: this default is the documented "deliberately LAN-only" posture,
+        // which the porcelain renders as healthy and NOT as a warning. It is unavoidable (a bool
+        // has no third state) but it must stay deliberate, so it is pinned rather than left to
+        // be rediscovered by whoever writes the next fixture.
+        let n = SelfNetwork::default();
+        assert!(!n.online, "no relay connection is established");
+        assert!(
+            n.relays.is_empty() && n.home_relay.is_none(),
+            "and none are known — which the renderer reads as LAN-BY-CONFIGURATION, not as an \
+             outage; say 'nobody looked' with StatusResult.self_network: None instead"
+        );
+        assert_eq!(n.last_change_epoch, None, "no transition was observed");
+
+        let r = RelayInfo::default();
+        assert!(
+            !r.connected,
+            "an unset relay must not claim a live connection"
+        );
+
+        let st = StorageInfo::default();
+        assert_eq!(
+            (st.audit_bytes, st.redb_bytes, st.blobs_bytes),
+            (0, 0, 0),
+            "zeros read as MEASURED-and-empty; `StatusResult.storage: None` is 'unmeasured'"
+        );
+
+        let ro = RosterStatus::default();
+        assert!(
+            ro.state.is_empty(),
+            "not a valid state word, deliberately — `doctor` warns on an unknown state rather \
+             than reporting a healthy roster"
+        );
+        assert_eq!(ro.serial, 0);
+
+        let pp = PresencePeer::default();
+        assert!(
+            !pp.online,
+            "an unset presence row must not claim the device is up"
+        );
+        assert!(pp.role.is_empty() && pp.user_id.is_empty());
+
+        let rp = RecentPairing::default();
+        assert_eq!(rp.paired_at_epoch, 0);
+        assert!(rp.sas_code.is_empty(), "no ceremony produced a code");
     }
 
     /// #150 gate: "an unrecognized value reads as `unknown`" must hold for any VALUE, not just an
