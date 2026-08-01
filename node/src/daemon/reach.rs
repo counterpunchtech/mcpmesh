@@ -39,6 +39,19 @@ pub struct ReachEntry {
     pub path: mcpmesh_local_api::PeerPath,
 }
 
+/// One reachability transition on the way to `subscribe`'s fan-out (#150): the row, plus WHICH
+/// producer observed it.
+///
+/// The ring used to carry a bare `PeerReachability`, which left the two senders indistinguishable
+/// by the time [`run_subscription`](crate::control) built the frame. Only the sender knows, so it
+/// stamps the attribution — see [`ReachabilitySource`](mcpmesh_local_api::ReachabilitySource) for
+/// why the difference matters to an embedder.
+#[derive(Clone, Debug)]
+pub struct ReachTransition {
+    pub peer: mcpmesh_local_api::PeerReachability,
+    pub source: mcpmesh_local_api::ReachabilitySource,
+}
+
 /// Advisory reachability TTL: a cache entry older than this is refreshed by a NON-BLOCKING
 /// background probe on the next [`reachability_of`] read.
 pub const REACH_TTL_SECS: i64 = 20;
@@ -182,9 +195,14 @@ pub async fn probe_peer(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> ReachEn
         // which accepts a bare `eid:` with no stored row. Emitting for one of those would push a
         // NAMELESS frame for an endpoint the snapshot's store-driven list can never contain — the
         // stream asserting state `status` contradicts (#58 review).
-        if let Some(row) = stored_row(mesh, endpoint_id, &entry) {
+        if let Some(peer) = stored_row(mesh, endpoint_id, &entry) {
             // Best-effort: `send` errors only when there are no subscribers, the common case.
-            let _ = mesh.reach_bcast.send(row);
+            let _ = mesh.reach_bcast.send(ReachTransition {
+                peer,
+                // #150: a probe is a throwaway dial. It says nothing about any live connection,
+                // and a consumer must be able to tell that without inferring it from `rtt_ms`.
+                source: mcpmesh_local_api::ReachabilitySource::Probe,
+            });
         }
     }
     entry

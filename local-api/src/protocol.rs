@@ -160,6 +160,47 @@ pub struct PeerReachability {
     pub path: PeerPath,
 }
 
+/// WHICH producer emitted a [`StreamFrame::Reachability`] (#150). The two say different things
+/// about the world and license different user-facing statements, and until API 1.30 the frame
+/// carried no way to tell them apart.
+///
+/// Advisory attribution, never an authz input: it says where an observation CAME FROM, never who a
+/// peer is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ReachabilitySource {
+    /// A **probe** completed — a fresh throwaway dial (`status`/`subscribe` refreshing a stale
+    /// entry). It describes that dial and nothing else: a `Probe` frame saying `Relay` does NOT
+    /// mean any live connection is relayed.
+    Probe,
+    /// A **live session**'s selected path changed under it (#92 item 2). This is a claim about the
+    /// link a peer's traffic is actually on — the frame an embedder wants when warning that a call
+    /// which WAS direct silently is not any more.
+    Session,
+    /// The daemon did not say (`api_minor < 30`), or it named a producer this client predates.
+    ///
+    /// The DEFAULT, deliberately — see [`StreamFrame::Reachability`]. Like [`PeerPath::Unknown`] it
+    /// means "we do not know" and must never be collapsed into either confident case.
+    #[default]
+    Unknown,
+}
+
+/// Hand-written so an unrecognized producer lands on [`ReachabilitySource::Unknown`] instead of
+/// failing the whole frame. [`PeerPath`] gets this from `#[serde(other)]`, which serde allows only
+/// on an internally/adjacently tagged enum; this one is a plain string, so it is spelled out. The
+/// stakes are the same as there: without it, adding a third producer later would break every
+/// `Reachability` frame an older pinned client reads, not just the new field.
+impl<'de> Deserialize<'de> for ReachabilitySource {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(match String::deserialize(d)?.as_str() {
+            "probe" => Self::Probe,
+            "session" => Self::Session,
+            _ => Self::Unknown,
+        })
+    }
+}
+
 /// Roster-mode status. Surface-clean roster VOCABULARY only: org_id, serial, a plain
 /// state word, and the pinned org-root FINGERPRINT in short words — never raw keys/EndpointIds/serials-
 /// as-transport-vocab. Absent in a pure-pairing daemon.
@@ -1244,18 +1285,38 @@ pub enum StreamFrame {
     /// (#92 item 1), when `path` joined the transition rule. A consumer that assumed same-verdict
     /// frames were impossible was reading a stale guarantee.
     ///
-    /// Two producers, as of API 1.22:
+    /// Two producers, as of API 1.22 — and since 1.30 `source` says WHICH ONE, so the distinction
+    /// is readable rather than inferred:
     ///
-    /// - a **probe** completing (`status`/`subscribe` refreshing a stale entry), which carries a
-    ///   measured `rtt_ms`; and
-    /// - a **live session** whose selected path changed under it (#92 item 2), which carries
-    ///   `rtt_ms: None` on a first observation — no round trip was measured and none is invented.
+    /// - [`ReachabilitySource::Probe`] — a probe completing (`status`/`subscribe` refreshing a
+    ///   stale entry). It describes a throwaway dial, not anyone's live connection.
+    /// - [`ReachabilitySource::Session`] — a live session whose selected path changed under it
+    ///   (#92 item 2). A claim about the link in use.
     ///
     /// The second producer is why `path` is trustworthy for a long-lived session: a session that
     /// degrades Direct→Relay mid-call now says so when it happens, rather than staying silently
     /// mislabelled until something probes. `path` is a truth claim about where user data went, so
     /// `Unknown` means "we do not know" and must never be rendered as private.
-    Reachability { peer: PeerReachability },
+    ///
+    /// **`rtt_ms` is not a discriminator, and never was** (#150). Until 1.30 this doc said a
+    /// session-sourced frame carries `rtt_ms: None` — true only of a FIRST observation, where no
+    /// round trip was measured and none is invented. A session-sourced frame for an
+    /// already-probed peer carries that probe's `rtt_ms: Some(..)`, because the path watcher
+    /// deliberately leaves `rtt_ms`/`meta`/`probed_at` alone (refreshing them would stamp a stale
+    /// RTT as fresh and suppress the corrective probe — #92 review). That is the common case for a
+    /// peer probed at pairing time and then watched through a long call. Read `source`.
+    Reachability {
+        peer: PeerReachability,
+        /// Which producer emitted this frame (#150). `api_minor >= 30`.
+        ///
+        /// Additive: `#[serde(default)]`, landing on [`ReachabilitySource::Unknown`] — NOT on
+        /// `Probe`. A daemon at `api_minor` 22–29 already has both producers, so an absent field
+        /// genuinely does not say which one ran; defaulting to `Probe` would assert the wrong
+        /// producer for every session-sourced frame such a daemon emits, which is the exact
+        /// ambiguity this field exists to remove.
+        #[serde(default)]
+        source: ReachabilitySource,
+    },
     /// THIS node's own network posture CHANGED (#90): `online` flipped, the home relay moved,
     /// or a relay's connection state changed — pushed so an embedder learns "you just went
     /// unreachable" the moment it happens instead of on a poll tick, and so #53's `set_relays`
@@ -1324,7 +1385,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   twenty-four have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.29";
+pub const API_VERSION: &str = "1.30";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -1384,7 +1445,11 @@ pub const API_VERSION: &str = "1.29";
 /// the node's OWN reachability posture, previously unanswerable from either side of the API
 /// (#90); to 29 with [`AuditRecord::principal`] — stable identity on the event stream and the
 /// on-disk log, resolving #57's parked docs conflict in favour of the #41/#42/#73 line (the
-/// audit surface bans secrets and raw hex, not the prefixed principal rendering).
+/// audit surface bans secrets and raw hex, not the prefixed principal rendering); to 30 with
+/// [`StreamFrame::Reachability`]'s `source` — the frame has had TWO producers since 22 with no way
+/// to tell them apart, so an embedder could not distinguish "a throwaway dial went via a relay"
+/// from "the link this call is on just degraded", and had to hedge every message down to the
+/// weaker claim. `rtt_ms: None` was never the discriminator the doc implied (#150).
 ///
 /// **Not every semantic change gets a minor, and that is the gap to watch (#122).** A minor marks a
 /// change to this *surface*. A change to behaviour BEHIND the surface — same fields, same shapes,
@@ -1395,7 +1460,7 @@ pub const API_VERSION: &str = "1.29";
 /// That class is bigger than it looks: **10, 17, 21, 22, 23 and 24 all shipped with no change to
 /// any type in this file** — they moved meaning, not shape. Six of the twenty-four. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 29;
+pub const API_MINOR: u32 = 30;
 
 #[cfg(test)]
 mod tests {
@@ -1458,6 +1523,7 @@ mod tests {
                 principal: Some("eid:beef".into()),
                 path: Default::default(),
             },
+            source: ReachabilitySource::Probe,
         };
         let v = serde_json::to_value(&frame).unwrap();
         assert_eq!(v["type"], "reachability");
@@ -1467,8 +1533,59 @@ mod tests {
             v["peer"]["age_secs"], 0,
             "a transition frame is fresh by construction: {v}"
         );
+        assert_eq!(v["source"], "probe", "#150: the producer is named: {v}");
         let back: StreamFrame = serde_json::from_value(v).unwrap();
         assert_eq!(back, frame);
+    }
+
+    /// #150: the frame's `source` wire shape, and the two ways it must degrade.
+    ///
+    /// The default is the load-bearing part. An absent key comes from a daemon at `api_minor`
+    /// 22–29, which ALREADY has both producers — so it must land on `Unknown`, never on `Probe`.
+    /// Defaulting to `Probe` would tell a consumer "a throwaway dial saw this" about frames that
+    /// were a live session degrading, which is the ambiguity the field exists to remove.
+    #[test]
+    fn reachability_source_tags_and_defaults_to_unknown() {
+        let tagged = |s: ReachabilitySource| serde_json::to_value(s).unwrap();
+        assert_eq!(tagged(ReachabilitySource::Probe), "probe");
+        assert_eq!(tagged(ReachabilitySource::Session), "session");
+        assert_eq!(tagged(ReachabilitySource::Unknown), "unknown");
+        for s in [
+            ReachabilitySource::Probe,
+            ReachabilitySource::Session,
+            ReachabilitySource::Unknown,
+        ] {
+            let back: ReachabilitySource = serde_json::from_value(tagged(s)).unwrap();
+            assert_eq!(back, s, "round trip");
+        }
+
+        let peer = serde_json::json!({"name": "bob", "reachable": true});
+
+        // A pre-#150 frame: no `source` key at all.
+        let old: StreamFrame =
+            serde_json::from_value(serde_json::json!({"type": "reachability", "peer": peer}))
+                .expect("an older daemon's frame must still parse");
+        let StreamFrame::Reachability { source, .. } = old else {
+            panic!("expected a reachability frame");
+        };
+        assert_eq!(
+            source,
+            ReachabilitySource::Unknown,
+            "an api_minor 22-29 daemon has BOTH producers, so an absent key must not claim Probe"
+        );
+
+        // A producer from a NEWER daemon must degrade to Unknown, not fail the whole frame — the
+        // same stake `PeerPath` buys with `#[serde(other)]`. Without the hand-written Deserialize
+        // a third producer would break every Reachability frame an older pinned client reads.
+        let future: StreamFrame = serde_json::from_value(
+            serde_json::json!({"type": "reachability", "peer": peer, "source": "telemetry"}),
+        )
+        .expect("an unknown producer must not fail the whole frame");
+        let StreamFrame::Reachability { source, peer } = future else {
+            panic!("expected a reachability frame");
+        };
+        assert_eq!(source, ReachabilitySource::Unknown);
+        assert!(peer.reachable, "the rest of the frame survives");
     }
 
     /// #90: the self-network frame tags as `{"type":"self_network","self_network":{…}}` — the

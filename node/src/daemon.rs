@@ -92,7 +92,7 @@ pub fn admitted_services_for_test(
 ) -> Vec<String> {
     caller_admitted_services(mesh, identity)
 }
-pub use reach::{REACH_TTL_SECS, ReachEntry, probe_peer, reachability_of};
+pub use reach::{REACH_TTL_SECS, ReachEntry, ReachTransition, probe_peer, reachability_of};
 pub(crate) use self_net::read_current as self_network_now;
 pub use self_net::spawn_self_net_watch;
 
@@ -331,7 +331,11 @@ pub struct MeshState {
     /// the audit file or split record-from-broadcast. Keeping them apart leaves the audit log's
     /// schema exactly as it is. Sends are best-effort — no subscribers is the common case and a
     /// `send` error there is expected, never an error.
-    pub(crate) reach_bcast: tokio::sync::broadcast::Sender<mcpmesh_local_api::PeerReachability>,
+    ///
+    /// Carries the PRODUCER alongside the row (#150): the two senders — [`reach::probe_peer`] and
+    /// [`path_watch::commit_observation`] — are the only places that know which one ran, so the
+    /// attribution is stamped at the `send` rather than guessed at the subscription.
+    pub(crate) reach_bcast: tokio::sync::broadcast::Sender<ReachTransition>,
     /// Monotonic probe ticket source (#58 review). Probes of one peer overlap and complete out of
     /// order; each takes a ticket at START so a slow earlier probe cannot overwrite a fast later
     /// one — see [`ReachEntry::seq`].
@@ -449,9 +453,7 @@ impl MeshState {
     /// opens the session, or the transition it exists to observe can land in the gap between open
     /// and subscribe and the test passes or fails on timing rather than on behaviour.
     #[doc(hidden)]
-    pub fn reach_bcast_for_test(
-        &self,
-    ) -> &tokio::sync::broadcast::Sender<mcpmesh_local_api::PeerReachability> {
+    pub fn reach_bcast_for_test(&self) -> &tokio::sync::broadcast::Sender<ReachTransition> {
         &self.reach_bcast
     }
 

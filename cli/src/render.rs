@@ -601,7 +601,10 @@ pub fn render_frame(frame: &StreamFrame) -> String {
         // #58: a liveness transition. Renders the nickname and the new state only — the row also
         // carries the `eid:` principal for programmatic joins, but the DISPLAY surface stays
         // endpoint-id-free, exactly as every other frame here.
-        StreamFrame::Reachability { peer } => format!(
+        // `source` (#150) is deliberately not rendered: it disambiguates a MACHINE claim (probe
+        // dial vs live link) for an embedder, and this line makes neither claim — it says
+        // online/offline, which both producers support. It rides `--json`.
+        StreamFrame::Reachability { peer, .. } => format!(
             "[reachability] {} is now {}",
             peer.name,
             if peer.reachable { "online" } else { "offline" }
@@ -663,7 +666,7 @@ mod tests {
     /// one for programmatic joins.
     #[test]
     fn render_frame_shows_a_reachability_transition() {
-        use mcpmesh_local_api::{PeerReachability, StreamFrame};
+        use mcpmesh_local_api::{PeerReachability, ReachabilitySource, StreamFrame};
         let frame = |reachable| StreamFrame::Reachability {
             peer: PeerReachability {
                 name: "bob".into(),
@@ -674,6 +677,7 @@ mod tests {
                 principal: Some("eid:beef".into()),
                 path: Default::default(),
             },
+            source: ReachabilitySource::Session,
         };
         let up = super::render_frame(&frame(true));
         assert!(up.contains("bob") && up.contains("online"), "got {up}");

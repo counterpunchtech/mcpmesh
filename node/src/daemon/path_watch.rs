@@ -202,7 +202,13 @@ pub(crate) fn commit_observation(
     let nickname = mesh.store.resolve(&endpoint_id).ok().flatten()?.nickname;
     let row = super::reach::reachability_row(nickname, endpoint_id, Some(&committed), Some(0));
     // Best-effort: `send` errors only when there are no subscribers, the common case.
-    let _ = mesh.reach_bcast.send(row.clone());
+    let _ = mesh.reach_bcast.send(super::reach::ReachTransition {
+        peer: row.clone(),
+        // #150: this is the producer whose claim is about the link actually in use. Note the row
+        // may carry a PROBE's `rtt_ms` (the Some(entry) arm above leaves it alone deliberately),
+        // so `rtt_ms` cannot stand in for this attribution.
+        source: mcpmesh_local_api::ReachabilitySource::Session,
+    });
     Some(row)
 }
 
@@ -392,6 +398,67 @@ mod tests {
             "no RTT was measured — never fabricate one"
         );
         assert_eq!(row.path, PeerPath::Direct);
+    }
+
+    /// #150: the watcher stamps its frames `Session`, and it does so on the UPDATE branch — the
+    /// one that fires for a peer some probe already measured.
+    ///
+    /// This is the case that makes `rtt_ms` unusable as a discriminator, and the reason the issue's
+    /// cheap option (documenting `rtt_ms: None` as the session marker) was rejected rather than
+    /// taken. `commit_observation`'s update arm deliberately leaves the probe's measurement alone,
+    /// so the frame goes out `Session` AND `rtt_ms: Some(..)` — exactly the shape a consumer
+    /// keying on `rtt_ms` would misfile as probe-sourced. It is also the COMMON shape for the
+    /// scenario the field exists for: a peer probed at pairing time, then watched through a call.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_frame_for_an_already_probed_peer_keeps_the_probes_rtt() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+        std::fs::write(&cfg, "").unwrap();
+        let mesh = crate::daemon::testutil::hermetic_mesh(cfg).await;
+        let eid = [17u8; 32];
+        mesh.store
+            .add(crate::allowlist::PeerEntry {
+                endpoint_id: eid,
+                nickname: "erin".into(),
+                services: vec![],
+                paired_at: None,
+                user_id: None,
+                last_addr: None,
+            })
+            .unwrap();
+
+        // A probe landed first: Direct, with a MEASURED round trip.
+        mesh.reachability.lock().unwrap().insert(
+            eid,
+            crate::daemon::ReachEntry {
+                reachable: true,
+                rtt_ms: Some(12),
+                probed_at: crate::util::epoch_now_i64(),
+                meta: String::new(),
+                services: Vec::new(),
+                seq: 1,
+                path: PeerPath::Direct,
+            },
+        );
+
+        let mut rx = mesh.reach_bcast.subscribe();
+        // Now the live session degrades under it. This is the update branch.
+        let row = commit_observation(&mesh, eid, 2, &PeerPath::Relay { url: None })
+            .expect("a Direct->Relay change on a live session commits");
+        assert_eq!(row.path, PeerPath::Relay { url: None });
+
+        let t = rx.try_recv().expect("the transition must be pushed");
+        assert_eq!(
+            t.source,
+            mcpmesh_local_api::ReachabilitySource::Session,
+            "a live-session observation must attribute itself to the session producer"
+        );
+        assert_eq!(
+            t.peer.rtt_ms,
+            Some(12),
+            "the probe's measurement survives, so `rtt_ms: None` is NOT the session marker — this \
+             frame is session-sourced AND carries an rtt"
+        );
     }
 
     /// An unchanged path must not commit or emit, even with a fresh ticket — otherwise a stable

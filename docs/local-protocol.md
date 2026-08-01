@@ -628,12 +628,18 @@ probe that produces these frames (see below).
     "age_secs": 0,
     "meta": "",
     "principal": "eid:9f2k…"
-  }
+  },
+  "source": "session"
 }
 ```
 
 `peer` is a whole `PeerReachability` row — the same shape the opening `snapshot`'s `reachability`
 list carries, so both project through one code path.
+
+`source` (`api_minor >= 30`, #150) names WHICH of the two producers observed the transition —
+`"probe"`, `"session"`, or `"unknown"`. See "Two producers" below. It sits on the frame rather than
+on the row because it describes the *event*, not the peer — `status` and the snapshot report cached
+rows with no producer to name.
 
 **`self_network`** — THIS node's own posture changed (`api_minor >= 28`, #90): `online` flipped,
 the home relay moved, or a relay's connection state changed. `direct_addrs` drift alone does not
@@ -713,16 +719,28 @@ is advisory detail, not a transition. `age_secs` is `0` — the observation just
 the transition rule; same-verdict frames have been possible ever since. `api_minor` cannot date
 this correction, because it describes behaviour that already shipped — the release can.
 
-**Two producers, since `api_minor` 22:**
+**Two producers, since `api_minor` 22 — and since 30, `source` says which one (#150):**
 
-| producer | when |
-|---|---|
-| a completing **probe** | `status`, `subscribe`'s snapshot, or `peer_services` refreshes a stale entry |
-| a **live session** | its selected path changed under it (0.20.0) |
+| `source` | producer | when | what it licenses |
+|---|---|---|---|
+| `"probe"` | a completing **probe** | `status`, `subscribe`'s snapshot, or `peer_services` refreshes a stale entry | "a fresh throwaway dial toward this peer went via a relay." Says nothing about the connection anyone is using. |
+| `"session"` | a **live session** | its selected path changed under it (0.20.0) | "the connection this peer's traffic is actually on just changed." A real statement about a live link. |
+| `"unknown"` | — | the daemon predates `api_minor` 30, or named a producer you predate | Neither. Hedge to the weaker (probe-level) claim. |
 
-**`rtt_ms` does not tell you which one sent a frame.** A probe reporting a peer *unreachable*
-carries `null`, and a live-session update on a peer a probe already measured carries that earlier —
-possibly stale — number. There is no producer discriminator on the wire; if you need one, ask for it.
+That distinction is the difference between warning a user that their call has silently degraded and
+saying nothing useful at all, so read `source` rather than inferring it.
+
+**`rtt_ms` does not tell you which one sent a frame, and never did.** A probe reporting a peer
+*unreachable* carries `null`, and a live-session update on a peer a probe already measured carries
+that earlier — possibly stale — number. Only a session-sourced frame for a peer **never probed**
+carries `null` for the reason people assume. Through `api_minor` 29 this document said there was no
+discriminator and invited the ask; #150 was that ask, and `source` is the answer.
+
+**Absent `source` means `unknown`, not `probe`.** An older daemon's frame omits the key, and any
+daemon from `api_minor` 22 on already has *both* producers — so an absent key genuinely does not say
+which one ran. Defaulting it to `probe` would assert the wrong producer for every session-sourced
+frame such a daemon emits. An unrecognized value also reads as `unknown`, so a future third producer
+will not break your parse.
 
 The live producer is why `path` is trustworthy for a long-lived session: a call that degrades
 `direct` → `relay` says so **when it happens**, rather than staying silently mislabelled until
@@ -883,8 +901,9 @@ things:
   (#62) are `api_minor >= 15`; the pushed `reachability` stream frame (#58)
   is `api_minor >= 12`; the `set_nickname` verb
   and `StatusResult.self_nickname` are `api_minor >= 2` (#37); STABLE-principal `allow`
-  strings + `ServiceInfo.allow_display` are `api_minor >= 3` (#38). `api_minor` is itself
-  additive: a pre-1.1 daemon omits it and it reads as `0`.
+  strings + `ServiceInfo.allow_display` are `api_minor >= 3` (#38); the `reachability` frame's
+  `source` — which of the two producers observed the transition (#150) — is `api_minor >= 30`.
+  `api_minor` is itself additive: a pre-1.1 daemon omits it and it reads as `0`.
 
 Changes remain **additive within a major**: new response fields are optional (absent-tolerant), so a
 newer daemon's payload still parses in an older client and vice versa. Build defensively — ignore
