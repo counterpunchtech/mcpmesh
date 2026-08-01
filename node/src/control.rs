@@ -1106,6 +1106,45 @@ mod tests {
         json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params })
     }
 
+    /// #147: a nickname-collision refusal reaches the embedder as `ERR_NICKNAME_TAKEN`, and
+    /// nothing else does.
+    ///
+    /// This pins the DOWNCAST ARM, which is the whole embedder-visible contract — the point of the
+    /// issue is that a consumer branches on this number instead of substring-matching prose it
+    /// cannot rewrite. The gate caught that deleting the arm outright broke no test: the unit
+    /// coverage exercised the `refusal_error` helper, never the call site that turns its output
+    /// into a code. A tested helper nobody calls is not coverage.
+    #[test]
+    fn a_nickname_collision_answers_err_nickname_taken() {
+        let reason = "pairing refused: nickname 'studio-mac' is already taken by another paired \
+                      peer; the invite was NOT consumed — rename this node and redeem the same \
+                      invite again";
+        let typed: anyhow::Result<()> = Err(anyhow::Error::new(
+            crate::pairing::rendezvous::NicknameTaken(reason.into()),
+        ));
+        let v = respond(json!(1), "pair", typed);
+        assert_eq!(
+            v["error"]["code"],
+            mcpmesh_local_api::ERR_NICKNAME_TAKEN,
+            "the collision must be branchable, not -32000: {v}"
+        );
+        assert_eq!(
+            v["error"]["code"], -32043,
+            "the value is the wire contract: {v}"
+        );
+        let msg = v["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("rename this node") && !msg.contains("set_nickname"),
+            "the message carries the inviter's reworded prose verbatim: {v}"
+        );
+
+        // Every other pairing failure stays generic. An embedder branching on -32043 must not be
+        // told to rename after a wrong-or-expired secret.
+        let generic: anyhow::Result<()> = Err(anyhow::anyhow!("pairing refused: pairing refused"));
+        let v = respond(json!(1), "pair", generic);
+        assert_eq!(v["error"]["code"], -32000, "got {v}");
+    }
+
     /// The transport-agnostic serve body speaks full mcpmesh-local/1 over a plain duplex —
     /// what an embedded node's `Node::control` runs (no socket, no peer gate: the pipe
     /// never leaves the process). Proves hello + a typed request round-trip end to end

@@ -40,10 +40,20 @@ This repo already has the pattern (`NoSuchService` → `ERR_NO_SUCH_SERVICE`): a
 downcast in `respond`, a stable JSON-RPC code. Follow it exactly.
 
 - `ERR_NICKNAME_TAKEN: i64 = -32043` in `local-api/src/protocol.rs`.
-- `NicknameTaken { nickname, invite_survived }` in `node/src/pairing/rendezvous.rs`, an
-  `std::error::Error` whose `Display` is the reworded prose — ONE source for the string, so the
-  wire reason and the local error cannot drift.
+- `NicknameTaken(String)` in `node/src/pairing/rendezvous.rs`, an `std::error::Error` carrying the
+  inviter's reason VERBATIM — the inviter is the only side that knows whether the invite survived,
+  so rebuilding the sentence redeemer-side would be a second source of truth for it.
 - `respond` (`node/src/control.rs:880`) downcasts it alongside the existing arms.
+
+**The code means "rename and redeem the SAME invite again"**, so it rides only a refusal whose
+invite survived. The post-redeem race guard refuses the same collision with the invite already
+burned; it keeps its specific prose ("ask the inviter for a fresh invite") and gets NO code. An
+embedder writing copy off the code would otherwise send that user back to an invite that no longer
+exists — worse than the prose it replaced. (The first implementation coded both sites; the
+adversarial gate caught it.)
+
+The redeemer-side squat check is likewise uncoded: it is a condition on the redeemer's own store,
+not the inviter's, and names its own remedy.
 
 ### 3. The redeemer must not substring-match either
 
@@ -71,11 +81,12 @@ node crate. An inviter older than 0.25.1 sends no `code`, and the redeemer falls
 generic `bail!` — same behavior as now, so a mixed-version pairing still works and still refuses
 correctly, just without the branchable code.
 
-**No oracle risk.** The code rides only the two refusals that already carry the distinguishable
-collision reason — both sent exclusively to a caller that proved possession of a live secret (the
-peek pre-check) or spent one (the post-redeem race guard). The generic `REASON_REFUSED` path, which
-deliberately does not distinguish unknown-vs-expired-vs-wrong-secret, gains no code and stays
-opaque. This spec does not widen what a refusal reveals; it only labels what it already said.
+**No oracle risk.** The one coded refusal is the peek pre-check's, sent exclusively to a caller
+that proved possession of a live invite secret — and it already names the colliding nickname in
+prose, so the code reveals nothing new. The generic `REASON_REFUSED` path, which deliberately does
+not distinguish unknown-vs-expired-vs-wrong-secret, gains no code and stays opaque: a code there
+would rebuild that oracle in a form easier to script. This spec does not widen what a refusal
+reveals; it only labels what it already said.
 
 ## Versioning
 
@@ -99,8 +110,16 @@ condition arrives as `-32000` with the same prose.
 3. **The generic refusal still answers the generic code and the opaque reason** — pins that the new
    code did not leak onto the oracle path.
 4. **Wire additivity** — a `Refused` payload with no `code` key deserializes (older inviter); one
-   with an unrecognized code deserializes to `Unknown` rather than failing the reply.
+   with an unrecognized code, or any non-string shape, deserializes to `Unknown` rather than
+   failing the reply.
 5. **`Display` and the wire reason are the same string** — pins the single-source claim.
+6. **Only a SURVIVING invite earns the code** — the burned race-guard collision must not carry it.
+7. **`respond` really maps it** — assert the `-32043` on `respond`'s output, not on the helper.
+   Testing the helper alone leaves the arm deletable with no test failing, which is what happened.
+
+Assert the oracle boundary (3) on the real SEND SITE, not on a hand-built `PairReply`: a literal
+pins the serializer, not the branch that chooses the code. A mutation stamping the code on the
+generic refusal's send site passed a unit test written that way.
 
 Mutation-tested: restoring the verb name fails 1; mapping the collision to `-32000` fails 2; adding
 the code to the generic path fails 3; deleting the hand-written `Deserialize` fails 4.

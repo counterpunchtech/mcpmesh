@@ -76,8 +76,9 @@ pub(crate) const NO_LIVE_INVITE_CLOSE: &[u8] = b"no pairing in progress";
 /// never to an unproven dialer, or it becomes a store-contents oracle. `invite_survived` selects
 /// the recovery guidance: the pre-check path preserves the invite, the race-guard path burned it.
 ///
-/// It is ALSO the redeemer-side error's `Display` (see [`NicknameTaken`]), so the wire reason and
-/// the local message are one string and cannot drift.
+/// The redeemer carries this string VERBATIM into [`NicknameTaken`] (under a `pairing refused: `
+/// prefix) rather than rebuilding the sentence, so there is one source for the wording — the
+/// inviter is also the only side that knows whether the invite survived.
 ///
 /// **Names the action, never a control verb (#147).** The recovery clause used to say "pick a
 /// different nickname (`set_nickname`)". That verb is control-API vocabulary a GUI user cannot
@@ -95,6 +96,22 @@ fn reason_nickname_taken(nickname: &str, invite_survived: bool) -> String {
     format!("nickname '{nickname}' is already taken by another paired peer; {recovery}")
 }
 
+/// The complete nickname-collision refusal: the prose AND its code, chosen together (#147).
+///
+/// Both send sites go through here rather than building a `PairReply` each, because the two are
+/// ONE decision. The code means "rename and redeem the SAME invite again", so it is exactly the
+/// `invite_survived` case — and the first implementation of #147 stamped it on both sites, which
+/// would have had an embedder send a race-guard loser back to an invite that no longer exists.
+///
+/// A test over a helper could not have caught that: the bug was at the call site. Keeping the two
+/// fields inseparable is what makes it unrepresentable.
+fn collision_refusal(nickname: &str, invite_survived: bool) -> PairReply {
+    PairReply::Refused {
+        reason: reason_nickname_taken(nickname, invite_survived),
+        code: invite_survived.then_some(RefusalCode::NicknameTaken),
+    }
+}
+
 /// A machine-readable refusal kind on [`PairReply::Refused`] (#147), so the REDEEMER can raise a
 /// typed error without parsing the inviter's prose — the same anti-pattern we are asking embedders
 /// to stop doing, and it would break the moment we improved the wording.
@@ -110,7 +127,13 @@ fn reason_nickname_taken(nickname: &str, invite_survived: bool) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 enum RefusalCode {
-    /// The redeemer's nickname is held by a DIFFERENT paired peer (#87).
+    /// The redeemer's nickname is held by a DIFFERENT paired peer AND the invite survived, so
+    /// renaming and redeeming the same invite again works (#87).
+    ///
+    /// **The surviving invite is part of the meaning, not a coincidence.** It is what the remedy
+    /// every consumer writes off this code depends on. The post-redeem race guard refuses the
+    /// same collision with the invite already BURNED, and deliberately sends no code: an embedder
+    /// branching on one would tell the user to retry an invite that is gone.
     NicknameTaken,
     /// A refusal kind this node predates. Never sent — only reached on receive.
     Unknown,
@@ -445,10 +468,7 @@ pub async fn handle_inviter_side(
             );
             let _ = send_reply(
                 &mut send,
-                &PairReply::Refused {
-                    reason: reason_nickname_taken(&hello.redeemer_nickname, true),
-                    code: Some(RefusalCode::NicknameTaken),
-                },
+                &collision_refusal(&hello.redeemer_nickname, true),
             )
             .await;
             return Ok(());
@@ -485,10 +505,9 @@ pub async fn handle_inviter_side(
                 );
                 let _ = send_reply(
                     &mut send,
-                    &PairReply::Refused {
-                        reason: reason_nickname_taken(&hello.redeemer_nickname, false),
-                        code: Some(RefusalCode::NicknameTaken),
-                    },
+                    // `false` = the invite was BURNED winning the race, so this carries no
+                    // rename-and-retry code — see `collision_refusal`.
+                    &collision_refusal(&hello.redeemer_nickname, false),
                 )
                 .await;
                 return Ok(());
@@ -881,13 +900,6 @@ pub async fn redeem_invite(
     })
 }
 
-/// Display-uniqueness guard for pairing. Returns `true` = REFUSE when a redeemer's
-/// self-asserted `nickname` is already held by a DIFFERENT stored peer: a duplicate display
-/// name would make the inviter's own records ambiguous (status shows two peers as one, and
-/// outbound routing by name is first-match). NOT a privilege defense anymore (#38): grants
-/// are principal-keyed, so no name can inherit or confer access — this protects display and
-/// routing clarity only.
-///
 /// Turn an inviter's refusal into the redeemer's error (#147).
 ///
 /// A CODED refusal becomes a typed [`NicknameTaken`], which `respond` downcasts to
@@ -906,6 +918,13 @@ fn refusal_error(reason: &str, code: Option<RefusalCode>) -> anyhow::Error {
     }
 }
 
+/// Display-uniqueness guard for pairing. Returns `true` = REFUSE when a redeemer's
+/// self-asserted `nickname` is already held by a DIFFERENT stored peer: a duplicate display
+/// name would make the inviter's own records ambiguous (status shows two peers as one, and
+/// outbound routing by name is first-match). NOT a privilege defense anymore (#38): grants
+/// are principal-keyed, so no name can inherit or confer access — this protects display and
+/// routing clarity only.
+///
 /// A same-id re-pair (every same-name entry shares `tls_id`) passes: that peer's own name is
 /// no duplicate. Blocking (redb read) — call on a blocking thread.
 fn nickname_collision(
@@ -1020,10 +1039,15 @@ mod tests {
         }
     }
 
-    /// #147 boundary: the collision refusal is coded; the GENERIC one is not, and must not become
-    /// so. `REASON_REFUSED` withholds unknown-vs-expired-vs-wrong-secret deliberately — it is sent
-    /// to callers who proved nothing — so a code labelling it would rebuild the redemption oracle
-    /// that reason exists to prevent. This pins the boundary, not just the happy path.
+    /// #147: the serialized wire SHAPE of a coded and an uncoded refusal — the `snake_case`
+    /// rendering and `skip_serializing_if` eliding the key rather than sending `null`.
+    ///
+    /// Scope note, because the first version of this test overreached: it builds its own
+    /// `PairReply`, so it pins the SERIALIZER, not the branch that chooses a code. The
+    /// oracle boundary — that an unproven caller's refusal carries none — is pinned on the real
+    /// send site by `a_wrong_secret_with_a_colliding_nickname_gets_only_the_generic_refusal` in
+    /// `cli/tests/pairing_rendezvous.rs`. A mutation stamping the code at that send site passed
+    /// THIS test.
     #[test]
     fn only_the_collision_refusal_is_coded() {
         let coded = serde_json::to_value(PairReply::Refused {
@@ -1074,6 +1098,48 @@ mod tests {
             );
             assert_eq!(e.to_string(), format!("pairing refused: {REASON_REFUSED}"));
         }
+    }
+
+    /// #147 gate: the code means "rename and redeem the SAME invite again", so it may ride ONLY a
+    /// refusal whose invite survived.
+    ///
+    /// The post-redeem race guard refuses the same collision with the invite already burned. The
+    /// first implementation coded it too — every doc then told an embedder to send that user back
+    /// to an invite that no longer exists, which is worse than the prose it replaced. This pairs
+    /// the two send sites' prose with their coding decision so they cannot drift apart again.
+    #[test]
+    fn only_a_surviving_invite_earns_the_rename_and_retry_code() {
+        // Through `collision_refusal`, which is what BOTH send sites call — not through the
+        // pieces. Asserting on `reason_nickname_taken` + `refusal_error` separately passes even
+        // when a send site pairs the wrong two, which is precisely the defect this pins.
+        let PairReply::Refused { reason, code } = collision_refusal("studio-mac", true) else {
+            panic!("expected a refusal");
+        };
+        assert!(reason.contains("redeem the same invite again"), "{reason}");
+        assert_eq!(
+            code,
+            Some(RefusalCode::NicknameTaken),
+            "the recoverable collision is the one that earns the code"
+        );
+
+        // The burned-invite collision. Its prose sends the user to a NEW invite, so a consumer
+        // acting on the rename-and-retry code here would give the opposite of correct advice.
+        let PairReply::Refused { reason, code } = collision_refusal("studio-mac", false) else {
+            panic!("expected a refusal");
+        };
+        assert!(
+            reason.contains("ask the inviter for a fresh invite"),
+            "{reason}"
+        );
+        assert!(
+            !reason.contains("redeem the same invite again"),
+            "the two remedies must stay distinguishable: {reason}"
+        );
+        assert_eq!(
+            code, None,
+            "a burned invite must NOT carry the rename-and-retry code — an embedder writing copy \
+             off it would send the user back to an invite that no longer exists"
+        );
     }
 
     /// #147: the typed error's `Display` is the inviter's reason verbatim, so the wire message and
