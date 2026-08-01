@@ -153,7 +153,7 @@ Methods split into two groups by audience:
 | `peer_rename` | `{to, user_id?, nickname?}` — rename a person by `user_id`, else a provisional contact by `nickname` | `{}` (ack) |
 | `set_nickname` | `{nickname}` — rename **this node** live (#37, `api_minor >= 2`): validated (trimmed non-empty, no `/`), persisted to `[identity].nickname` under the daemon's own config lock (no lost-update window against a concurrent grant/registration), and effective for FUTURE invites/presentations immediately — no restart. Display-only: peers keep the nickname they stored at pairing time until a re-invite | `{}` (ack) |
 | `service_allow_grant` | `{service, principal}` — grant a stable principal (`b64u:`/`eid:`) access to ONE service's allow WITHOUT (re)pairing (#44), under the daemon's config lock + hot-reload. The per-peer "sharing on" toggle. Works on EPHEMERAL registrations too, mutating their in-memory allow (#55, `api_minor >= 11`). Idempotent; a name in neither the config nor the ephemeral registry → `-32040`. **When the edit lands only in the ephemeral overlay (nothing changes on disk), the registry is updated in place rather than rebuilt from `config.toml` — so the verb no longer picks up unrelated hand-edits to the config file as a side effect (#94). Use `register_service` or a daemon restart to apply config edits.** | `{}` (ack) |
-| `service_allow_revoke` | `{service, principal}` — remove a stable principal from ONE service's allow WITHOUT unpairing (#44): the peer's `PeerEntry` identity is untouched. **Immediate at `api_minor >= 10`** — see "Revocation is immediate" below. Works on EPHEMERAL registrations too (#69, `api_minor >= 11`). Idempotent; an absent principal is a clean no-op, a name in neither the config nor the ephemeral registry → `-32040`. **Same overlay-only fast path as `service_allow_grant`: when nothing changes on disk the registry is updated in place rather than rebuilt, so unrelated `config.toml` hand-edits are not applied as a side effect (#94).** | `{}` (ack) |
+| `service_allow_revoke` | `{service, principal}` — remove ONE allow entry from ONE service WITHOUT unpairing (#44): the peer's `PeerEntry` identity is untouched. **`principal` is matched as an EXACT STRING, never resolved — so any literal in the list is a valid target, including a BARE entry** (a legacy nickname from a pre-#38 config, a roster group name). See the note below (#149). **Immediate at `api_minor >= 10`** — see "Revocation is immediate" below. Works on EPHEMERAL registrations too (#69, `api_minor >= 11`). Idempotent; an absent principal is a clean no-op, a name in neither the config nor the ephemeral registry → `-32040`. **Same overlay-only fast path as `service_allow_grant`: when nothing changes on disk the registry is updated in place rather than rebuilt, so unrelated `config.toml` hand-edits are not applied as a side effect (#94).** | `{}` (ack) |
 | `unregister_service` | `{name}` — remove a service registration (#50), the mirror of `register_service`: drops the whole `[services.<name>]` entry (allow included) + any ephemeral registration, then hot-reloads. Idempotent; unknown name → clean no-op. In-flight sessions finish; no new ones admitted. | `{}` (ack) |
 | `peer_services` | `{peer}` — discover which services a paired `peer` (nickname / `eid:` / `b64u:`) CURRENTLY grants you (#52): dials the peer over `mcpmesh/ping/1` and returns `{services:[…]}` — the names whose allow admits YOUR principal (only yours, never the peer's full registry). **Reuses a reachability-cache entry younger than ~20s rather than always dialing (#89)** — an unconditional probe collided with the `mcpmesh/ping/1` rate limiter, and a refused probe is reported as unreachable, so polling this verb faster than ~1/s made a healthy peer appear offline. Freshness is now the same contract `status` gives. **Answered from the LIVE service registry — the same one the accept path authorizes from (#100, `api_minor >= 17`). A service present in `config.toml` but not yet loaded is NOT reported: it would be refused on connect, which a caller cannot distinguish from a network failure. `status` likewise lists only live services.** | `{services:[…]}` |
 | `set_relays` | `{relay_urls}` — set this node's CUSTOM relay set LIVE (#53, `api_minor >= 9`): each URL must parse as an iroh relay URL (empty list → error; disable relays via a `relay_mode="disabled"` restart). When the node is already `relay_mode="custom"`, the daemon diffs against the running endpoint and applies the delta with iroh's live `insert_relay`/`remove_relay` — **no restart, no dropped peer sessions** — then persists `[network] relay_mode="custom" relay_urls=[…]` under the config lock. Idempotent (an unchanged set → `changed:false`, no writes). When the node is currently `default`/`disabled`, iroh cannot live-transition the relay MODE: the config is persisted but `restart_required:true` is returned (apply on next start). | `{changed, restart_required}` |
@@ -187,6 +187,32 @@ Methods split into two groups by audience:
 > serving from here", never as "unshare from everyone".
 >
 > *(Before `api_minor` 19 the following applied, and is why #107 existed:)*
+> **Removing an allow entry no other path will strip (#149).** `service_allow_revoke` matches the
+> exact string, so it is the remedy for an entry that has outlived its meaning — most often a bare
+> nickname left in an allow list by a pre-#38 config.
+>
+> Two neighbouring paths deliberately will NOT do it, and reading them together suggests such an
+> entry is permanent. It is not:
+>
+> - **`peer_remove` (unpair)** strips the peer's stable principals but never bare strings, on
+>   purpose: post-#38 a bare entry is roster vocabulary, and a nickname-keyed strip could collide
+>   with a group name and revoke a whole roster group.
+> - **`register_service`** unions the incoming allow with what is on disk, so re-registering cannot
+>   drop an entry either.
+>
+> `service_allow_revoke` sidesteps that hazard because the caller names a **literal** rather than a
+> name to resolve — there is no group-vs-nickname guessing to get wrong. The corollary: it is
+> exactly as literal as it sounds. Revoking `b64u:<user>` removes that entry outright, without the
+> multi-device protection unpairing applies (which keeps a shared `b64u:` while another paired
+> device still carries it).
+>
+> **Reading which entries are stale:** `status`'s `services[].allow_display` is index-aligned with
+> `allow`, and renders an unresolvable `eid:` as `unpaired-device` and an unresolvable `b64u:` as
+> `unpaired-peer`. A bare entry renders verbatim — the daemon cannot tell a live roster group from
+> dead legacy vocabulary, because in pairing mode there is no roster to check against. An
+> unresolvable entry admits nobody either way (the gate resolves the peer first), so this is
+> hygiene, not an access question.
+
 > **`blob_republish` can undo a `blob_unpublish`.** Unpublish removes reachability, not bytes
 > (there is no reclaim — #80), so the blob stays complete in the local store indefinitely and
 > `blob_republish` will happily re-add it to the same scope, whose grants unpublish never touched.

@@ -1314,11 +1314,22 @@ pub async fn grant_service_allow(
     Ok(())
 }
 
-/// Revoke a SINGLE stable `principal` from a SINGLE `service`'s allow (#44, the
-/// `service_allow_revoke` verb) — the per-peer "sharing off" toggle, WITHOUT unpairing (the
-/// peer's `PeerEntry` identity is untouched). A thin `DaemonState` wrapper over
-/// [`revoke_service_allow`], mirroring how [`service_allow_grant`] wraps
-/// [`grant_service_access`].
+/// Revoke a SINGLE allow entry from a SINGLE `service` (#44, the `service_allow_revoke` verb) —
+/// the per-peer "sharing off" toggle, WITHOUT unpairing (the peer's `PeerEntry` identity is
+/// untouched). A thin `DaemonState` wrapper over [`revoke_service_allow`], mirroring how
+/// [`service_allow_grant`] wraps [`grant_service_access`].
+///
+/// **`principal` is matched as an EXACT STRING, not resolved (#149).** The parameter name says
+/// "principal" because that is what an allow entry normally is, but nothing validates it: any
+/// literal already in the list is a valid target, including a BARE entry (a legacy nickname from a
+/// pre-#38 config, a roster group name). That is the documented remedy for an entry no other path
+/// will strip — [`revoke_service_access`] deliberately refuses to guess at bare strings, and
+/// `write_service_to_config` unions rather than replaces.
+///
+/// The corollary is worth stating too: an exact match is exactly as literal as it sounds. Revoking
+/// `b64u:<user>` removes that entry outright, without the multi-device protection
+/// [`revoke_service_access`] applies (it keeps a shared `b64u:` while another stored peer carries
+/// it). Here the caller named the string, so the string goes.
 pub(crate) async fn service_allow_revoke(
     state: &DaemonState,
     service: String,
@@ -1484,6 +1495,14 @@ async fn sever_principals(mesh: &Arc<MeshState>, principals: &[String]) -> Resul
 /// group name and revoke a whole roster group. (Note the boundary: admission requires gate
 /// RESOLVE first, so deleting the PeerEntry already denies the device outright — this strip
 /// is grant hygiene, not the security boundary.)
+///
+/// **A bare entry is still removable — just not from HERE (#149).** This paragraph was read as
+/// "bare entries are permanent", which is a fair reading of it and wrong about the system:
+/// [`revoke_service_allow`] strips by EXACT STRING, so
+/// `service_allow_revoke {service, principal: "<the literal>"}` removes any entry, bare included.
+/// The collision hazard above does not apply there, which is the point — the caller names a
+/// literal instead of a name to resolve, so there is no group-vs-nickname guessing to get wrong.
+/// What is unavailable is doing it as a SIDE EFFECT of unpairing, and that is deliberate.
 ///
 /// Serialized against [`register_service`] / [`grant_service_access`] via `mesh.reload_lock` (the
 /// SAME lock — a concurrent config mutation must not read the same base config and clobber this
@@ -1660,6 +1679,92 @@ mod tests {
         unregister_service(&state, "kb".into()).await.unwrap();
         unregister_service(&state, "ghost".into()).await.unwrap();
         assert!(has("notes"));
+    }
+
+    /// #149: `service_allow_revoke` strips an allow entry by EXACT STRING, so a BARE entry — a
+    /// legacy nickname left by a pre-#38 config, a roster group, anything — is removable. The
+    /// remedy exists; nothing said so, and nothing pinned it.
+    ///
+    /// The issue reported bare entries as permanent, having read three code paths that all
+    /// genuinely refuse to strip them: `revoke_service_access` says so outright (a nickname-keyed
+    /// strip could collide with a group name and revoke a whole roster group),
+    /// `write_service_to_config` unions rather than replaces, and this verb's parameter is called
+    /// `principal`. That last one is the misreading, and it was a fair one: nothing validates the
+    /// argument as a stable principal, and `remove_principal_from_service` compares `s !=
+    /// principal`.
+    ///
+    /// The collision hazard that rules out a nickname-keyed strip does not apply here, which is
+    /// the whole point: the caller names a LITERAL rather than a name to resolve, so there is no
+    /// group-vs-nickname guessing to get wrong.
+    ///
+    /// Pinned across BOTH allow sources — a config entry and an ephemeral registration's
+    /// in-memory allow — because "revocation must be fail-closed across every allow the name owns"
+    /// (#55 review) applies to a bare entry exactly as it does to a principal.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_exact_literal_revokes_a_bare_allow_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[services.kb]\nsocket = \"/run/kb.sock\"\nallow = [\"legacy-nickname\", \"eid:beef\", \"ops-team\"]\n",
+        )
+        .unwrap();
+        let mesh = hermetic_mesh(config_path.clone()).await;
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+        let allow = || {
+            crate::config::Config::load(&config_path)
+                .unwrap()
+                .services
+                .get("kb")
+                .unwrap()
+                .allow
+                .clone()
+        };
+
+        // The legacy bare entry goes, and ONLY it — an exact match cannot take a neighbour with it.
+        service_allow_revoke(&state, "kb".into(), "legacy-nickname".into())
+            .await
+            .expect("a bare entry is a valid revoke target");
+        assert_eq!(
+            allow(),
+            vec!["eid:beef".to_string(), "ops-team".to_string()],
+            "the exact literal is stripped and nothing else is"
+        );
+
+        // Idempotent, like every other revoke: a second call is a clean no-op, not an error.
+        service_allow_revoke(&state, "kb".into(), "legacy-nickname".into())
+            .await
+            .expect("revoking an absent entry is a no-op");
+        assert_eq!(
+            allow(),
+            vec!["eid:beef".to_string(), "ops-team".to_string()]
+        );
+
+        // A bare entry in an EPHEMERAL registration's in-memory allow is equally removable.
+        // Revocation is fail-closed across every allow a name owns (#55 review); a bare entry is
+        // not an exception to that.
+        mesh.register_ephemeral(
+            "tmp".to_string(),
+            crate::daemon::EphemeralService {
+                backend: mcpmesh_local_api::BackendSpec::Socket {
+                    path: "/run/tmp.sock".into(),
+                },
+                allow: vec!["legacy-nickname".to_string(), "eid:beef".to_string()],
+            },
+        );
+        service_allow_revoke(&state, "tmp".into(), "legacy-nickname".into())
+            .await
+            .expect("a bare entry in an ephemeral allow is a valid target");
+        assert_eq!(
+            mesh.ephemeral_services
+                .lock()
+                .unwrap()
+                .get("tmp")
+                .unwrap()
+                .allow,
+            vec!["eid:beef".to_string()],
+            "the ephemeral allow lost the bare entry and kept the principal"
+        );
     }
 
     /// #44: `service_allow_grant`/`service_allow_revoke` toggle
