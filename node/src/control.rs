@@ -408,11 +408,16 @@ async fn run_subscription(
 
     /// The reachability-ring equivalent (#58).
     fn reach_frame(
-        r: Result<mcpmesh_local_api::PeerReachability, RecvError>,
+        r: Result<crate::daemon::ReachTransition, RecvError>,
         closed: &mut bool,
     ) -> Option<StreamFrame> {
         match r {
-            Ok(peer) => Some(StreamFrame::Reachability { peer }),
+            // #150: the producer rides the ring, stamped by whichever sender observed the
+            // transition — this mapping never has to guess.
+            Ok(t) => Some(StreamFrame::Reachability {
+                peer: t.peer,
+                source: t.source,
+            }),
             Err(RecvError::Lagged(n)) => Some(StreamFrame::Lagged { dropped: n }),
             Err(RecvError::Closed) => {
                 *closed = true;

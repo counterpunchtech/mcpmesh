@@ -10,10 +10,16 @@
 //! drops the connection, so the transition happens on a connection nobody is watching. That is the
 //! whole reason this suite is separate from `peer_path.rs`.
 //!
-//! The assertion that makes this about LIVE signal rather than probing: `rtt_ms` must be `None`. A
-//! probe measures a round trip and reports `Some(rtt)`; the watcher observes a path and never
-//! fabricates a measurement. `probe_seq` is NOT the discriminator — the watcher shares that counter
-//! with `probe_peer` on purpose, so a correct implementation advances it.
+//! The assertion that makes this about LIVE signal rather than probing: `source` must be
+//! `Session` (#150). `probe_seq` is NOT the discriminator — the watcher shares that counter with
+//! `probe_peer` on purpose, so a correct implementation advances it.
+//!
+//! **And `rtt_ms` is not the discriminator either, however it may read below.** Until #150 this
+//! suite leaned on `rtt_ms: None`, which works HERE only because these fixtures seed the cache
+//! entry: no probe has run, so the watcher's `None` is visible. It does not generalize —
+//! `commit_observation`'s update arm leaves an already-probed peer's measured `rtt_ms` in place, so
+//! a session-sourced frame routinely carries `Some(..)`. That case is covered by a unit fixture in
+//! `node/src/daemon/path_watch.rs`. If you add a case here, assert `source`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -252,7 +258,7 @@ async fn a_live_relay_to_direct_transition_pushes_a_frame() {
             .expect("broadcast channel alive");
 
         assert_eq!(
-            frame.path,
+            frame.peer.path,
             mcpmesh_local_api::PeerPath::Direct,
             "the frame must report the path the session ACTUALLY moved to"
         );
@@ -260,17 +266,26 @@ async fn a_live_relay_to_direct_transition_pushes_a_frame() {
         // The point of the suite: this came from the LIVE session, not a probe. If a probe drove
         // it, item (1) already emits and this test proves nothing about item (2).
         //
-        // `rtt_ms` is the discriminator, NOT the probe ticket. An earlier draft asserted
-        // `probe_seq` was unchanged; that was wrong, because the watcher deliberately SHARES the
-        // ticket counter with `probe_peer` — that shared ordering is what stops an in-flight probe
-        // overwriting a fresher live observation. A correct implementation therefore advances it.
+        // NOT the probe ticket. An earlier draft asserted `probe_seq` was unchanged; that was
+        // wrong, because the watcher deliberately SHARES the ticket counter with `probe_peer` —
+        // that shared ordering is what stops an in-flight probe overwriting a fresher live
+        // observation. A correct implementation therefore advances it.
         //
-        // A probe measures a round trip and reports `Some(rtt)`. The watcher observes a path and
-        // never fabricates a measurement, so a watcher-seeded entry carries `None`.
+        // And no longer `rtt_ms` (#150). That worked here only because this fixture SEEDS the
+        // entry: no probe has run, so the watcher's `None` is visible. It is not a general
+        // discriminator — `commit_observation`'s update branch leaves an already-probed peer's
+        // measured `rtt_ms` in place, so a session-sourced frame can carry `Some(..)`. `source` is
+        // the attribution, and asserting it is what makes this test say what it claims to say.
         assert_eq!(
-            frame.rtt_ms, None,
-            "the frame must be watcher-seeded: a probe-driven row carries a measured rtt_ms, and \
-             a probe-driven path frame is item (1), already shipped in 0.19.0"
+            frame.source,
+            mcpmesh_local_api::ReachabilitySource::Session,
+            "the frame must be watcher-sourced: a probe-driven path frame is item (1), already \
+             shipped in 0.19.0, and this suite exists for item (2)"
+        );
+        assert_eq!(
+            frame.peer.rtt_ms, None,
+            "a watcher-SEEDED entry fabricates no measurement (true of this fixture, where no \
+             probe has run — not of a session frame in general)"
         );
         assert!(
             mesh.probe_seq_for_test() > seq_before,
@@ -316,7 +331,7 @@ async fn status_agrees_with_the_frame_the_watcher_just_pushed() {
             .find(|r| r.name == "bob")
             .expect("the peer must appear in the status projection");
         assert_eq!(
-            row.path, frame.path,
+            row.path, frame.peer.path,
             "status must agree with the frame that was just pushed — a watcher that emits without \
              writing the cache leaves status contradicting its own event stream"
         );

@@ -444,6 +444,13 @@ async fn reachability_flips_are_pushed_to_subscribers() {
         assert_eq!(frame["type"], "reachability", "got {frame}");
         assert_eq!(frame["peer"]["reachable"], true, "came online: {frame}");
         assert_eq!(frame["peer"]["name"], "bob", "got {frame}");
+        // #150: a probe drove this, and the frame must say so on the WIRE — this is the whole
+        // path (producer -> ring -> run_subscription -> JSON), not just the enum. `probe` is the
+        // weaker claim: it describes this throwaway dial, not any session's link.
+        assert_eq!(
+            frame["source"], "probe",
+            "a probe-driven transition must attribute itself to the probe producer: {frame}"
+        );
         // The frame's path is whatever was known at transition time — `direct` or, if the path
         // had not settled yet, `unknown`. Never `relay`: none is configured.
         assert_ne!(frame["peer"]["path"]["kind"], "relay", "got {frame}");
@@ -462,6 +469,18 @@ async fn reachability_flips_are_pushed_to_subscribers() {
         );
 
         // --- Steady state: a re-probe that re-confirms UP is not a transition. ---
+        //
+        // Drain first. The settle loop above re-probes until the path reaches Direct, and each
+        // Unknown->Direct step is a genuine transition that queues its own frame — so on a run
+        // where the first probe reported Unknown there is a SECOND frame already waiting, which
+        // the silence check below would read and blame on the re-probe. That is a fixture race,
+        // not the property under test, and it failed this suite under full-workspace load. The
+        // drain is bounded by the same window as the assertion, so a daemon that pushes
+        // unboundedly still fails.
+        while timeout(Duration::from_millis(600), sub.reader.next())
+            .await
+            .is_ok()
+        {}
         let _ = daemon::probe_peer(&mesh, peer_id).await;
         assert!(
             timeout(Duration::from_millis(600), sub.reader.next())
