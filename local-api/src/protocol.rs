@@ -601,6 +601,62 @@ pub struct PeerServicesResult {
     pub services: Vec<String>,
 }
 
+/// Params of [`Request::PeerDiagnostics`] (#140): the peer to dump — a nickname or an `eid:`
+/// device principal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerDiagnosticsParams {
+    pub peer: String,
+}
+
+/// Result of [`Request::PeerDiagnostics`] (#140): the DURABLE per-peer state this node carries,
+/// for diagnosing why a specific long-lived pairing behaves differently from a fresh one.
+///
+/// **This is the one surface that deliberately carries transport vocabulary.** Every other verb is
+/// surface-clean — nicknames and path KINDS, never addresses — because that discipline is what
+/// keeps a peer's coordinates out of screenshots and logs. Here it is the point: the question this
+/// answers is "what address is this node about to dial, and where did it come from", which cannot
+/// be answered without the address. It is your OWN store's record of your OWN paired peers. Do not
+/// render it in ordinary porcelain, and do not paste it publicly without reading it first.
+///
+/// The intended use is a paired capture: run it on BOTH ends of a stuck pairing and compare the
+/// stored hint against the live path each side reports.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerDiagnosticsResult {
+    /// The peer's nickname as this node stores it.
+    pub nickname: String,
+    /// The peer's stable `eid:` device principal.
+    pub principal: String,
+    /// The peer's `b64u:` user_id if it proved a device→user binding at pairing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    /// When the pairing was written (epoch seconds as a string), if recorded. A LONG-LIVED pairing
+    /// is exactly what #140 is about, so the age is part of the evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paired_at: Option<String>,
+    /// The persisted dial HINT, verbatim as stored — the durable state a freshly paired identity
+    /// does not have. `None` for a peer added without one.
+    ///
+    /// It is MERGED with discovery rather than replacing it (iroh inserts it as one more candidate
+    /// path and still runs address lookup), so a stale entry does not by itself hide a live
+    /// address — but it is the only durable per-peer state that differs between a long-lived
+    /// pairing and a fresh one, which makes it the first thing to compare.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_addr: Option<String>,
+    /// The IP addresses parsed out of `last_addr`, for reading without a JSON round trip. Empty
+    /// when the hint is absent or unparseable — an unparseable hint degrades to an id-only dial.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hint_addrs: Vec<String>,
+    /// Whether `last_addr` parses AND its embedded id matches this peer. A `false` here with a
+    /// present `last_addr` means the hint is being silently discarded at every dial.
+    pub hint_usable: bool,
+    /// This node's LIVE view of the peer from the reachability cache, if it has one — the same
+    /// values `status` reports, repeated here so one capture holds both the durable and the live
+    /// side. `None` when the peer has never been probed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reachability: Option<PeerReachability>,
+}
+
 /// Params of [`Request::UnregisterService`] (#50): the persistent (or ephemeral) service name
 /// to remove — the deregistration mirror of `register_service`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -830,6 +886,11 @@ pub enum Request {
     /// and returns the service names whose allow admits the caller's principal. Answers
     /// [`PeerServicesResult`].
     PeerServices(PeerServicesParams),
+    /// Dump the DURABLE per-peer state this node carries for one peer (#140) — the persisted dial
+    /// hint, the pairing stamp, and the live reachability row, in one capture. A DIAGNOSTIC verb:
+    /// unlike every other surface it carries transport vocabulary on purpose. Answers with
+    /// [`PeerDiagnosticsResult`]. `api_minor >= 33`.
+    PeerDiagnostics(PeerDiagnosticsParams),
     ServiceAllowGrant(ServiceAllowParams),
     /// Revoke a single stable principal from a single service's allow (#44) — "sharing off"
     /// WITHOUT unpairing (the peer's identity row is untouched; only NEW sessions are refused).
@@ -1515,7 +1576,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   thirty have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.32";
+pub const API_VERSION: &str = "1.33";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -1587,7 +1648,9 @@ pub const API_VERSION: &str = "1.32";
 /// rewrite it (#147); to 32 with [`SelfNetwork::identity_conflict_epoch`] — two nodes booted from
 /// COPIES of one mesh root share an endpoint id, and the displaced one's peers went unreachable
 /// with nothing saying why. The relay reports it and iroh only `warn!`s it, so the fact existed
-/// and was unreadable (#134).
+/// and was unreadable (#134); to 33 with the `peer_diagnostics` verb — a long-lived pairing that
+/// cannot hole-punch while a fresh identity on the same hardware can differs only in DURABLE
+/// per-peer state, and none of it was readable from outside the daemon (#140).
 ///
 /// **Not every semantic change gets a minor, and that is the gap to watch (#122).** A minor marks a
 /// change to this *surface*. A change to behaviour BEHIND the surface — same fields, same shapes,
@@ -1598,7 +1661,7 @@ pub const API_VERSION: &str = "1.32";
 /// That class is bigger than it looks: **10, 17, 21, 22, 23 and 24 all shipped with no change to
 /// any type in this file** — they moved meaning, not shape. Six of the thirty. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 32;
+pub const API_MINOR: u32 = 33;
 
 #[cfg(test)]
 mod tests {

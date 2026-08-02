@@ -633,6 +633,20 @@ pub(crate) async fn handle_request(req: &Value, state: &DaemonState) -> Value {
                 crate::daemon::peer_services(state, p.peer).await,
             )
         }
+        // #140: dump the durable per-peer state — a DIAGNOSTIC surface that deliberately carries
+        // transport vocabulary, because "what address is this node about to dial" cannot be
+        // answered without the address.
+        Some("peer_diagnostics") => {
+            let p: mcpmesh_local_api::PeerDiagnosticsParams = match params_of(&params) {
+                Ok(p) => p,
+                Err(e) => return error(id, -32602, format!("peer_diagnostics: {e}")),
+            };
+            respond(
+                id,
+                "peer_diagnostics",
+                crate::daemon::peer_diagnostics(state, &p.peer).await,
+            )
+        }
         // Deregistration (#50): remove a service registration, mirror of register_service.
         Some("unregister_service") => respond(
             id,

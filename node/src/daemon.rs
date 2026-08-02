@@ -120,8 +120,8 @@ pub use handlers::RELAY_READY_TIMEOUT;
 pub use handlers::unregister_ephemeral;
 pub(crate) use handlers::{
     add_peer, blob_fetch, blob_grant, blob_list, blob_publish, blob_republish, blob_revoke,
-    blob_unpublish, mint_invite, open_session, peer_services, redeem, register_service,
-    service_allow_grant, service_allow_revoke, set_relays, unregister_service,
+    blob_unpublish, mint_invite, open_session, peer_diagnostics, peer_services, redeem,
+    register_service, service_allow_grant, service_allow_revoke, set_relays, unregister_service,
 };
 pub(crate) use roster_install::{
     install_roster, org_join, set_app_metadata, set_nickname, set_roster_url,

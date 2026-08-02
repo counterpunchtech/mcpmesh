@@ -875,6 +875,70 @@ pub(crate) async fn redeem(state: &DaemonState, invite_line: String) -> Result<P
 /// Only the caller's own admitted services. Reuses a cache entry younger than `REACH_TTL_SECS`
 /// rather than always probing (#89) — see `probe_peer_cached` for why an unconditional probe made
 /// this verb collide with the ping rate limiter and report healthy peers as offline.
+/// Dump the DURABLE per-peer state for one peer (#140), plus this node's live view of it.
+///
+/// The question behind #140 is "what does a long-lived pairing carry that a fresh identity does
+/// not, that could durably prevent a hole-punch while leaving relayed connectivity healthy?" The
+/// honest answer from this side is: exactly one thing survives a restart and differs between the
+/// two, and that is [`PeerEntry::last_addr`](crate::allowlist::PeerEntry::last_addr). Everything
+/// else a fresh identity lacks is derived at runtime.
+///
+/// So this reports the hint verbatim, whether it PARSES and matches this peer (an unusable hint is
+/// silently discarded at every dial, which is invisible from outside), the addresses inside it, and
+/// the live reachability row — one capture, both sides of the question, runnable on both ends of a
+/// stuck pairing.
+///
+/// **Deliberately carries transport vocabulary**, alone among the verbs. See
+/// [`PeerDiagnosticsResult`](mcpmesh_local_api::PeerDiagnosticsResult).
+///
+/// Read-only: it probes nothing, dials nothing, and writes nothing — running it cannot perturb the
+/// state being diagnosed, which matters when the reproduction is the thing under study.
+pub(crate) async fn peer_diagnostics(
+    state: &DaemonState,
+    peer: &str,
+) -> Result<mcpmesh_local_api::PeerDiagnosticsResult> {
+    let mesh = state.mesh_required()?;
+    let endpoint_id = resolve_peer_endpoint(mesh, peer).await?;
+    let store = mesh.store.clone();
+    let entry = blocking("join peer-diagnostics store read", move || {
+        store.resolve(&endpoint_id)
+    })
+    .await??
+    .with_context(|| format!("peer '{peer}' is not in the allowlist"))?;
+
+    let id = iroh::EndpointId::from_bytes(&endpoint_id)
+        .map_err(|e| anyhow::anyhow!("stored endpoint id for '{peer}' is invalid: {e}"))?;
+    // Parse the hint the same way the DIAL does — via `stored_dial_addr`, not a bespoke reading —
+    // so "usable" here means usable to the code that actually dials, and the two cannot drift.
+    let dialed = crate::daemon::dial::stored_dial_addr(entry.last_addr.as_deref(), id);
+    let hint_addrs: Vec<String> = dialed
+        .addrs
+        .iter()
+        .filter_map(|a| match a {
+            iroh::TransportAddr::Ip(s) => Some(s.to_string()),
+            _ => None,
+        })
+        .collect();
+    // An id-only `EndpointAddr` is what a MISSING or REJECTED hint degrades to, so a stored hint
+    // that yields no addresses is one being thrown away at every dial.
+    let hint_usable = entry.last_addr.is_some() && !dialed.addrs.is_empty();
+
+    let reachability = crate::daemon::reachability_of(mesh)
+        .into_iter()
+        .find(|r| r.name == entry.nickname);
+
+    Ok(mcpmesh_local_api::PeerDiagnosticsResult {
+        nickname: entry.nickname,
+        principal: mcpmesh_net::EndpointId::from_bytes(entry.endpoint_id).principal(),
+        user_id: entry.user_id,
+        paired_at: entry.paired_at,
+        last_addr: entry.last_addr,
+        hint_addrs,
+        hint_usable,
+        reachability,
+    })
+}
+
 pub(crate) async fn peer_services(
     state: &DaemonState,
     peer: String,
@@ -1705,6 +1769,97 @@ mod tests {
         unregister_service(&state, "kb".into()).await.unwrap();
         unregister_service(&state, "ghost".into()).await.unwrap();
         assert!(has("notes"));
+    }
+
+    /// #140: the dump reports the durable state, and `hint_usable` agrees with what the DIAL
+    /// actually does — including the case that is invisible from outside.
+    ///
+    /// A stored hint whose embedded id is not this peer, or that does not parse, is silently
+    /// discarded by `stored_dial_addr` at EVERY dial: the node behaves as if it had no hint while
+    /// the store says it has one. That is the discrepancy this verb exists to expose, so it is
+    /// computed through `stored_dial_addr` itself rather than by re-reading the JSON — the two
+    /// cannot disagree.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn peer_diagnostics_reports_the_hint_the_dial_would_actually_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+
+        let key = iroh::SecretKey::from_bytes(&[3u8; 32]);
+        let eid = *key.public().as_bytes();
+        let other = *iroh::SecretKey::from_bytes(&[4u8; 32]).public().as_bytes();
+        let seed = |last_addr: Option<String>| {
+            mesh.store
+                .add(crate::allowlist::PeerEntry {
+                    endpoint_id: eid,
+                    nickname: "jetson".into(),
+                    services: vec![],
+                    paired_at: Some("1753000000".into()),
+                    user_id: None,
+                    last_addr,
+                })
+                .unwrap();
+        };
+
+        // No hint: the node dials by id alone — the same shape a freshly paired identity has, and
+        // the baseline #140 compares against.
+        seed(None);
+        let d = peer_diagnostics(&state, "jetson").await.unwrap();
+        assert_eq!(d.nickname, "jetson");
+        assert!(d.principal.starts_with("eid:"), "{}", d.principal);
+        assert_eq!(d.last_addr, None);
+        assert!(!d.hint_usable, "no hint cannot be a usable hint");
+        assert!(d.hint_addrs.is_empty());
+        assert_eq!(d.paired_at.as_deref(), Some("1753000000"));
+
+        // A usable hint: reported verbatim, with its addresses extracted.
+        let good = serde_json::to_string(&iroh::EndpointAddr::from_parts(
+            key.public(),
+            [iroh::TransportAddr::Ip(
+                "192.168.1.50:4433".parse().unwrap(),
+            )],
+        ))
+        .unwrap();
+        seed(Some(good.clone()));
+        let d = peer_diagnostics(&state, "jetson").await.unwrap();
+        assert_eq!(d.last_addr.as_deref(), Some(good.as_str()));
+        assert!(d.hint_usable, "a well-formed hint for THIS peer is usable");
+        assert_eq!(d.hint_addrs, vec!["192.168.1.50:4433".to_string()]);
+
+        // The invisible case: a hint whose embedded id is a DIFFERENT peer. The store holds it,
+        // and every dial throws it away. Reporting this as usable would send someone hunting the
+        // wrong address.
+        let mismatched = serde_json::to_string(&iroh::EndpointAddr::from_parts(
+            iroh::EndpointId::from_bytes(&other).unwrap(),
+            [iroh::TransportAddr::Ip(
+                "192.168.1.99:4433".parse().unwrap(),
+            )],
+        ))
+        .unwrap();
+        seed(Some(mismatched.clone()));
+        let d = peer_diagnostics(&state, "jetson").await.unwrap();
+        assert_eq!(
+            d.last_addr.as_deref(),
+            Some(mismatched.as_str()),
+            "the stored value is reported verbatim — that is the evidence"
+        );
+        assert!(
+            !d.hint_usable,
+            "a hint for a different endpoint is discarded at every dial; saying otherwise sends \
+             the reader after an address the node never uses"
+        );
+        assert!(
+            d.hint_addrs.is_empty(),
+            "and its addresses are not this peer's"
+        );
+
+        // Garbage degrades the same way, rather than erroring the verb.
+        seed(Some("not json at all".into()));
+        let d = peer_diagnostics(&state, "jetson").await.unwrap();
+        assert!(!d.hint_usable);
+        assert_eq!(d.last_addr.as_deref(), Some("not json at all"));
     }
 
     /// #149: `service_allow_revoke` strips an allow entry by EXACT STRING, so a BARE entry — a

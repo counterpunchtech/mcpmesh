@@ -7,7 +7,7 @@ named pipe on Windows. Anything that can open the endpoint and parse JSON can sp
 language — [`local-api/examples/status.py`](../local-api/examples/status.py) is a complete client
 in ~60 lines of dependency-free Python.
 
-> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.32`, `api_minor` `32`) and evolves
+> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.33`, `api_minor` `33`) and evolves
 > **additively** (see [Versioning](#versioning)), but until a stable release this document — like the
 > wire format itself — may change without a migration path. Pin the mcpmesh version you build
 > against. Source of truth is the Rust in [`local-api/`](../local-api/src/protocol.rs); where this
@@ -155,6 +155,7 @@ Methods split into two groups by audience:
 | `service_allow_grant` | `{service, principal}` — grant a stable principal (`b64u:`/`eid:`) access to ONE service's allow WITHOUT (re)pairing (#44), under the daemon's config lock + hot-reload. The per-peer "sharing on" toggle. Works on EPHEMERAL registrations too, mutating their in-memory allow (#55, `api_minor >= 11`). Idempotent; a name in neither the config nor the ephemeral registry → `-32040`. **When the edit lands only in the ephemeral overlay (nothing changes on disk), the registry is updated in place rather than rebuilt from `config.toml` — so the verb no longer picks up unrelated hand-edits to the config file as a side effect (#94). Use `register_service` or a daemon restart to apply config edits.** | `{}` (ack) |
 | `service_allow_revoke` | `{service, principal}` — remove ONE allow entry from ONE service WITHOUT unpairing (#44): the peer's `PeerEntry` identity is untouched. **`principal` is matched as an EXACT STRING, never resolved — so any literal in the list is a valid target, including a BARE entry** (a legacy nickname from a pre-#38 config, a roster group name). See the note below (#149). **Immediate at `api_minor >= 10`** — see "Revocation is immediate" below. Works on EPHEMERAL registrations too (#69, `api_minor >= 11`). Idempotent; an absent principal is a clean no-op, a name in neither the config nor the ephemeral registry → `-32040`. **Same overlay-only fast path as `service_allow_grant`: when nothing changes on disk the registry is updated in place rather than rebuilt, so unrelated `config.toml` hand-edits are not applied as a side effect (#94).** | `{}` (ack) |
 | `unregister_service` | `{name}` — remove a service registration (#50), the mirror of `register_service`: drops the whole `[services.<name>]` entry (allow included) + any ephemeral registration, then hot-reloads. Idempotent; unknown name → clean no-op. In-flight sessions finish; no new ones admitted. | `{}` (ack) |
+| `peer_diagnostics` | `{peer}` — dump the DURABLE state this node stores for one peer (#140, `api_minor >= 33`): the persisted dial hint verbatim, whether it is actually usable (an unparseable or id-mismatched hint is silently discarded at every dial), the addresses inside it, the pairing stamp, and the live reachability row. **The one verb that deliberately carries transport vocabulary** — see the note below. Read-only: probes nothing, dials nothing, writes nothing. | `PeerDiagnosticsResult` |
 | `peer_services` | `{peer}` — discover which services a paired `peer` (nickname / `eid:` / `b64u:`) CURRENTLY grants you (#52): dials the peer over `mcpmesh/ping/1` and returns `{services:[…]}` — the names whose allow admits YOUR principal (only yours, never the peer's full registry). **Reuses a reachability-cache entry younger than ~20s rather than always dialing (#89)** — an unconditional probe collided with the `mcpmesh/ping/1` rate limiter, and a refused probe is reported as unreachable, so polling this verb faster than ~1/s made a healthy peer appear offline. Freshness is now the same contract `status` gives. **Answered from the LIVE service registry — the same one the accept path authorizes from (#100, `api_minor >= 17`). A service present in `config.toml` but not yet loaded is NOT reported: it would be refused on connect, which a caller cannot distinguish from a network failure. `status` likewise lists only live services.** | `{services:[…]}` |
 | `set_relays` | `{relay_urls}` — set this node's CUSTOM relay set LIVE (#53, `api_minor >= 9`): each URL must parse as an iroh relay URL (empty list → error; disable relays via a `relay_mode="disabled"` restart). When the node is already `relay_mode="custom"`, the daemon diffs against the running endpoint and applies the delta with iroh's live `insert_relay`/`remove_relay` — **no restart, no dropped peer sessions** — then persists `[network] relay_mode="custom" relay_urls=[…]` under the config lock. Idempotent (an unchanged set → `changed:false`, no writes). When the node is currently `default`/`disabled`, iroh cannot live-transition the relay MODE: the config is persisted but `restart_required:true` is returned (apply on next start). | `{changed, restart_required}` |
 | `set_app_metadata` | `{metadata}` — attach this node's opaque app metadata (#39, `api_minor >= 4`, roster mode): a ≤256-byte blob the daemon never interprets, folded **signed** into each presence heartbeat so paired roster peers see it in their `status` presence (`PresencePeer.meta`) — no per-peer session. `""` clears it. In-memory (lost on restart; re-set on startup). Over-cap → error. In pairing mode it is carried on the `mcpmesh/ping/1` reachability probe pong instead (#40), surfacing as `PeerReachability.meta` (near-real-time when a peer reads `status` — the probe cache has a ~20s TTL). | `{}` (ack) |
@@ -710,6 +711,41 @@ become viable).
 }
 ```
 
+### `peer_diagnostics` — the durable state behind one pairing (`api_minor >= 33`, #140)
+
+**This verb prints IP addresses. Every other surface deliberately does not.** The rule everywhere
+else — nicknames and path *kinds*, never coordinates — exists so a peer's address cannot leak
+through a screenshot or a log. Here it is the whole question: "what is this node about to dial, and
+where did that come from" has no answer without the address. It is your own store's record of your
+own paired peers; read the output before pasting it anywhere public.
+
+It exists because of a specific shape of failure: a long-lived pairing that cannot hole-punch while
+a **fresh identity on the same hardware punches direct in milliseconds**. Everything else having
+been eliminated, the question becomes what durable state a long-lived pairing carries that a fresh
+one does not — and from this node's side there is exactly one such thing, the persisted dial hint.
+Everything else a fresh identity lacks is derived at runtime.
+
+```json
+{"nickname": "jetson", "principal": "eid:9f2k…", "paired_at": "1753600000",
+ "last_addr": "{\"id\":\"…\",\"addrs\":[…]}", "hint_addrs": ["192.168.1.50:4433"],
+ "hint_usable": true,
+ "reachability": {"name": "jetson", "reachable": true, "path": {"kind": "relay"}, …}}
+```
+
+`hint_usable` is the field to read first. A stored hint that does not parse, or whose embedded
+endpoint id is a *different* peer, is silently discarded on every dial — the node behaves as though
+it had no hint at all while the store insists it has one. That discrepancy is invisible from every
+other surface, and it is computed here by running the hint through the same function the dial uses,
+so the two cannot disagree.
+
+**The hint is merged with discovery, not substituted for it.** iroh inserts these addresses as
+additional candidate paths and still runs address lookup, so a stale entry does not by itself hide a
+live address. It remains the first thing to compare because it is the only durable per-peer
+difference.
+
+Intended as a **paired capture**: run it on both ends of a stuck pairing and read the two side by
+side. `mcpmesh internal peer state <peer> [--json]`.
+
 ### `identity_conflict_epoch` — someone else is using this identity (`api_minor >= 32`, #134)
 
 Two nodes booted from **copies** of one mesh root present the same endpoint id. A relay can serve
@@ -1034,7 +1070,8 @@ things:
   strings + `ServiceInfo.allow_display` are `api_minor >= 3` (#38); the `reachability` frame's
   `source` — which of the two producers observed the transition (#150) — is `api_minor >= 30`;
   the branchable nickname-collision refusal `-32043` (#147) is `api_minor >= 31`;
-  `SelfNetwork.identity_conflict_epoch` (#134) is `api_minor >= 32`.
+  `SelfNetwork.identity_conflict_epoch` (#134) is `api_minor >= 32`; the `peer_diagnostics` verb
+  (#140) is `api_minor >= 33`.
   `api_minor` is itself additive: a pre-1.1 daemon omits it and it reads as `0`.
 
 Changes remain **additive within a major**: new response fields are optional (absent-tolerant), so a
