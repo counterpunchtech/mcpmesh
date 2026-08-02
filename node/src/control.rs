@@ -546,7 +546,7 @@ pub(crate) async fn handle_request(req: &Value, state: &DaemonState) -> Value {
                 id,
                 "invite",
                 with_params(&params, |p: InviteParams| {
-                    crate::daemon::mint_invite(p.services, p.app_label, mesh)
+                    crate::daemon::mint_invite(p.services, p.app_label, p.max_uses, mesh)
                 })
                 .await,
             )
@@ -872,7 +872,7 @@ pub(crate) async fn handle_request(req: &Value, state: &DaemonState) -> Value {
 /// is the caller's error), while a handler failure stays `-32000`. Carried through the shared
 /// `anyhow::Result` surface and recovered by downcast.
 #[derive(Debug)]
-struct InvalidParams(String);
+pub(crate) struct InvalidParams(pub(crate) String);
 impl std::fmt::Display for InvalidParams {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)

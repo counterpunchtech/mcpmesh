@@ -7,7 +7,7 @@ named pipe on Windows. Anything that can open the endpoint and parse JSON can sp
 language — [`local-api/examples/status.py`](../local-api/examples/status.py) is a complete client
 in ~60 lines of dependency-free Python.
 
-> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.34`, `api_minor` `34`) and evolves
+> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.35`, `api_minor` `35`) and evolves
 > **additively** (see [Versioning](#versioning)), but until a stable release this document — like the
 > wire format itself — may change without a migration path. Pin the mcpmesh version you build
 > against. Source of truth is the Rust in [`local-api/`](../local-api/src/protocol.rs); where this
@@ -147,7 +147,7 @@ Methods split into two groups by audience:
 | `audit_summary` | *(none)* | `{per_peer:[[name,count],…], per_service:[[name,count],…], total_sessions}` — this node's **local** session tallies; nothing is transmitted |
 | `audit_prune` | `{before:"YYYY-MM"}` — delete audit months **strictly older** than `before` (that month itself is kept), `api_minor >= 27` (#88). The month shape is validated up front: a malformed key is an error, never a silent no-op. Idempotent; local-only; owner-only (the control socket). | `{deleted_months:[…]}` ascending |
 | `audit_list` | `{since?, until?, kind?, peer?, limit?, offset?}` — read this node's **local** audit records, filtered (AND-combined) and paged, `api_minor >= 27` (#88): the "show me everything you hold about me" verb. `since`/`until` are inclusive `YYYY-MM` month keys (the rotation unit). `kind` is one of `session_open` / `session_close` / `request` / `blob_fetch` / `trust` — an unknown kind **errors** rather than silently matching all. `limit` defaults to 500 and is **clamped to 1000** (the response is one JSON frame; `blob_list`'s minor-20 lesson). `total` counts ALL matches, so a caller pages without a second counting call. | `{records:[AuditRecord…], total}` chronological (oldest month first) |
-| `invite` | `{services:[…]}` — mint a single-use pairing invite. **Outstanding invites survive a daemon restart** (`api_minor >= 34`, #87b): they are persisted, so `expires_at_epoch` is the real lifetime rather than an upper bound on process lifetime. A mint that cannot be persisted is an ERROR rather than an invite that will quietly not survive. | `{invite_line:"mcpmesh-invite:…", expires_at_epoch}` |
+| `invite` | `{services:[…], max_uses?}` — mint a pairing invite. **Outstanding invites survive a daemon restart** (`api_minor >= 34`, #87b): they are persisted, so `expires_at_epoch` is the real lifetime rather than an upper bound on process lifetime, and a mint that cannot be persisted is an ERROR rather than an invite that will quietly not survive. **`max_uses`** (#87, `api_minor >= 35`) makes it redeemable that many times, each redemption running its OWN SAS ceremony and writing its own peer rows — N independent pairings sharing one secret, never a group identity. Absent = 1. `0` is rejected (`-32602`); above `MAX_INVITE_USES` (64) is clamped, and `uses_remaining` in the result is the value ACTUALLY applied — read it rather than assuming your request was honoured. Sending `max_uses` to an `api_minor < 35` daemon FAILS with `-32602 unknown field` rather than degrading to single-use (params are strict), so omit it unless you have checked. | `{invite_line, expires_at_epoch, uses_remaining}` |
 | `pair` | `{invite_line}` | `{peer_nickname, sas_code, services:[…], app_label?, peer_user_id?}` — `app_label` echoes any opaque label the inviter attached (#31); `peer_user_id` is the inviter's stable `b64u:` identity when it presented a binding (#30). **Grants MUTUALLY (#43):** redemption grants the inviter access to ALL services THIS (redeemer) node serves — under the same stable-principal rule as the inviter-side grant — so one ceremony admits both directions. Fails (no dial attempted) if the invite's suggested nickname is already yours for a *different* peer; see [Nickname collisions](#nickname-collisions) |
 | `peer_remove` | `{nickname}` | `{}` (ack) |
 | `peer_rename` | `{to, user_id?, nickname?}` — rename a person by `user_id`, else a provisional contact by `nickname` | `{}` (ack) |
@@ -1082,7 +1082,8 @@ things:
   the branchable nickname-collision refusal `-32043` (#147) is `api_minor >= 31`;
   `SelfNetwork.identity_conflict_epoch` (#134) is `api_minor >= 32`; the `peer_diagnostics` verb
   (#140) is `api_minor >= 33`; durable outstanding invites — `expires_at_epoch` became the real
-  lifetime rather than an upper bound on process lifetime (#87b) — are `api_minor >= 34`.
+  lifetime rather than an upper bound on process lifetime (#87b) — are `api_minor >= 34`;
+  `InviteParams.max_uses` + `InviteResult.uses_remaining` (#87) are `api_minor >= 35`.
   `api_minor` is itself additive: a pre-1.1 daemon omits it and it reads as `0`.
 
 Changes remain **additive within a major**: new response fields are optional (absent-tolerant), so a

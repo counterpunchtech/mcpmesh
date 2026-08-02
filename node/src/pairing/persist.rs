@@ -8,9 +8,15 @@
 //! **This file holds BEARER SECRETS.** Anyone who can read it can redeem those invites until they
 //! expire or are burned. That is a deliberate, recorded decision rather than an oversight: the
 //! device key already lives on disk at `0600` and grants strictly more — it *is* the node's
-//! identity, permanently — whereas an invite secret is single-use, TTL-bounded, and grants only the
-//! right to pair. Declining to persist the lesser credential while persisting the greater one
-//! protects nothing.
+//! identity, permanently — whereas an invite secret is TTL-bounded and grants only the right to
+//! pair. Declining to persist the lesser credential while persisting the greater one protects
+//! nothing.
+//!
+//! **The bound widened with #87 and the argument still holds, but state it honestly**: an invite is
+//! no longer necessarily single-use. It admits up to `max_uses` (capped at 64) redemptions inside
+//! its TTL, so a leaked file is worth up to that many pairings rather than one. It remains strictly
+//! less than the device key, which is unbounded and permanent — and the count is written here
+//! precisely so it cannot be reset by a restart.
 //!
 //! Deleting this file is a safe operator action: it invalidates every outstanding invite and
 //! nothing else.
@@ -127,6 +133,7 @@ mod tests {
             services: vec!["notes".into()],
             expires_at_epoch,
             app_label: None,
+            uses_remaining: 1,
         }
     }
 

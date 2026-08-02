@@ -735,9 +735,22 @@ fn unregistered_service_error(requested: &[String], served: &[String]) -> Option
 pub(crate) async fn mint_invite(
     services: Vec<String>,
     app_label: Option<String>,
+    max_uses: Option<u32>,
     mesh: &MeshState,
 ) -> Result<InviteResult> {
     use rand::RngCore;
+
+    // #87: `None` = 1, the single-use default every existing caller already gets. `0` is REJECTED
+    // rather than silently meaning "unusable" — a caller asking for zero redemptions has a bug,
+    // and answering with an invite nobody can redeem hides it. Above the cap is CLAMPED, and the
+    // clamped value is what comes back, so a caller is never told it got more than it did.
+    let uses_remaining = match max_uses {
+        None => 1,
+        Some(0) => anyhow::bail!(crate::control::InvalidParams(
+            "max_uses must be at least 1 (omit it for a single-use invite)".into()
+        )),
+        Some(n) => n.min(mcpmesh_local_api::MAX_INVITE_USES),
+    };
 
     // The opaque app label (#31) is capped: the invite line is a human-copied base32 artifact,
     // so a caller cannot bloat it. mcpmesh never interprets the label — this bounds size only.
@@ -803,6 +816,7 @@ pub(crate) async fn mint_invite(
         services: services.clone(),
         expires_at_epoch,
         app_label,
+        uses_remaining,
     };
     let invite_line = invite.encode();
     // Reap expired invites before minting so a long-lived daemon's registry can't grow
@@ -817,10 +831,11 @@ pub(crate) async fn mint_invite(
     )?;
 
     // Trust event: record the mint. NO secret, NO peer id (there is no peer yet).
-    tracing::info!(?services, "invite minted");
+    tracing::info!(?services, uses_remaining, "invite minted");
     Ok(InviteResult {
         invite_line,
         expires_at_epoch,
+        uses_remaining,
     })
 }
 
@@ -1930,6 +1945,47 @@ mod tests {
         );
     }
 
+    /// #87: `max_uses` is clamped, `0` is rejected, and the CLAMPED value is what comes back.
+    ///
+    /// Reporting the requested value rather than the applied one would let a caller ask for 500,
+    /// be told 500, and discover the truth when the 65th colleague fails. Rejecting `0` rather
+    /// than treating it as "unusable" surfaces a caller bug instead of minting a credential
+    /// nobody can redeem.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn max_uses_is_clamped_and_zero_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[services.notes]\nsocket = \"/run/notes.sock\"\nallow = []\n",
+        )
+        .unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        let svc = || vec!["notes".to_string()];
+
+        let one = mint_invite(svc(), None, None, &mesh).await.unwrap();
+        assert_eq!(one.uses_remaining, 1, "absent means single-use");
+
+        let three = mint_invite(svc(), None, Some(3), &mesh).await.unwrap();
+        assert_eq!(three.uses_remaining, 3);
+
+        let capped = mint_invite(svc(), None, Some(10_000), &mesh).await.unwrap();
+        assert_eq!(
+            capped.uses_remaining,
+            mcpmesh_local_api::MAX_INVITE_USES,
+            "over the cap is clamped, and the caller is told the value it ACTUALLY got"
+        );
+
+        let err = mint_invite(svc(), None, Some(0), &mesh)
+            .await
+            .expect_err("zero redemptions is a caller bug, not a valid invite");
+        assert!(
+            err.downcast_ref::<crate::control::InvalidParams>()
+                .is_some(),
+            "and it must be branchable as -32602 invalid params, not a generic failure: {err}"
+        );
+    }
+
     /// #87b gate: the DAEMON path really persists. `mint_invite` -> a file on disk.
     ///
     /// Every other test for this drove `LiveInvites`/`InviteFile` directly, which left the wiring
@@ -1960,7 +2016,7 @@ allow = []
         )
         .await;
 
-        let res = mint_invite(vec!["notes".into()], None, &mesh)
+        let res = mint_invite(vec!["notes".into()], None, None, &mesh)
             .await
             .expect("mint");
         assert!(res.invite_line.starts_with("mcpmesh-invite:"));

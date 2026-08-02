@@ -104,20 +104,42 @@ fn strip_wire_framing(message: &str) -> &str {
 /// `services` arg (what the operator asked to grant). No peer endpoint id appears — the only
 /// id-bearing artifact is the opaque invite line itself.
 pub fn invite_lines(invite: &InviteResult, services: &[String], now: u64) -> Vec<String> {
-    vec![
-        format!(
+    // #87: say the quota when it is not the single-use default, and say it FIRST — someone about
+    // to paste a line into a group chat needs to know it admits more than one person before they
+    // paste it, not after.
+    let headline = match invite.uses_remaining {
+        1 => format!(
             "One-time invite (expires {}). Share it out-of-band:",
             friendly_expiry(invite.expires_at_epoch, now)
         ),
+        n => format!(
+            "Invite for {n} people (expires {}). Anyone holding it can redeem it {n} times \
+             — share it out-of-band:",
+            friendly_expiry(invite.expires_at_epoch, now)
+        ),
+    };
+    let mut out = vec![
+        headline,
         format!("  {}", invite.invite_line),
         format!("Whoever redeems it can access: {}", services.join(", ")),
         String::new(),
+    ];
+    out.push(if invite.uses_remaining == 1 {
         "Next: send them that line over any channel. They redeem it with `mcpmesh pair <line>`,"
-            .to_string(),
+            .to_string()
+    } else {
+        "Next: send that line to each of them. Each redeems it with `mcpmesh pair <line>`,"
+            .to_string()
+    });
+    out.push(
         "which prints a short safety code — run `mcpmesh status` to see yours and confirm the two"
             .to_string(),
-        "match, out loud. Same words = the pairing is authentic.".to_string(),
-    ]
+    );
+    out.push("match, out loud. Same words = the pairing is authentic.".to_string());
+    if invite.uses_remaining > 1 {
+        out.push("Every redemption gets its own code — compare each one separately.".to_string());
+    }
+    out
 }
 
 /// Render the `mcpmesh pair` success output: the SAS, the ceremony as the next step, what the
@@ -661,6 +683,44 @@ pub fn render_frame(frame: &StreamFrame) -> String {
 mod tests {
     use mcpmesh_local_api::{PeerInfo, ServiceInfo};
 
+    /// #87: a multi-use invite SAYS so, and says it first.
+    ///
+    /// Someone about to paste a line into a group chat needs to know it admits more than one
+    /// person BEFORE they paste it. Rendering it identically to a single-use invite would be a
+    /// quiet way to leak a several-person credential.
+    #[test]
+    fn a_multi_use_invite_announces_its_quota() {
+        use mcpmesh_local_api::InviteResult;
+        let at = |uses_remaining| InviteResult {
+            invite_line: "mcpmesh-invite:ABC".into(),
+            expires_at_epoch: 1_800_000_000,
+            uses_remaining,
+        };
+        let svc = vec!["notes".to_string()];
+
+        let single = super::invite_lines(&at(1), &svc, 1_799_000_000).join("\n");
+        assert!(single.contains("One-time invite"), "{single}");
+        assert!(
+            !single.contains("Every redemption"),
+            "no multi-use noise on an ordinary invite: {single}"
+        );
+
+        let multi = super::invite_lines(&at(5), &svc, 1_799_000_000).join("\n");
+        assert!(
+            multi.contains("5 people") && multi.contains("5 times"),
+            "the quota must be stated up front, before the line itself: {multi}"
+        );
+        assert!(
+            !multi.contains("One-time invite"),
+            "and must not still call itself one-time: {multi}"
+        );
+        assert!(
+            multi.contains("its own code"),
+            "each redemption is its own ceremony; a reader must not expect one shared code: \
+             {multi}"
+        );
+    }
+
     /// #58: the pushed liveness frame renders as a legible line naming the peer and the new
     /// state — and, like every other frame here, shows NO endpoint id even though the row carries
     /// one for programmatic joins.
@@ -703,6 +763,7 @@ mod tests {
         let invite = InviteResult {
             invite_line: "mcpmesh-invite:MFRGGZDF".into(),
             expires_at_epoch: 1_000_000 + DAY,
+            uses_remaining: 1,
         };
         let lines = invite_lines(&invite, &["notes".to_string()], 1_000_000);
         assert_eq!(
@@ -730,6 +791,7 @@ mod tests {
         let invite = InviteResult {
             invite_line: "mcpmesh-invite:X".into(),
             expires_at_epoch: 500 + DAY,
+            uses_remaining: 1,
         };
         let lines = invite_lines(&invite, &["notes".to_string(), "kb".to_string()], 500);
         assert_eq!(lines[2], "Whoever redeems it can access: notes, kb");

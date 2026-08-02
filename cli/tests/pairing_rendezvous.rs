@@ -69,6 +69,7 @@ fn make_invite(
         services: services.iter().map(|s| s.to_string()).collect(),
         expires_at_epoch,
         app_label: None,
+        uses_remaining: 1,
     }
 }
 
@@ -551,6 +552,109 @@ async fn collision_guard_allows_same_peer_additional_service() {
     .expect("additional-service re-pair test timed out");
 }
 
+/// #87: ONE multi-use invite really pairs two different peers, and a later collision on it is
+/// still refused recoverably.
+///
+/// Every other rendezvous case uses a single-use invite, so "every existing guard applies per
+/// redemption" was asserted in prose and never executed. This executes it.
+///
+/// **Scope, stated because the first version of this docstring overclaimed it.** The collision here
+/// is caught by the PRE-check (`peek_live` before `try_redeem`), not by the post-redeem race guard.
+/// That guard also carried a defect — a hardcoded `invite_survived = false`, which told the loser of
+/// a race to fetch a fresh invite while holding one with uses left, and dropped the branchable
+/// ERR_NICKNAME_TAKEN exactly where renaming WOULD work — and it is fixed, but it is NOT covered
+/// here: flipping it back leaves this test green. Reaching it needs a store write interleaved
+/// between peek and burn, and no seam exists for that, which is the same gap #87/#147 recorded for
+/// that arm. Multi-use makes the race routine rather than rare, which is why the fix matters even
+/// unpinned.
+#[tokio::test]
+async fn one_multi_use_invite_pairs_two_peers_and_tells_a_loser_the_truth() {
+    timeout(Duration::from_secs(90), async {
+        let (redeemer, addr, store, invites, inviter_id, _config_path) =
+            setup_full(&format!("[services.notes]\nrun = ['{STUB}']\nallow = []\n")).await;
+        let first_id = *redeemer.id().as_bytes();
+
+        let secret = [31u8; 32];
+        let mut inv = make_invite(secret, inviter_id, &["notes"], FUTURE);
+        inv.uses_remaining = 3;
+        invites.mint(inv).await.unwrap();
+
+        // First redemption: an ordinary pairing off a multi-use line.
+        let reply = drive_redeemer(
+            &redeemer,
+            addr.clone(),
+            hello_frame(&secret, &first_id, "alpha"),
+        )
+        .await;
+        assert_eq!(reply["result"], "ok", "first redemption must pair: {reply}");
+        assert!(
+            store.resolve(&first_id).unwrap().is_some(),
+            "and must write a real peer row"
+        );
+
+        // SECOND redemption of the SAME line by a DIFFERENT endpoint — the point of the feature.
+        let second = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .secret_key(iroh::SecretKey::from_bytes(&[77u8; 32]))
+            .bind()
+            .await
+            .expect("bind a second redeemer");
+        let second_id = *second.id().as_bytes();
+        assert_ne!(second_id, first_id);
+        let reply = drive_redeemer(
+            &second,
+            addr.clone(),
+            hello_frame(&secret, &second_id, "beta"),
+        )
+        .await;
+        assert_eq!(
+            reply["result"], "ok",
+            "the SAME invite must pair a second, independent peer: {reply}"
+        );
+        let a = store.resolve(&first_id).unwrap().expect("first peer");
+        let b = store.resolve(&second_id).unwrap().expect("second peer");
+        assert_ne!(
+            a.endpoint_id, b.endpoint_id,
+            "two independent pairings, not one shared identity"
+        );
+
+        // Third redemption, colliding on a name the FIRST redeemer already holds. The invite still
+        // has a use left, so the refusal must say RENAME-AND-RETRY, not "get a fresh invite".
+        let third = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .secret_key(iroh::SecretKey::from_bytes(&[78u8; 32]))
+            .bind()
+            .await
+            .expect("bind a third redeemer");
+        let third_id = *third.id().as_bytes();
+        let reply = drive_redeemer(
+            &third,
+            addr.clone(),
+            hello_frame(&secret, &third_id, "alpha"),
+        )
+        .await;
+        assert_eq!(
+            reply["result"], "refused",
+            "the collision must refuse: {reply}"
+        );
+        let reason = reply["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("rename this node"),
+            "a collision on a live multi-use invite is recoverable by renaming — the invite is \
+             untouched, since the pre-check refuses before try_redeem spends a use: {reason}"
+        );
+        assert!(
+            !reason.contains("ask the inviter for a fresh invite"),
+            "and must NOT send it back to the inviter: {reason}"
+        );
+        assert_eq!(
+            reply["code"], "nickname_taken",
+            "and must stay BRANCHABLE — the code exists exactly for the recoverable case, which \
+             this is: {reply}"
+        );
+    })
+    .await
+    .expect("multi-use rendezvous test timed out");
+}
+
 /// Case 4 — collision: a peer "carol" (a DIFFERENT endpoint_id) already exists; a redeemer that
 /// names itself "carol" is REFUSED (blocks assuming another peer's display identity). No entry
 /// is written under the redeemer's id and no grant happens — and since #87 the invite SURVIVES
@@ -842,6 +946,7 @@ async fn repeat_grant_unions_the_redeemers_dial_directory_and_applies_the_new_ni
             services: vec!["kb".into(), "notes".into()],
             expires_at_epoch: FUTURE,
             app_label: None,
+            uses_remaining: 1,
         };
         invites.mint(invite.clone()).await.unwrap();
 
@@ -925,6 +1030,7 @@ async fn redeem_refuses_an_invite_squatting_an_existing_peers_nickname() {
             services: vec!["kb".into()],
             expires_at_epoch: FUTURE,
             app_label: None,
+            uses_remaining: 1,
         };
         invites.mint(invite.clone()).await.unwrap();
 
@@ -982,6 +1088,7 @@ async fn a_dead_invite_dial_reports_the_cause_not_a_bare_connection_failure() {
             services: vec![],
             expires_at_epoch: FUTURE, // the LINE still advertises a live TTL — that is the bug
             app_label: None,
+            uses_remaining: 1,
         };
         let err = redeem_invite(
             redeemer,
@@ -995,9 +1102,16 @@ async fn a_dead_invite_dial_reports_the_cause_not_a_bare_connection_failure() {
         .expect_err("a dead invite must fail");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("no longer live") && msg.contains("restart"),
-            "the error must name the dead-invite causes (expired / already used / inviter \
-             daemon restarted) instead of presenting as a connection failure (#87b): {msg}"
+            msg.contains("no longer live") && msg.contains("expired"),
+            "the error must name the dead-invite causes instead of presenting as a connection \
+             failure (#87b): {msg}"
+        );
+        // #87b made invites SURVIVE restarts, so the old wording — which offered "the inviter's
+        // daemon restarted (invites do not survive a restart)" as an explanation — became a false
+        // one, handed to a user in the exact moment they are working out what went wrong.
+        assert!(
+            !msg.contains("restart"),
+            "and must not blame a restart, which no longer voids an invite: {msg}"
         );
     })
     .await
@@ -1059,6 +1173,7 @@ async fn paired_and_granted_peer_is_admitted_to_the_service_end_to_end() {
             services: vec!["notes".into()],
             expires_at_epoch: FUTURE,
             app_label: None,
+            uses_remaining: 1,
         };
         invites.mint(invite.clone()).await.unwrap();
 
@@ -1240,6 +1355,7 @@ async fn rename_after_pairing_keeps_the_peer_admitted() {
             services: vec!["notes".into()],
             expires_at_epoch: FUTURE,
             app_label: None,
+            uses_remaining: 1,
         };
         invites.mint(invite.clone()).await.unwrap();
         let bob = redeemer_endpoint().await;
@@ -1392,6 +1508,7 @@ async fn pairing_exchanges_and_stores_each_sides_verified_user_id() {
             services: vec![],
             expires_at_epoch: FUTURE,
             app_label: None,
+            uses_remaining: 1,
         };
         invites.mint(invite.clone()).await.unwrap();
 
@@ -1491,6 +1608,7 @@ async fn redeem_refuses_an_address_swap_and_writes_no_entry_p3() {
             services: vec!["notes".into()],
             expires_at_epoch: FUTURE,
             app_label: None,
+            uses_remaining: 1,
         };
 
         let bob = redeemer_endpoint().await;

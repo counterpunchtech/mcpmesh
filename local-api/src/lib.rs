@@ -61,14 +61,14 @@ pub use protocol::{
     BlobFetchParams, BlobFetchResult, BlobGrantParams, BlobListParams, BlobPublishParams,
     BlobPublishResult, BlobRepublishParams, BlobRevokeParams, BlobScopeList, BlobUnpublishParams,
     ERR_BLOB_WITHDRAWN, ERR_NICKNAME_TAKEN, ERR_NO_SUCH_BLOB, ERR_NO_SUCH_SERVICE, Hello,
-    InviteParams, InviteResult, OpenSessionParams, OrgJoinParams, OrgJoinResult, PairParams,
-    PairResult, PeerAddParams, PeerDiagnosticsParams, PeerDiagnosticsResult, PeerInfo, PeerPath,
-    PeerReachability, PeerRemoveParams, PeerRenameParams, PeerServicesParams, PeerServicesResult,
-    PresencePeer, ReachabilitySource, RecentPairing, RegisterServiceParams, RelayInfo, Request,
-    RosterInstallParams, RosterInstallResult, RosterStatus, ScopeInfo, SelfNetwork,
-    ServiceAllowParams, ServiceInfo, SetAppMetadataParams, SetNicknameParams, SetRelaysParams,
-    SetRelaysResult, SetRosterUrlParams, StatusResult, StorageInfo, StreamFrame,
-    UnregisterServiceParams, method_of,
+    InviteParams, InviteResult, MAX_INVITE_USES, OpenSessionParams, OrgJoinParams, OrgJoinResult,
+    PairParams, PairResult, PeerAddParams, PeerDiagnosticsParams, PeerDiagnosticsResult, PeerInfo,
+    PeerPath, PeerReachability, PeerRemoveParams, PeerRenameParams, PeerServicesParams,
+    PeerServicesResult, PresencePeer, ReachabilitySource, RecentPairing, RegisterServiceParams,
+    RelayInfo, Request, RosterInstallParams, RosterInstallResult, RosterStatus, ScopeInfo,
+    SelfNetwork, ServiceAllowParams, ServiceInfo, SetAppMetadataParams, SetNicknameParams,
+    SetRelaysParams, SetRelaysResult, SetRosterUrlParams, StatusResult, StorageInfo, StreamFrame,
+    UnregisterServiceParams, method_of, one_use,
 };
 
 #[cfg(feature = "client")]

@@ -1,6 +1,11 @@
-//! Pairing invites. An invite is a one-time bearer credential the inviter
-//! mints and hands out-of-band; the redeemer dials the inviter's addr on ALPN
-//! `mcpmesh/pair/1`, proves the secret, and both write mutual [`PeerEntry`] rows.
+//! Pairing invites. An invite is a bearer credential the inviter mints and hands out-of-band; the
+//! redeemer dials the inviter's addr on ALPN `mcpmesh/pair/1`, proves the secret, and both write
+//! mutual [`PeerEntry`] rows.
+//!
+//! **Single-use by default, up to `max_uses` when asked (#87).** Each redemption is its own
+//! ceremony — its own SAS, its own mutually authenticated peer rows — so a multi-use invite is N
+//! independent pairings sharing one secret, never a group identity. The count is part of the
+//! credential: it is persisted, and a redemption that cannot be recorded is refused.
 //!
 //! This module is pure types + logic (no iroh, no daemon): the [`Invite`] wire type + its
 //! `mcpmesh-invite:` line codec, and [`LiveInvites`] — the daemon's in-RAM registry of
@@ -21,11 +26,11 @@ use std::sync::{Mutex, MutexGuard};
 /// The scheme prefix of the single copyable pairing artifact.
 const INVITE_SCHEME: &str = "mcpmesh-invite:";
 
-/// A one-time pairing invite. Serialized to the `mcpmesh-invite:` line, carried
-/// out-of-band, and redeemed once over `mcpmesh/pair/1`.
+/// A pairing invite. Serialized to the `mcpmesh-invite:` line, carried out-of-band, and redeemed
+/// over `mcpmesh/pair/1` — once by default, up to `uses_remaining` times (#87).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Invite {
-    /// Single-use bearer credential (32 CSPRNG bytes).
+    /// Bearer credential (32 CSPRNG bytes). Admits `uses_remaining` redemptions before it burns.
     pub secret: [u8; 32],
     /// The redeemer verifies the TLS peer id == this (the address-swap defense).
     pub inviter_id: [u8; 32],
@@ -45,6 +50,15 @@ pub struct Invite {
     /// `#[serde(default)]` so an old invite line decodes to `None` and an old daemon ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_label: Option<String>,
+    /// Redemptions still available on this invite (#87). `1` for an ordinary single-use invite,
+    /// which is what an absent field means — so an invite line minted by an older daemon decodes
+    /// as single-use rather than as unusable.
+    ///
+    /// Decremented per redemption; the invite is BURNED when it reaches zero, so the terminal
+    /// state is byte-identical to the single-use behaviour and the accept gate's `count() == 0`
+    /// check needs no change.
+    #[serde(default = "mcpmesh_local_api::one_use")]
+    pub uses_remaining: u32,
 }
 
 /// The maximum length of [`Invite::app_label`], in bytes. The invite line is a human-copied
@@ -85,20 +99,33 @@ impl Invite {
 /// for why the security model is the secret's entropy, not an attempt cap.
 #[derive(Debug)]
 pub enum Redeem {
-    /// The secret matched a live, unexpired invite; it is now BURNED (removed).
+    /// The secret matched a live, unexpired invite. Its use count is decremented, and it is
+    /// BURNED (removed) when that reaches zero — so a single-use invite is burned on first
+    /// redemption exactly as before (#87). The returned copy carries the count AFTER this
+    /// redemption.
     Ok(Invite),
     /// The secret matched an invite that had already expired; it was removed.
     Expired,
     /// The secret matches no outstanding invite (no state changed).
     Unknown,
+    /// The redemption could not be RECORDED, so it was refused and rolled back (#87).
+    ///
+    /// A use count is part of the credential: if we cannot persist that one was spent, granting it
+    /// would let a restart re-issue it. With `max_uses` up to 64 that is not a bounded slip — it is
+    /// up to `max_uses` extra redemptions per restart, for every restart inside the TTL.
+    ///
+    /// So redemption fails CLOSED, the same direction `mint` fails: a transient write problem
+    /// denies a pairing that can be retried, rather than silently over-issuing a bearer credential
+    /// nobody can count.
+    Unavailable,
 }
 
 /// The daemon's in-RAM registry of outstanding invites, keyed by secret.
 ///
 /// **Model.** The redeemer SENDS a secret; the daemon LOOKS IT UP. A wrong/absent secret is
 /// simply not in the map → [`Redeem::Unknown`], NO state change — so probing random secrets can
-/// never burn or perturb a real invite. A matched live invite is BURNED on redemption
-/// (single-use). Security rests ENTIRELY on the 32-byte CSPRNG secret (2^256), NOT on any
+/// never burn or perturb a real invite. A matched live invite has its use count decremented and is
+/// BURNED when that reaches zero — once, for an ordinary single-use invite (#87). Security rests ENTIRELY on the 32-byte CSPRNG secret (2^256), NOT on any
 /// attempt cap: a per-invite guess counter would be both useless here (a stranger's garbage
 /// secret is unattributable to any invite → `Unknown`) AND harmful (attributing garbage to
 /// invites would let a stranger invalidate every live invite), so there is none. Map growth is
@@ -236,9 +263,11 @@ impl LiveInvites {
             .is_some_and(|inv| inv.expires_at_epoch >= now_epoch)
     }
 
-    /// Redeem `secret` at `now_epoch`. Unknown secret → [`Redeem::Unknown`] (no state
-    /// change). Known but expired → [`Redeem::Expired`] (removed). Known + live → SUCCESS:
-    /// the invite is BURNED (removed) and returned as [`Redeem::Ok`].
+    /// Redeem `secret` at `now_epoch`. Unknown secret → [`Redeem::Unknown`] (no state change).
+    /// Known but expired → [`Redeem::Expired`] (removed). Known + live → SUCCESS: the use count is
+    /// decremented, the invite is BURNED when it hits zero, and the copy returned in
+    /// [`Redeem::Ok`] carries the count AFTER this redemption (#87). A redemption that cannot be
+    /// RECORDED is refused as [`Redeem::Unavailable`] and rolled back.
     pub async fn try_redeem(&self, secret: &[u8; 32], now_epoch: u64) -> Redeem {
         let _w = self.writes.lock().await;
         // Decide and mutate under the std mutex, then release it BEFORE the write. `Unknown`
@@ -252,12 +281,51 @@ impl LiveInvites {
                     (Redeem::Expired, map.values().cloned().collect::<Vec<_>>())
                 }
                 Some(_) => {
-                    let inv = map.remove(secret).expect("present under lock");
+                    // #87: decrement, and burn only at zero. A multi-use invite is N independent
+                    // pairings sharing one secret — the collision pre-check, the post-redeem race
+                    // guard, expiry and the SAS all run again per redemption. Burning at zero
+                    // keeps the terminal REGISTRY state identical to single-use.
+                    let entry = map.get_mut(secret).expect("present under lock");
+                    // `checked_sub`, not `saturating_sub`: a zero-count entry must be refused, not
+                    // granted one more redemption. Unreachable through the `invite` verb (which
+                    // rejects `max_uses: 0`), but reachable by an embedder building an `Invite`
+                    // directly or by a hand-edited/rolled-back invites.json — and an invariant on
+                    // a bearer credential should fail closed wherever it is violated (#87 gate).
+                    let Some(left) = entry.uses_remaining.checked_sub(1) else {
+                        return Redeem::Unknown;
+                    };
+                    entry.uses_remaining = left;
+                    let inv = if left == 0 {
+                        map.remove(secret).expect("present under lock")
+                    } else {
+                        entry.clone()
+                    };
                     (Redeem::Ok(inv), map.values().cloned().collect::<Vec<_>>())
                 }
             }
         };
-        inv_persist_burn(self, snapshot).await;
+        // Fail CLOSED (#87 gate). Warning here was defensible while an invite was single-use —
+        // the worst case was one extra redemption, bounded by the TTL. With a counted credential
+        // it is up to `max_uses` extra redemptions per restart, and the "still refused by the
+        // collision/expiry checks" consolation is false: a resurrected use admits a genuinely new
+        // peer that nothing refuses.
+        //
+        // This runs BEFORE the caller writes any peer rows, so refusing here denies a pairing that
+        // has not happened yet rather than undoing one that has.
+        if let Err(e) = self.persist(snapshot).await {
+            tracing::warn!(%e, "could not record an invite redemption; refusing it rather than \
+                                risking a restart re-issuing the use");
+            let mut map = self.guard();
+            // Put it back with the count it had BEFORE this redemption. An expiry reap that
+            // could not be written is deliberately NOT restored: the entry was already dead, and
+            // resurrecting an expired invite would be worse than losing the reap.
+            if let Redeem::Ok(inv) = &outcome {
+                let mut restored = inv.clone();
+                restored.uses_remaining = restored.uses_remaining.saturating_add(1);
+                map.insert(*secret, restored);
+            }
+            return Redeem::Unavailable;
+        }
         outcome
     }
 
@@ -296,14 +364,13 @@ impl LiveInvites {
     }
 }
 
-/// Persist a BURN (a redemption or an expiry reap) — a removal, so a write failure cannot be rolled
-/// back into anything meaningful: the invite is spent either way, and re-adding it would resurrect
-/// a credential the peer has already used.
+/// Persist an expiry REAP — a removal of invites that are already dead.
 ///
-/// So this warns rather than failing, deliberately, and it is the OPPOSITE trade from
-/// [`LiveInvites::mint`]. The worst case is an invite that survives a restart it should not have —
-/// bounded by its own TTL, and still refused by the collision/expiry checks on the next attempt.
-/// Failing the redemption instead would deny a pairing that has already legitimately succeeded.
+/// Warns rather than failing, and that is safe HERE in a way it is not for a redemption: the worst
+/// case is an expired invite lingering on disk until the next mutation, and expiry is re-checked on
+/// load and on every redemption, so it cannot be used. Redemption itself fails CLOSED (see
+/// [`Redeem::Unavailable`]) — an unrecorded USE is a credential we have lost count of, which is a
+/// different thing entirely (#87 gate).
 async fn inv_persist_burn(reg: &LiveInvites, snapshot: Vec<Invite>) {
     if let Err(e) = reg.persist(snapshot).await {
         tracing::warn!(
@@ -468,6 +535,113 @@ mod tests {
         assert_eq!(on_disk[0].expires_at_epoch, 9_000);
     }
 
+    /// #87: a multi-use invite admits exactly `max_uses` redemptions and then behaves like any
+    /// spent invite.
+    ///
+    /// The fourth attempt answers `Unknown` — the SAME answer a never-existed secret gets — so
+    /// exhausting an invite introduces no new oracle: a prober still cannot distinguish "spent"
+    /// from "never real".
+    #[tokio::test]
+    async fn a_multi_use_invite_admits_exactly_its_quota() {
+        let reg = LiveInvites::new();
+        let mut inv = sample_invite(11, 9_000);
+        inv.uses_remaining = 3;
+        reg.mint(inv.clone()).await.unwrap();
+
+        for expected_left in [2, 1, 0] {
+            match reg.try_redeem(&inv.secret, 1_000).await {
+                Redeem::Ok(got) => assert_eq!(
+                    got.uses_remaining, expected_left,
+                    "each redemption decrements, and the caller sees what is left"
+                ),
+                other => panic!("redemption within quota must succeed, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            reg.count(),
+            0,
+            "at zero the invite is BURNED, exactly as single-use"
+        );
+        assert!(
+            matches!(reg.try_redeem(&inv.secret, 1_000).await, Redeem::Unknown),
+            "an exhausted invite answers Unknown — the same answer a secret that never existed \
+             gets, so exhausting one is not an oracle"
+        );
+    }
+
+    /// #87: the default is unchanged. An invite with no `max_uses` burns on first redemption,
+    /// which is what every caller that predates this already relies on.
+    #[tokio::test]
+    async fn a_single_use_invite_still_burns_on_first_redemption() {
+        let reg = LiveInvites::new();
+        let inv = sample_invite(12, 9_000);
+        assert_eq!(inv.uses_remaining, 1, "the sample IS the default shape");
+        reg.mint(inv.clone()).await.unwrap();
+        assert!(matches!(
+            reg.try_redeem(&inv.secret, 1_000).await,
+            Redeem::Ok(_)
+        ));
+        assert_eq!(reg.count(), 0);
+    }
+
+    /// #87 + #87b: the remaining count is DURABLE. A restart that reset it would silently hand
+    /// out more redemptions than the minter authorized — the count is part of the credential.
+    #[tokio::test]
+    async fn the_remaining_use_count_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invites.json");
+        let mut inv = sample_invite(13, 9_000);
+        inv.uses_remaining = 3;
+
+        let first = LiveInvites::load(&path, 1_000);
+        first.mint(inv.clone()).await.unwrap();
+        assert!(matches!(
+            first.try_redeem(&inv.secret, 1_000).await,
+            Redeem::Ok(_)
+        ));
+        drop(first);
+
+        let after = LiveInvites::load(&path, 1_000);
+        match after.try_redeem(&inv.secret, 1_000).await {
+            Redeem::Ok(got) => assert_eq!(
+                got.uses_remaining, 1,
+                "the restart must not restore spent uses — 3 minted, 1 spent, 2 left, so this \
+                 redemption leaves 1"
+            ),
+            other => panic!("expected a redemption, got {other:?}"),
+        }
+    }
+
+    /// #87: an invite line from a daemon that predates multi-use decodes as SINGLE-use.
+    ///
+    /// A `default` of 0 would make every old invite instantly unusable — the field's default is
+    /// load-bearing for compatibility, not a formality.
+    #[test]
+    fn an_invite_line_without_a_use_count_decodes_as_single_use() {
+        let mut v = serde_json::to_value(sample_invite(14, 9_000)).unwrap();
+        v.as_object_mut().unwrap().remove("uses_remaining");
+        let old: Invite = serde_json::from_value(v).expect("an older invite must still decode");
+        assert_eq!(
+            old.uses_remaining, 1,
+            "an invite minted before #87 is single-use, not unusable"
+        );
+    }
+
+    /// #87: expiry still terminates a multi-use invite that has uses left. The two bounds are
+    /// independent, and the TTL is the one that caps a leaked line's blast radius over time.
+    #[tokio::test]
+    async fn expiry_beats_remaining_uses() {
+        let reg = LiveInvites::new();
+        let mut inv = sample_invite(15, 5_000);
+        inv.uses_remaining = 10;
+        reg.mint(inv.clone()).await.unwrap();
+        assert!(
+            matches!(reg.try_redeem(&inv.secret, 6_000).await, Redeem::Expired),
+            "uses left does not outlive the TTL"
+        );
+        assert_eq!(reg.count(), 0, "and it is removed");
+    }
+
     /// A RAM-only registry still behaves exactly as it did before #87b — the seam is opt-in, and
     /// every test that does not care about durability keeps working unchanged.
     #[tokio::test]
@@ -495,6 +669,7 @@ mod tests {
             services: vec!["notes".into()],
             expires_at_epoch,
             app_label: None,
+            uses_remaining: 1,
         }
     }
 
@@ -552,9 +727,20 @@ mod tests {
         let secret = inv.secret;
         live.mint(inv.clone()).await.unwrap();
         assert_eq!(live.count(), 1);
-        // First redeem succeeds and returns the invite.
+        // First redeem succeeds and returns the invite. Since #87 the returned copy carries the
+        // count AFTER this redemption — 0 for a single-use invite — so it reports what the
+        // redemption left rather than what was minted. Everything else is the invite verbatim.
         match live.try_redeem(&secret, 1_000_000_000).await {
-            Redeem::Ok(got) => assert_eq!(got, inv),
+            Redeem::Ok(got) => {
+                assert_eq!(got.uses_remaining, 0, "spent");
+                assert_eq!(
+                    Invite {
+                        uses_remaining: inv.uses_remaining,
+                        ..got
+                    },
+                    inv
+                );
+            }
             other => panic!("expected Ok, got {other:?}"),
         }
         // The invite is burned: a second redeem of the same secret is now Unknown.

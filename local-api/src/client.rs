@@ -200,7 +200,8 @@ impl ControlClient {
         .await
     }
 
-    /// Mint a one-time pairing invite granting `services`; return the copyable
+    /// Mint a single-use pairing invite granting `services` (see `invite_multi` for more than
+    /// one); return the copyable
     /// `mcpmesh-invite:` line + its expiry.
     pub async fn invite(&mut self, services: Vec<String>) -> Result<InviteResult, ClientError> {
         self.invite_with(services, None).await
@@ -213,10 +214,27 @@ impl ControlClient {
         services: Vec<String>,
         app_label: Option<String>,
     ) -> Result<InviteResult, ClientError> {
+        self.invite_multi(services, app_label, None).await
+    }
+
+    /// `invite_with`, plus `max_uses` (#87): an invite redeemable up to that many times, each
+    /// redemption running its own SAS ceremony and writing its own peer rows.
+    ///
+    /// `None` = 1, the single-use default. The value is clamped daemon-side to
+    /// [`MAX_INVITE_USES`](crate::MAX_INVITE_USES) — read
+    /// [`InviteResult::uses_remaining`](crate::InviteResult::uses_remaining) for what you actually
+    /// got rather than assuming the request was honoured verbatim.
+    pub async fn invite_multi(
+        &mut self,
+        services: Vec<String>,
+        app_label: Option<String>,
+        max_uses: Option<u32>,
+    ) -> Result<InviteResult, ClientError> {
         self.request_typed(
             Request::Invite(InviteParams {
                 services,
                 app_label,
+                max_uses,
             }),
             "invite result",
         )
