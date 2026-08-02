@@ -133,6 +133,35 @@ pub fn check_network(net: &crate::config::NetworkCfg) -> Verdict {
     }
 }
 
+/// Report whether another endpoint has been seen presenting this node's identity (#134).
+///
+/// Two nodes booted from COPIES of one mesh root share an endpoint id; a relay serves only one, and
+/// the displaced node's peers go unreachable with nothing saying why. `doctor` is where that gets
+/// said, for the same reason #125's relay check lives here: the daemon's own `error!` reaches
+/// nobody in the shipped binary.
+///
+/// `epoch` is `status.self_network.identity_conflict_epoch`. `None` means NOT OBSERVED — which on
+/// an embedded node without an `IdentityConflictLayer` also means not observable — so it reports
+/// nothing rather than a green "identity is unique" it cannot support.
+pub fn check_identity_conflict(epoch: Option<i64>, now: i64) -> Option<Verdict> {
+    let seen = epoch?;
+    let mins = (now - seen).max(0) / 60;
+    let ago = match mins {
+        0 => "less than a minute".to_string(),
+        1 => "1 minute".to_string(),
+        m if m < 60 => format!("{m} minutes"),
+        m if m < 120 => "1 hour".to_string(),
+        m if m < 1440 => format!("{} hours", m / 60),
+        m => format!("{} days", m / 1440),
+    };
+    Some(Verdict::warn(format!(
+        "another endpoint was seen presenting this node's identity {ago} ago — two nodes booted \
+         from COPIES of one mesh root cannot both use the relay, and this node's peers will \
+         appear unreachable while that lasts. Stop the duplicate, or give it its own identity. \
+         (Advisory: the report comes from a relay and is not authenticated.)"
+    )))
+}
+
 /// Report the LIVE connection state of each configured relay (#125).
 ///
 /// `status --json` has carried `self_network.relays[].connected` since #90, but no HUMAN surface
@@ -500,6 +529,9 @@ struct DoctorInputs {
     /// The daemon's LIVE relay connection states (#125), or `None` when it is unreachable or
     /// mesh-less. Distinct from `network.relay_urls`, which is what the CONFIG asks for.
     live_relays: Option<Vec<mcpmesh_local_api::RelayInfo>>,
+    /// When another endpoint was last seen presenting this node's identity (#134), or `None` for
+    /// "not observed" — which also covers "no detector installed".
+    identity_conflict_epoch: Option<i64>,
 }
 
 /// Ping the local daemon over the control socket WITHOUT auto-starting it (read-only, local-only).
@@ -513,27 +545,32 @@ fn probe_daemon() -> (
     bool,
     Option<String>,
     Option<Vec<mcpmesh_local_api::RelayInfo>>,
+    Option<i64>,
 ) {
     let Ok(socket) = mcpmesh_trust::paths::default_endpoint() else {
-        return (false, None, None);
+        return (false, None, None, None);
     };
     let Ok(rt) = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
     else {
-        return (false, None, None);
+        return (false, None, None, None);
     };
     rt.block_on(async move {
         match crate::client::connect_control(&socket).await {
             Ok(mut client) => match client.status().await {
-                Ok(s) => (
-                    true,
-                    s.roster.map(|r| r.state),
-                    s.self_network.map(|n| n.relays),
-                ),
-                Err(_) => (true, None, None),
+                Ok(s) => {
+                    let net = s.self_network;
+                    (
+                        true,
+                        s.roster.map(|r| r.state),
+                        net.as_ref().map(|n| n.relays.clone()),
+                        net.and_then(|n| n.identity_conflict_epoch),
+                    )
+                }
+                Err(_) => (true, None, None, None),
             },
-            Err(_) => (false, None, None),
+            Err(_) => (false, None, None, None),
         }
     })
 }
@@ -613,7 +650,8 @@ fn gather() -> DoctorInputs {
     .flatten()
     .map(|lc| epoch_now() - lc);
 
-    let (daemon_reachable, daemon_roster_state, live_relays) = probe_daemon();
+    let (daemon_reachable, daemon_roster_state, live_relays, identity_conflict_epoch) =
+        probe_daemon();
 
     DoctorInputs {
         parse_ok,
@@ -643,6 +681,7 @@ fn gather() -> DoctorInputs {
         daemon_reachable,
         daemon_roster_state,
         live_relays,
+        identity_conflict_epoch,
     }
 }
 
@@ -692,6 +731,12 @@ fn findings(inp: &DoctorInputs) -> Vec<(&'static str, Verdict)> {
             "relays",
             check_relays(&inp.network.relay_urls, inp.live_relays.as_deref()),
         ));
+    }
+    // #134: only when there is something to report. An absent stamp means "not observed" — and on
+    // an embedded node with no detector installed, "not observable" — so a green line here would
+    // be a uniqueness claim nothing supports.
+    if let Some(v) = check_identity_conflict(inp.identity_conflict_epoch, epoch_now()) {
+        out.push(("identity", v));
     }
     if inp.perm_lints_apply {
         out.push((
@@ -782,6 +827,7 @@ mod tests {
             daemon_reachable: true,
             daemon_roster_state: None,
             live_relays: None,
+            identity_conflict_epoch: None,
         }
     }
 
@@ -900,6 +946,47 @@ mod tests {
             v.level,
             Level::Ok,
             "a re-spelling of the same relay must not read as a second, dead one: {v:?}"
+        );
+    }
+
+    /// #134: `doctor` says it when another endpoint is using this identity — and says NOTHING
+    /// when it has not been observed.
+    ///
+    /// The silence is the load-bearing half. An absent stamp means "not observed", and on an
+    /// embedded node without an `IdentityConflictLayer` it means "not observable" — so a green
+    /// "identity is unique" line would be a claim nothing supports, on the surface an operator
+    /// trusts most.
+    #[test]
+    fn the_identity_check_speaks_only_when_it_has_seen_something() {
+        assert!(
+            check_identity_conflict(None, 1_753_900_000).is_none(),
+            "no observation must produce NO finding — never a green uniqueness claim"
+        );
+
+        let v = check_identity_conflict(Some(1_753_900_000), 1_753_900_120)
+            .expect("an observation must produce a finding");
+        assert_eq!(v.level, Level::Warn, "{v:?}");
+        assert!(
+            v.message.contains("2 minutes"),
+            "the age tells an operator whether this is live or historical: {}",
+            v.message
+        );
+        assert!(
+            v.message.contains("not authenticated"),
+            "the claim is relay-attested; saying so is what stops it being trusted as proof: {}",
+            v.message
+        );
+
+        // It appears in the assembled report only when observed.
+        let mut inp = base_inputs();
+        assert!(
+            !findings(&inp).iter().any(|(l, _)| *l == "identity"),
+            "an unobserved node gets no identity line at all"
+        );
+        inp.identity_conflict_epoch = Some(1_753_900_000);
+        assert!(
+            findings(&inp).iter().any(|(l, _)| *l == "identity"),
+            "an observed conflict must reach the report"
         );
     }
 
@@ -1299,6 +1386,7 @@ mod tests {
             daemon_reachable: true,
             daemon_roster_state: None,
             live_relays: None,
+            identity_conflict_epoch: None,
         };
         let out = findings(&inp);
 

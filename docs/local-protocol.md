@@ -7,7 +7,7 @@ named pipe on Windows. Anything that can open the endpoint and parse JSON can sp
 language — [`local-api/examples/status.py`](../local-api/examples/status.py) is a complete client
 in ~60 lines of dependency-free Python.
 
-> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.31`, `api_minor` `31`) and evolves
+> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.32`, `api_minor` `32`) and evolves
 > **additively** (see [Versioning](#versioning)), but until a stable release this document — like the
 > wire format itself — may change without a migration path. Pin the mcpmesh version you build
 > against. Source of truth is the Rust in [`local-api/`](../local-api/src/protocol.rs); where this
@@ -415,10 +415,13 @@ health warning. `home_relay` is the connected relay, sanitized to scheme+host+po
 URLs can carry credentials). `direct_addrs` are the node's own dialable coordinates (the same ones
 its invites embed). `last_change_epoch` is when the daemon's watcher last saw the block change —
 `null` until the first change after boot. No per-relay latency: iroh's `net_report` is
-unstable-feature-gated as of 1.0.3; `connected` is the stable truth. A change of `online`, the
-home relay, or any relay's connection state also pushes a `self_network` frame on `subscribe`
-(and the subscribe snapshot carries the block), so an embedder learns "you just went unreachable"
-without polling — the signal `set_relays` (#53) never had.
+unstable-feature-gated as of 1.0.3; `connected` is the stable truth. `identity_conflict_epoch`
+(`api_minor >= 32`, #134) is when another endpoint was last seen presenting THIS node's identity,
+absent if never — see its own section below, including why absence does not mean "unique". A change
+of `online`, the home relay, any relay's connection state, **or a new identity-conflict
+observation** also pushes a `self_network` frame on `subscribe` (and the subscribe snapshot carries
+the block), so an embedder learns "you just went unreachable" without polling — the signal
+`set_relays` (#53) never had.
 
 `storage` (`api_minor >= 27`, #88) is this node's own on-disk footprint — counts, never content:
 the summed monthly audit files, the `state.redb` trust store, and the app-blob store directory
@@ -702,9 +705,53 @@ become viable).
 {
   "type": "self_network",
   "self_network": {"online": false, "relays": [{"url": "https://relay.example:443", "connected": false}],
-                   "direct_addrs": ["192.168.1.20:53420"], "last_change_epoch": 1753842000}
+                   "direct_addrs": ["192.168.1.20:53420"], "last_change_epoch": 1753842000,
+                   "identity_conflict_epoch": 1753841880}
 }
 ```
+
+### `identity_conflict_epoch` — someone else is using this identity (`api_minor >= 32`, #134)
+
+Two nodes booted from **copies** of one mesh root present the same endpoint id. A relay can serve
+only one of them, so the displaced node's peers simply go unreachable — with nothing, anywhere,
+saying why. That is the failure this field exists to name.
+
+`self_network.identity_conflict_epoch` is the epoch second at which the relay last reported that
+another endpoint is presenting this node's identity, and is **absent** if it never has. A new
+observation is a posture change, so it also pushes a `self_network` frame — you learn it when it
+happens rather than on a poll.
+
+**Sticky, and a timestamp rather than a flag.** The relay announces the condition once, as the
+displaced connection is dropped; it is not a state that keeps being reported. A flag that cleared
+itself would read `false` by the time anyone called `status`, so judge staleness from the epoch the
+way you would `last_change_epoch`.
+
+**Absence is not proof of uniqueness.** iroh exposes this condition only as a log line, so detection
+requires an `IdentityConflictLayer` in the process's `tracing` subscriber. The standalone `mcpmesh`
+daemon installs one at boot. An **embedded** node cannot — a subscriber is global and your
+application owns it — so it reports `null` until you compose the layer into yours:
+
+```rust
+use tracing_subscriber::prelude::*;
+let conflict = std::sync::Arc::new(mcpmesh_node::diag::IdentityConflict::default());
+tracing_subscriber::registry()
+    .with(your_fmt_layer)
+    .with(mcpmesh_node::diag::IdentityConflictLayer::new(conflict.clone()))
+    .init();
+```
+
+Never render an absent value as "identity verified unique" — it means "not observed", and on an
+embedded node with no layer installed it means "not observable".
+
+The remedy is always the same: stop the duplicate, or give it its own identity. mcpmesh does not
+refuse either node, deliberately — with two live endpoints there is no principled way to tell the
+impostor from the original, and a wrong refusal takes down the legitimate node.
+
+**Advisory, and relay-attested rather than authenticated.** The claim originates at a relay, and
+iroh's older health frame carries arbitrary text through the same channel, so any relay in your set
+can synthesize this condition. Treat it as a diagnostic: show it, act on it manually, never gate
+authorization on it. The worst a hostile relay achieves is a misleading status field — the same
+trust you already extend to a relay for reachability.
 
 ### `path` — direct or relayed (`api_minor >= 13`, #64)
 
@@ -986,7 +1033,8 @@ things:
   and `StatusResult.self_nickname` are `api_minor >= 2` (#37); STABLE-principal `allow`
   strings + `ServiceInfo.allow_display` are `api_minor >= 3` (#38); the `reachability` frame's
   `source` — which of the two producers observed the transition (#150) — is `api_minor >= 30`;
-  the branchable nickname-collision refusal `-32043` (#147) is `api_minor >= 31`.
+  the branchable nickname-collision refusal `-32043` (#147) is `api_minor >= 31`;
+  `SelfNetwork.identity_conflict_epoch` (#134) is `api_minor >= 32`.
   `api_minor` is itself additive: a pre-1.1 daemon omits it and it reads as `0`.
 
 Changes remain **additive within a major**: new response fields are optional (absent-tolerant), so a

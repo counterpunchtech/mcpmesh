@@ -53,6 +53,19 @@ pub async fn serve_forever(socket: &Path, paths: NodePaths) -> Result<()> {
     };
     let booted = start_node(paths, None).await?;
     let state = booted.state;
+    // #134: the duplicate-identity detector, installed ONLY here.
+    //
+    // `serve_forever` is the STANDALONE daemon — it owns its process and installs no subscriber of
+    // its own, so taking the global default is ours to take. This must never move into
+    // `boot_node`: that path is shared with `NodeBuilder::start`, and an embedded node seizing the
+    // process-global subscriber would panic a host that calls `fmt::init()` afterwards, or
+    // silently swallow its logs for the process lifetime if it uses `try_init()`. An embedder
+    // wires the same detection through `NodeBuilder::identity_conflict` instead.
+    if let Some(mesh) = state.mesh() {
+        let conflict = std::sync::Arc::new(crate::diag::IdentityConflict::default());
+        mesh.adopt_identity_conflict(conflict.clone());
+        crate::diag::install_for_daemon(conflict);
+    }
     // The daemon serves for the process lifetime — the background handles need no owner
     // (the embedding `Node` keeps them to abort on `shutdown`; the process just exits).
     drop(booted.background);

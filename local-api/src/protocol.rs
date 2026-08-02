@@ -423,6 +423,27 @@ pub struct SelfNetwork {
     /// after boot, and from a point-in-time computation with no watcher running.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_change_epoch: Option<i64>,
+    /// When the relay last reported that ANOTHER endpoint is presenting this node's identity
+    /// (#134, epoch seconds), or absent if never — the overwhelmingly common case.
+    ///
+    /// Two nodes booted from COPIES of one mesh root share an endpoint id. The relay can serve only
+    /// one, so the displaced node's peers simply go unreachable with nothing saying why; diagnosing
+    /// that cost a downstream real time. This is that missing "why".
+    ///
+    /// **Sticky, and a timestamp rather than a flag.** The condition is announced once, as the
+    /// displaced connection is dropped — it is not a state the relay keeps reporting — so a
+    /// self-clearing flag would read false by the time anyone called `status`. Judge staleness from
+    /// the epoch, exactly as with `last_change_epoch`.
+    ///
+    /// **Absence is not proof of uniqueness.** Detection needs an
+    /// `IdentityConflictLayer` in the process's `tracing` subscriber: the standalone daemon
+    /// installs one at boot, but an EMBEDDED node cannot (a subscriber is global and the host owns
+    /// it) and reports `None` until the host installs it. Never render absence as "identity
+    /// verified unique".
+    ///
+    /// Additive: `#[serde(default, skip_serializing_if = "Option::is_none")]`. `api_minor >= 32`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_conflict_epoch: Option<i64>,
 }
 
 /// One home relay's connection state (#90). No latency — per-relay RTT needs iroh's
@@ -1494,7 +1515,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   thirty have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.31";
+pub const API_VERSION: &str = "1.32";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -1563,7 +1584,10 @@ pub const API_VERSION: &str = "1.31";
 /// `-32000`, so an embedder writes its own recovery copy rather than substring-matching ours. The
 /// prose changed with it: it named the `set_nickname` CONTROL VERB as the remedy, which a GUI user
 /// cannot type, and the refusal is generated inviter-side so the embedder displaying it could not
-/// rewrite it (#147).
+/// rewrite it (#147); to 32 with [`SelfNetwork::identity_conflict_epoch`] — two nodes booted from
+/// COPIES of one mesh root share an endpoint id, and the displaced one's peers went unreachable
+/// with nothing saying why. The relay reports it and iroh only `warn!`s it, so the fact existed
+/// and was unreadable (#134).
 ///
 /// **Not every semantic change gets a minor, and that is the gap to watch (#122).** A minor marks a
 /// change to this *surface*. A change to behaviour BEHIND the surface — same fields, same shapes,
@@ -1574,7 +1598,7 @@ pub const API_VERSION: &str = "1.31";
 /// That class is bigger than it looks: **10, 17, 21, 22, 23 and 24 all shipped with no change to
 /// any type in this file** — they moved meaning, not shape. Six of the thirty. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 31;
+pub const API_MINOR: u32 = 32;
 
 #[cfg(test)]
 mod tests {
@@ -1892,6 +1916,7 @@ mod tests {
                 }],
                 direct_addrs: vec!["192.168.1.2:4444".into()],
                 last_change_epoch: Some(1_753_842_000),
+                identity_conflict_epoch: None,
             },
         };
         let v = serde_json::to_value(&frame).unwrap();
