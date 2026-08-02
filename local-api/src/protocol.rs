@@ -612,12 +612,13 @@ pub struct PeerDiagnosticsParams {
 /// Result of [`Request::PeerDiagnostics`] (#140): the DURABLE per-peer state this node carries,
 /// for diagnosing why a specific long-lived pairing behaves differently from a fresh one.
 ///
-/// **This is the one surface that deliberately carries transport vocabulary.** Every other verb is
-/// surface-clean — nicknames and path KINDS, never addresses — because that discipline is what
-/// keeps a peer's coordinates out of screenshots and logs. Here it is the point: the question this
-/// answers is "what address is this node about to dial, and where did it come from", which cannot
-/// be answered without the address. It is your OWN store's record of your OWN paired peers. Do not
-/// render it in ordinary porcelain, and do not paste it publicly without reading it first.
+/// **This surface carries a PEER's transport coordinates on purpose.** The rendered porcelain is
+/// address-free everywhere — nicknames and path KINDS — because that discipline keeps a peer's
+/// coordinates out of screenshots. (`SelfNetwork.direct_addrs` already returns this node's OWN
+/// addresses on `status`; what is new here is another endpoint's.) The question this answers is
+/// "what address is this node about to dial, and where did it come from", which has no answer
+/// without the address. It is your own store's record of your own paired peers. Do not render it
+/// in ordinary porcelain, and read it before pasting it anywhere public.
 ///
 /// The intended use is a paired capture: run it on BOTH ends of a stuck pairing and compare the
 /// stored hint against the live path each side reports.
@@ -637,22 +638,43 @@ pub struct PeerDiagnosticsResult {
     /// The persisted dial HINT, verbatim as stored — the durable state a freshly paired identity
     /// does not have. `None` for a peer added without one.
     ///
-    /// It is MERGED with discovery rather than replacing it (iroh inserts it as one more candidate
-    /// path and still runs address lookup), so a stale entry does not by itself hide a live
-    /// address — but it is the only durable per-peer state that differs between a long-lived
-    /// pairing and a fresh one, which makes it the first thing to compare.
+    /// It is MERGED with discovery rather than replacing it — iroh inserts it as one more
+    /// candidate path (`Source::App`) and then triggers address lookup.
+    ///
+    /// **But that lookup is skipped when a path is already selected.** iroh's
+    /// `trigger_address_lookup` returns early if `selected_path.is_some()`, and a selected path is
+    /// cleared only when the last connection to that peer closes. So on a pair that already holds
+    /// an open RELAYED connection — live sessions, dial-backs, a working relay — discovery does
+    /// NOT re-run, and this hint is the only addressing the dial contributes. Do not read "merged,
+    /// so a stale hint is harmless" as unconditional; it is least true in exactly the state a
+    /// stuck pairing is in.
+    ///
+    /// It is the only durable per-peer state ON THIS NODE'S DISK that the dial path reads, which
+    /// is what makes it the first thing to compare between two ends. It is not the only durable
+    /// state a long-lived identity carries — a published discovery record under the same key, and
+    /// [`SelfNetwork::identity_conflict_epoch`], live elsewhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_addr: Option<String>,
-    /// The IP addresses parsed out of `last_addr`, for reading without a JSON round trip. Empty
-    /// when the hint is absent or unparseable — an unparseable hint degrades to an id-only dial.
+    /// The addresses parsed out of `last_addr`, for reading without a JSON round trip: IP
+    /// addresses verbatim, relay URLs as `relay <url>` and SANITIZED to scheme+host+port (an
+    /// operator's relay URL can carry a userinfo token, and this output is meant to be pasted into
+    /// an issue). Empty when the hint is absent, unparseable, or for a different endpoint — all of
+    /// which degrade to an id-only dial.
+    ///
+    /// A `relay …` entry with no IP alongside it is worth noticing: that hint can never punch.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hint_addrs: Vec<String>,
     /// Whether `last_addr` parses AND its embedded id matches this peer. A `false` here with a
     /// present `last_addr` means the hint is being silently discarded at every dial.
     pub hint_usable: bool,
-    /// This node's LIVE view of the peer from the reachability cache, if it has one — the same
+    /// This node's LIVE view of the peer, read straight from the reachability cache — the same
     /// values `status` reports, repeated here so one capture holds both the durable and the live
-    /// side. `None` when the peer has never been probed.
+    /// side. `None` when this peer has **never been probed**, which is the honest answer on a
+    /// freshly restarted daemon; it is not the same as unreachable.
+    ///
+    /// Read from the cache rather than through `status`'s projection deliberately: that projection
+    /// spawns a background probe for every stale peer, which would make this diagnostic a
+    /// participant in the reproduction it is meant to observe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reachability: Option<PeerReachability>,
 }

@@ -24,24 +24,36 @@ doing so, and build the capture they asked for. That is what ships.
 
 ## The state question, answered
 
-From this node's side exactly one thing is durable, per-peer, and different between a long-lived
-pairing and a fresh identity: **`PeerEntry.last_addr`**, the persisted dial hint. Everything else a
-fresh identity lacks — path state, the reachability cache, iroh's per-remote actor — is derived at
-runtime and does not survive a restart, and the report notes restarts do not clear the failure.
+Scoped carefully, because the reporter will act on it: **the only durable per-peer state on this
+node's disk that the DIAL PATH reads is `PeerEntry.last_addr`.**
+
+That is narrower than "the only durable difference", and the first draft overstated it. Other
+durable state a long-lived identity carries that a fresh one does not: a discovery record published
+under the same key (the `presets::N0` pkarr publisher), accumulated `services` from repeated
+pairings, legacy bare-nickname allow entries, blob-scope grants, and #134's
+`identity_conflict_epoch`. None of it feeds the dial — but "exactly one thing" would have sent
+someone looking in one place when several exist.
 
 ### A correction found on the way
 
 Two of our own docs disagreed about what a hint does. `dial.rs` said iroh *merges* it with
 discovery; `dial_hint.rs` said a hint is *"replacing the bare-id dial"*.
 
-`dial.rs` is right. In iroh 1.0.3, `handle_msg_resolve_remote` inserts the provided addresses as
-candidate paths with `Source::App` and then calls `trigger_address_lookup` — discovery still runs.
-What a new hint replaces is the previously **stored** hint, which is why #124's real finding (never
-persist a relay URL over a direct one) holds while its wording did not.
+`dial.rs` is right about the merge: `handle_msg_resolve_remote` inserts the provided addresses as
+candidate paths with `Source::App`, then calls `trigger_address_lookup`. What a new hint replaces is
+the previously **stored** hint, which is why #124's real finding (never persist a relay URL over a
+direct one) holds while its wording did not.
 
-This matters for reading #140: a stale hint does **not** by itself hide a live discovered address.
-It stays the first thing to compare because it is the only durable per-peer difference — not because
-it is proven to be the cause.
+**But that lookup is conditional, and the condition is the interesting part.**
+`trigger_address_lookup` returns early when `selected_path.is_some()`, and a selected path is
+cleared only when the last connection to that peer closes. So on a pair that already holds an open
+**relayed** connection — live sessions and dial-backs in both directions, which is precisely the
+reported steady state — discovery does **not** re-run, and the stored hint is the only addressing
+the dial contributes.
+
+The first draft stated the merge unconditionally and told the reporter a stale hint "does not by
+itself hide a live address". That reassurance is least true in exactly the state a stuck pairing is
+in, which makes the condition a lead rather than a footnote.
 
 ## What ships
 
@@ -60,10 +72,16 @@ uses — not by re-reading the JSON, so the report and the behaviour cannot disa
 
 ### Transport vocabulary, deliberately
 
-Every other surface is address-free on purpose. This one is not, because the question is "what
-address is this node about to dial". Marked loudly on the type, the verb, the CLI help, and the
-protocol doc. Read-only — it probes nothing, dials nothing, writes nothing — so running it cannot
-perturb the state under study, which matters when the reproduction *is* the experiment.
+The rendered porcelain is address-free on purpose. This surface is not, because the question is
+"what address is this node about to dial". (`status` already returns this node's OWN `direct_addrs`;
+what is new is a peer's.) Relay URLs are sanitized to scheme+host+port, as everywhere else, because
+an operator's can carry a userinfo token and this output is meant to be pasted into an issue.
+
+Read-only, and getting that right took a correction: the first version read the live row through
+`status`'s projection, which **spawns a background probe for every stale peer** — so a verb
+documented as "dials nothing" dialed every paired peer, wrote both caches, pushed `Reachability`
+frames at subscribers, and spent the peer's #89 ping budget. It now reads the cache directly. A
+diagnostic used ON a live reproduction must observe it, not join it.
 
 ## Versioning
 
@@ -77,9 +95,13 @@ perturb the state under study, which matters when the reproduction *is* the expe
 3. **A hint whose embedded id is a different peer** → reported verbatim, `hint_usable: false`,
    no addresses. The invisible case.
 4. Garbage → degrades identically rather than erroring the verb.
+5. A **relay-only** hint is reported, not filtered into an empty line, and its userinfo is
+   sanitized. That shape can never punch and is reachable in production.
+6. The verb **takes no probe ticket** — it does not dial.
+7. The live row is joined by **endpoint id**, not nickname: two peers may share a name.
 
 Mutation: computing `hint_usable` from "a hint is present" instead of from `stored_dial_addr` fails
-3 — which is the whole point of the field.
+3; restoring the `reachability_of` call fails 6 and 7.
 
 ## Out of scope
 

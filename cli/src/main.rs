@@ -764,13 +764,24 @@ fn run_peer_state(peer: String, json: bool) -> anyhow::Result<()> {
             ),
             (Some(_), true) => {
                 println!("dial hint:  {}", d.hint_addrs.join(", "));
+                if !d.hint_addrs.iter().any(|a| !a.starts_with("relay ")) {
+                    println!(
+                        "            RELAY-ONLY — this hint can never punch. It is what an invite \
+                         minted while only the relay path was up leaves behind."
+                    );
+                }
                 println!(
-                    "            merged with discovery as an extra candidate, never replacing it"
+                    "            merged with discovery as an extra candidate — but iroh SKIPS \
+                     that lookup while a path is already selected, so on a pair holding an open \
+                     relayed connection this hint is the only addressing a dial contributes."
                 );
             }
         }
         match &d.reachability {
-            None => println!("live:       never probed"),
+            None => println!(
+                "live:       never probed (this is a cache read — it does not dial, so a fresh \
+                 daemon reports this until something else probes)"
+            ),
             Some(r) => {
                 let path = match &r.path {
                     mcpmesh_local_api::PeerPath::Direct => "direct".to_string(),

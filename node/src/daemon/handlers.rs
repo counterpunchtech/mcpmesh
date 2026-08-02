@@ -875,13 +875,32 @@ pub(crate) async fn redeem(state: &DaemonState, invite_line: String) -> Result<P
 /// Only the caller's own admitted services. Reuses a cache entry younger than `REACH_TTL_SECS`
 /// rather than always probing (#89) — see `probe_peer_cached` for why an unconditional probe made
 /// this verb collide with the ping rate limiter and report healthy peers as offline.
+pub(crate) async fn peer_services(
+    state: &DaemonState,
+    peer: String,
+) -> Result<mcpmesh_local_api::PeerServicesResult> {
+    let mesh = state.mesh_required()?;
+    let endpoint_id = resolve_peer_endpoint(mesh, &peer).await?;
+    let entry = crate::daemon::reach::probe_peer_cached(mesh, endpoint_id).await;
+    anyhow::ensure!(
+        entry.reachable,
+        "peer '{peer}' is unreachable — cannot fetch its shared services"
+    );
+    Ok(mcpmesh_local_api::PeerServicesResult {
+        services: entry.services,
+    })
+}
+
 /// Dump the DURABLE per-peer state for one peer (#140), plus this node's live view of it.
 ///
 /// The question behind #140 is "what does a long-lived pairing carry that a fresh identity does
-/// not, that could durably prevent a hole-punch while leaving relayed connectivity healthy?" The
-/// honest answer from this side is: exactly one thing survives a restart and differs between the
-/// two, and that is [`PeerEntry::last_addr`](crate::allowlist::PeerEntry::last_addr). Everything
-/// else a fresh identity lacks is derived at runtime.
+/// not, that could durably prevent a hole-punch while leaving relayed connectivity healthy?"
+///
+/// Scoped honestly: the only durable per-peer state ON THIS NODE'S DISK that the DIAL PATH reads is
+/// [`PeerEntry::last_addr`](crate::allowlist::PeerEntry::last_addr). Other durable state exists and
+/// is not this — a discovery record published under the same long-lived key, accumulated
+/// `services`, legacy allow entries, `identity_conflict_epoch` (#134) — but none of it feeds the
+/// dial. That makes the hint the first thing to compare, not the proven cause.
 ///
 /// So this reports the hint verbatim, whether it PARSES and matches this peer (an unusable hint is
 /// silently discarded at every dial, which is invisible from outside), the addresses inside it, and
@@ -891,8 +910,9 @@ pub(crate) async fn redeem(state: &DaemonState, invite_line: String) -> Result<P
 /// **Deliberately carries transport vocabulary**, alone among the verbs. See
 /// [`PeerDiagnosticsResult`](mcpmesh_local_api::PeerDiagnosticsResult).
 ///
-/// Read-only: it probes nothing, dials nothing, and writes nothing — running it cannot perturb the
-/// state being diagnosed, which matters when the reproduction is the thing under study.
+/// Read-only, and it has to be: it reads the reachability CACHE rather than `status`'s projection,
+/// which would spawn a background probe for every stale peer. A diagnostic that dials the thing it
+/// is measuring is a participant in the reproduction, not an observer of it (#140 gate).
 pub(crate) async fn peer_diagnostics(
     state: &DaemonState,
     peer: &str,
@@ -911,21 +931,54 @@ pub(crate) async fn peer_diagnostics(
     // Parse the hint the same way the DIAL does — via `stored_dial_addr`, not a bespoke reading —
     // so "usable" here means usable to the code that actually dials, and the two cannot drift.
     let dialed = crate::daemon::dial::stored_dial_addr(entry.last_addr.as_deref(), id);
+    // EVERY address the hint carries, IP and relay alike, each labelled.
+    //
+    // Filtering to IP hid the one shape most worth seeing (#140 gate): an invite made while only
+    // the inviter's relay path was up stores a RELAY-only hint, which is exactly the state #124
+    // identified as harmful — it can never punch — and it rendered as an empty line. Relay URLs are
+    // SANITIZED to scheme+host+port through the same helper `status` uses: an operator-supplied
+    // relay URL can carry a userinfo token, and this output is meant to be pasted into an issue.
     let hint_addrs: Vec<String> = dialed
         .addrs
         .iter()
-        .filter_map(|a| match a {
-            iroh::TransportAddr::Ip(s) => Some(s.to_string()),
-            _ => None,
+        .map(|a| match a {
+            iroh::TransportAddr::Ip(s) => s.to_string(),
+            iroh::TransportAddr::Relay(u) => {
+                format!("relay {}", crate::daemon::sanitize_relay_url(u))
+            }
+            other => format!("{other:?}"),
         })
         .collect();
     // An id-only `EndpointAddr` is what a MISSING or REJECTED hint degrades to, so a stored hint
     // that yields no addresses is one being thrown away at every dial.
     let hint_usable = entry.last_addr.is_some() && !dialed.addrs.is_empty();
 
-    let reachability = crate::daemon::reachability_of(mesh)
-        .into_iter()
-        .find(|r| r.name == entry.nickname);
+    // The LIVE row, read straight out of the cache — deliberately NOT via `reachability_of`.
+    //
+    // That helper spawns a background probe for every peer whose entry is stale or missing, so
+    // calling it here would make this "read-only" verb dial EVERY paired peer, write both caches,
+    // push `Reachability` frames at any subscriber, and spend the peer's #89 ping budget. On a
+    // freshly restarted daemon that is one dial per peer. A diagnostic used ON a live reproduction
+    // must not be a participant in it (#140 gate).
+    //
+    // Keyed on the ENDPOINT ID, not the nickname: nicknames collide (which is the whole reason
+    // #41/#42/#73 exist), and joining this peer's durable state to a namesake's live row is the
+    // most confusing possible output for a capture whose entire job is comparison.
+    let reachability = {
+        let cache = mesh
+            .reachability
+            .lock()
+            .expect("reachability lock not poisoned");
+        cache.get(&endpoint_id).map(|e| {
+            let age = (crate::util::epoch_now_i64() - e.probed_at).max(0);
+            crate::daemon::reach::reachability_row(
+                entry.nickname.clone(),
+                endpoint_id,
+                Some(e),
+                Some(age as u64),
+            )
+        })
+    };
 
     Ok(mcpmesh_local_api::PeerDiagnosticsResult {
         nickname: entry.nickname,
@@ -936,22 +989,6 @@ pub(crate) async fn peer_diagnostics(
         hint_addrs,
         hint_usable,
         reachability,
-    })
-}
-
-pub(crate) async fn peer_services(
-    state: &DaemonState,
-    peer: String,
-) -> Result<mcpmesh_local_api::PeerServicesResult> {
-    let mesh = state.mesh_required()?;
-    let endpoint_id = resolve_peer_endpoint(mesh, &peer).await?;
-    let entry = crate::daemon::reach::probe_peer_cached(mesh, endpoint_id).await;
-    anyhow::ensure!(
-        entry.reachable,
-        "peer '{peer}' is unreachable — cannot fetch its shared services"
-    );
-    Ok(mcpmesh_local_api::PeerServicesResult {
-        services: entry.services,
     })
 }
 
@@ -1860,6 +1897,128 @@ mod tests {
         let d = peer_diagnostics(&state, "jetson").await.unwrap();
         assert!(!d.hint_usable);
         assert_eq!(d.last_addr.as_deref(), Some("not json at all"));
+
+        // #140 gate: a RELAY-ONLY hint must be visible, not filtered into an empty line. This is
+        // the shape #124 identified as harmful — it can never punch — and it is reachable in
+        // production, because an invite minted while only the relay path was up stores exactly it.
+        // Filtering to IP hid the single most diagnostic value the verb can report.
+        let relay_only = serde_json::to_string(&iroh::EndpointAddr::from_parts(
+            key.public(),
+            [iroh::TransportAddr::Relay(
+                "https://user:token@relay.example/".parse().unwrap(),
+            )],
+        ))
+        .unwrap();
+        seed(Some(relay_only));
+        let d = peer_diagnostics(&state, "jetson").await.unwrap();
+        assert_eq!(
+            d.hint_addrs.len(),
+            1,
+            "the relay hint must be REPORTED: {d:?}"
+        );
+        assert!(d.hint_addrs[0].starts_with("relay "), "{:?}", d.hint_addrs);
+        assert!(
+            !d.hint_addrs[0].contains("token"),
+            "a relay URL's userinfo must be SANITIZED — this output is meant to be pasted into an \
+             issue, and every other surface sanitizes it: {:?}",
+            d.hint_addrs
+        );
+    }
+
+    /// #140 gate: the diagnostic must NOT dial. It reads the reachability cache.
+    ///
+    /// The first version called `reachability_of`, which spawns a background probe for every peer
+    /// whose entry is stale or missing — so a verb documented as "probes nothing, dials nothing"
+    /// dialed EVERY paired peer, wrote both caches, pushed `Reachability` frames at subscribers,
+    /// and spent the peer's #89 ping budget. On a freshly restarted daemon that is one dial per
+    /// peer, every time. A diagnostic used ON a live reproduction must observe it, not join it.
+    ///
+    /// `probe_seq` is the witness: `probe_peer` takes a ticket before anything else, so the
+    /// counter moving is proof a dial started.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn peer_diagnostics_never_dials() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+        for (i, nick) in [(21u8, "jetson"), (22u8, "studio")] {
+            mesh.store
+                .add(crate::allowlist::PeerEntry {
+                    endpoint_id: *iroh::SecretKey::from_bytes(&[i; 32]).public().as_bytes(),
+                    nickname: nick.into(),
+                    services: vec![],
+                    paired_at: None,
+                    user_id: None,
+                    last_addr: None,
+                })
+                .unwrap();
+        }
+
+        let before = mesh.probe_seq_for_test();
+        let d = peer_diagnostics(&state, "jetson").await.unwrap();
+        assert_eq!(
+            mesh.probe_seq_for_test(),
+            before,
+            "peer_diagnostics took a probe ticket — it is dialing, and the peer it is meant to be \
+             observing is now being perturbed by the act of observing it"
+        );
+        assert_eq!(
+            d.reachability, None,
+            "never probed is NOT unreachable — reporting a fabricated `reachable: false` row on a \
+             fresh daemon would read as a real verdict in a capture"
+        );
+    }
+
+    /// #140 gate: the live row is joined by ENDPOINT ID, not by nickname.
+    ///
+    /// Nicknames collide — that is the entire reason #41/#42/#73 exist, and `add_peer` enforces no
+    /// uniqueness. Joining one peer's durable state to a namesake's live row is the most confusing
+    /// possible output for a capture whose whole job is comparing two ends.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn peer_diagnostics_joins_the_live_row_by_id_not_nickname() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+
+        let a = *iroh::SecretKey::from_bytes(&[31u8; 32]).public().as_bytes();
+        let b = *iroh::SecretKey::from_bytes(&[32u8; 32]).public().as_bytes();
+        for eid in [a, b] {
+            mesh.store
+                .add(crate::allowlist::PeerEntry {
+                    endpoint_id: eid,
+                    nickname: "jetson".into(), // the SAME name, deliberately
+                    services: vec![],
+                    paired_at: None,
+                    user_id: None,
+                    last_addr: None,
+                })
+                .unwrap();
+        }
+        // Only B has a live row, and it is reachable.
+        mesh.reachability.lock().unwrap().insert(
+            b,
+            crate::daemon::ReachEntry {
+                reachable: true,
+                rtt_ms: Some(9),
+                probed_at: crate::util::epoch_now_i64(),
+                meta: String::new(),
+                services: Vec::new(),
+                seq: 1,
+                path: mcpmesh_local_api::PeerPath::Direct,
+            },
+        );
+
+        let d = peer_diagnostics(&state, &mcpmesh_net::EndpointId::from_bytes(a).principal())
+            .await
+            .unwrap();
+        assert_eq!(
+            d.reachability, None,
+            "peer A has no live row of its OWN; borrowing its namesake's would report a direct, \
+             9ms link for a peer that has never been probed"
+        );
     }
 
     /// #149: `service_allow_revoke` strips an allow entry by EXACT STRING, so a BARE entry — a

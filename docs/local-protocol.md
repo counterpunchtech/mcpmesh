@@ -713,9 +713,11 @@ become viable).
 
 ### `peer_diagnostics` — the durable state behind one pairing (`api_minor >= 33`, #140)
 
-**This verb prints IP addresses. Every other surface deliberately does not.** The rule everywhere
-else — nicknames and path *kinds*, never coordinates — exists so a peer's address cannot leak
-through a screenshot or a log. Here it is the whole question: "what is this node about to dial, and
+**This verb prints another endpoint's addresses.** The rendered porcelain is address-free
+everywhere — nicknames and path *kinds* — so a peer's coordinates cannot leak through a screenshot.
+(`status` already returns *this* node's own `direct_addrs`; what is new here is a peer's.) Relay
+URLs are sanitized to scheme+host+port, as everywhere else, because an operator's can carry a
+userinfo token. Here it is the whole question: "what is this node about to dial, and
 where did that come from" has no answer without the address. It is your own store's record of your
 own paired peers; read the output before pasting it anywhere public.
 
@@ -738,10 +740,18 @@ it had no hint at all while the store insists it has one. That discrepancy is in
 other surface, and it is computed here by running the hint through the same function the dial uses,
 so the two cannot disagree.
 
-**The hint is merged with discovery, not substituted for it.** iroh inserts these addresses as
-additional candidate paths and still runs address lookup, so a stale entry does not by itself hide a
-live address. It remains the first thing to compare because it is the only durable per-peer
-difference.
+**The hint is merged with discovery, not substituted for it — but that merge has a condition worth
+knowing.** iroh inserts these addresses as additional candidate paths and then triggers address
+lookup, *except* that the lookup is skipped while a path is already selected, and a selected path is
+cleared only when the last connection to that peer closes. On a pair holding an open **relayed**
+connection, discovery does not re-run and this hint is the only addressing the dial contributes. So
+"a stale hint is harmless because discovery still runs" is least true on a pair that is already
+stuck.
+
+It is the first thing to compare because it is the only durable per-peer state **on this node's
+disk that the dial path reads** — not the only durable difference. A discovery record published
+under the same long-lived key, and `identity_conflict_epoch`, are others; they just do not feed the
+dial.
 
 Intended as a **paired capture**: run it on both ends of a stuck pairing and read the two side by
 side. `mcpmesh internal peer state <peer> [--json]`.
