@@ -37,6 +37,12 @@ use tracing_subscriber::layer::Context;
 /// as the displaced connection is dropped — so a flag that cleared itself would be blank by the
 /// time anyone read `status`. It records the LAST observation and lets the reader judge staleness
 /// from the epoch, exactly as `last_change_epoch` does.
+///
+/// **ADVISORY, and relay-attested rather than authenticated.** The claim originates at a relay, and
+/// iroh's older `Health { problem }` frame carries arbitrary text through the same log line, so any
+/// relay in this node's set can synthesize this condition. It is a DIAGNOSTIC — it must never gate
+/// authorization, refuse a peer, or stop a node. The worst a hostile relay achieves is a misleading
+/// status field, which is the same class of trust already extended to a relay for reachability.
 #[derive(Debug, Default)]
 pub struct IdentityConflict {
     /// Epoch seconds of the last observation, or 0 for "never seen".
@@ -82,7 +88,12 @@ fn needle() -> String {
 ///     .init();
 /// ```
 ///
-/// It records only; it never filters, never emits, and never suppresses another layer's output.
+/// It never filters another layer's events and never suppresses anyone's output. It does re-emit
+/// one `error!` under mcpmesh's own target when it fires, because iroh's line says only that "a
+/// relay reported a problem" — it does not say that THIS node's identity is in use elsewhere,
+/// which is the fact an operator needs. (Under a scoped subscriber that nested event is dropped by
+/// tracing's re-entrancy guard; under a global one it is emitted. The recording happens either
+/// way, and the recording is what `status` reads.)
 pub struct IdentityConflictLayer {
     state: Arc<IdentityConflict>,
     needle: String,
@@ -140,6 +151,33 @@ impl<S: tracing::Subscriber> Layer<S> for IdentityConflictLayer {
                  unreachable. Stop the duplicate, or give it its own identity."
             );
         }
+    }
+}
+
+/// Install [`IdentityConflictLayer`] as the process-global subscriber. **Standalone daemon only.**
+///
+/// A `tracing` subscriber is process-global and can be set once. `serve_forever` owns its process
+/// and installs none of its own, so taking it there is safe. It must NOT be called from any path an
+/// embedded node shares: seizing the global would panic a host that calls `fmt::init()` afterwards,
+/// and silently swallow its logs for the process lifetime if it uses `try_init()`.
+///
+/// The layer is filtered to `WARN`, which matters for more than tidiness: `tracing`'s max-level
+/// hint is derived from the installed subscriber, and a bare registry sets it to `TRACE` — turning
+/// every `trace!` and `trace_span!` in iroh, quinn and tokio from a compiled-out no-op into an
+/// allocation on the datagram hot path, for a daemon that prints nothing anyway.
+///
+/// Best effort: if a subscriber already exists we leave it alone and say so at `debug!`.
+pub fn install_for_daemon(state: Arc<IdentityConflict>) {
+    use tracing_subscriber::filter::LevelFilter;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let layer = IdentityConflictLayer::new(state).with_filter(LevelFilter::WARN);
+    if tracing::subscriber::set_global_default(tracing_subscriber::registry().with(layer)).is_err()
+    {
+        tracing::debug!(
+            "a tracing subscriber is already installed, so the duplicate-identity detector was \
+             NOT registered (#134)"
+        );
     }
 }
 

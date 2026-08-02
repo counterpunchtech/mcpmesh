@@ -55,6 +55,7 @@ impl StartError {
 pub struct NodeBuilder {
     root: PathBuf,
     config: Option<Config>,
+    identity_conflict: Option<std::sync::Arc<crate::diag::IdentityConflict>>,
 }
 
 impl NodeBuilder {
@@ -66,6 +67,7 @@ impl NodeBuilder {
         Self {
             root: root.into(),
             config: None,
+            identity_conflict: None,
         }
     }
 
@@ -78,6 +80,42 @@ impl NodeBuilder {
         self
     }
 
+    /// Share the duplicate-identity observation with the host's `tracing` subscriber (#134).
+    ///
+    /// Two nodes booted from COPIES of one mesh root present the same endpoint id; the relay can
+    /// serve only one, and the displaced node's peers go unreachable with nothing saying why. iroh
+    /// 1.0.3 exposes that report **only as a log event**, so detecting it needs a layer in the
+    /// process's subscriber — and an embedded node cannot install one, because the subscriber is
+    /// global and your application owns it.
+    ///
+    /// Pass the SAME `Arc` you gave [`IdentityConflictLayer`](crate::diag::IdentityConflictLayer),
+    /// so that what the layer records is what this node's `status` reports:
+    ///
+    /// ```ignore
+    /// use std::sync::Arc;
+    /// use tracing_subscriber::prelude::*;
+    /// use mcpmesh_node::diag::{IdentityConflict, IdentityConflictLayer};
+    ///
+    /// let conflict = Arc::new(IdentityConflict::default());
+    /// tracing_subscriber::registry()
+    ///     .with(my_fmt_layer)
+    ///     .with(IdentityConflictLayer::new(conflict.clone()))
+    ///     .init();
+    ///
+    /// let node = NodeBuilder::new(root).identity_conflict(conflict).start().await?;
+    /// ```
+    ///
+    /// Without it, `status.self_network.identity_conflict_epoch` is always absent — which means
+    /// "not observable here", NOT "this identity is unique". Nothing else changes: the node boots,
+    /// serves, and behaves identically either way.
+    pub fn identity_conflict(
+        mut self,
+        shared: std::sync::Arc<crate::diag::IdentityConflict>,
+    ) -> Self {
+        self.identity_conflict = Some(shared);
+        self
+    }
+
     /// Boot the node: identity, stores, gates, the iroh endpoint, and every serving loop
     /// the daemon runs. Requires a multi-thread tokio runtime (the node spawns its serving
     /// loops onto the ambient runtime). Installs a process-default rustls `CryptoProvider`
@@ -85,6 +123,12 @@ impl NodeBuilder {
     pub async fn start(self) -> Result<Node, StartError> {
         let paths = NodePaths::under_root(&self.root);
         let booted = start_node(paths, self.config).await?;
+        // #134: adopt the host's shared observation, so the layer IN THEIR subscriber and this
+        // node's `status` read the same cell. Set after boot rather than threaded through it —
+        // the field is only ever read by the status projection, never during construction.
+        if let (Some(shared), Some(mesh)) = (self.identity_conflict, booted.state.mesh()) {
+            mesh.adopt_identity_conflict(shared);
+        }
         Ok(Node { booted })
     }
 }

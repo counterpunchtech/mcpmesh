@@ -272,6 +272,7 @@ reports, per check, one of `OK` / `WARN` / `ERR` and exits non-zero if any check
 | `daemon` | the local daemon is reachable (WARN if not running — start it with any verb). |
 | `self-hosting` | the `[network]` posture: ERR if the config is one the daemon refuses (unknown mode, `custom` without URLs); WARN if exactly one of relay/discovery is self-hosted (§10.3) or if discovery knobs are set alongside the hermetic `relay_mode = "disabled"`; OK otherwise. |
 | `relays` | **`relay_mode = "custom"` only.** Which of your pinned relays are actually connected, read from the live daemon. WARN naming any that are not — the node keeps working over the healthy ones, but a dead entry costs a bounded penalty on every boot (#125). INFO when no mesh daemon is running to ask. |
+| `identity` | Only appears if another endpoint has been seen presenting this node's identity (#134) — two nodes booted from copies of one mesh root. WARN naming how long ago. Absence means *not observed*, never "verified unique". |
 | `roster-url` | WARN if roster mode has no `[roster].url` (degrades to stale). |
 | `roster-freshness` | the roster's state (approved/degraded/stopped/pending) + last-confirmed age. |
 | `device.key` / `user.key` / `org-root.key` | ERR if group/world-writable, WARN if readable (must be 0600). |

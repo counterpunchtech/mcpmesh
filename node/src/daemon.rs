@@ -293,11 +293,16 @@ pub struct MeshState {
     /// `reach_bcast` for the same reason that one is separate from audit: the frames have
     /// different shapes and different producers, and merging happens at the subscription.
     pub(crate) self_net_bcast: tokio::sync::broadcast::Sender<mcpmesh_local_api::SelfNetwork>,
-    /// The duplicate-identity observation (#134), shared with whatever
-    /// [`IdentityConflictLayer`](crate::diag::IdentityConflictLayer) is installed — by the
-    /// standalone daemon at boot, or by an embedder into the subscriber it owns. Never observed
-    /// on a node whose identity is unique, which is the overwhelmingly common case.
-    pub(crate) identity_conflict: Arc<crate::diag::IdentityConflict>,
+    /// The duplicate-identity observation (#134) — the SAME cell as whatever
+    /// [`IdentityConflictLayer`](crate::diag::IdentityConflictLayer) is recording into. Set once
+    /// by the standalone daemon at boot, or by an embedder via
+    /// [`NodeBuilder::identity_conflict`](crate::NodeBuilder::identity_conflict).
+    ///
+    /// Set-once (same discipline as `audit`/`limits`) rather than owned, because the layer must be
+    /// constructed with this Arc BEFORE the host installs its subscriber, which happens before any
+    /// node exists. Unset — the default — means the condition is not observable here, which is why
+    /// `status` reports absence rather than "no conflict".
+    pub(crate) identity_conflict: std::sync::OnceLock<Arc<crate::diag::IdentityConflict>>,
     /// When the self-net watcher last observed a posture change (#90, epoch seconds) — merged
     /// into `status.self_network.last_change_epoch`. A std Mutex, never held across an await.
     pub(crate) self_net_change: std::sync::Mutex<Option<i64>>,
@@ -438,7 +443,7 @@ impl MeshState {
             self_binding: std::sync::OnceLock::new(),
             recent_pairings: std::sync::Mutex::new(std::collections::VecDeque::new()),
             reachability: std::sync::Mutex::new(std::collections::HashMap::new()),
-            identity_conflict: Arc::new(crate::diag::IdentityConflict::default()),
+            identity_conflict: std::sync::OnceLock::new(),
             reach_bcast: tokio::sync::broadcast::channel(REACH_BROADCAST_DEPTH).0,
             // Same depth as the reachability ring: posture transitions are rarer still.
             self_net_bcast: tokio::sync::broadcast::channel(REACH_BROADCAST_DEPTH).0,
@@ -456,6 +461,20 @@ impl MeshState {
     #[doc(hidden)]
     pub fn endpoint_for_test(&self) -> &iroh::Endpoint {
         &self.endpoint
+    }
+
+    /// Adopt the shared duplicate-identity cell (#134). Set-once; a second call is ignored, so a
+    /// host that both passes one to `NodeBuilder` and runs the daemon path cannot end up with the
+    /// status projection reading a different cell than the layer writes.
+    pub(crate) fn adopt_identity_conflict(&self, shared: Arc<crate::diag::IdentityConflict>) {
+        let _ = self.identity_conflict.set(shared);
+    }
+
+    /// When another endpoint was last seen presenting this node's identity (#134), or `None` —
+    /// which covers BOTH "never observed" and "no detector installed here". Never render it as
+    /// "this identity is unique".
+    pub(crate) fn identity_conflict_epoch(&self) -> Option<i64> {
+        self.identity_conflict.get()?.last_seen_epoch()
     }
 
     /// The reachability broadcast, for subscribing BEFORE the event under test can occur.

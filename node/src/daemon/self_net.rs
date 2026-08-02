@@ -71,7 +71,7 @@ pub(crate) fn read_current(mesh: &MeshState, last_change_epoch: Option<i64>) -> 
         relays,
         direct_addrs,
         last_change_epoch,
-        mesh.identity_conflict.last_seen_epoch(),
+        mesh.identity_conflict_epoch(),
     )
 }
 
@@ -121,13 +121,14 @@ pub fn spawn_self_net_watch(mesh: Arc<MeshState>) -> tokio::task::JoinHandle<()>
     })
 }
 
-/// What counts as a transition (#90): `online`, the home relay, and the relay list — NOT
-/// `direct_addrs` (chatty, advisory) and NOT the stamp itself (comparing it would make every
-/// emission differ from its successor by construction).
-/// What the watcher compares tick to tick — `online`, the home relay, every relay's state, and
-/// (since #134) the duplicate-identity stamp. Named because it outgrew a readable tuple.
+/// What the watcher compares tick to tick. Named because it outgrew a readable tuple.
 type Posture<'a> = (bool, Option<&'a str>, Vec<(&'a str, bool)>, Option<i64>);
 
+/// What counts as a transition (#90): `online`, the home relay, and the relay list — NOT
+/// `direct_addrs` (chatty, advisory) and NOT `last_change_epoch` itself (comparing it would make
+/// every emission differ from its successor by construction). Since #134 the duplicate-identity
+/// stamp joins it: that stamp is sticky, so including it emits once per relay report rather than
+/// once per tick.
 fn signature(net: &SelfNetwork) -> Posture<'_> {
     (
         net.online,
@@ -178,6 +179,46 @@ mod tests {
         let net = project(std::iter::empty::<(String, bool)>(), Vec::new(), None, None);
         assert!(!net.online, "no relays configured (relay_mode=disabled)");
         assert!(net.relays.is_empty());
+    }
+
+    /// #134 gate: the WIRE from the detector to `status`, end to end.
+    ///
+    /// Everything else here tests `project()` in isolation, which left the actual plumbing
+    /// unpinned — severing it (returning `None` instead of reading the cell) passed the entire
+    /// workspace: 245 unit tests and the `self_network` integration suite, all green, with the
+    /// feature completely disconnected. This drives a real `MeshState`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_observation_reaches_status_through_the_shared_cell() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+        std::fs::write(&cfg, "").unwrap();
+        let mesh = crate::daemon::testutil::hermetic_mesh(cfg).await;
+
+        // No detector installed: absence must mean "not observable", and must NOT be reported as
+        // a verified-unique identity.
+        assert_eq!(
+            read_current(&mesh, None).identity_conflict_epoch,
+            None,
+            "with no cell adopted the field is absent"
+        );
+
+        // The host's cell — the same Arc its IdentityConflictLayer would record into.
+        let shared = std::sync::Arc::new(crate::diag::IdentityConflict::default());
+        mesh.adopt_identity_conflict(shared.clone());
+        assert_eq!(
+            read_current(&mesh, None).identity_conflict_epoch,
+            None,
+            "adopting a cell is not itself an observation"
+        );
+
+        // What the layer does when the relay reports.
+        shared.observe(1_753_900_000);
+        assert_eq!(
+            read_current(&mesh, None).identity_conflict_epoch,
+            Some(1_753_900_000),
+            "an observation recorded by the HOST's layer must reach this node's status — if these \
+             are different cells the feature is silently disconnected, which is what shipped"
+        );
     }
 
     /// #134: a NEW duplicate-identity observation is a transition, so it PUSHES a frame rather
