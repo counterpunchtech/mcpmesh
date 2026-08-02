@@ -218,6 +218,42 @@ impl<'de> serde::Deserialize<'de> for RefusalCode {
     }
 }
 
+/// A pairing refusal that carries its own JSON-RPC code (#159).
+///
+/// One type rather than a marker struct per condition: `respond` downcasts once and reads `.code`,
+/// so adding the seventh onboarding condition is a constant plus a call site, not another arm.
+///
+/// The point is that an embedder can decide PER CASE whether to render our prose or replace it.
+/// Before this, `ERR_NICKNAME_TAKEN` was the only coded pairing failure, so the choice was
+/// all-or-nothing: forward every sentence verbatim to end users, or substring-match them.
+#[derive(Debug)]
+pub struct PairRefusal {
+    code: i64,
+    message: String,
+}
+
+impl PairRefusal {
+    pub fn new(code: i64, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+
+    /// The JSON-RPC code `respond` should answer with.
+    pub fn code(&self) -> i64 {
+        self.code
+    }
+}
+
+impl std::fmt::Display for PairRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for PairRefusal {}
+
 /// The redeemer-side typed error for a nickname-collision refusal (#147), which `respond` downcasts
 /// to [`ERR_NICKNAME_TAKEN`](mcpmesh_local_api::ERR_NICKNAME_TAKEN). Same shape as
 /// [`NoSuchService`](crate::daemon::NoSuchService): a type, a downcast, a stable code.
@@ -735,7 +771,12 @@ pub async fn redeem_invite(
     // Client-side pre-check: a friendly early error for an expired invite (the inviter also
     // enforces at redeem — this just avoids a pointless dial).
     if invite.expires_at_epoch < epoch_now() {
-        bail!("invite expired");
+        // #159: decided from the line in hand, before any dial — so it reveals nothing about the
+        // inviter and is safe to name precisely.
+        bail!(PairRefusal::new(
+            mcpmesh_local_api::ERR_INVITE_EXPIRED,
+            "this invite has expired — ask for a fresh one",
+        ));
     }
 
     // Client-side nickname-squatting check — the mirror of the inviter side's
@@ -746,28 +787,48 @@ pub async fn redeem_invite(
     // principal-keyed (#38), so no access can follow the name; refusing here keeps the
     // invariant that redeeming an invite grants the other side nothing.
     if let Some(conflict) = nickname_squat(&store, &invite.nickname, &invite.inviter_id)? {
-        bail!(
-            "this invite asks to be called '{}', but {conflict} \
-             Ask them for an invite suggesting a different name.",
-            invite.nickname,
-        );
+        bail!(PairRefusal::new(
+            mcpmesh_local_api::ERR_INVITE_NAME_CONFLICT,
+            format!(
+                "this invite asks to be called '{}', but {conflict} \
+                 Ask them for an invite suggesting a different name.",
+                invite.nickname,
+            ),
+        ));
     }
 
     // Dial the inviter at the exact address the invite embeds — pairing needs no discovery
     // (the invite carries the dialable `EndpointAddr`, so this works on localhost too).
     let addr: iroh::EndpointAddr = serde_json::from_str(&invite.inviter_addr_json)
         .context("invite carries an undecodable inviter address")?;
+    // #159: unreachable is its own condition — the invite is untouched, so the remedy is "check
+    // they are running and retry the same line", not "get a new one".
     let conn = endpoint
         .connect(addr, mcpmesh_net::ALPN_PAIR)
         .await
-        .context("could not dial the inviter's machine")?;
+        .map_err(|e| {
+            anyhow::Error::new(PairRefusal::new(
+                mcpmesh_local_api::ERR_INVITER_UNREACHABLE,
+                format!(
+                    "could not reach the inviter's machine — check it is running and online, \
+                     then retry this same invite ({e})"
+                ),
+            ))
+        })?;
 
     // Address-swap defense: the TLS-authenticated peer id is AUTHORITATIVE. If it is not the
     // id the invite names, we reached a substituted/MITM endpoint — refuse BEFORE revealing the
     // secret. (A whole-invite forgery that also swapped `inviter_id` still diverges the SAS,
     // which the human catches out-of-band.)
     if *conn.remote_id().as_bytes() != invite.inviter_id {
-        bail!("inviter id mismatch — refusing (address-swap defense)");
+        // #159: the ONE onboarding refusal that must not be rendered as "try again". Something
+        // answered in place of the machine this invite names.
+        bail!(PairRefusal::new(
+            mcpmesh_local_api::ERR_INVITER_MISMATCH,
+            "the machine that answered is not the one this invite names — refusing before \
+             revealing the secret (address-swap defense). Do not retry; get the invite again \
+             through a channel you trust.",
+        ));
     }
 
     // We (the redeemer) OPEN the bi-stream; the inviter `accept_bi`s. Send the hello proving the
@@ -816,10 +877,11 @@ pub async fn redeem_invite(
         // #87b made them survive, so that sentence became a false explanation handed to a user in
         // the one place they are trying to work out what went wrong.
         Err(_) if no_live_invite_close(&conn) => {
-            bail!(
+            bail!(PairRefusal::new(
+                mcpmesh_local_api::ERR_INVITE_NOT_LIVE,
                 "the invite is no longer live on the inviter: it expired, was already \
-                 redeemed, or the inviter cancelled it — ask for a fresh invite"
-            );
+                 redeemed, or the inviter cancelled it — ask for a fresh invite",
+            ));
         }
         Err(e) => return Err(e),
     };
@@ -926,7 +988,10 @@ fn refusal_error(reason: &str, code: Option<RefusalCode>) -> anyhow::Error {
     let msg = format!("pairing refused: {reason}");
     match code {
         Some(RefusalCode::NicknameTaken) => anyhow::Error::new(NicknameTaken(msg)),
-        _ => anyhow::anyhow!(msg),
+        // #159: branchable as "that invite did not work" WITHOUT saying why. The inviter answers
+        // one reason for unknown / expired / wrong secret on purpose — telling them apart is a
+        // redemption oracle — so this code carries exactly as much as the prose already did.
+        _ => anyhow::Error::new(PairRefusal::new(mcpmesh_local_api::ERR_INVITE_REFUSED, msg)),
     }
 }
 
@@ -1110,6 +1175,60 @@ mod tests {
             );
             assert_eq!(e.to_string(), format!("pairing refused: {REASON_REFUSED}"));
         }
+    }
+
+    /// #159, and the load-bearing half: the OPAQUE refusal gains a code without gaining
+    /// information.
+    ///
+    /// The inviter answers one reason for unknown / expired / wrong secret deliberately —
+    /// distinguishing them is a redemption oracle, since a prober would learn which guessed
+    /// secrets were ever real. #159 asked for "expired vs already consumed" as separate codes;
+    /// this is why the answer is no, and `ERR_INVITE_NOT_LIVE` (a fact about the INVITER, not the
+    /// secret) is as close as it is safe to get.
+    ///
+    /// So: same code, same prose, whatever the underlying cause.
+    #[test]
+    fn the_opaque_refusal_gains_a_code_but_not_information() {
+        // The three causes the inviter refuses to distinguish all arrive here identically — an
+        // uncoded `PairReply::Refused` carrying REASON_REFUSED.
+        let seen: Vec<(i64, String)> = [None, Some(RefusalCode::Unknown)]
+            .into_iter()
+            .map(|code| {
+                let e = refusal_error(REASON_REFUSED, code);
+                let refusal = e
+                    .downcast_ref::<PairRefusal>()
+                    .expect("the opaque refusal must still be branchable");
+                (refusal.code(), e.to_string())
+            })
+            .collect();
+
+        assert!(
+            seen.iter()
+                .all(|(c, _)| *c == mcpmesh_local_api::ERR_INVITE_REFUSED),
+            "one code for the whole opaque family: {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|(_, m)| *m == seen[0].1),
+            "and one MESSAGE — a per-cause message would rebuild the oracle in prose that the \
+             code refuses to build in a number: {seen:?}"
+        );
+        assert!(
+            !seen[0].1.contains("expired") && !seen[0].1.contains("unknown"),
+            "the opaque reason must not name a cause at all: {}",
+            seen[0].1
+        );
+
+        // And the collision refusal is NOT swallowed into it — that one is safe to distinguish,
+        // because it only reaches a caller that already proved possession of a live secret.
+        let collision = refusal_error("nickname taken", Some(RefusalCode::NicknameTaken));
+        assert!(
+            collision.downcast_ref::<NicknameTaken>().is_some(),
+            "the recoverable collision keeps its own typed error"
+        );
+        assert!(
+            collision.downcast_ref::<PairRefusal>().is_none(),
+            "and must not be re-coded as the opaque refusal"
+        );
     }
 
     /// #147 gate: the code means "rename and redeem the SAME invite again", so it may ride ONLY a

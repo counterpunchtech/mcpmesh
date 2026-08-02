@@ -908,6 +908,19 @@ fn respond<T: serde::Serialize>(id: Value, method: &str, r: anyhow::Result<T>) -
             mcpmesh_local_api::ERR_NO_SUCH_BLOB,
             format!("{method} failed: {e}"),
         ),
+        // #159: an onboarding refusal that carries its own code. ONE arm for the whole family —
+        // expired line, no live invite, inviter unreachable, id mismatch, name conflict, and the
+        // deliberately-opaque refusal — so adding the next condition is a constant plus a call
+        // site rather than another arm here. Checked BEFORE the generic fallthrough.
+        Err(e)
+            if e.downcast_ref::<crate::pairing::rendezvous::PairRefusal>()
+                .is_some() =>
+        {
+            let refusal = e
+                .downcast_ref::<crate::pairing::rendezvous::PairRefusal>()
+                .expect("checked by the guard");
+            error(id, refusal.code(), format!("{method} failed: {e}"))
+        }
         // #147: the ONE `pair` refusal with a self-service remedy — rename and redeem the same
         // invite again. It gets a code so a GUI embedder writes its own recovery copy naming its
         // own rename affordance, instead of substring-matching prose that is generated on the
@@ -1118,6 +1131,63 @@ mod tests {
     }
     fn req(method: &str, params: Value) -> Value {
         json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params })
+    }
+
+    /// #159: each onboarding refusal reaches the embedder as its OWN code.
+    ///
+    /// The point of the issue: `ERR_NICKNAME_TAKEN` was the only coded pairing failure, so an
+    /// embedder either forwarded our prose verbatim to end users or substring-matched it. These
+    /// codes let it decide per case.
+    #[test]
+    fn each_onboarding_refusal_carries_its_own_code() {
+        use crate::pairing::rendezvous::PairRefusal;
+        let coded = |code: i64| -> Value {
+            let e: anyhow::Result<()> = Err(anyhow::Error::new(PairRefusal::new(code, "why")));
+            respond(json!(1), "pair", e)
+        };
+        for code in [
+            mcpmesh_local_api::ERR_INVITE_EXPIRED,
+            mcpmesh_local_api::ERR_INVITE_NOT_LIVE,
+            mcpmesh_local_api::ERR_INVITER_UNREACHABLE,
+            mcpmesh_local_api::ERR_INVITER_MISMATCH,
+            mcpmesh_local_api::ERR_INVITE_NAME_CONFLICT,
+            mcpmesh_local_api::ERR_INVITE_REFUSED,
+        ] {
+            let v = coded(code);
+            assert_eq!(
+                v["error"]["code"], code,
+                "each condition keeps its own code: {v}"
+            );
+        }
+
+        // They are all DISTINCT — collapsing any two would silently merge two different remedies.
+        let all = [
+            mcpmesh_local_api::ERR_INVITE_EXPIRED,
+            mcpmesh_local_api::ERR_INVITE_NOT_LIVE,
+            mcpmesh_local_api::ERR_INVITER_UNREACHABLE,
+            mcpmesh_local_api::ERR_INVITER_MISMATCH,
+            mcpmesh_local_api::ERR_INVITE_NAME_CONFLICT,
+            mcpmesh_local_api::ERR_INVITE_REFUSED,
+            mcpmesh_local_api::ERR_NICKNAME_TAKEN,
+        ];
+        let unique: std::collections::BTreeSet<i64> = all.iter().copied().collect();
+        assert_eq!(unique.len(), all.len(), "codes must not collide: {all:?}");
+
+        // `ERR_INVITER_MISMATCH` is the one that must never read as "retry me". It is distinct
+        // from every recoverable code, which is what lets an embedder render it differently — an
+        // app that treats every pairing failure as a friendly retry papers over the address-swap
+        // attack this check exists to catch.
+        assert!(
+            !all[..all.len() - 1]
+                .iter()
+                .filter(|c| **c != mcpmesh_local_api::ERR_INVITER_MISMATCH)
+                .any(|c| *c == mcpmesh_local_api::ERR_INVITER_MISMATCH),
+            "the address-swap refusal must not share a code with a recoverable one"
+        );
+
+        // And an unrelated failure still answers -32000, so the codes stay meaningful.
+        let plain: anyhow::Result<()> = Err(anyhow::anyhow!("something else"));
+        assert_eq!(respond(json!(1), "pair", plain)["error"]["code"], -32000);
     }
 
     /// #147: a nickname-collision refusal reaches the embedder as `ERR_NICKNAME_TAKEN`, and
