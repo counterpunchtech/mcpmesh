@@ -61,11 +61,17 @@ fn write_if_changed(mesh: &Arc<MeshState>, endpoint_id: [u8; 32], observed: Stri
 /// [`crate::allowlist::PeerEntry::last_addr`] stores them.
 ///
 /// **Filters to IP paths, and returns `None` when only a relay path is open (#124 review).** The
-/// first version took every path unfiltered, which is actively harmful: a hint is *replacing* the
-/// bare-id dial, so persisting a relay URL leaves the direct-candidate set EMPTY. Measured — a
-/// seeded direct hint was overwritten with a relay URL and stayed that way for the rest of the
-/// session — and it manufactures in production exactly the state this repo's own tests seed
-/// deliberately to force a relayed session. A relay URL must never become a dial hint.
+/// first version took every path unfiltered, which is actively harmful: persisting a relay URL
+/// replaces a peer's stored DIRECT candidate with one that can never punch. Measured — a seeded
+/// direct hint was overwritten with a relay URL and stayed that way for the rest of the session —
+/// and it manufactures in production exactly the state this repo's own tests seed deliberately to
+/// force a relayed session. A relay URL must never become a dial hint.
+///
+/// (The #124-era wording said a hint "replaces the bare-id dial". It does not, and the correction
+/// matters for reading #140: `handle_msg_resolve_remote` inserts our addresses as candidate paths
+/// with `Source::App` and then still triggers address lookup, so the hint is MERGED with discovery.
+/// What it replaces is the previously STORED hint, which is why writing a relay URL over a direct
+/// one is the real harm.)
 ///
 /// `None` (empty snapshot, no IP path, or a serialize failure) means "learned nothing", which the
 /// caller treats as leave-alone rather than clear.

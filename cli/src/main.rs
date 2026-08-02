@@ -389,6 +389,27 @@ enum PeerCmd {
         #[arg(long)]
         allow: Option<String>,
     },
+    /// Dump the DURABLE state this node stores for one peer (#140) — a diagnostic.
+    ///
+    /// Answers "what is this node about to dial, and where did that come from": the
+    /// persisted dial hint verbatim, whether it is actually usable (an unparseable or
+    /// mismatched hint is silently discarded at every dial), the addresses inside it, the
+    /// pairing stamp, and the live reachability row.
+    ///
+    /// UNLIKE every other surface this PRINTS TRANSPORT VOCABULARY — IP addresses — because
+    /// that is the question. It is your own store's record of your own peers; read it before
+    /// pasting it anywhere public.
+    ///
+    /// Read-only: probes nothing, dials nothing, writes nothing, so running it cannot perturb
+    /// the state being diagnosed. Intended as a paired capture — run it on BOTH ends of a
+    /// stuck pairing and compare.
+    State {
+        /// The peer: a nickname or an `eid:` device principal.
+        peer: String,
+        /// Emit the raw `PeerDiagnosticsResult` as JSON (the shape to attach to an issue).
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -480,6 +501,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                         },
                 },
         }) => run_peer_add(nickname, endpoint_id, allow, cli.json),
+        Some(Cmd::Internal {
+            command:
+                Internal::Peer {
+                    command: PeerCmd::State { peer, json },
+                },
+        }) => run_peer_state(peer, json || cli.json),
         Some(Cmd::Internal {
             command:
                 Internal::Roster {
@@ -696,6 +723,87 @@ fn run_peer_add(
             println!("{}", serde_json::json!({"peer": nickname, "added": true}));
         } else {
             println!("added peer '{nickname}'");
+        }
+        Ok(())
+    })
+}
+
+/// `mcpmesh internal peer state <peer> [--json]` (#140): dump the durable per-peer state.
+///
+/// The human form is laid out to be READ SIDE BY SIDE with the same output from the other end of a
+/// stuck pairing, which is how the state that differs becomes visible. `--json` is the shape to
+/// attach to an issue.
+fn run_peer_state(peer: String, json: bool) -> anyhow::Result<()> {
+    with_daemon(async move |mut client| {
+        let v = client
+            .request(mcpmesh::Request::PeerDiagnostics(
+                mcpmesh_local_api::PeerDiagnosticsParams { peer: peer.clone() },
+            ))
+            .await?;
+        if json {
+            println!("{v}");
+            return Ok(());
+        }
+        let d: mcpmesh_local_api::PeerDiagnosticsResult = serde_json::from_value(v)?;
+        println!("peer:       {} ({})", d.nickname, d.principal);
+        if let Some(u) = &d.user_id {
+            println!("user:       {u}");
+        }
+        println!(
+            "paired_at:  {}",
+            d.paired_at.as_deref().unwrap_or("(not recorded)")
+        );
+        match (&d.last_addr, d.hint_usable) {
+            (None, _) => println!(
+                "dial hint:  (none) — this node dials by id alone, exactly as a freshly paired \
+                 identity does"
+            ),
+            (Some(_), false) => println!(
+                "dial hint:  PRESENT BUT UNUSABLE — it does not parse, or its embedded id is not \
+                 this peer, so every dial silently discards it and falls back to id-only"
+            ),
+            (Some(_), true) => {
+                println!("dial hint:  {}", d.hint_addrs.join(", "));
+                if !d.hint_addrs.iter().any(|a| !a.starts_with("relay ")) {
+                    println!(
+                        "            RELAY-ONLY — this hint can never punch. It is what an invite \
+                         minted while only the relay path was up leaves behind."
+                    );
+                }
+                println!(
+                    "            merged with discovery as an extra candidate — but iroh SKIPS \
+                     that lookup while a path is already selected, so on a pair holding an open \
+                     relayed connection this hint is the only addressing a dial contributes."
+                );
+            }
+        }
+        match &d.reachability {
+            None => println!(
+                "live:       never probed (this is a cache read — it does not dial, so a fresh \
+                 daemon reports this until something else probes)"
+            ),
+            Some(r) => {
+                let path = match &r.path {
+                    mcpmesh_local_api::PeerPath::Direct => "direct".to_string(),
+                    mcpmesh_local_api::PeerPath::Relay { url } => match url {
+                        Some(u) => format!("relay ({u})"),
+                        None => "relay".to_string(),
+                    },
+                    _ => "unknown".to_string(),
+                };
+                println!(
+                    "live:       {} via {path}{}",
+                    if r.reachable {
+                        "reachable"
+                    } else {
+                        "UNREACHABLE"
+                    },
+                    match r.rtt_ms {
+                        Some(ms) => format!(", {ms} ms"),
+                        None => String::new(),
+                    }
+                );
+            }
         }
         Ok(())
     })
