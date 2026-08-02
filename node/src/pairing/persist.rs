@@ -127,6 +127,7 @@ mod tests {
             services: vec!["notes".into()],
             expires_at_epoch,
             app_label: None,
+            uses_remaining: 1,
         }
     }
 

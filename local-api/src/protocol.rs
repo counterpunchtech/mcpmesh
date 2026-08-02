@@ -502,7 +502,25 @@ pub struct InviteParams {
     /// metadata slot for the embedder (e.g. its own URN). Capped at the daemon; omit for none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_label: Option<String>,
+    /// How many times this invite may be redeemed (#87). Absent = **1**, the single-use behaviour
+    /// every existing caller already gets.
+    ///
+    /// Each redemption runs its OWN SAS ceremony and writes its own mutual peer rows — this is not
+    /// a shared or group identity, it is N independent pairings that happen to share one secret.
+    /// Onboarding a team stops being N mint-and-send rounds.
+    ///
+    /// Clamped to [`MAX_INVITE_USES`]; `0` is rejected rather than silently meaning "unusable". A
+    /// bearer credential's blast radius is `max_uses` × TTL, so it is opt-in and capped on purpose.
+    /// The value actually applied comes back in [`InviteResult::uses_remaining`] — read that rather
+    /// than assuming you got what you asked for. `api_minor >= 35`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_uses: Option<u32>,
 }
+
+/// The ceiling on [`InviteParams::max_uses`] (#87). Comfortably above "a team", far below "a
+/// fleet": one leaked invite line must not be able to enroll an unbounded number of devices for the
+/// whole 24h TTL.
+pub const MAX_INVITE_USES: u32 = 64;
 
 /// Params of [`Request::Pair`]: the copyable `mcpmesh-invite:` line. Defaultable — an
 /// absent field reads as an empty line, which simply fails to decode (a clean pair error).
@@ -1155,6 +1173,20 @@ pub struct InviteResult {
     pub invite_line: String,
     /// When the invite expires (epoch seconds); the daemon burns it at redemption or expiry.
     pub expires_at_epoch: u64,
+    /// How many redemptions this invite has left (#87) — **the value actually applied**, after the
+    /// [`MAX_INVITE_USES`] clamp. `1` for an ordinary single-use invite.
+    ///
+    /// Reported so a caller that asked for more than the cap is told what it got rather than
+    /// discovering it when the fourth colleague fails. Additive: `#[serde(default = "one")]`, so a
+    /// response from an older daemon reads as single-use. `api_minor >= 35`.
+    #[serde(default = "one_use")]
+    pub uses_remaining: u32,
+}
+
+/// The serde default for a `uses_remaining` field absent from an older payload or invite line: one
+/// redemption, which is what every pre-#87 invite is.
+pub fn one_use() -> u32 {
+    1
 }
 
 /// Result of a [`Request::Pair`] request: the inviter's suggested nickname (the
@@ -1598,7 +1630,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   thirty have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.34";
+pub const API_VERSION: &str = "1.35";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -1677,7 +1709,10 @@ pub const API_VERSION: &str = "1.34";
 /// bound on the daemon's process lifetime to the real lifetime, and `invite` gained an error where
 /// it previously always succeeded. No shape changed, which is exactly the class minor 10 records:
 /// guard on `api_minor >= 34` before telling a user their invite will still be good tomorrow
-/// (#87b).
+/// (#87b); to 35 with `InviteParams.max_uses` + `InviteResult.uses_remaining` — a bounded
+/// multi-use invite, so onboarding a team is one link rather than one ceremony per person. Each
+/// redemption still runs its own SAS and writes its own peer rows; it is N pairings sharing a
+/// secret, never a group identity (#87).
 ///
 /// **Not every semantic change gets a minor, and that is the gap to watch (#122).** A minor marks a
 /// change to this *surface*. A change to behaviour BEHIND the surface — same fields, same shapes,
@@ -1688,7 +1723,7 @@ pub const API_VERSION: &str = "1.34";
 /// That class is bigger than it looks: **10, 17, 21, 22, 23 and 24 all shipped with no change to
 /// any type in this file** — they moved meaning, not shape. Six of the thirty. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 34;
+pub const API_MINOR: u32 = 35;
 
 #[cfg(test)]
 mod tests {
@@ -2358,6 +2393,7 @@ mod tests {
         let r = Request::Invite(InviteParams {
             services: vec!["notes".into(), "kb".into()],
             app_label: None,
+            max_uses: None,
         });
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["method"], "invite");
@@ -2374,6 +2410,7 @@ mod tests {
         let res = InviteResult {
             invite_line: "mcpmesh-invite:ABCDEF".into(),
             expires_at_epoch: 1_800_000_000,
+            uses_remaining: 1,
         };
         let v = serde_json::to_value(&res).unwrap();
         assert_eq!(v["invite_line"], "mcpmesh-invite:ABCDEF");

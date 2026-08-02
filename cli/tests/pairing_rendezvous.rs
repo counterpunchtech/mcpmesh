@@ -69,6 +69,7 @@ fn make_invite(
         services: services.iter().map(|s| s.to_string()).collect(),
         expires_at_epoch,
         app_label: None,
+        uses_remaining: 1,
     }
 }
 
@@ -842,6 +843,7 @@ async fn repeat_grant_unions_the_redeemers_dial_directory_and_applies_the_new_ni
             services: vec!["kb".into(), "notes".into()],
             expires_at_epoch: FUTURE,
             app_label: None,
+            uses_remaining: 1,
         };
         invites.mint(invite.clone()).await.unwrap();
 
@@ -925,6 +927,7 @@ async fn redeem_refuses_an_invite_squatting_an_existing_peers_nickname() {
             services: vec!["kb".into()],
             expires_at_epoch: FUTURE,
             app_label: None,
+            uses_remaining: 1,
         };
         invites.mint(invite.clone()).await.unwrap();
 
@@ -982,6 +985,7 @@ async fn a_dead_invite_dial_reports_the_cause_not_a_bare_connection_failure() {
             services: vec![],
             expires_at_epoch: FUTURE, // the LINE still advertises a live TTL — that is the bug
             app_label: None,
+            uses_remaining: 1,
         };
         let err = redeem_invite(
             redeemer,
@@ -1059,6 +1063,7 @@ async fn paired_and_granted_peer_is_admitted_to_the_service_end_to_end() {
             services: vec!["notes".into()],
             expires_at_epoch: FUTURE,
             app_label: None,
+            uses_remaining: 1,
         };
         invites.mint(invite.clone()).await.unwrap();
 
@@ -1240,6 +1245,7 @@ async fn rename_after_pairing_keeps_the_peer_admitted() {
             services: vec!["notes".into()],
             expires_at_epoch: FUTURE,
             app_label: None,
+            uses_remaining: 1,
         };
         invites.mint(invite.clone()).await.unwrap();
         let bob = redeemer_endpoint().await;
@@ -1392,6 +1398,7 @@ async fn pairing_exchanges_and_stores_each_sides_verified_user_id() {
             services: vec![],
             expires_at_epoch: FUTURE,
             app_label: None,
+            uses_remaining: 1,
         };
         invites.mint(invite.clone()).await.unwrap();
 
@@ -1491,6 +1498,7 @@ async fn redeem_refuses_an_address_swap_and_writes_no_entry_p3() {
             services: vec!["notes".into()],
             expires_at_epoch: FUTURE,
             app_label: None,
+            uses_remaining: 1,
         };
 
         let bob = redeemer_endpoint().await;

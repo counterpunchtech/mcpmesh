@@ -103,6 +103,15 @@ enum Cmd {
         /// never interprets it — a slot for an embedding app to pass its own identity/metadata.
         #[arg(long, value_name = "text")]
         label: Option<String>,
+        /// How many people may redeem this one invite (#87). Default 1.
+        ///
+        /// Each redemption is its OWN pairing — its own code to compare, its own trust entry. One
+        /// link onboards a team instead of one ceremony per person.
+        ///
+        /// It is a bearer credential for that many redemptions until it expires, so it is capped;
+        /// the value actually applied is printed back.
+        #[arg(long, value_name = "n")]
+        uses: Option<u32>,
     },
     /// Redeem an invite to access a peer's services, or unpair a peer.
     ///
@@ -456,7 +465,11 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         }) => run_internal_id(),
         Some(Cmd::Serve { name, allow, cmd }) => run_serve(name, allow, cmd, cli.json),
         Some(Cmd::Connect { target }) => run_connect(target),
-        Some(Cmd::Invite { services, label }) => run_invite(services, label, cli.json),
+        Some(Cmd::Invite {
+            services,
+            label,
+            uses,
+        }) => run_invite(services, label, uses, cli.json),
         Some(Cmd::Pair { invite, remove }) => run_pair(invite, remove, cli.json),
         Some(Cmd::Use { target }) => run_use(target, cli.json),
         Some(Cmd::Join {
@@ -623,12 +636,17 @@ fn run_connect(target: String) -> anyhow::Result<()> {
 ///
 /// Empty `services` is an ERROR: an invite that grants nothing is useless, and erroring here is
 /// friendlier than minting a dead invite the redeemer can do nothing with.
-fn run_invite(services: Vec<String>, label: Option<String>, json: bool) -> anyhow::Result<()> {
+fn run_invite(
+    services: Vec<String>,
+    label: Option<String>,
+    uses: Option<u32>,
+    json: bool,
+) -> anyhow::Result<()> {
     if services.is_empty() {
         anyhow::bail!("specify at least one service to grant (e.g. `mcpmesh invite notes`)");
     }
     with_daemon(async move |mut client| {
-        let invite = client.invite_with(services.clone(), label).await?;
+        let invite = client.invite_multi(services.clone(), label, uses).await?;
         if json {
             println!("{}", mcpmesh::json::invite_json(&invite, &services));
             return Ok(());

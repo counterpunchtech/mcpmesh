@@ -191,6 +191,7 @@ mod tests {
         let invite = InviteResult {
             invite_line: "mcpmesh-invite:MFRGGZDF".into(),
             expires_at_epoch: 1_086_400,
+            uses_remaining: 1,
         };
         let v = invite_json(&invite, &["notes".to_string(), "kb".to_string()]);
         assert_eq!(v["invite_line"], "mcpmesh-invite:MFRGGZDF");

@@ -216,6 +216,7 @@ async fn four_command_hero_flow() {
             .request(Request::Invite(InviteParams {
                 services: vec!["notes".into()],
                 app_label: None,
+                max_uses: None,
             }))
             .await
             .expect("invite over mcpmesh-local/1");
