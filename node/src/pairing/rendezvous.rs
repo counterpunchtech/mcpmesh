@@ -499,15 +499,24 @@ pub async fn handle_inviter_side(
             let (existing, collides) =
                 resolve_and_check_collision(&ctx.store, &hello.redeemer_nickname, tls_id).await?;
             if collides {
+                // #87: whether the invite SURVIVED is now a fact about this invite, not a
+                // constant. `try_redeem` returns the count AFTER decrementing, so uses remaining
+                // means the redeemer can rename and retry with the very same line.
+                //
+                // Hardcoding `false` here shipped the #147 defect straight back: a multi-use
+                // invite makes this race routine (two colleagues redeeming one link, the #87(a)
+                // same-hostname case), and the loser was told "ask the inviter for a fresh invite"
+                // while holding one with four uses left — AND lost the branchable
+                // ERR_NICKNAME_TAKEN precisely where the recovery is self-service.
+                let survived = invite.uses_remaining > 0;
                 tracing::warn!(
                     nickname = %hello.redeemer_nickname,
-                    "pairing refused: nickname collision (post-redeem race guard; invite burned)"
+                    uses_remaining = invite.uses_remaining,
+                    "pairing refused: nickname collision (post-redeem race guard)"
                 );
                 let _ = send_reply(
                     &mut send,
-                    // `false` = the invite was BURNED winning the race, so this carries no
-                    // rename-and-retry code — see `collision_refusal`.
-                    &collision_refusal(&hello.redeemer_nickname, false),
+                    &collision_refusal(&hello.redeemer_nickname, survived),
                 )
                 .await;
                 return Ok(());
@@ -801,12 +810,15 @@ pub async fn redeem_invite(
         // The exchange failed. If the inviter's accept gate fast-closed us (#87b), say what
         // that MEANS — the invite line in hand may still advertise a live TTL, but invites are
         // in-memory on the inviter, so this is the everyday shape of "expired, already used,
-        // or the inviter's daemon restarted", not a network problem.
+        // or the inviter cancelled it", not a network problem.
+        //
+        // It used to say "the inviter's daemon restarted (invites do not survive a restart)".
+        // #87b made them survive, so that sentence became a false explanation handed to a user in
+        // the one place they are trying to work out what went wrong.
         Err(_) if no_live_invite_close(&conn) => {
             bail!(
                 "the invite is no longer live on the inviter: it expired, was already \
-                 redeemed, or the inviter's daemon restarted since minting it (invites do \
-                 not survive a restart) — ask for a fresh invite"
+                 redeemed, or the inviter cancelled it — ask for a fresh invite"
             );
         }
         Err(e) => return Err(e),

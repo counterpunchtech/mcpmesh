@@ -200,7 +200,8 @@ impl ControlClient {
         .await
     }
 
-    /// Mint a one-time pairing invite granting `services`; return the copyable
+    /// Mint a single-use pairing invite granting `services` (see `invite_multi` for more than
+    /// one); return the copyable
     /// `mcpmesh-invite:` line + its expiry.
     pub async fn invite(&mut self, services: Vec<String>) -> Result<InviteResult, ClientError> {
         self.invite_with(services, None).await

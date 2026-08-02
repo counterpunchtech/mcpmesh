@@ -143,6 +143,15 @@ pub fn spawn_accept_loop(mesh: Arc<MeshState>, services: Arc<Services>) -> JoinH
                         // conn burns the last invite first, this one still reaches `try_redeem` and
                         // gets `Unknown` → refused — so per-invite expiry/burn stays authoritative
                         // there, and this is a cheap front-door close, not the security boundary.
+                        // #87 widened the WINDOW this closes, without changing this code. A
+                        // single-use invite made the front door shut seconds after minting — the
+                        // first redemption burned the only invite. A multi-use one keeps
+                        // `count() > 0` for its whole TTL in the normal case, so a stranger
+                        // dialing ALPN_PAIR gets past this fast-close and into the rate-limited
+                        // rendezvous for up to 24h. That is the one genuinely new exposure to a
+                        // caller WITHOUT the secret; it is bounded by the same rate limiter and
+                        // strike budget that already protect the by-design-open pair ALPN, and by
+                        // the operator choosing to mint a multi-use invite at all.
                         if mesh.invites.count() == 0 {
                             // The shared constant (#87b): the redeemer matches these bytes off
                             // `close_reason()` to say "expired / used / inviter restarted"

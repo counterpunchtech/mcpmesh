@@ -83,7 +83,8 @@ live end-to-end proof and cleanup is [`docs/loopback.md`](docs/loopback.md), or 
 - **🕵️ No middleman.** Traffic is end-to-end encrypted, machine to machine
   ([iroh](https://iroh.computer)/QUIC with NAT hole-punching). No account to create, no server of
   ours in the trust path.
-- **✋ Tamper-evident invites.** Invites are one-time and expiring, and the spoken safety code
+- **✋ Tamper-evident invites.** Invites are expiring and single-use by default (`--uses N` for a
+  bounded multi-person link), and the spoken safety code
   catches a tampered invite *before* anything is shared.
 
 ## 👥 The full walkthrough: Alice and Bob
@@ -121,7 +122,7 @@ match, out loud. Same words = the pairing is authentic.
 Alice sends that `mcpmesh-invite:…` line to Bob over **any** channel he can paste from — chat,
 email, a shared doc. (It's a long line, a couple of KB of text — not one to copy by hand.) The
 channel doesn't need to be secure: tampering with the invite makes the next step's code mismatch,
-and the invite is one-time and expiring.
+and the invite is expiring and single-use by default.
 
 ### 2️⃣ Bob redeems the invite
 

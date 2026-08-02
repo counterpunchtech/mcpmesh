@@ -90,7 +90,7 @@ enum Cmd {
         /// The service to reach, as `<peer>/<service>`.
         target: String,
     },
-    /// Mint a one-time invite granting access to your services.
+    /// Mint an invite granting access to your services. Single-use unless `--uses` says otherwise.
     ///
     /// Auto-starts the daemon and prints the copyable `mcpmesh-invite:` line to
     /// share out-of-band; whoever redeems it can access the listed services on this

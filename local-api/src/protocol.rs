@@ -512,7 +512,12 @@ pub struct InviteParams {
     /// Clamped to [`MAX_INVITE_USES`]; `0` is rejected rather than silently meaning "unusable". A
     /// bearer credential's blast radius is `max_uses` × TTL, so it is opt-in and capped on purpose.
     /// The value actually applied comes back in [`InviteResult::uses_remaining`] — read that rather
-    /// than assuming you got what you asked for. `api_minor >= 35`.
+    /// than assuming you got what you asked for.
+    ///
+    /// **`api_minor >= 35`, and sending it to an older daemon FAILS rather than degrading.**
+    /// `InviteParams` is `deny_unknown_fields`, so an `api_minor < 35` daemon answers `-32602
+    /// unknown field 'max_uses'` — it does not quietly mint a single-use invite. Loud is the right
+    /// behaviour; omit the field entirely when talking to one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_uses: Option<u32>,
 }
@@ -840,7 +845,8 @@ pub enum Request {
     /// Register/update a `[services.*]` entry idempotently.
     RegisterService(RegisterServiceParams),
     Status,
-    /// Mint a one-time pairing invite granting `services`. The daemon
+    /// Mint a pairing invite granting `services` — single-use unless `max_uses` says otherwise
+    /// (#87). The daemon
     /// answers an [`InviteResult`] carrying the copyable `mcpmesh-invite:` line. Tag
     /// `"invite"` (snake_case). `method_of` needs no per-variant arm — it reads the
     /// `method` string generically; the tag comes from `rename_all`.
