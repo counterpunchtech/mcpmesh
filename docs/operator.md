@@ -267,7 +267,11 @@ invite line advertises (#87b). It contains **bearer secrets** — anyone who can
 those invites until they expire — and is written `0600`, the same protection the device key gets.
 
 Deleting the file is a safe, supported action: it invalidates every outstanding invite and nothing
-else. Redeemed and expired invites are removed automatically, so it does not grow.
+else. Redeemed and expired invites are removed from it as they go, so it does not grow — including
+the case where every invite has expired, which leaves it empty rather than holding dead secrets.
+
+`doctor`'s `invites` check lints its permissions the same way it lints `device.key`, so drift from a
+`cp -r` under a loose umask or a restore from backup is reported rather than assumed away.
 
 ## 6. Health check reference
 

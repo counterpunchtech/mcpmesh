@@ -184,6 +184,7 @@ async fn happy_path_writes_the_trust_grant_and_returns_the_inviter_identity() {
         let secret = [7u8; 32];
         invites
             .mint(make_invite(secret, inviter_id, &["notes", "kb"], FUTURE))
+            .await
             .unwrap();
         assert_eq!(invites.count(), 1);
 
@@ -246,6 +247,7 @@ async fn wrong_secret_is_refused_and_leaves_the_live_invite_untouched() {
         // A real live invite exists under secret A; the redeemer sends secret B.
         invites
             .mint(make_invite([1u8; 32], inviter_id, &["notes"], FUTURE))
+            .await
             .unwrap();
         assert_eq!(invites.count(), 1);
 
@@ -284,6 +286,7 @@ async fn expired_invite_is_refused_and_writes_no_entry() {
         // Minted already-expired: correct secret, but expiry in the past.
         invites
             .mint(make_invite(secret, inviter_id, &["notes"], PAST))
+            .await
             .unwrap();
 
         let reply =
@@ -315,6 +318,7 @@ async fn id_mismatch_is_refused_writes_no_entry_and_logs_no_peer_id() {
         let secret = [5u8; 32];
         invites
             .mint(make_invite(secret, inviter_id, &["notes"], FUTURE))
+            .await
             .unwrap();
 
         // The redeemer LIES about its own id (claims all-9s, its real TLS id differs). The
@@ -376,6 +380,7 @@ async fn malformed_hello_is_refused_without_panicking_and_writes_no_entry() {
         // A live invite exists, but the redeemer never sends a valid RedeemerHello.
         invites
             .mint(make_invite([4u8; 32], inviter_id, &["notes"], FUTURE))
+            .await
             .unwrap();
 
         // Send raw GARBAGE bytes (not JSON) on the pair stream — the attacker-reachable parse
@@ -443,6 +448,7 @@ async fn collision_guard_allows_a_fresh_unique_nickname() {
         let secret = [21u8; 32];
         invites
             .mint(make_invite(secret, inviter_id, &["notes"], FUTURE))
+            .await
             .unwrap();
 
         let reply =
@@ -485,6 +491,7 @@ async fn collision_guard_allows_same_peer_re_pair() {
         let secret = [22u8; 32];
         invites
             .mint(make_invite(secret, inviter_id, &["notes"], FUTURE))
+            .await
             .unwrap();
         let reply =
             drive_redeemer(&redeemer, addr, hello_frame(&secret, &redeemer_id, "bob")).await;
@@ -526,6 +533,7 @@ async fn collision_guard_allows_same_peer_additional_service() {
         let secret = [23u8; 32];
         invites
             .mint(make_invite(secret, inviter_id, &["kb"], FUTURE))
+            .await
             .unwrap();
         let reply =
             drive_redeemer(&redeemer, addr, hello_frame(&secret, &redeemer_id, "bob")).await;
@@ -563,6 +571,7 @@ async fn collision_guard_refuses_impersonating_an_existing_peer() {
         let secret = [24u8; 32];
         invites
             .mint(make_invite(secret, inviter_id, &["notes"], FUTURE))
+            .await
             .unwrap();
         let reply =
             drive_redeemer(&redeemer, addr, hello_frame(&secret, &redeemer_id, "carol")).await;
@@ -634,6 +643,7 @@ async fn collision_refusal_preserves_the_invite_for_a_retry_under_a_new_name() {
         let secret = [25u8; 32];
         invites
             .mint(make_invite(secret, inviter_id, &[], FUTURE))
+            .await
             .unwrap();
 
         // First attempt collides and is refused…
@@ -680,6 +690,7 @@ async fn a_wrong_secret_with_a_colliding_nickname_gets_only_the_generic_refusal(
         // while claiming the colliding name.
         invites
             .mint(make_invite([26u8; 32], inviter_id, &[], FUTURE))
+            .await
             .unwrap();
         let reply = drive_redeemer(
             &redeemer,
@@ -749,6 +760,7 @@ async fn reverse_pairing_preserves_the_inviters_dial_directory_and_nickname() {
         let secret = [31u8; 32];
         invites
             .mint(make_invite(secret, inviter_id, &["code"], FUTURE))
+            .await
             .unwrap();
         let reply = drive_redeemer(
             &redeemer,
@@ -831,7 +843,7 @@ async fn repeat_grant_unions_the_redeemers_dial_directory_and_applies_the_new_ni
             expires_at_epoch: FUTURE,
             app_label: None,
         };
-        invites.mint(invite.clone()).unwrap();
+        invites.mint(invite.clone()).await.unwrap();
 
         let result = redeem_invite(
             redeemer,
@@ -914,7 +926,7 @@ async fn redeem_refuses_an_invite_squatting_an_existing_peers_nickname() {
             expires_at_epoch: FUTURE,
             app_label: None,
         };
-        invites.mint(invite.clone()).unwrap();
+        invites.mint(invite.clone()).await.unwrap();
 
         let err = redeem_invite(
             redeemer,
@@ -1048,7 +1060,7 @@ async fn paired_and_granted_peer_is_admitted_to_the_service_end_to_end() {
             expires_at_epoch: FUTURE,
             app_label: None,
         };
-        invites.mint(invite.clone()).unwrap();
+        invites.mint(invite.clone()).await.unwrap();
 
         // ---- Bob redeems it (real dial over the accept loop) ----
         let bob = redeemer_endpoint().await;
@@ -1229,7 +1241,7 @@ async fn rename_after_pairing_keeps_the_peer_admitted() {
             expires_at_epoch: FUTURE,
             app_label: None,
         };
-        invites.mint(invite.clone()).unwrap();
+        invites.mint(invite.clone()).await.unwrap();
         let bob = redeemer_endpoint().await;
         let bob_dir = tempfile::tempdir().unwrap();
         let bob_store = Arc::new(PeerStore::open(&bob_dir.path().join("state.redb")).unwrap());
@@ -1381,7 +1393,7 @@ async fn pairing_exchanges_and_stores_each_sides_verified_user_id() {
             expires_at_epoch: FUTURE,
             app_label: None,
         };
-        invites.mint(invite.clone()).unwrap();
+        invites.mint(invite.clone()).await.unwrap();
 
         // ---- Bob redeems, presenting HIS own binding over his endpoint ----
         let bob = redeemer_endpoint().await;

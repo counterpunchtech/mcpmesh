@@ -1598,7 +1598,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   thirty have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.33";
+pub const API_VERSION: &str = "1.34";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -1672,7 +1672,12 @@ pub const API_VERSION: &str = "1.33";
 /// with nothing saying why. The relay reports it and iroh only `warn!`s it, so the fact existed
 /// and was unreadable (#134); to 33 with the `peer_diagnostics` verb — a long-lived pairing that
 /// cannot hole-punch while a fresh identity on the same hardware can differs only in DURABLE
-/// per-peer state, and none of it was readable from outside the daemon (#140).
+/// per-peer state, and none of it was readable from outside the daemon (#140); to 34 when
+/// outstanding invites became DURABLE — `invite.expires_at_epoch` changed meaning from an upper
+/// bound on the daemon's process lifetime to the real lifetime, and `invite` gained an error where
+/// it previously always succeeded. No shape changed, which is exactly the class minor 10 records:
+/// guard on `api_minor >= 34` before telling a user their invite will still be good tomorrow
+/// (#87b).
 ///
 /// **Not every semantic change gets a minor, and that is the gap to watch (#122).** A minor marks a
 /// change to this *surface*. A change to behaviour BEHIND the surface — same fields, same shapes,
@@ -1683,7 +1688,7 @@ pub const API_VERSION: &str = "1.33";
 /// That class is bigger than it looks: **10, 17, 21, 22, 23 and 24 all shipped with no change to
 /// any type in this file** — they moved meaning, not shape. Six of the thirty. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 33;
+pub const API_MINOR: u32 = 34;
 
 #[cfg(test)]
 mod tests {

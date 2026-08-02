@@ -1117,6 +1117,16 @@ pub(crate) mod testutil {
     /// Build a HERMETIC mesh (relay-disabled endpoint, temp config/store, EMPTY roster) so we can
     /// drive `org_join` + `roster_status` in-process against the real config-write + status paths.
     pub(crate) async fn hermetic_mesh(config_path: PathBuf) -> Arc<MeshState> {
+        hermetic_mesh_with_invites(config_path, Arc::new(LiveInvites::new())).await
+    }
+
+    /// [`hermetic_mesh`] with an explicit invite registry — a file-backed one models what
+    /// `boot_node` builds (#87b), so a test can assert the DAEMON path persists rather than only
+    /// that `LiveInvites` can.
+    pub(crate) async fn hermetic_mesh_with_invites(
+        config_path: PathBuf,
+        invites: Arc<LiveInvites>,
+    ) -> Arc<MeshState> {
         let dir = config_path.parent().unwrap();
         let store = Arc::new(PeerStore::open(&dir.join("state.redb")).unwrap());
         let pairs = Arc::new(AllowlistGate::new(store.clone()));
@@ -1133,7 +1143,7 @@ pub(crate) mod testutil {
             endpoint,
             gate,
             store,
-            Arc::new(LiveInvites::new()),
+            invites,
             "test".into(),
             config_path,
             roster,

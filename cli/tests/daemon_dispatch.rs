@@ -168,7 +168,7 @@ async fn accept_loop_routes_pair_alpn_to_the_gate_exempt_rendezvous() {
         // A live DECOY invite (secret [1u8; 32]) opens the accept-gate; the hello below sends a
         // DIFFERENT secret ([0u8; 32]), so it reaches the rendezvous and is refused by secret.
         let invites = Arc::new(LiveInvites::new());
-        invites.mint(decoy_invite([1u8; 32])).unwrap();
+        invites.mint(decoy_invite([1u8; 32])).await.unwrap();
 
         let server = dual_alpn_endpoint().await;
         let addr = server.addr();
