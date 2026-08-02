@@ -1622,6 +1622,47 @@ pub const ERR_BLOB_WITHDRAWN: i64 = -32042;
 /// reason: distinguishing unknown-vs-expired-vs-wrong-secret would be a redemption oracle.
 pub const ERR_NICKNAME_TAKEN: i64 = -32043;
 
+/// The invite line's own `expires_at_epoch` has passed (#159). Decided LOCALLY, before dialing —
+/// this says nothing about the inviter's state. Remedy: ask for a fresh invite.
+pub const ERR_INVITE_EXPIRED: i64 = -32044;
+
+/// The inviter has **no outstanding invite at all** — its accept gate fast-closed the dial (#159).
+///
+/// This is as close to "expired or already used" as we can safely get, and the distinction matters:
+/// it is a fact about the INVITER, not about the secret presented. Answering per-secret would be a
+/// redemption oracle — a prober would learn which guessed secrets were ever real — which is why
+/// [`ERR_INVITE_REFUSED`] stays deliberately undifferentiated. Remedy: ask for a fresh invite.
+pub const ERR_INVITE_NOT_LIVE: i64 = -32045;
+
+/// The inviter's address could not be dialed at all (#159) — offline, asleep, or unroutable.
+/// Remedy: check they are running, then retry the same invite; it is untouched.
+pub const ERR_INVITER_UNREACHABLE: i64 = -32046;
+
+/// **The address-swap defense fired**: the TLS-authenticated peer is not the endpoint the invite
+/// names (#159).
+///
+/// The one refusal here that must NOT be rendered as "try again". Something answered in place of
+/// the machine the invite identifies — a substituted address, or a forged invite. An embedder that
+/// treats every pairing failure as a friendly retry papers over exactly the attack this check
+/// exists to catch. Remedy: do not retry; get the invite again through a channel you trust.
+pub const ERR_INVITER_MISMATCH: i64 = -32047;
+
+/// The invite asks to be called a name this node already uses for a DIFFERENT peer (#159).
+///
+/// The redeemer-side mirror of [`ERR_NICKNAME_TAKEN`], and a distinct condition: that one is the
+/// inviter refusing the redeemer's name, this is the redeemer refusing the inviter's suggestion.
+/// Nothing is granted either way — a name confers no access (#38) — so this protects this node's
+/// own display and routing clarity. Remedy: ask for an invite suggesting a different name.
+pub const ERR_INVITE_NAME_CONFLICT: i64 = -32048;
+
+/// The inviter refused, and the cause is **deliberately withheld** (#159).
+///
+/// Unknown secret, expired secret, and wrong secret are one answer on purpose: telling them apart
+/// is a redemption oracle. The code carries exactly as much as the prose already did — "that invite
+/// did not work" — so a consumer can branch without parsing, and without learning anything a
+/// prober could use. Remedy: ask for a fresh invite.
+pub const ERR_INVITE_REFUSED: i64 = -32049;
+
 pub const API_NAME: &str = "mcpmesh-local/1";
 /// The protocol-compatibility version as `"MAJOR.MINOR"`, distinct from the crate/stack version.
 ///
@@ -1636,7 +1677,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   thirty have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.35";
+pub const API_VERSION: &str = "1.36";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -1718,7 +1759,11 @@ pub const API_VERSION: &str = "1.35";
 /// (#87b); to 35 with `InviteParams.max_uses` + `InviteResult.uses_remaining` — a bounded
 /// multi-use invite, so onboarding a team is one link rather than one ceremony per person. Each
 /// redemption still runs its own SAS and writes its own peer rows; it is N pairings sharing a
-/// secret, never a group identity (#87).
+/// secret, never a group identity (#87); to 36 with branchable codes for the rest of the ONBOARDING
+/// refusals — expired line, no live invite, inviter unreachable, id mismatch, name conflict, and
+/// the deliberately-opaque refusal. `ERR_NICKNAME_TAKEN` had been the only coded pairing failure,
+/// so every other one arrived as `-32000` and an embedder could either forward our prose to end
+/// users or substring-match it (#159).
 ///
 /// **Not every semantic change gets a minor, and that is the gap to watch (#122).** A minor marks a
 /// change to this *surface*. A change to behaviour BEHIND the surface — same fields, same shapes,
@@ -1729,7 +1774,7 @@ pub const API_VERSION: &str = "1.35";
 /// That class is bigger than it looks: **10, 17, 21, 22, 23 and 24 all shipped with no change to
 /// any type in this file** — they moved meaning, not shape. Six of the thirty. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 35;
+pub const API_MINOR: u32 = 36;
 
 #[cfg(test)]
 mod tests {

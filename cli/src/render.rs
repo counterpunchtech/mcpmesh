@@ -1657,8 +1657,14 @@ mod tests {
     fn failed_pair_dial_renders_in_user_language() {
         // The daemon-side message (its exact shape in pairing/rendezvous.rs) is terse; the
         // porcelain seam maps it to the human explanation (issue #10).
+        //
+        // The CODE is `ERR_INVITER_UNREACHABLE` since #159 — pinned here, because this branch
+        // matches on the MESSAGE and #159's first draft reworded it. That silently made this
+        // branch dead code and replaced the self-redeem explanation with "retry this same
+        // invite", which can never work on the machine that minted it. Keeping the real code in
+        // the fixture is what ties this test to what production actually emits.
         let err = api_error(json!({
-            "code": -32000,
+            "code": mcpmesh_local_api::ERR_INVITER_UNREACHABLE,
             "message": "pair failed: could not dial the inviter's machine"
         }));
         let rendered = error_lines(&err).join("\n");

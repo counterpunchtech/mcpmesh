@@ -908,6 +908,19 @@ fn respond<T: serde::Serialize>(id: Value, method: &str, r: anyhow::Result<T>) -
             mcpmesh_local_api::ERR_NO_SUCH_BLOB,
             format!("{method} failed: {e}"),
         ),
+        // #159: an onboarding refusal that carries its own code. ONE arm for the whole family —
+        // expired line, no live invite, inviter unreachable, id mismatch, name conflict, and the
+        // deliberately-opaque refusal — so adding the next condition is a constant plus a call
+        // site rather than another arm here. Checked BEFORE the generic fallthrough.
+        Err(e)
+            if e.downcast_ref::<crate::pairing::rendezvous::PairRefusal>()
+                .is_some() =>
+        {
+            let refusal = e
+                .downcast_ref::<crate::pairing::rendezvous::PairRefusal>()
+                .expect("checked by the guard");
+            error(id, refusal.code(), format!("{method} failed: {e}"))
+        }
         // #147: the ONE `pair` refusal with a self-service remedy — rename and redeem the same
         // invite again. It gets a code so a GUI embedder writes its own recovery copy naming its
         // own rename affordance, instead of substring-matching prose that is generated on the
@@ -1120,6 +1133,71 @@ mod tests {
         json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params })
     }
 
+    /// #159: each onboarding refusal reaches the embedder as its OWN code.
+    ///
+    /// The point of the issue: `ERR_NICKNAME_TAKEN` was the only coded pairing failure, so an
+    /// embedder either forwarded our prose verbatim to end users or substring-matched it. These
+    /// codes let it decide per case.
+    #[test]
+    fn each_onboarding_refusal_carries_its_own_code() {
+        use crate::pairing::rendezvous::PairRefusal;
+        let coded = |code: i64| -> Value {
+            let e: anyhow::Result<()> = Err(anyhow::Error::new(PairRefusal::new(code, "why")));
+            respond(json!(1), "pair", e)
+        };
+        for code in [
+            mcpmesh_local_api::ERR_INVITE_EXPIRED,
+            mcpmesh_local_api::ERR_INVITE_NOT_LIVE,
+            mcpmesh_local_api::ERR_INVITER_UNREACHABLE,
+            mcpmesh_local_api::ERR_INVITER_MISMATCH,
+            mcpmesh_local_api::ERR_INVITE_NAME_CONFLICT,
+            mcpmesh_local_api::ERR_INVITE_REFUSED,
+        ] {
+            let v = coded(code);
+            assert_eq!(
+                v["error"]["code"], code,
+                "each condition keeps its own code: {v}"
+            );
+        }
+
+        // They are all DISTINCT — collapsing any two would silently merge two different remedies.
+        let all = [
+            mcpmesh_local_api::ERR_INVITE_EXPIRED,
+            mcpmesh_local_api::ERR_INVITE_NOT_LIVE,
+            mcpmesh_local_api::ERR_INVITER_UNREACHABLE,
+            mcpmesh_local_api::ERR_INVITER_MISMATCH,
+            mcpmesh_local_api::ERR_INVITE_NAME_CONFLICT,
+            mcpmesh_local_api::ERR_INVITE_REFUSED,
+            mcpmesh_local_api::ERR_NICKNAME_TAKEN,
+        ];
+        let unique: std::collections::BTreeSet<i64> = all.iter().copied().collect();
+        assert_eq!(unique.len(), all.len(), "codes must not collide: {all:?}");
+
+        // `ERR_INVITER_MISMATCH` must never read as "retry me", which means it must not equal any
+        // of the recoverable codes. The first version of this assertion filtered the mismatch code
+        // out and then asked whether anything left equalled it — always false, so it passed for
+        // any input including all-codes-identical (#159 gate). This compares it against the
+        // recoverable set directly.
+        let recoverable = [
+            mcpmesh_local_api::ERR_INVITE_EXPIRED,
+            mcpmesh_local_api::ERR_INVITE_NOT_LIVE,
+            mcpmesh_local_api::ERR_INVITER_UNREACHABLE,
+            mcpmesh_local_api::ERR_INVITE_NAME_CONFLICT,
+            mcpmesh_local_api::ERR_INVITE_REFUSED,
+            mcpmesh_local_api::ERR_NICKNAME_TAKEN,
+        ];
+        assert!(
+            !recoverable.contains(&mcpmesh_local_api::ERR_INVITER_MISMATCH),
+            "the address-swap refusal must not share a code with any recoverable one — an app \
+             that renders every pairing failure as a friendly retry would paper over exactly the \
+             attack that check exists to catch"
+        );
+
+        // And an unrelated failure still answers -32000, so the codes stay meaningful.
+        let plain: anyhow::Result<()> = Err(anyhow::anyhow!("something else"));
+        assert_eq!(respond(json!(1), "pair", plain)["error"]["code"], -32000);
+    }
+
     /// #147: a nickname-collision refusal reaches the embedder as `ERR_NICKNAME_TAKEN`, and
     /// nothing else does.
     ///
@@ -1152,8 +1230,9 @@ mod tests {
             "the message carries the inviter's reworded prose verbatim: {v}"
         );
 
-        // Every other pairing failure stays generic. An embedder branching on -32043 must not be
-        // told to rename after a wrong-or-expired secret.
+        // A NON-pairing failure stays generic. (Since #159 the other pairing refusals carry their
+        // own codes rather than -32000 — see `each_onboarding_refusal_carries_its_own_code`; what
+        // this pins is that an untyped error is not silently absorbed into one of them.)
         let generic: anyhow::Result<()> = Err(anyhow::anyhow!("pairing refused: pairing refused"));
         let v = respond(json!(1), "pair", generic);
         assert_eq!(v["error"]["code"], -32000, "got {v}");

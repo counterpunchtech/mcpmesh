@@ -7,7 +7,7 @@ named pipe on Windows. Anything that can open the endpoint and parse JSON can sp
 language — [`local-api/examples/status.py`](../local-api/examples/status.py) is a complete client
 in ~60 lines of dependency-free Python.
 
-> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.35`, `api_minor` `35`) and evolves
+> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.36`, `api_minor` `36`) and evolves
 > **additively** (see [Versioning](#versioning)), but until a stable release this document — like the
 > wire format itself — may change without a migration path. Pin the mcpmesh version you build
 > against. Source of truth is the Rust in [`local-api/`](../local-api/src/protocol.rs); where this
@@ -1012,10 +1012,36 @@ Reference: [`cli/src/backends/spawn.rs`](../cli/src/backends/spawn.rs) (`run`),
 | `-32041` | `blob_republish` — the blob is not held COMPLETE by this daemon (#83). Remedy: fetch it first. |
 | `-32042` | `blob_republish` — the blob was deliberately WITHDRAWN from that scope (#107). Remedy: `blob_publish {scope, path}` from the file if the re-share is intended. |
 | `-32043` | `pair` — the INVITER refused: the nickname is already held by a different peer it has paired, **and the invite survived** (#87, `api_minor >= 31`). The one refusal with a self-service remedy: **rename this node and redeem the same invite again**. Branch on this and write your own copy; see the note below (#147). |
+| `-32044` | `pair` — the invite line's own expiry has passed, checked before dialing (#159, `api_minor >= 36`). Ask for a fresh invite. |
+| `-32045` | `pair` — the inviter has **no outstanding invite at all**; its accept gate closed the dial (#159). The safe union of "expired, already used, or cancelled" — see the note below on why it is not split further. Ask for a fresh invite. |
+| `-32046` | `pair` — the inviter's machine could not be dialed (#159). The invite is untouched: check they are online and retry the SAME line. |
+| `-32047` | `pair` — **the address-swap defense fired**: the machine that answered is not the endpoint the invite names (#159). **Do not render this as "try again"** — get the invite again through a channel you trust. |
+| `-32048` | `pair` — the invite asks to be called a name this node already uses for a different peer (#159). The redeemer-side mirror of `-32043`. Ask for an invite suggesting a different name. |
+| `-32049` | `pair` — the inviter refused and the cause is **deliberately withheld** (#159). Ask for a fresh invite. |
 | `-32000` | operation failed — `message` carries the detail. One common instance: the daemon is in control-only mode with no mesh (e.g. `invite`/`pair` before a mesh exists) |
 | `-32055` | *(session only)* peer unreachable |
 | `-32054` | *(session only)* session refused |
 | `-32053` | *(session only)* rate-limited; carries `retry_after_ms`. **Requests only** — a rate-limited *notification* gets no reply (none is possible), but is recorded as `status: "rate_limited"` from `api_minor` 26, see below |
+
+**Why "expired" and "already used" are not separate codes (#159).** The inviter answers ONE refusal
+for unknown, expired, and wrong secret on purpose: telling them apart is a **redemption oracle** — a
+prober presenting guessed secrets would learn which ones were ever real. So `-32049` says "that
+invite did not work" and nothing more, which is exactly what the prose already said.
+
+`-32045` gets as close as is safe by answering a different question: it reports that *the inviter has
+nothing outstanding*, which is a fact about the inviter rather than about the secret presented. In
+practice that is the everyday shape of "expired or already used", and it is the one to branch on.
+
+Be precise about what that discloses, though. It comes from the accept gate, **before** any secret is
+presented, so anyone who can dial the node learns whether it currently has an invite outstanding —
+and for a node with exactly one (the single-use default) that is effectively "is this invite still
+live". The bit was already observable: #87b gave that path its own distinct sentence, and an invite
+line is unsigned, so anyone could fabricate one to reach it. `api_minor >= 36` makes it a documented
+contract rather than incidental prose.
+
+**And SAS mismatch is not a refusal.** The short authentication code is compared by two humans out of
+band; the daemon never learns the other side's reading, so there is nothing to signal. A mismatch
+means the humans stop and `peer_remove`.
 
 **A refusal's prose is ours; its remedy is yours (#147, `api_minor >= 31`).** The nickname-collision
 message is built on the **inviter** and travels to the redeemer, so the embedder that displays it is
@@ -1083,7 +1109,8 @@ things:
   `SelfNetwork.identity_conflict_epoch` (#134) is `api_minor >= 32`; the `peer_diagnostics` verb
   (#140) is `api_minor >= 33`; durable outstanding invites — `expires_at_epoch` became the real
   lifetime rather than an upper bound on process lifetime (#87b) — are `api_minor >= 34`;
-  `InviteParams.max_uses` + `InviteResult.uses_remaining` (#87) are `api_minor >= 35`.
+  `InviteParams.max_uses` + `InviteResult.uses_remaining` (#87) are `api_minor >= 35`; the
+  onboarding refusal codes `-32044`..`-32049` (#159) are `api_minor >= 36`.
   `api_minor` is itself additive: a pre-1.1 daemon omits it and it reads as `0`.
 
 Changes remain **additive within a major**: new response fields are optional (absent-tolerant), so a
