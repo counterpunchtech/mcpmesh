@@ -13,6 +13,9 @@ pub struct NodePaths {
     pub user_key_path: PathBuf,
     pub roster_path: PathBuf,
     pub state_db_path: PathBuf,
+    /// Outstanding pairing invites (#87b) — bearer secrets, written 0600. Beside the trust store
+    /// because it is durable per-node state, not config.
+    pub invites_path: PathBuf,
     pub blobs_dir: PathBuf,
     pub blob_scopes_path: PathBuf,
     pub audit_dir: PathBuf,
@@ -30,6 +33,7 @@ impl NodePaths {
             user_key_path: config.join("user.key"),
             roster_path: config.join("roster.json"),
             state_db_path: data.join("state.redb"),
+            invites_path: data.join("invites.json"),
             blobs_dir: data.join("blobs"),
             blob_scopes_path: data.join("blob-scopes.redb"),
             audit_dir: root.join("state").join("audit"),
@@ -47,6 +51,7 @@ impl NodePaths {
             user_key_path: p::default_user_key_path()?,
             roster_path: p::default_roster_path()?,
             state_db_path: p::default_state_db_path()?,
+            invites_path: p::default_invites_path()?,
             blobs_dir: p::default_blobs_dir()?,
             blob_scopes_path: p::default_blob_scopes_path()?,
             audit_dir: p::default_audit_dir()?,

@@ -532,6 +532,11 @@ struct DoctorInputs {
     /// When another endpoint was last seen presenting this node's identity (#134), or `None` for
     /// "not observed" — which also covers "no detector installed".
     identity_conflict_epoch: Option<i64>,
+    /// `(present, mode)` for the outstanding-invite file (#87b). It holds BEARER SECRETS, and the
+    /// case for writing them at all rests on it getting the same protection as the device key —
+    /// which has to include being LINTED like the device key, or the equivalence is only half
+    /// true and permission drift (a `cp -r` under a loose umask, a restore) goes unnoticed.
+    invites_file: (bool, u32),
 }
 
 /// Ping the local daemon over the control socket WITHOUT auto-starting it (read-only, local-only).
@@ -650,6 +655,16 @@ fn gather() -> DoctorInputs {
     .flatten()
     .map(|lc| epoch_now() - lc);
 
+    // #87b: the outstanding-invite file holds bearer secrets and is written 0600. Stat it the
+    // same way the keys are stated, so drift is reported rather than assumed away.
+    #[cfg(unix)]
+    let invites_file = stat_mode(&mcpmesh_trust::paths::default_invites_path().unwrap_or_default());
+    #[cfg(windows)]
+    let invites_file = (
+        stat_present(&mcpmesh_trust::paths::default_invites_path().unwrap_or_default()),
+        0u32,
+    );
+
     let (daemon_reachable, daemon_roster_state, live_relays, identity_conflict_epoch) =
         probe_daemon();
 
@@ -682,6 +697,7 @@ fn gather() -> DoctorInputs {
         daemon_roster_state,
         live_relays,
         identity_conflict_epoch,
+        invites_file,
     }
 }
 
@@ -737,6 +753,14 @@ fn findings(inp: &DoctorInputs) -> Vec<(&'static str, Verdict)> {
     // be a uniqueness claim nothing supports.
     if let Some(v) = check_identity_conflict(inp.identity_conflict_epoch, epoch_now()) {
         out.push(("identity", v));
+    }
+    // #87b: only when the file exists — a node that has never minted an invite has none, and a
+    // finding about an absent file is noise.
+    if inp.perm_lints_apply && inp.invites_file.0 {
+        out.push((
+            "invites",
+            check_key_perms(inp.invites_file.0, inp.invites_file.1),
+        ));
     }
     if inp.perm_lints_apply {
         out.push((
@@ -828,6 +852,7 @@ mod tests {
             daemon_roster_state: None,
             live_relays: None,
             identity_conflict_epoch: None,
+            invites_file: (false, 0),
         }
     }
 
@@ -946,6 +971,44 @@ mod tests {
             v.level,
             Level::Ok,
             "a re-spelling of the same relay must not read as a second, dead one: {v:?}"
+        );
+    }
+
+    /// #87b gate: the invite file is linted like the device key, because the case for writing
+    /// bearer secrets to disk at all rests on that equivalence.
+    ///
+    /// `docs/operator.md` and the persistence module both argue "0600, the same protection the
+    /// device key gets". That was only half true: `chmod 644 device.key` warned, `chmod 644
+    /// invites.json` was silent. Permission drift is realistic — a `cp -r` of the data dir under
+    /// a loose umask, a restore from backup, a container build — and an unlinted claim of
+    /// equivalence is worse than no claim.
+    ///
+    /// Absent file → NO finding: a node that has never minted an invite has none, and a line
+    /// about a file that does not exist is noise.
+    #[test]
+    fn the_invite_file_is_linted_like_the_device_key() {
+        let mut inp = base_inputs();
+        inp.perm_lints_apply = true;
+
+        inp.invites_file = (false, 0);
+        assert!(
+            !findings(&inp).iter().any(|(l, _)| *l == "invites"),
+            "a node that never minted an invite gets no finding"
+        );
+
+        inp.invites_file = (true, 0o600);
+        let f = findings(&inp);
+        let v = &f.iter().find(|(l, _)| *l == "invites").expect("linted").1;
+        assert_eq!(v.level, Level::Ok, "0600 is the expected state: {v:?}");
+
+        // The half that was missing: drift must be reported, exactly as it is for device.key.
+        inp.invites_file = (true, 0o644);
+        let f = findings(&inp);
+        let v = &f.iter().find(|(l, _)| *l == "invites").expect("linted").1;
+        assert_ne!(
+            v.level,
+            Level::Ok,
+            "a world-readable file of BEARER SECRETS must not pass silently: {v:?}"
         );
     }
 
@@ -1387,6 +1450,7 @@ mod tests {
             daemon_roster_state: None,
             live_relays: None,
             identity_conflict_epoch: None,
+            invites_file: (false, 0),
         };
         let out = findings(&inp);
 

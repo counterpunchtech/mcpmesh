@@ -41,8 +41,13 @@ the daemon's own handlers.
 `NodeBuilder::new(root)` takes ONE directory that holds the node's whole world:
 
     <root>/config/   config.toml, device.key, user.key, roster.json
-    <root>/data/     state.redb (the peer allowlist), blobs
+    <root>/data/     state.redb (the peer allowlist), blobs, invites.json
     <root>/state/    audit/   (the append-only audit log)
+
+`data/invites.json` holds pairing invites you have minted that nobody has redeemed yet, so they
+survive a restart and honour the expiry the invite line advertises (#87b). It contains **bearer
+secrets** and is written `0600` — the same protection the device key gets. Deleting it invalidates
+every outstanding invite and nothing else.
 
 - The layout is identical to a `mcpmesh --profile <root>` profile dir — handy for
   debugging: point the CLI at your app's root (while your app is stopped) and inspect it.

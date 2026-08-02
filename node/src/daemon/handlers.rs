@@ -808,8 +808,13 @@ pub(crate) async fn mint_invite(
     // Reap expired invites before minting so a long-lived daemon's registry can't grow
     // unboundedly with never-redeemed invites (bounds map growth; the invite lifetime cap,
     // the invite-lifetime cap). Cheap: one lock + retain over a small map.
-    mesh.invites.remove_expired(now);
-    mesh.invites.mint(invite);
+    mesh.invites.remove_expired(now).await;
+    // #87b: persist BEFORE handing the invite out. A mint that cannot be written must fail — the
+    // 24h TTL on the line we are about to return is a promise, and issuing one we already know
+    // will not survive the next restart is precisely what #87 filed.
+    mesh.invites.mint(invite).await.context(
+        "persist the outstanding invite (its advertised TTL depends on surviving a restart)",
+    )?;
 
     // Trust event: record the mint. NO secret, NO peer id (there is no peer yet).
     tracing::info!(?services, "invite minted");
@@ -1922,6 +1927,54 @@ mod tests {
             "a relay URL's userinfo must be SANITIZED — this output is meant to be pasted into an \
              issue, and every other surface sanitizes it: {:?}",
             d.hint_addrs
+        );
+    }
+
+    /// #87b gate: the DAEMON path really persists. `mint_invite` -> a file on disk.
+    ///
+    /// Every other test for this drove `LiveInvites`/`InviteFile` directly, which left the wiring
+    /// unpinned: replacing `LiveInvites::load(paths.invites_path, ..)` with `LiveInvites::new()`
+    /// in boot — reverting the ENTIRE feature — passed the whole workspace. A durable-invite
+    /// feature that no test notices the absence of is not a feature.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn minting_an_invite_writes_it_to_the_configured_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[services.notes]
+socket = \"/run/notes.sock\"
+allow = []
+",
+        )
+        .unwrap();
+        let invites_path = dir.path().join("invites.json");
+
+        // A file-backed registry, exactly as `boot_node` builds one.
+        let mesh = crate::daemon::testutil::hermetic_mesh_with_invites(
+            config_path,
+            Arc::new(crate::pairing::LiveInvites::load(
+                invites_path.clone(),
+                crate::util::epoch_now_u64(),
+            )),
+        )
+        .await;
+
+        let res = mint_invite(vec!["notes".into()], None, &mesh)
+            .await
+            .expect("mint");
+        assert!(res.invite_line.starts_with("mcpmesh-invite:"));
+
+        let on_disk = crate::pairing::persist::InviteFile::new(&invites_path).load(0);
+        assert_eq!(
+            on_disk.len(),
+            1,
+            "the `invite` verb must leave the invite ON DISK — otherwise the 24h TTL it just \
+             advertised is a promise the next restart breaks (#87b)"
+        );
+        assert_eq!(
+            on_disk[0].expires_at_epoch, res.expires_at_epoch,
+            "and it must be THE invite that was handed out"
         );
     }
 

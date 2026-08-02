@@ -475,7 +475,7 @@ pub async fn handle_inviter_side(
         }
     }
 
-    match ctx.invites.try_redeem(&hello.secret, now) {
+    match ctx.invites.try_redeem(&hello.secret, now).await {
         Redeem::Ok(invite) => {
             // Resolve any EXISTING entry for the TLS-authenticated redeemer id FIRST — a same-id
             // re-pair, or the REVERSE pairing of an earlier redeem (we redeemed THEIR invite
