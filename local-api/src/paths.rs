@@ -331,6 +331,14 @@ pub fn default_state_db_path() -> std::io::Result<PathBuf> {
     Ok(data_dir()?.join("state.redb"))
 }
 
+/// Outstanding pairing invites (`<data_dir>/invites.json`, #87b).
+///
+/// Holds BEARER SECRETS and is written `0600`. Beside the trust store because it is durable
+/// per-node state; deleting it is a safe operator action that invalidates every outstanding invite.
+pub fn default_invites_path() -> std::io::Result<PathBuf> {
+    Ok(data_dir()?.join("invites.json"))
+}
+
 /// The gated app-blob store directory (`<data_dir>/blobs/` — the daemon's gated iroh-blobs store).
 pub fn default_blobs_dir() -> std::io::Result<PathBuf> {
     Ok(data_dir()?.join("blobs"))

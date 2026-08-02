@@ -261,6 +261,14 @@ WARNs on that combination (and ERRs on a `[network]` the daemon would refuse). B
 
 ---
 
+**Outstanding invites are on disk.** `<data_dir>/invites.json` holds the pairing invites you have
+minted and nobody has redeemed yet, so they survive a daemon restart and honour the expiry the
+invite line advertises (#87b). It contains **bearer secrets** — anyone who can read it can redeem
+those invites until they expire — and is written `0600`, the same protection the device key gets.
+
+Deleting the file is a safe, supported action: it invalidates every outstanding invite and nothing
+else. Redeemed and expired invites are removed automatically, so it does not grow.
+
 ## 6. Health check reference
 
 Run `mcpmesh doctor` after install, after any config change, and when a node behaves unexpectedly. It

@@ -299,7 +299,14 @@ async fn boot_node(paths: NodePaths, config: Option<Config>) -> Result<BootedNod
     //    the loop's handle): build `mesh` with an empty accept_task, spawn the loop with
     //    `mesh.clone()`, then set the handle. The invite registry starts empty (`invite`
     //    mints into it).
-    let invites = Arc::new(LiveInvites::new());
+    // #87b: restore outstanding invites rather than starting empty. Without this every restart
+    // silently voided every invite while the invite line advertised a 24h TTL — an invite mailed
+    // to a colleague was reliably dead within a couple of hours on a node that auto-updates.
+    // Expired ones are dropped on load, so the file cannot accumulate.
+    let invites = Arc::new(LiveInvites::load(
+        paths.invites_path.clone(),
+        crate::util::epoch_now_u64(),
+    ));
     // The nickname we suggest for ourselves in invites + advertise to peers: config override, else the
     // machine hostname (friendly: peers see `jetson`, not `96246d3f`), else the endpoint fingerprint.
     let self_nickname = cfg

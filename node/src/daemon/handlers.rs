@@ -809,7 +809,12 @@ pub(crate) async fn mint_invite(
     // unboundedly with never-redeemed invites (bounds map growth; the invite lifetime cap,
     // the invite-lifetime cap). Cheap: one lock + retain over a small map.
     mesh.invites.remove_expired(now);
-    mesh.invites.mint(invite);
+    // #87b: persist BEFORE handing the invite out. A mint that cannot be written must fail — the
+    // 24h TTL on the line we are about to return is a promise, and issuing one we already know
+    // will not survive the next restart is precisely what #87 filed.
+    mesh.invites.mint(invite).context(
+        "persist the outstanding invite (its advertised TTL depends on surviving a restart)",
+    )?;
 
     // Trust event: record the mint. NO secret, NO peer id (there is no peer yet).
     tracing::info!(?services, "invite minted");

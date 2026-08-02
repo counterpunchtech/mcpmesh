@@ -7,6 +7,9 @@
 //! outstanding invites. The rendezvous handler mints into and redeems out of it.
 //!
 //! [`PeerEntry`]: crate::allowlist::PeerEntry
+/// On-disk persistence for outstanding invites (#87b) — see the module doc for why a bearer
+/// secret is written to disk at all, and why it is not the redb trust store.
+pub mod persist;
 pub mod rendezvous;
 pub mod sas;
 
@@ -102,16 +105,56 @@ pub enum Redeem {
 /// bounded by expiry — [`remove_expired`](Self::remove_expired) is reaped before each production
 /// mint (`daemon::mint_invite`). Stranger-flood hardening of the by-design-open pair ALPN (rate
 /// limit / read timeout / accept-gate) lives in the accept loop, not in a per-invite cap.
+///
+/// **Durable since #87b.** The registry was RAM-only, so every restart dropped every outstanding
+/// invite while the invite advertised a 24h TTL — an invite emailed to a colleague was reliably
+/// dead within a couple of hours on a node that auto-updates. With a [`persist::InviteFile`]
+/// attached, every mutation is written through, and [`load`](Self::load) restores the live set at
+/// boot. Without one (tests, a control-only node) it behaves exactly as before.
 #[derive(Default)]
 pub struct LiveInvites {
     inner: Mutex<HashMap<[u8; 32], Invite>>,
+    /// Where mutations are written through, if anywhere. `None` = RAM-only (the old behaviour),
+    /// which is what every test that does not care about durability gets.
+    file: Option<persist::InviteFile>,
 }
 
 impl LiveInvites {
-    /// A fresh, empty registry — equivalent to [`Default::default`], provided so daemon call
-    /// sites read `LiveInvites::new()`.
+    /// A fresh, empty RAM-only registry — equivalent to [`Default::default`], provided so daemon
+    /// call sites read `LiveInvites::new()`.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A registry backed by `path`, restored from whatever is still live at `now_epoch`.
+    ///
+    /// Expired invites are dropped AND the file is rewritten without them, so it cannot accumulate
+    /// dead entries across restarts. A rewrite failure here is not fatal — the live set is already
+    /// correct in memory, and the next mint will surface a persistent write problem as an error
+    /// where it actually matters.
+    pub fn load(path: impl Into<std::path::PathBuf>, now_epoch: u64) -> Self {
+        let file = persist::InviteFile::new(path);
+        let live = file.load(now_epoch);
+        let reaped = !live.is_empty();
+        let map: HashMap<[u8; 32], Invite> = live.into_iter().map(|i| (i.secret, i)).collect();
+        if reaped && let Err(e) = file.store(&map.values().collect::<Vec<_>>()) {
+            tracing::warn!(%e, "could not rewrite the invite file after reaping expired invites");
+        }
+        Self {
+            inner: Mutex::new(map),
+            file: Some(file),
+        }
+    }
+
+    /// Write the current live set through to disk, if this registry is backed by a file.
+    ///
+    /// Called under the SAME lock as the mutation it follows, so the file can never reflect a set
+    /// that never existed in memory.
+    fn persist(&self, map: &HashMap<[u8; 32], Invite>) -> std::io::Result<()> {
+        match &self.file {
+            None => Ok(()),
+            Some(f) => f.store(&map.values().collect::<Vec<_>>()),
+        }
     }
 
     /// Lock the registry. The mutex is only ever held for the duration of a single
@@ -123,8 +166,28 @@ impl LiveInvites {
 
     /// Insert an outstanding invite (keyed by its secret; a re-mint of the same secret would
     /// replace, but secrets are CSPRNG-unique in practice).
-    pub fn mint(&self, invite: Invite) {
-        self.guard().insert(invite.secret, invite);
+    ///
+    /// **Fails if the invite cannot be persisted (#87b).** The advertised TTL is part of the
+    /// invite's contract, and handing someone an invite we already know will not survive the next
+    /// restart is exactly the defect this issue filed. A write failure in the data directory is
+    /// also a real problem the operator needs to see — the trust store lives there too.
+    ///
+    /// The in-memory insert is rolled back on a write failure, so the registry never holds an
+    /// invite the caller was told it does not have.
+    pub fn mint(&self, invite: Invite) -> std::io::Result<()> {
+        let mut map = self.guard();
+        let secret = invite.secret;
+        let displaced = map.insert(secret, invite);
+        match self.persist(&map) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                match displaced {
+                    Some(prev) => map.insert(secret, prev),
+                    None => map.remove(&secret),
+                };
+                Err(e)
+            }
+        }
     }
 
     /// Is `secret` a LIVE invite at `now_epoch`, without redeeming it? NON-MUTATING — never
@@ -148,10 +211,12 @@ impl LiveInvites {
             None => Redeem::Unknown,
             Some(inv) if inv.expires_at_epoch < now_epoch => {
                 map.remove(secret);
+                inv_persist_burn(self, &map);
                 Redeem::Expired
             }
             Some(_) => {
                 let inv = map.remove(secret).expect("present under lock");
+                inv_persist_burn(self, &map);
                 Redeem::Ok(inv)
             }
         }
@@ -177,8 +242,133 @@ impl LiveInvites {
     }
 }
 
+/// Persist a BURN (a redemption or an expiry reap) — a removal, so a write failure cannot be rolled
+/// back into anything meaningful: the invite is spent either way, and re-adding it would resurrect
+/// a credential the peer has already used.
+///
+/// So this warns rather than failing, deliberately, and it is the OPPOSITE trade from
+/// [`LiveInvites::mint`]. The worst case is an invite that survives a restart it should not have —
+/// bounded by its own TTL, and still refused by the collision/expiry checks on the next attempt.
+/// Failing the redemption instead would deny a pairing that has already legitimately succeeded.
+fn inv_persist_burn(reg: &LiveInvites, map: &HashMap<[u8; 32], Invite>) {
+    if let Err(e) = reg.persist(map) {
+        tracing::warn!(
+            %e,
+            "could not persist an invite burn; it may reappear after a restart until it expires"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// #87b: an invite outlives the registry that minted it. This is the whole issue — the
+    /// registry was RAM-only while the invite line advertised a 24h TTL, so a node that
+    /// auto-updates every couple of hours voided invites its users had already mailed out.
+    #[test]
+    fn an_invite_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invites.json");
+        let inv = sample_invite(1, 9_000);
+
+        let first = LiveInvites::load(&path, 1_000);
+        first.mint(inv.clone()).unwrap();
+        drop(first); // the daemon exits — an update, a crash, a reboot
+
+        let after = LiveInvites::load(&path, 2_000);
+        assert_eq!(after.count(), 1, "the invite must still be outstanding");
+        assert!(
+            matches!(after.try_redeem(&inv.secret, 2_000), Redeem::Ok(_)),
+            "and must still be redeemable — an invite that survives but cannot be spent is no \
+             better than one that did not survive"
+        );
+    }
+
+    /// #87b: a REDEMPTION is durable too. A burn that lived only in RAM would let a restart
+    /// resurrect a spent single-use bearer credential.
+    #[test]
+    fn a_redemption_is_not_undone_by_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invites.json");
+        let inv = sample_invite(2, 9_000);
+
+        let first = LiveInvites::load(&path, 1_000);
+        first.mint(inv.clone()).unwrap();
+        assert!(matches!(
+            first.try_redeem(&inv.secret, 1_000),
+            Redeem::Ok(_)
+        ));
+        drop(first);
+
+        let after = LiveInvites::load(&path, 1_000);
+        assert_eq!(after.count(), 0);
+        assert!(
+            matches!(after.try_redeem(&inv.secret, 1_000), Redeem::Unknown),
+            "a spent single-use credential must not be resurrected by a restart"
+        );
+    }
+
+    /// #87b: an EXPIRED invite does not come back, and the file does not accumulate.
+    #[test]
+    fn an_expired_invite_is_dropped_on_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invites.json");
+        let dead = sample_invite(3, 5_000);
+        let live = sample_invite(4, 9_000);
+
+        let first = LiveInvites::load(&path, 1_000);
+        first.mint(dead.clone()).unwrap();
+        first.mint(live.clone()).unwrap();
+        drop(first);
+
+        let after = LiveInvites::load(&path, 6_000); // dead has expired
+        assert_eq!(after.count(), 1, "only the live one survives");
+        assert!(matches!(
+            after.try_redeem(&dead.secret, 6_000),
+            Redeem::Unknown
+        ));
+        assert!(matches!(
+            after.try_redeem(&live.secret, 6_000),
+            Redeem::Ok(_)
+        ));
+    }
+
+    /// #87b: a mint that cannot be persisted FAILS, and leaves no phantom in memory.
+    ///
+    /// Returning `Ok` here would hand back an invite carrying a 24h TTL that we already know will
+    /// not survive the next restart — the exact defect this issue filed, re-created one layer
+    /// down. The rollback matters just as much: a registry holding an invite the caller was told
+    /// it does not have would accept a redemption nobody believes exists.
+    #[test]
+    fn a_mint_that_cannot_persist_fails_and_rolls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        // The invite path is a DIRECTORY, so the atomic rename can never succeed.
+        let path = dir.path().join("invites.json");
+        std::fs::create_dir(&path).unwrap();
+
+        let reg = LiveInvites::load(&path, 1_000);
+        let inv = sample_invite(5, 9_000);
+        assert!(
+            reg.mint(inv.clone()).is_err(),
+            "a mint that cannot promise the TTL it advertises must not report success"
+        );
+        assert_eq!(reg.count(), 0, "and must leave no phantom behind");
+        assert!(matches!(
+            reg.try_redeem(&inv.secret, 1_000),
+            Redeem::Unknown
+        ));
+    }
+
+    /// A RAM-only registry still behaves exactly as it did before #87b — the seam is opt-in, and
+    /// every test that does not care about durability keeps working unchanged.
+    #[test]
+    fn a_ram_only_registry_is_unchanged() {
+        let reg = LiveInvites::new();
+        let inv = sample_invite(6, 9_000);
+        reg.mint(inv.clone()).expect("a RAM-only mint cannot fail");
+        assert_eq!(reg.count(), 1);
+        assert!(matches!(reg.try_redeem(&inv.secret, 1_000), Redeem::Ok(_)));
+    }
+
     use super::*;
 
     fn sample_invite(secret: u8, expires_at_epoch: u64) -> Invite {
@@ -245,7 +435,7 @@ mod tests {
         let live = LiveInvites::default();
         let inv = sample_invite(7, 1_800_000_000);
         let secret = inv.secret;
-        live.mint(inv.clone());
+        live.mint(inv.clone()).unwrap();
         assert_eq!(live.count(), 1);
         // First redeem succeeds and returns the invite.
         match live.try_redeem(&secret, 1_000_000_000) {
@@ -264,7 +454,7 @@ mod tests {
     fn redeem_unknown_secret_is_unknown_and_leaves_other_invites_untouched() {
         let live = LiveInvites::default();
         let inv = sample_invite(7, 1_800_000_000);
-        live.mint(inv);
+        live.mint(inv).unwrap();
         // An unknown/wrong secret consumes NOTHING — no invite's state changes.
         assert!(matches!(
             live.try_redeem(&[9u8; 32], 1_000_000_000),
@@ -282,7 +472,7 @@ mod tests {
         let live = LiveInvites::default();
         let inv = sample_invite(7, 1_000);
         let secret = inv.secret;
-        live.mint(inv);
+        live.mint(inv).unwrap();
         // now is past expiry → Expired, and the stale invite is removed.
         assert!(matches!(live.try_redeem(&secret, 2_000), Redeem::Expired));
         assert_eq!(live.count(), 0);
@@ -291,8 +481,8 @@ mod tests {
     #[test]
     fn remove_expired_drops_only_the_stale_invites() {
         let live = LiveInvites::default();
-        live.mint(sample_invite(1, 1_000)); // expires early
-        live.mint(sample_invite(2, 9_000)); // still live at now=2_000
+        live.mint(sample_invite(1, 1_000)).unwrap(); // expires early
+        live.mint(sample_invite(2, 9_000)).unwrap(); // still live at now=2_000
         assert_eq!(live.count(), 2);
         live.remove_expired(2_000);
         assert_eq!(live.count(), 1);
