@@ -1173,16 +1173,24 @@ mod tests {
         let unique: std::collections::BTreeSet<i64> = all.iter().copied().collect();
         assert_eq!(unique.len(), all.len(), "codes must not collide: {all:?}");
 
-        // `ERR_INVITER_MISMATCH` is the one that must never read as "retry me". It is distinct
-        // from every recoverable code, which is what lets an embedder render it differently — an
-        // app that treats every pairing failure as a friendly retry papers over the address-swap
-        // attack this check exists to catch.
+        // `ERR_INVITER_MISMATCH` must never read as "retry me", which means it must not equal any
+        // of the recoverable codes. The first version of this assertion filtered the mismatch code
+        // out and then asked whether anything left equalled it — always false, so it passed for
+        // any input including all-codes-identical (#159 gate). This compares it against the
+        // recoverable set directly.
+        let recoverable = [
+            mcpmesh_local_api::ERR_INVITE_EXPIRED,
+            mcpmesh_local_api::ERR_INVITE_NOT_LIVE,
+            mcpmesh_local_api::ERR_INVITER_UNREACHABLE,
+            mcpmesh_local_api::ERR_INVITE_NAME_CONFLICT,
+            mcpmesh_local_api::ERR_INVITE_REFUSED,
+            mcpmesh_local_api::ERR_NICKNAME_TAKEN,
+        ];
         assert!(
-            !all[..all.len() - 1]
-                .iter()
-                .filter(|c| **c != mcpmesh_local_api::ERR_INVITER_MISMATCH)
-                .any(|c| *c == mcpmesh_local_api::ERR_INVITER_MISMATCH),
-            "the address-swap refusal must not share a code with a recoverable one"
+            !recoverable.contains(&mcpmesh_local_api::ERR_INVITER_MISMATCH),
+            "the address-swap refusal must not share a code with any recoverable one — an app \
+             that renders every pairing failure as a friendly retry would paper over exactly the \
+             attack that check exists to catch"
         );
 
         // And an unrelated failure still answers -32000, so the codes stay meaningful.
@@ -1222,8 +1230,9 @@ mod tests {
             "the message carries the inviter's reworded prose verbatim: {v}"
         );
 
-        // Every other pairing failure stays generic. An embedder branching on -32043 must not be
-        // told to rename after a wrong-or-expired secret.
+        // A NON-pairing failure stays generic. (Since #159 the other pairing refusals carry their
+        // own codes rather than -32000 — see `each_onboarding_refusal_carries_its_own_code`; what
+        // this pins is that an untyped error is not silently absorbed into one of them.)
         let generic: anyhow::Result<()> = Err(anyhow::anyhow!("pairing refused: pairing refused"));
         let v = respond(json!(1), "pair", generic);
         assert_eq!(v["error"]["code"], -32000, "got {v}");

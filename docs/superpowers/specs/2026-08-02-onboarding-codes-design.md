@@ -43,6 +43,15 @@ cancelled" is the honest union — and it is the everyday shape of the failure b
 
 `ERR_INVITE_REFUSED` covers the rest without splitting it.
 
+**What `-32045` does disclose, stated because promoting it to a contract is the decision here.** It
+is decided by the accept gate before any secret is presented, so it is an unauthenticated,
+unrate-limited "does this node have an invite outstanding right now" signal — and for the single-use
+default that is effectively "is that one invite still live". The bit was already observable (#87b
+gave the path its own sentence, and an invite line is unsigned so anyone can fabricate one to reach
+it), so this is not a new capability; what is new is that `api_minor >= 36` makes it a contract we
+cannot withdraw without a break. Accepted, because the alternative — leaving every onboarding
+failure at `-32000` — is what the issue is about.
+
 ### Not applicable
 
 **SAS mismatch is not a refusal and cannot be one.** The short authentication code is compared by two
@@ -79,4 +88,13 @@ these is `-32000`.
    three inputs.
 4. An unrelated failure still answers `-32000`, so the codes stay meaningful.
 
-Mutation: mapping any two of these to one code fails 1; splitting the opaque refusal by cause fails 3.
+Mutation: rewiring the call sites to one code fails 1 (the first draft tested `respond` with a
+hand-built `PairRefusal`, which only proved `respond` can read a field — five of six call sites were
+pinned by nothing); splitting the opaque refusal by cause fails 3.
+
+**And the prose must not move.** The issue's one explicit non-ask was any change to the wording, and
+the first draft changed three messages anyway — including the dial failure, which the porcelain
+matches on by substring to explain a self-redeem. That silently made the branch dead code and
+replaced a correct explanation with "retry this same invite", which can never work on the machine
+that minted it. The messages are byte-identical now, and the render test pins the real code so the
+seam is tied to what production emits.

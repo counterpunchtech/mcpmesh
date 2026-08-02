@@ -775,7 +775,7 @@ pub async fn redeem_invite(
         // inviter and is safe to name precisely.
         bail!(PairRefusal::new(
             mcpmesh_local_api::ERR_INVITE_EXPIRED,
-            "this invite has expired — ask for a fresh one",
+            "invite expired",
         ));
     }
 
@@ -806,13 +806,20 @@ pub async fn redeem_invite(
     let conn = endpoint
         .connect(addr, mcpmesh_net::ALPN_PAIR)
         .await
+        // #159: the CODE is added; the message and its cause chain are untouched. The porcelain
+        // owns the human explanation for this one (`render.rs` turns a self-redeem into "you
+        // cannot redeem your own invite on the machine that minted it"), it MATCHES ON THIS
+        // STRING, and it needs iroh's cause underneath. Rewording it here made that branch dead
+        // code and replaced a correct explanation with advice — "retry this same invite" — that
+        // can never work for the most common newcomer mistake (#159 gate).
         .map_err(|e| {
-            anyhow::Error::new(PairRefusal::new(
+            // `.context(PairRefusal)` rather than `Error::new(PairRefusal).context(e)`: context
+            // goes on TOP, so this keeps our message as the Display (the porcelain matches on it)
+            // AND keeps iroh's error as the source, so `{:#}` still carries the cause for
+            // diagnostics. Wrapping the other way round hid our message behind iroh's.
+            anyhow::Error::new(e).context(PairRefusal::new(
                 mcpmesh_local_api::ERR_INVITER_UNREACHABLE,
-                format!(
-                    "could not reach the inviter's machine — check it is running and online, \
-                     then retry this same invite ({e})"
-                ),
+                "could not dial the inviter's machine",
             ))
         })?;
 
@@ -825,9 +832,7 @@ pub async fn redeem_invite(
         // answered in place of the machine this invite names.
         bail!(PairRefusal::new(
             mcpmesh_local_api::ERR_INVITER_MISMATCH,
-            "the machine that answered is not the one this invite names — refusing before \
-             revealing the secret (address-swap defense). Do not retry; get the invite again \
-             through a channel you trust.",
+            "inviter id mismatch — refusing (address-swap defense)",
         ));
     }
 
@@ -1175,6 +1180,111 @@ mod tests {
             );
             assert_eq!(e.to_string(), format!("pairing refused: {REASON_REFUSED}"));
         }
+    }
+
+    /// A minimal invite naming `inviter`, for the refusal-code call-site tests.
+    fn sample_invite_for(inviter: iroh::EndpointId, expires_at_epoch: u64) -> Invite {
+        Invite {
+            secret: [5u8; 32],
+            inviter_id: *inviter.as_bytes(),
+            inviter_addr_json: serde_json::to_string(&iroh::EndpointAddr::from(inviter)).unwrap(),
+            nickname: "alice".into(),
+            services: vec!["notes".into()],
+            expires_at_epoch,
+            app_label: None,
+            uses_remaining: 1,
+        }
+    }
+
+    /// #159 gate: each refusal carries its own code AT ITS CALL SITE.
+    ///
+    /// The first version tested this by handing `respond` a `PairRefusal::new(code, ..)` and
+    /// checking it returned that number — i.e. that `respond` can read a field. Rewriting all six
+    /// call sites to the SAME wrong code left the entire workspace green: five of the six were
+    /// pinned by nothing, and could have been wired to each other's codes unnoticed.
+    ///
+    /// These drive the real functions. The two that need a live inviter (`ERR_INVITE_NOT_LIVE`,
+    /// `ERR_INVITE_REFUSED`) are covered by the rendezvous integration suite; the rest are decided
+    /// locally and are covered here.
+    #[tokio::test]
+    async fn each_refusal_call_site_uses_its_own_code() {
+        use mcpmesh_local_api as api;
+        let code_of = |e: &anyhow::Error| e.downcast_ref::<PairRefusal>().map(|r| r.code());
+
+        let store = || {
+            std::sync::Arc::new(
+                crate::allowlist::PeerStore::open(
+                    &tempfile::tempdir().unwrap().keep().join("s.redb"),
+                )
+                .unwrap(),
+            )
+        };
+        let ep = || async {
+            iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .bind()
+                .await
+                .unwrap()
+        };
+        let inviter = iroh::SecretKey::from_bytes(&[41u8; 32]).public();
+
+        // EXPIRED — decided from the line in hand, before any dial.
+        let mut expired = sample_invite_for(inviter, 1);
+        expired.expires_at_epoch = 1;
+        let e = redeem_invite(
+            ep().await,
+            "me".into(),
+            expired.encode(),
+            store(),
+            None,
+            None,
+        )
+        .await
+        .expect_err("an expired line must refuse");
+        assert_eq!(
+            code_of(&e),
+            Some(api::ERR_INVITE_EXPIRED),
+            "the local expiry pre-check owns ERR_INVITE_EXPIRED: {e:#}"
+        );
+
+        // NAME CONFLICT — the invite's suggested name is already ours for a different peer.
+        let s = store();
+        s.add(crate::allowlist::PeerEntry {
+            endpoint_id: [0xAB; 32],
+            nickname: "taken".into(),
+            services: vec![],
+            paired_at: None,
+            user_id: None,
+            last_addr: None,
+        })
+        .unwrap();
+        let mut named = sample_invite_for(inviter, 9_999_999_999);
+        named.nickname = "taken".into();
+        let e = redeem_invite(ep().await, "me".into(), named.encode(), s, None, None)
+            .await
+            .expect_err("a squatting invite must refuse");
+        assert_eq!(
+            code_of(&e),
+            Some(api::ERR_INVITE_NAME_CONFLICT),
+            "the redeemer-side squat check owns ERR_INVITE_NAME_CONFLICT: {e:#}"
+        );
+
+        // UNREACHABLE — an id-only address on the Minimal preset (no relay, no discovery), so
+        // there is nothing to dial and it fails immediately. An unroutable IP would exercise the
+        // same branch but spend 30s on a connect timeout in every CI run.
+        let dead = sample_invite_for(inviter, 9_999_999_999);
+        let e = redeem_invite(ep().await, "me".into(), dead.encode(), store(), None, None)
+            .await
+            .expect_err("an undialable inviter must refuse");
+        assert_eq!(
+            code_of(&e),
+            Some(api::ERR_INVITER_UNREACHABLE),
+            "the dial failure owns ERR_INVITER_UNREACHABLE: {e:#}"
+        );
+        assert!(
+            e.to_string().contains("dial the inviter"),
+            "and its MESSAGE must stay the string the porcelain matches on to explain a \
+             self-redeem — rewording it made that branch dead code (#159 gate): {e}"
+        );
     }
 
     /// #159, and the load-bearing half: the OPAQUE refusal gains a code without gaining

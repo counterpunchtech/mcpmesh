@@ -1032,6 +1032,13 @@ invite did not work" and nothing more, which is exactly what the prose already s
 nothing outstanding*, which is a fact about the inviter rather than about the secret presented. In
 practice that is the everyday shape of "expired or already used", and it is the one to branch on.
 
+Be precise about what that discloses, though. It comes from the accept gate, **before** any secret is
+presented, so anyone who can dial the node learns whether it currently has an invite outstanding —
+and for a node with exactly one (the single-use default) that is effectively "is this invite still
+live". The bit was already observable: #87b gave that path its own distinct sentence, and an invite
+line is unsigned, so anyone could fabricate one to reach it. `api_minor >= 36` makes it a documented
+contract rather than incidental prose.
+
 **And SAS mismatch is not a refusal.** The short authentication code is compared by two humans out of
 band; the daemon never learns the other side's reading, so there is nothing to signal. A mismatch
 means the humans stop and `peer_remove`.
