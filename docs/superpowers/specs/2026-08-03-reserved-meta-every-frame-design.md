@@ -74,6 +74,20 @@ Control-API change, so `api_minor` is unchanged.
    panicking — `Value`'s `IndexMut` panics on a non-object base, and `select_service` already
    documents this shape as reachable.
 
-Mutation: reverting the strip to first-frame-only fails 1 and 2; dropping the later-`initialize`
-injection fails 1; stripping all of `_meta` rather than the reserved prefix fails 3; injecting for
-the `run` backend fails 4.
+Mutation, four run and four caught: reverting the strip to first-frame-only (deleting the call site,
+not the helper) fails 1, 2 and 5; dropping the later-`initialize` injection fails 1; stripping all of
+`_meta` rather than the reserved prefix fails 3; making `spawn.rs` pass a peer instead of `None`
+fails 4.
+
+**Case 4 needed a call-site test, and the first attempt was a helper test that proved nothing.**
+`sanitize_caller_frame(&mut f, None)` is not evidence that `spawn.rs` passes `None` — the argument is
+the whole decision. The `run` case is now pinned end to end through the child process, which reports
+whether the `initialize` it received carried a `mcpmesh/peer` at all.
+
+## Implementation note
+
+The strip and the injection live in one `sanitize_caller_frame` helper rather than inline in the
+pump loop, so the property is testable directly for odd frame shapes a duplex harness makes awkward
+to drive. The `!frame.is_object()` guard the socket backend needs is **absent** here on purpose:
+only an object can carry `method == "initialize"`, so a non-object frame returns before any indexing
+and passes through unchanged rather than being coerced into an invented `initialize`.

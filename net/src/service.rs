@@ -12,6 +12,30 @@ pub enum ServiceDecision {
     Refuse, // caller sends errors::synthesized(id, ERR_SERVICE, MSG_SERVICE)
 }
 
+/// Delete every caller-supplied `mcpmesh/*` key from a frame's `params._meta`.
+///
+/// **The single definition of "reserved".** Called by [`select_service`] on the session's first
+/// frame AND by the backend pump on every later one — #164 was exactly these two drifting apart:
+/// the rule held on frame 1 only, so a caller sent a `ping` first and its real `initialize` second,
+/// where nothing stripped and nothing injected. A shared server reading `_meta["mcpmesh/peer"]` out
+/// of `initialize` saw whatever the caller wrote.
+///
+/// A non-object `_meta` (array/string) has no keys in the reserved namespace and passes through
+/// untouched — deliberate asymmetry with `select_service`'s non-string-request refusal (D6: parse
+/// no further than the rule requires); the peer injector must therefore REPLACE a non-object
+/// `_meta`, never merge (seam note).
+///
+/// **Scope, stated rather than implied:** this covers `params._meta`, the seam MCP defines and the
+/// only one a backend reads. A top-level `_meta` sibling of `params` is not touched.
+pub fn strip_reserved_meta(frame: &mut Value) {
+    if let Some(meta) = frame
+        .pointer_mut("/params/_meta")
+        .and_then(Value::as_object_mut)
+    {
+        meta.retain(|k, _| !k.starts_with("mcpmesh/"));
+    }
+}
+
 pub fn select_service(init: &mut Value, caller_allowed: &[String]) -> ServiceDecision {
     // Read the request before stripping, distinguishing "key absent" (may default)
     // from "key present but not a string" (malformed → requested something
@@ -21,16 +45,7 @@ pub fn select_service(init: &mut Value, caller_allowed: &[String]) -> ServiceDec
     let requested: Option<String> = entry.and_then(Value::as_str).map(String::from);
 
     // Strip ALL reserved keys, always — before any decision is acted on.
-    // A non-object `_meta` (array/string) has no keys in the reserved namespace and
-    // passes through untouched — deliberate asymmetry with the non-string-request
-    // refusal above (D6: parse no further than the rule requires); the M2 peer
-    // injector must therefore REPLACE a non-object `_meta`, never merge (seam note).
-    if let Some(meta) = init
-        .pointer_mut("/params/_meta")
-        .and_then(Value::as_object_mut)
-    {
-        meta.retain(|k, _| !k.starts_with("mcpmesh/"));
-    }
+    strip_reserved_meta(init);
 
     if malformed {
         return ServiceDecision::Refuse;

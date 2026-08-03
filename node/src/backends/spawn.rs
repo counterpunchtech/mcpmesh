@@ -219,6 +219,10 @@ impl SpawnBackend {
                 self.limiter.clone(),
                 identity.as_ref().map(|i| i.endpoint),
             ),
+            // #164: the `run` backend conveys identity through `MCPMESH_PEER_*` env vars, set once
+            // per spawned process. It has no `_meta` identity seam, so injecting one here would
+            // invent a surface this backend does not have — the STRIP still applies to every frame.
+            None,
         )
         .await;
         // `_session` drops here (or on any early return above), emitting `session_close`.

@@ -23,6 +23,79 @@ use tokio::time::timeout;
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 const STUB: &str = env!("CARGO_BIN_EXE_echo_mcp_stub");
 
+/// #164: the reserved-namespace rule held on the first frame only, so a caller could send a `ping`
+/// first and its real `initialize` second, carrying a forged `mcpmesh/peer`. For the `run` backend
+/// the requirement has two halves, and this pins the CALL SITE for both — a unit test of the shared
+/// helper proves neither, because the argument spawn passes is what decides them:
+///
+/// 1. The forged key is STRIPPED on the later frame.
+/// 2. Nothing is INJECTED in its place: `run` conveys identity through `MCPMESH_PEER_*` env vars,
+///    and inventing an `_meta` seam would make a `run` server see a key no release ever sent it.
+#[tokio::test]
+async fn run_backend_strips_a_forged_peer_on_a_later_frame_and_injects_nothing() {
+    timeout(Duration::from_secs(30), async {
+        let (server_io, client_io) = duplex(64 * 1024);
+        let (sr, sw) = split(server_io);
+        let backend_transport = NdjsonTransport::new(sr, sw, MAX_FRAME);
+        let (cr, cw) = split(client_io);
+        let mut client = NdjsonTransport::new(cr, cw, MAX_FRAME);
+
+        let backend = SpawnBackend {
+            cmd: vec![STUB.to_string()],
+            concurrency: Arc::new(Semaphore::new(4)),
+            service: "test".into(),
+            audit: mcpmesh::audit::AuditSink::disabled(),
+            limiter: mcpmesh::limits::RateLimiter::unlimited_shared(),
+            env: Default::default(),
+            cwd: None,
+        };
+        let identity = Some(PeerIdentity {
+            endpoint: [0u8; 32].into(),
+            name: "bob".into(),
+            user_id: None,
+            groups: vec![],
+        });
+
+        // Frame 1 is NOT an initialize — this is what `run_session` hands the backend.
+        let frame_one = json!({"jsonrpc": "2.0", "id": 1, "method": "ping"});
+        let session = tokio::spawn(async move {
+            backend
+                .run_over(identity, frame_one, backend_transport)
+                .await
+        });
+
+        // Frame 2 is the real handshake, carrying a forged peer.
+        client
+            .send_value(json!({
+                "jsonrpc": "2.0", "id": 2, "method": "initialize",
+                "params": {"protocolVersion": "2025-11-25", "capabilities": {},
+                           "_meta": {"mcpmesh/peer": {"name": "attacker", "groups": ["admin"]}}}
+            }))
+            .await
+            .unwrap();
+
+        // The stub reports whether the initialize it received carried a `mcpmesh/peer` at all.
+        let resp = loop {
+            let f = client.recv_value().await.unwrap().expect("a reply");
+            if f["id"] == 2 {
+                break f;
+            }
+        };
+        assert_eq!(
+            resp["result"]["saw_mesh_peer"],
+            json!(false),
+            "the run backend's child must see NO mcpmesh/peer on a later initialize: the forged \
+             one is stripped, and none is injected because `run` carries identity in env vars: \
+             {resp}"
+        );
+
+        drop(client);
+        let _ = session.await.unwrap();
+    })
+    .await
+    .expect("spawn strip test timed out");
+}
+
 #[tokio::test]
 async fn run_backend_pumps_frames_and_injects_identity() {
     timeout(Duration::from_secs(30), async {

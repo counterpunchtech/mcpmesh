@@ -70,6 +70,44 @@ pub(crate) const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 ///
 /// A trusted local server that emits a malformed line is a bug, not an attack: the
 /// session ends rather than interpreting it (the platform pumps, never interprets).
+/// Enforce the reserved `mcpmesh/*` namespace on ONE caller→backend frame (#164).
+///
+/// The rule used to run on the session's first frame only, and `run_session` treats frame 1 as
+/// `initialize` whatever its method actually is. So a caller spent frame 1 on a `ping` — which the
+/// MCP lifecycle permits before `initialize`, and which rmcp answers — and sent its real
+/// `initialize` as frame 2, which reached the backend verbatim with a forged `mcpmesh/peer`.
+///
+/// Two steps, because each alone leaves a hole:
+///
+/// 1. **Strip** every caller-supplied `mcpmesh/*` key. Unconditional, both backends.
+///    `mcpmesh/service` is the key `select_service` acts on, so this is authorization-relevant.
+/// 2. **Inject** the authoritative peer into whichever frame is actually the handshake. Stripping
+///    alone would leave the backend's real `initialize` carrying no identity at all —
+///    unattributable, which is the second harm the issue names.
+///
+/// `peer_meta` is `None` for the `run` backend, which conveys identity through `MCPMESH_PEER_*` env
+/// vars and has no `_meta` seam; inventing one there would make a `run` server see a key that
+/// appears on no other release. The strip still applies to it.
+///
+/// Non-object `params`/`_meta` are REPLACED, never indexed into — `Value`'s `IndexMut` panics on a
+/// non-object base, and a caller controls this shape.
+fn sanitize_caller_frame(frame: &mut Value, peer_meta: Option<&Value>) {
+    mcpmesh_net::service::strip_reserved_meta(frame);
+    let Some(peer) = peer_meta else { return };
+    if frame.get("method").and_then(Value::as_str) != Some("initialize") {
+        return;
+    }
+    // No `!frame.is_object()` guard: only an object can carry `method == "initialize"`, and the
+    // check above already returned for everything else. `params`/`_meta` still need theirs.
+    if !frame["params"].is_object() {
+        frame["params"] = serde_json::json!({});
+    }
+    if !frame["params"]["_meta"].is_object() {
+        frame["params"]["_meta"] = serde_json::json!({});
+    }
+    frame["params"]["_meta"]["mcpmesh/peer"] = peer.clone();
+}
+
 pub(crate) async fn pump<TR, TW, SR, SW>(
     initialize: Value,
     transport: &mut NdjsonTransport<TR, TW>,
@@ -77,6 +115,9 @@ pub(crate) async fn pump<TR, TW, SR, SW>(
     mut server_write: SW,
     auditor: crate::audit::RequestAuditor,
     rate: crate::limits::RateGate,
+    // The daemon-authored `mcpmesh/peer` value, re-injected if a LATER frame turns out to be the
+    // real `initialize` (#164). `None` = this backend has no `_meta` identity seam.
+    peer_meta: Option<Value>,
 ) -> Result<()>
 where
     TR: AsyncRead + Send + Unpin,
@@ -107,7 +148,11 @@ where
     let to_server = async {
         loop {
             match transport.recv_value().await {
-                Ok(Some(frame)) => {
+                Ok(Some(mut frame)) => {
+                    // #164: strip reserved keys and re-attribute a later handshake, BEFORE the
+                    // rate gate, the audit hook, or the forward — `select_service`'s same "before
+                    // anything acts on the frame" discipline.
+                    sanitize_caller_frame(&mut frame, peer_meta.as_ref());
                     // Per-identity rate limit: consult BEFORE forwarding a
                     // proxied REQUEST/notification (a method-bearing frame). FAIL-SAFE over-limit —
                     // DROP the request (never forward, never queue), reply -32053{retry_after_ms}
@@ -283,6 +328,7 @@ mod tests {
                     server_write,
                     auditor,
                     rate,
+                    None,
                 )
                 .await;
             });
@@ -326,6 +372,91 @@ mod tests {
         })
         .await
         .expect("dropped-notification audit test timed out");
+    }
+
+    /// #164 spec case 4: the `run` backend conveys identity through `MCPMESH_PEER_*` env vars and
+    /// has NO `_meta` seam. It must still get the strip on every frame — but injecting a
+    /// `mcpmesh/peer` there would invent a surface that backend does not have, and a `run` server
+    /// would start seeing a key that appears on no other release.
+    #[test]
+    fn a_none_peer_meta_strips_but_never_injects() {
+        let mut frame = json!({"jsonrpc":"2.0","id":2,"method":"initialize","params":{"_meta":{
+            "mcpmesh/peer": {"name":"attacker","groups":["admin"]},
+            "mcpmesh/service": "not-yours",
+            "app/keep": "yes"
+        }}});
+        sanitize_caller_frame(&mut frame, None);
+
+        assert!(
+            frame["params"]["_meta"].get("mcpmesh/peer").is_none(),
+            "a forged peer must be STRIPPED for a run backend too: {frame}"
+        );
+        assert!(
+            frame["params"]["_meta"].get("mcpmesh/service").is_none(),
+            "and so must the key select_service acts on: {frame}"
+        );
+        assert_eq!(
+            frame["params"]["_meta"]["app/keep"], "yes",
+            "non-reserved keys survive — this is a prefix strip, not an _meta eraser: {frame}"
+        );
+    }
+
+    /// #164: the injection targets the frame whose METHOD is `initialize`, not a positional guess.
+    #[test]
+    fn the_authoritative_peer_lands_on_the_real_initialize_only() {
+        let peer = json!({"eid":"eid:aa","name":"bob","user_id":null,"groups":[]});
+
+        // A non-initialize frame is stripped but NOT given an identity — inventing one would
+        // attribute a `tools/call` as though it were a handshake.
+        let mut call = json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                              "params":{"_meta":{"mcpmesh/peer":{"name":"attacker"}}}});
+        sanitize_caller_frame(&mut call, Some(&peer));
+        assert!(
+            call["params"]["_meta"].get("mcpmesh/peer").is_none(),
+            "a forged peer on a non-initialize frame is stripped and NOT replaced: {call}"
+        );
+
+        // The real handshake gets the authoritative value, whole-value.
+        let mut init = json!({"jsonrpc":"2.0","id":2,"method":"initialize",
+                              "params":{"_meta":{"mcpmesh/peer":
+                                  {"name":"attacker","groups":["admin"],"user_id":"root"}}}});
+        sanitize_caller_frame(&mut init, Some(&peer));
+        assert_eq!(init["params"]["_meta"]["mcpmesh/peer"], peer, "{init}");
+    }
+
+    /// #164: a caller controls these shapes, and `Value`'s `IndexMut` PANICS on a non-object base.
+    /// A panic on the proxy path is a remote crash, so every odd shape must survive.
+    #[test]
+    fn odd_shapes_survive_sanitize_without_panicking() {
+        let peer = json!({"eid":"eid:aa","name":"bob","user_id":null,"groups":[]});
+        for mut frame in [
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize"}), // no params
+            json!({"jsonrpc":"2.0","id":2,"method":"initialize","params":"a string"}),
+            json!({"jsonrpc":"2.0","id":3,"method":"initialize","params":["an","array"]}),
+            json!({"jsonrpc":"2.0","id":4,"method":"initialize","params":{"_meta":42}}),
+            json!({"jsonrpc":"2.0","id":5,"method":"initialize","params":{"_meta":["a"]}}),
+        ] {
+            sanitize_caller_frame(&mut frame, Some(&peer));
+            assert_eq!(
+                frame["params"]["_meta"]["mcpmesh/peer"], peer,
+                "an odd-shaped initialize must still end up attributed: {frame}"
+            );
+        }
+
+        // A non-OBJECT frame cannot carry a method, so it is not a handshake: passed through
+        // untouched rather than coerced into an object that invents an `initialize`.
+        for original in [json!("a bare string frame"), json!([1, 2, 3]), json!(null)] {
+            let mut frame = original.clone();
+            sanitize_caller_frame(&mut frame, Some(&peer));
+            assert_eq!(
+                frame, original,
+                "a non-object frame is not an initialize and must pass through unchanged"
+            );
+        }
+        // And with no identity, an odd shape must not panic either.
+        for mut frame in [json!(null), json!("s"), json!({"params": 7})] {
+            sanitize_caller_frame(&mut frame, None);
+        }
     }
 
     #[tokio::test]
@@ -383,6 +514,7 @@ mod tests {
                         None,
                     ),
                     rate,
+                    None,
                 )
                 .await
             });
@@ -496,6 +628,7 @@ mod tests {
                             None,
                         ),
                         RateGate::new(RateLimiter::unlimited_shared(), None),
+                        None,
                     )
                     .await
                 });
