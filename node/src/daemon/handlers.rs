@@ -732,10 +732,54 @@ fn unregistered_service_error(requested: &[String], served: &[String]) -> Option
 /// machine — the worst place to discover the inviter's typo. Validated against the SAME view
 /// `status` renders ([`service_infos`], read live from disk like `status_result`), so the
 /// refusal's "you serve:" list always matches what `mcpmesh status` shows.
+/// Validate a caller-supplied LOCAL alias (#87) — the one shared rule for both directions.
+///
+/// The same checks `set_nickname` applies, because the value lands in the same place: a stored
+/// `PeerEntry.nickname`, which is the `<peer>/<service>` mount prefix the porcelain splits on. The
+/// aliases shipped unvalidated in the first draft, and the review found `"alice/notes"` made the
+/// peer permanently unmountable (`split_target` cuts at the first `/`) while `" alice "` slipped
+/// past the collision check — which compares exact bytes — to render identically to an existing
+/// `alice` in any trimming UI. Two peers, one display name, which is the whole invariant.
+///
+/// Returns the TRIMMED value. Empty after trimming is an error rather than `None`: a UI passing
+/// through an untouched field must not silently get the name the user was avoiding.
+fn validated_alias(field: &str, alias: Option<String>) -> Result<Option<String>> {
+    let Some(raw) = alias else { return Ok(None) };
+    let name = raw.trim().to_string();
+    if name.is_empty() {
+        anyhow::bail!(crate::control::InvalidParams(format!(
+            "{field} must not be empty (omit it to use the name the peer suggests)"
+        )));
+    }
+    if name.contains('/') {
+        anyhow::bail!(crate::control::InvalidParams(format!(
+            "{field} must not contain '/': the nickname is the <peer>/<service> mount prefix, so \
+             one would make every mount of that peer unparseable"
+        )));
+    }
+    if name.chars().any(char::is_control) {
+        anyhow::bail!(crate::control::InvalidParams(format!(
+            "{field} must not contain control characters"
+        )));
+    }
+    if name.chars().count() > MAX_ALIAS_CHARS {
+        anyhow::bail!(crate::control::InvalidParams(format!(
+            "{field} is {} characters; the limit is {MAX_ALIAS_CHARS}",
+            name.chars().count()
+        )));
+    }
+    Ok(Some(name))
+}
+
+/// Cap on a local alias (#87). A display name, not a document — and `peer_nickname` is persisted
+/// into the whole-file-rewritten invite store, so an unbounded one is a write amplifier.
+const MAX_ALIAS_CHARS: usize = 64;
+
 pub(crate) async fn mint_invite(
     services: Vec<String>,
     app_label: Option<String>,
     max_uses: Option<u32>,
+    peer_nickname: Option<String>,
     mesh: &MeshState,
 ) -> Result<InviteResult> {
     use rand::RngCore;
@@ -751,6 +795,41 @@ pub(crate) async fn mint_invite(
         )),
         Some(n) => n.min(mcpmesh_local_api::MAX_INVITE_USES),
     };
+
+    // #87: OUR local name for whoever redeems. Validated here so a bad one is a clean -32602
+    // rather than a ceremony that fails halfway through, on the other machine, minutes later.
+    let peer_nickname = validated_alias("peer_nickname", peer_nickname)?;
+    // One alias applied to EVERY redeemer of a multi-use invite collides on the second redemption.
+    // Refused at mint rather than producing an invite that works exactly once. Reports the value
+    // the CALLER SENT, not the clamped one — "max_uses = 64" for a request of 10_000 names a number
+    // they never wrote.
+    if peer_nickname.is_some()
+        && let Some(requested) = max_uses.filter(|n| *n > 1)
+    {
+        anyhow::bail!(crate::control::InvalidParams(format!(
+            "peer_nickname cannot be combined with max_uses = {requested}: one local name applied \
+             to every redeemer would collide on the second redemption. Mint separate single-use \
+             invites, or omit peer_nickname and rename afterwards with peer_rename"
+        )));
+    }
+    // #87 gate: catch a collision the operator can still fix, HERE, where the error reaches the
+    // person who chose the name. At redemption it can only be answered opaquely — the redeemer must
+    // not learn our private name for it — so a mint-time check is the only place this is
+    // actionable. Not a guarantee: a peer added after minting can still collide later.
+    if let Some(alias) = &peer_nickname {
+        let store = mesh.store.clone();
+        let alias_c = alias.clone();
+        let taken = blocking("join alias collision check", move || {
+            anyhow::Ok(store.list()?.into_iter().any(|e| e.nickname == alias_c))
+        })
+        .await??;
+        if taken {
+            anyhow::bail!(crate::control::InvalidParams(format!(
+                "peer_nickname '{alias}' is already the name of a peer you have paired with — \
+                 pick another, or rename that peer first with peer_rename"
+            )));
+        }
+    }
 
     // The opaque app label (#31) is capped: the invite line is a human-copied base32 artifact,
     // so a caller cannot bloat it. mcpmesh never interprets the label — this bounds size only.
@@ -809,6 +888,7 @@ pub(crate) async fn mint_invite(
     let now = epoch_now_u64();
     let expires_at_epoch = now + INVITE_TTL.as_secs();
     let invite = Invite {
+        peer_nickname,
         secret,
         inviter_id,
         inviter_addr_json,
@@ -846,8 +926,18 @@ pub(crate) async fn mint_invite(
 /// [`crate::pairing::rendezvous::redeem_invite`], threading our own endpoint + self-nickname +
 /// store. The inviter-side authorization (adding US to its service `allow`) happens on ITS
 /// daemon inside its rendezvous handler — see [`grant_service_access`].
-pub(crate) async fn redeem(state: &DaemonState, invite_line: String) -> Result<PairResult> {
+pub(crate) async fn redeem(
+    state: &DaemonState,
+    invite_line: String,
+    as_nickname: Option<String>,
+) -> Result<PairResult> {
     let mesh = state.mesh_required()?;
+    // #87: validated HERE, at the control seam, so a blank field is a clean -32602 rather than a
+    // ceremony that dials a stranger and fails partway. Empty is rejected rather than treated as
+    // absent: `as_nickname: ""` almost certainly means a UI passed through an untouched field, and
+    // silently falling back to the invite's suggestion is how a user ends up with the very name
+    // they were trying to avoid.
+    let as_nickname = validated_alias("as_nickname", as_nickname)?;
     // #43: the redeemer-side MUTUAL grant hook — grant the inviter access to ALL services this
     // node serves (the same stable-principal + reload discipline as the inviter-side grant).
     let grant_mesh = mesh.clone();
@@ -883,6 +973,7 @@ pub(crate) async fn redeem(state: &DaemonState, invite_line: String) -> Result<P
         mesh.endpoint.clone(),
         mesh.self_nickname(),
         invite_line,
+        as_nickname,
         mesh.store.clone(),
         mesh.self_binding(),
         Some(grant_back),
@@ -1951,6 +2042,182 @@ mod tests {
     /// be told 500, and discover the truth when the 65th colleague fails. Rejecting `0` rather
     /// than treating it as "unusable" surfaces a caller bug instead of minting a credential
     /// nobody can redeem.
+    /// #87 gate: pin the CALL SITE, not just the validator.
+    ///
+    /// A helper test proves nothing about whether `redeem` calls it — deleting the call passed the
+    /// entire workspace. Driven with a deliberately GARBAGE invite line: validation runs before the
+    /// line is even decoded, so an alias error here proves the order as well as the call.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn redeem_validates_as_nickname_before_it_touches_the_invite_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        let state = crate::control::DaemonState::with_mesh("test", mesh);
+
+        let e = redeem(
+            &state,
+            "total-garbage-not-an-invite".into(),
+            Some("  ".into()),
+        )
+        .await
+        .expect_err("a blank as_nickname must be refused");
+        let msg = format!("{e:#}");
+        assert!(
+            msg.contains("as_nickname") && msg.contains("empty"),
+            "the ALIAS error must win over the invite-decode error — proving validation runs at \
+             this call site, and runs FIRST: {msg}"
+        );
+
+        let e = redeem(
+            &state,
+            "total-garbage-not-an-invite".into(),
+            Some("a/b".into()),
+        )
+        .await
+        .expect_err("a '/' in as_nickname must be refused");
+        assert!(format!("{e:#}").contains("as_nickname"), "{e:#}");
+
+        // …and a VALID alias must fall through to the real work (which fails on the garbage line).
+        let e = redeem(&state, "total-garbage".into(), Some("fine".into()))
+            .await
+            .expect_err("the garbage line still fails");
+        assert!(
+            !format!("{e:#}").contains("as_nickname"),
+            "a valid alias must not be reported as an alias problem: {e:#}"
+        );
+    }
+
+    /// #87 gate: BOTH aliases go through the same validation, and `as_nickname`'s branch had no
+    /// test at all — making a blank one fall back silently (the exact behaviour the comment forbids)
+    /// passed the whole suite.
+    ///
+    /// The rules match `set_nickname`'s because the value lands in the same place: a stored
+    /// nickname, which is the `<peer>/<service>` mount prefix. Shipping them unvalidated let
+    /// `"alice/notes"` make a peer permanently unmountable, and `" alice "` slip past a collision
+    /// check that compares exact bytes while rendering identically to `alice` in any trimming UI.
+    #[test]
+    fn an_alias_is_validated_the_same_way_a_nickname_is() {
+        for field in ["as_nickname", "peer_nickname"] {
+            assert_eq!(
+                validated_alias(field, None).unwrap(),
+                None,
+                "absent is fine"
+            );
+            assert_eq!(
+                validated_alias(field, Some("  alice  ".into())).unwrap(),
+                Some("alice".into()),
+                "a valid alias is TRIMMED — otherwise ' alice ' evades the exact-byte collision \
+                 check and renders as a duplicate of 'alice'"
+            );
+
+            for bad in ["", "   ", "\t\n"] {
+                let e = validated_alias(field, Some(bad.into()))
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    e.contains(field) && e.contains("empty"),
+                    "blank must be a clean error naming the field, never a silent fallback to the \
+                     name the caller was trying to avoid: {e}"
+                );
+            }
+            let e = validated_alias(field, Some("alice/notes".into()))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.contains('/') && e.contains(field),
+                "'/' must be refused — the porcelain splits <peer>/<service> at the first one, so \
+                 the peer would be permanently unmountable: {e}"
+            );
+            validated_alias(field, Some("line1\nline2".into()))
+                .expect_err("control characters must be refused");
+            validated_alias(field, Some("a".repeat(MAX_ALIAS_CHARS + 1)))
+                .expect_err("an over-long alias must be refused");
+            validated_alias(field, Some("a".repeat(MAX_ALIAS_CHARS)))
+                .expect("exactly the cap is allowed — both sides of the boundary");
+        }
+    }
+
+    /// #87: `peer_nickname` is the inviter's PRIVATE local name for the redeemer. Two properties,
+    /// and the second is the one a reviewer should check hardest: it must never ride the invite
+    /// LINE, which is a copyable artifact people paste into chats.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_peer_nickname_is_stored_but_never_travels_on_the_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[services.notes]\nsocket = \"/run/notes.sock\"\nallow = []\n",
+        )
+        .unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        let svc = || vec!["notes".to_string()];
+        let minted = mint_invite(svc(), None, None, Some("their-laptop".into()), &mesh)
+            .await
+            .expect("an alias on a single-use invite is fine");
+
+        // The LINE must not carry it — the redeemer has no business knowing what we call them.
+        let decoded = crate::pairing::Invite::decode(&minted.invite_line).expect("line decodes");
+        assert_eq!(
+            decoded.peer_nickname, None,
+            "the inviter's local alias must be STRIPPED from the invite line: {decoded:?}"
+        );
+        // Belt and braces: it must not appear anywhere in the encoded artifact, in any form.
+        assert!(
+            !minted.invite_line.contains("their-laptop"),
+            "the alias must not be recoverable from the line at all"
+        );
+
+        // …but the daemon must still HOLD it, or the invite it applies to is the one that
+        // survives a restart and the alias would be silently lost.
+        let held = mesh
+            .invites
+            .peek_live_alias(&decoded.secret, crate::util::epoch_now_u64())
+            .expect("the invite is live");
+        assert_eq!(
+            held.as_deref(),
+            Some("their-laptop"),
+            "the alias must be retained daemon-side — it is stripped from the line, so this is \
+             the only place it can live"
+        );
+    }
+
+    /// #87: one alias applied to every redeemer of a multi-use invite collides on the SECOND
+    /// redemption. Refused at mint rather than producing an invite that works exactly once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn peer_nickname_is_refused_with_a_multi_use_invite_and_when_blank() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[services.notes]\nsocket = \"/run/notes.sock\"\nallow = []\n",
+        )
+        .unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        let svc = || vec!["notes".to_string()];
+
+        let e = mint_invite(svc(), None, Some(3), Some("them".into()), &mesh)
+            .await
+            .expect_err("an alias on a multi-use invite must be refused at MINT");
+        let msg = format!("{e:#}");
+        assert!(
+            msg.contains("peer_nickname") && msg.contains('3'),
+            "the error must name the field and the max_uses it conflicts with: {msg}"
+        );
+        assert!(
+            msg.contains("peer_rename"),
+            "and point at the recovery, or the caller has to guess: {msg}"
+        );
+
+        // Blank is rejected rather than treated as absent — a UI passing through an untouched
+        // field must not silently get the name it was trying to avoid.
+        for blank in ["", "   "] {
+            mint_invite(svc(), None, None, Some(blank.into()), &mesh)
+                .await
+                .expect_err("a blank alias must be a clean error, not a silent fallback");
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn max_uses_is_clamped_and_zero_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
@@ -1963,20 +2230,24 @@ mod tests {
         let mesh = hermetic_mesh(config_path).await;
         let svc = || vec!["notes".to_string()];
 
-        let one = mint_invite(svc(), None, None, &mesh).await.unwrap();
+        let one = mint_invite(svc(), None, None, None, &mesh).await.unwrap();
         assert_eq!(one.uses_remaining, 1, "absent means single-use");
 
-        let three = mint_invite(svc(), None, Some(3), &mesh).await.unwrap();
+        let three = mint_invite(svc(), None, Some(3), None, &mesh)
+            .await
+            .unwrap();
         assert_eq!(three.uses_remaining, 3);
 
-        let capped = mint_invite(svc(), None, Some(10_000), &mesh).await.unwrap();
+        let capped = mint_invite(svc(), None, Some(10_000), None, &mesh)
+            .await
+            .unwrap();
         assert_eq!(
             capped.uses_remaining,
             mcpmesh_local_api::MAX_INVITE_USES,
             "over the cap is clamped, and the caller is told the value it ACTUALLY got"
         );
 
-        let err = mint_invite(svc(), None, Some(0), &mesh)
+        let err = mint_invite(svc(), None, Some(0), None, &mesh)
             .await
             .expect_err("zero redemptions is a caller bug, not a valid invite");
         assert!(
@@ -2016,7 +2287,7 @@ allow = []
         )
         .await;
 
-        let res = mint_invite(vec!["notes".into()], None, None, &mesh)
+        let res = mint_invite(vec!["notes".into()], None, None, None, &mesh)
             .await
             .expect("mint");
         assert!(res.invite_line.starts_with("mcpmesh-invite:"));

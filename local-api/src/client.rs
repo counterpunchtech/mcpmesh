@@ -230,11 +230,27 @@ impl ControlClient {
         app_label: Option<String>,
         max_uses: Option<u32>,
     ) -> Result<InviteResult, ClientError> {
+        self.invite_named(services, app_label, max_uses, None).await
+    }
+
+    /// Mint an invite, optionally under YOUR OWN local name for whoever redeems it (#87).
+    ///
+    /// `peer_nickname` overrides the name they claim for themselves — the fix for two same-model
+    /// machines that does not require the other person to rename theirs. Never sent to them, and
+    /// rejected alongside `max_uses > 1` (one name for every redeemer collides on the second).
+    pub async fn invite_named(
+        &mut self,
+        services: Vec<String>,
+        app_label: Option<String>,
+        max_uses: Option<u32>,
+        peer_nickname: Option<String>,
+    ) -> Result<InviteResult, ClientError> {
         self.request_typed(
             Request::Invite(InviteParams {
                 services,
                 app_label,
                 max_uses,
+                peer_nickname,
             }),
             "invite result",
         )
@@ -244,9 +260,24 @@ impl ControlClient {
     /// Redeem a pairing invite; return the inviter's suggested nickname, the display-only SAS
     /// code, and the granted services.
     pub async fn pair(&mut self, invite_line: &str) -> Result<PairResult, ClientError> {
+        self.pair_as(invite_line, None).await
+    }
+
+    /// Redeem an invite, optionally under YOUR OWN local name for the inviter (#87).
+    ///
+    /// `as_nickname` overrides the name the invite suggests. Use it when that name is already
+    /// taken locally — otherwise the pairing is refused and the only other fixes are asking the
+    /// inviter to re-mint or renaming your existing peer. It does not bypass the collision check:
+    /// an alias that itself collides is refused the same way.
+    pub async fn pair_as(
+        &mut self,
+        invite_line: &str,
+        as_nickname: Option<String>,
+    ) -> Result<PairResult, ClientError> {
         self.request_typed(
             Request::Pair(PairParams {
                 invite_line: invite_line.to_string(),
+                as_nickname,
             }),
             "pair result",
         )

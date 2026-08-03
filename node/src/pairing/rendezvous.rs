@@ -303,6 +303,41 @@ async fn resolve_and_check_collision(
     .context("join nickname collision check")?
 }
 
+/// Choose the collision refusal, given whether OUR OWN alias is what collided (#87 gate).
+///
+/// Two different failures wear the same shape and must not wear the same reply:
+///
+/// - **No alias.** The colliding name is the one the redeemer claimed for itself. It can rename and
+///   retry, so name it and answer [`RefusalCode::NicknameTaken`] — the documented
+///   rename-and-retry code.
+/// - **Alias set.** The colliding name is OURS, chosen on OUR machine, over a name the redeemer
+///   cannot see or influence. The first draft interpolated it into the reply, which sent the
+///   inviter's private name for that peer — and when the clash was with a third party, disclosed
+///   that name too. Worse, it carried `NicknameTaken`, so an embedder following the documented
+///   contract would rename and retry forever: every attempt collides identically, because the name
+///   is not theirs to change. It answers with the GENERIC refusal instead — byte-identical to every
+///   other opaque one, so it discloses nothing, not even that a collision is what happened. The
+///   operator gets the detail in the server-side log line.
+fn collision_reply(alias: Option<&str>, hello: &RedeemerHello, invite_survived: bool) -> PairReply {
+    match alias {
+        None => collision_refusal(&hello.redeemer_nickname, invite_survived),
+        Some(_) => PairReply::Refused {
+            reason: REASON_REFUSED.into(),
+            code: None,
+        },
+    }
+}
+
+/// The name the inviter will actually store for a redeemer (#87).
+///
+/// The inviter's own `peer_nickname` alias when the invite carries one, else the redeemer's
+/// self-claim. ONE function, used by the collision pre-check, the post-burn race guard, and the
+/// store write — so the name that is checked and the name that is written cannot diverge. They
+/// diverging is the whole failure mode: a check against a name nobody stores proves nothing.
+fn effective_redeemer_nickname<'a>(alias: Option<&'a str>, claimed: &'a str) -> &'a str {
+    alias.unwrap_or(claimed)
+}
+
 /// The redeemer's first (and only) frame: the secret it is redeeming plus its self-claimed id
 /// and suggested nickname. `[u8; 32]` fields serde-round-trip as JSON arrays (same as `Invite`).
 /// The claimed `redeemer_id` is NOT trusted — the TLS-authenticated `conn.remote_id()` is
@@ -492,21 +527,21 @@ pub async fn handle_inviter_side(
     // of a live secret may be told the truth: the name is taken, the invite was NOT consumed,
     // rename and redeem it again — which turns two same-hostname machines' first pairing from
     // a burned invite plus a generic refusal into a self-service retry.
-    if ctx.invites.peek_live(&hello.secret, now) {
-        let (_, collides) =
-            resolve_and_check_collision(&ctx.store, &hello.redeemer_nickname, tls_id).await?;
+    if let Some(alias) = ctx.invites.peek_live_alias(&hello.secret, now) {
+        // #87: check the name we will actually STORE. With a `peer_nickname` on the invite, the
+        // redeemer's self-claim is never used, so checking it here would refuse over a name we
+        // were never going to write — and admit over the one we were.
+        let claimed = effective_redeemer_nickname(alias.as_deref(), &hello.redeemer_nickname);
+        let (_, collides) = resolve_and_check_collision(&ctx.store, claimed, tls_id).await?;
         if collides {
             // Logged SERVER-side with the nickname (a pairing artifact, not a surface leak) —
             // NO endpoint id, NO secret.
             tracing::warn!(
-                nickname = %hello.redeemer_nickname,
+                nickname = %claimed,
+                aliased = alias.is_some(),
                 "pairing refused: nickname collision (invite preserved)"
             );
-            let _ = send_reply(
-                &mut send,
-                &collision_refusal(&hello.redeemer_nickname, true),
-            )
-            .await;
+            let _ = send_reply(&mut send, &collision_reply(alias.as_deref(), &hello, true)).await;
             return Ok(());
         }
     }
@@ -532,8 +567,14 @@ pub async fn handle_inviter_side(
             // own records/routing ambiguous, so a name held by a DIFFERENT store peer is
             // refused. For an EXISTING same-id entry the self-suggested name is DISCARDED
             // entirely (the stored nickname is preserved below) — same-id re-pairs keep passing.
+            // #87: the alias, when the invite carries one, is the name that gets stored.
+            let claimed = effective_redeemer_nickname(
+                invite.peer_nickname.as_deref(),
+                &hello.redeemer_nickname,
+            )
+            .to_string();
             let (existing, collides) =
-                resolve_and_check_collision(&ctx.store, &hello.redeemer_nickname, tls_id).await?;
+                resolve_and_check_collision(&ctx.store, &claimed, tls_id).await?;
             if collides {
                 // #87: whether the invite SURVIVED is now a fact about this invite, not a
                 // constant. `try_redeem` returns the count AFTER decrementing, so uses remaining
@@ -546,13 +587,14 @@ pub async fn handle_inviter_side(
                 // ERR_NICKNAME_TAKEN precisely where the recovery is self-service.
                 let survived = invite.uses_remaining > 0;
                 tracing::warn!(
-                    nickname = %hello.redeemer_nickname,
+                    nickname = %claimed,
+                    aliased = invite.peer_nickname.is_some(),
                     uses_remaining = invite.uses_remaining,
                     "pairing refused: nickname collision (post-redeem race guard)"
                 );
                 let _ = send_reply(
                     &mut send,
-                    &collision_refusal(&hello.redeemer_nickname, survived),
+                    &collision_reply(invite.peer_nickname.as_deref(), &hello, survived),
                 )
                 .await;
                 return Ok(());
@@ -579,9 +621,11 @@ pub async fn handle_inviter_side(
             //  - paired_at: keep the ORIGINAL stamp — the entry records when trust with this peer
             //    was FIRST established on this side (the re-pair itself is auditable via the
             //    trust event); stamp `now` only when the entry never had one (`internal peer add`).
+            // A same-id re-pair KEEPS its stored name (never renamed behind the operator's back);
+            // a brand-new peer gets `claimed`, which is the alias when the invite carried one.
             let nickname = existing
                 .as_ref()
-                .map_or_else(|| hello.redeemer_nickname.clone(), |e| e.nickname.clone());
+                .map_or_else(|| claimed.clone(), |e| e.nickname.clone());
             // The redeemer's OBSERVED transport address(es), from the live connection's
             // path snapshot — the pairing-proven dial-back hint. Synthesized as an
             // `EndpointAddr { id: <TLS-authenticated redeemer id>, addrs: <observed> }` and
@@ -762,11 +806,19 @@ pub async fn redeem_invite(
     endpoint: iroh::Endpoint,
     self_nickname: String,
     invite_line: String,
+    // #87: OUR local name for the inviter, overriding the one its invite suggests. Local only —
+    // never sent, and it does not bypass the squat check below.
+    as_nickname: Option<String>,
     store: Arc<PeerStore>,
     self_binding: Option<SelfBinding>,
     grant_back: Option<GrantBackFn>,
 ) -> anyhow::Result<PairResult> {
     let invite = Invite::decode(&invite_line)?;
+    // ONE binding for the name we will use everywhere below — the squat check, the stored entry,
+    // the grant-back display name, and the result. Computing it per-site is how a check ends up
+    // running against a different name than the one written.
+    let as_nickname_used = as_nickname.is_some();
+    let local_name = as_nickname.unwrap_or_else(|| invite.nickname.clone());
 
     // Client-side pre-check: a friendly early error for an expired invite (the inviter also
     // enforces at redeem — this just avoids a pointless dial).
@@ -786,14 +838,28 @@ pub async fn redeem_invite(
     // our own outbound `<peer>/<service>` routing keys on — first-match by name). Grants are
     // principal-keyed (#38), so no access can follow the name; refusing here keeps the
     // invariant that redeeming an invite grants the other side nothing.
-    if let Some(conflict) = nickname_squat(&store, &invite.nickname, &invite.inviter_id)? {
+    if let Some(conflict) = nickname_squat(&store, &local_name, &invite.inviter_id)? {
+        // The wording has to follow WHOSE name collided (#87 gate). With `as_nickname` set, the
+        // invite asked for nothing of the sort — the local user picked it — and "ask them for a
+        // different name" is advice for a problem they do not have.
+        let reason = if as_nickname_used {
+            format!(
+                "you asked to call this peer '{local_name}', but {conflict} \
+                 Redeem the same invite again with a different name."
+            )
+        } else {
+            // BYTE-IDENTICAL to before this change. A downstream forwards this prose to end
+            // users, and #159 shipped `-32048` precisely so the code — not a reword — is how a
+            // consumer offers the better remedy. Only the NEW aliased case above gets new wording,
+            // because it has no existing consumer.
+            format!(
+                "this invite asks to be called '{local_name}', but {conflict} \
+                 Ask them for an invite suggesting a different name."
+            )
+        };
         bail!(PairRefusal::new(
             mcpmesh_local_api::ERR_INVITE_NAME_CONFLICT,
-            format!(
-                "this invite asks to be called '{}', but {conflict} \
-                 Ask them for an invite suggesting a different name.",
-                invite.nickname,
-            ),
+            reason,
         ));
     }
 
@@ -920,7 +986,7 @@ pub async fn redeem_invite(
     // `endpoint_id` is `invite.inviter_id`, which we verified above equals the TLS id.
     // Resolve + merge + add run in ONE blocking closure (redb reads/writes block + fsync).
     let inviter_id = invite.inviter_id;
-    let nickname = invite.nickname.clone();
+    let nickname = local_name.clone();
     let granted = invite.services.clone();
     let paired_at = Some(epoch_now().to_string());
     let last_addr = Some(invite.inviter_addr_json.clone());
@@ -956,7 +1022,8 @@ pub async fn redeem_invite(
         let inviter_principal = peer_user_id
             .clone()
             .unwrap_or_else(|| mcpmesh_net::EndpointId::from_bytes(invite.inviter_id).principal());
-        grant_back(inviter_principal, invite.nickname.clone()).await?;
+        // `local_name`, not `invite.nickname`: the grant-back display name is OURS.
+        grant_back(inviter_principal, local_name.clone()).await?;
     }
 
     // Display-only SAS, order-independent → equals the inviter's. Both humans read it
@@ -964,7 +1031,7 @@ pub async fn redeem_invite(
     let self_id = *endpoint.id().as_bytes();
     let sas_code = short_auth_code(&invite.inviter_id, &self_id, &invite.secret);
     Ok(PairResult {
-        peer_nickname: invite.nickname,
+        peer_nickname: local_name,
         sas_code,
         // The services WE were granted (from the invite) — the porcelain renders each as
         // `<peer>/<service>` for the "You can mount:" line. Same list written into our
@@ -1193,6 +1260,7 @@ mod tests {
             expires_at_epoch,
             app_label: None,
             uses_remaining: 1,
+            peer_nickname: None,
         }
     }
 
@@ -1234,6 +1302,7 @@ mod tests {
             ep().await,
             "me".into(),
             expired.encode(),
+            None,
             store(),
             None,
             None,
@@ -1259,22 +1328,80 @@ mod tests {
         .unwrap();
         let mut named = sample_invite_for(inviter, 9_999_999_999);
         named.nickname = "taken".into();
-        let e = redeem_invite(ep().await, "me".into(), named.encode(), s, None, None)
-            .await
-            .expect_err("a squatting invite must refuse");
+        let e = redeem_invite(
+            ep().await,
+            "me".into(),
+            named.encode(),
+            None,
+            s.clone(),
+            None,
+            None,
+        )
+        .await
+        .expect_err("a squatting invite must refuse");
         assert_eq!(
             code_of(&e),
             Some(api::ERR_INVITE_NAME_CONFLICT),
             "the redeemer-side squat check owns ERR_INVITE_NAME_CONFLICT: {e:#}"
         );
 
+        // #87: the SAME squatting invite succeeds past the name check when the redeemer supplies
+        // its own local alias. This is the whole point — before it, the only fixes were to ask the
+        // inviter to re-mint or to unpair whoever holds the name. It still fails afterwards (the
+        // sample invite is undialable), but with a DIFFERENT code: the name check is behind it.
+        let e = redeem_invite(
+            ep().await,
+            "me".into(),
+            named.encode(),
+            Some("their-laptop".into()),
+            s.clone(),
+            None,
+            None,
+        )
+        .await
+        .expect_err("the sample invite is undialable, so this still fails — just not on the name");
+        assert_ne!(
+            code_of(&e),
+            Some(api::ERR_INVITE_NAME_CONFLICT),
+            "an alias must RESOLVE the collision, not merely rename the error: {e:#}"
+        );
+
+        // …but an alias that ITSELF collides is refused identically. The alias does not bypass the
+        // check — a duplicate display name makes our own `<peer>/<service>` routing ambiguous
+        // whoever chose it, which is just as true of a name the local user picked.
+        let fresh = sample_invite_for(inviter, 9_999_999_999);
+        let e = redeem_invite(
+            ep().await,
+            "me".into(),
+            fresh.encode(),
+            Some("taken".into()),
+            s,
+            None,
+            None,
+        )
+        .await
+        .expect_err("an alias that collides must still refuse");
+        assert_eq!(
+            code_of(&e),
+            Some(api::ERR_INVITE_NAME_CONFLICT),
+            "the collision check runs on the name we will STORE, alias or not: {e:#}"
+        );
+
         // UNREACHABLE — an id-only address on the Minimal preset (no relay, no discovery), so
         // there is nothing to dial and it fails immediately. An unroutable IP would exercise the
         // same branch but spend 30s on a connect timeout in every CI run.
         let dead = sample_invite_for(inviter, 9_999_999_999);
-        let e = redeem_invite(ep().await, "me".into(), dead.encode(), store(), None, None)
-            .await
-            .expect_err("an undialable inviter must refuse");
+        let e = redeem_invite(
+            ep().await,
+            "me".into(),
+            dead.encode(),
+            None,
+            store(),
+            None,
+            None,
+        )
+        .await
+        .expect_err("an undialable inviter must refuse");
         assert_eq!(
             code_of(&e),
             Some(api::ERR_INVITER_UNREACHABLE),

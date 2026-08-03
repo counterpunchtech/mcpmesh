@@ -7,7 +7,7 @@ named pipe on Windows. Anything that can open the endpoint and parse JSON can sp
 language — [`local-api/examples/status.py`](../local-api/examples/status.py) is a complete client
 in ~60 lines of dependency-free Python.
 
-> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.38`, `api_minor` `38`) and evolves
+> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.39`, `api_minor` `39`) and evolves
 > **additively** (see [Versioning](#versioning)), but until a stable release this document — like the
 > wire format itself — may change without a migration path. Pin the mcpmesh version you build
 > against. Source of truth is the Rust in [`local-api/`](../local-api/src/protocol.rs); where this
@@ -147,8 +147,8 @@ Methods split into two groups by audience:
 | `audit_summary` | *(none)* | `{per_peer:[[name,count],…], per_service:[[name,count],…], total_sessions}` — this node's **local** session tallies; nothing is transmitted |
 | `audit_prune` | `{before:"YYYY-MM"}` — delete audit months **strictly older** than `before` (that month itself is kept), `api_minor >= 27` (#88). The month shape is validated up front: a malformed key is an error, never a silent no-op. Idempotent; local-only; owner-only (the control socket). | `{deleted_months:[…]}` ascending |
 | `audit_list` | `{since?, until?, kind?, peer?, limit?, offset?}` — read this node's **local** audit records, filtered (AND-combined) and paged, `api_minor >= 27` (#88): the "show me everything you hold about me" verb. `since`/`until` are inclusive `YYYY-MM` month keys (the rotation unit). `kind` is one of `session_open` / `session_close` / `request` / `blob_fetch` / `trust` — an unknown kind **errors** rather than silently matching all. `limit` defaults to 500 and is **clamped to 1000** (the response is one JSON frame; `blob_list`'s minor-20 lesson). `total` counts ALL matches, so a caller pages without a second counting call. | `{records:[AuditRecord…], total}` chronological (oldest month first) |
-| `invite` | `{services:[…], max_uses?}` — mint a pairing invite. **Outstanding invites survive a daemon restart** (`api_minor >= 34`, #87b): they are persisted, so `expires_at_epoch` is the real lifetime rather than an upper bound on process lifetime, and a mint that cannot be persisted is an ERROR rather than an invite that will quietly not survive. **`max_uses`** (#87, `api_minor >= 35`) makes it redeemable that many times, each redemption running its OWN SAS ceremony and writing its own peer rows — N independent pairings sharing one secret, never a group identity. Absent = 1. `0` is rejected (`-32602`); above `MAX_INVITE_USES` (64) is clamped, and `uses_remaining` in the result is the value ACTUALLY applied — read it rather than assuming your request was honoured. Sending `max_uses` to an `api_minor < 35` daemon FAILS with `-32602 unknown field` rather than degrading to single-use (params are strict), so omit it unless you have checked. | `{invite_line, expires_at_epoch, uses_remaining}` |
-| `pair` | `{invite_line}` | `{peer_nickname, sas_code, services:[…], app_label?, peer_user_id?}` — `app_label` echoes any opaque label the inviter attached (#31); `peer_user_id` is the inviter's stable `b64u:` identity when it presented a binding (#30). **Grants MUTUALLY (#43):** redemption grants the inviter access to ALL services THIS (redeemer) node serves — under the same stable-principal rule as the inviter-side grant — so one ceremony admits both directions. Fails (no dial attempted) if the invite's suggested nickname is already yours for a *different* peer; see [Nickname collisions](#nickname-collisions) |
+| `invite` | `{services:[…], max_uses?, peer_nickname?}` — mint a pairing invite. **`peer_nickname`** (#87, `api_minor >= 39`) is YOUR local name for whoever redeems, overriding the nickname they claim for themselves — for two same-model laptops, the fix that does not require the other person to rename their machine. Never sent to them (it is stripped from the invite line) and it does **not** bypass the collision check: an alias that itself collides is refused identically. Rejected with `max_uses > 1`, since one alias applied to every redeemer would collide on the second redemption. **Outstanding invites survive a daemon restart** (`api_minor >= 34`, #87b): they are persisted, so `expires_at_epoch` is the real lifetime rather than an upper bound on process lifetime, and a mint that cannot be persisted is an ERROR rather than an invite that will quietly not survive. **`max_uses`** (#87, `api_minor >= 35`) makes it redeemable that many times, each redemption running its OWN SAS ceremony and writing its own peer rows — N independent pairings sharing one secret, never a group identity. Absent = 1. `0` is rejected (`-32602`); above `MAX_INVITE_USES` (64) is clamped, and `uses_remaining` in the result is the value ACTUALLY applied — read it rather than assuming your request was honoured. Sending `max_uses` to an `api_minor < 35` daemon FAILS with `-32602 unknown field` rather than degrading to single-use (params are strict), so omit it unless you have checked. | `{invite_line, expires_at_epoch, uses_remaining}` |
+| `pair` | `{invite_line, as_nickname?}` — **`as_nickname`** (#87, `api_minor >= 39`) is YOUR local name for the inviter, overriding the one its invite suggests. This is how you resolve a name collision yourself instead of asking them to re-mint; `set_nickname` is not the answer, it rewrites your own GLOBAL self-name. Never sent to the inviter, and it does not bypass the collision check. | `{peer_nickname, sas_code, services:[…], app_label?, peer_user_id?}` — `app_label` echoes any opaque label the inviter attached (#31); `peer_user_id` is the inviter's stable `b64u:` identity when it presented a binding (#30). **Grants MUTUALLY (#43):** redemption grants the inviter access to ALL services THIS (redeemer) node serves — under the same stable-principal rule as the inviter-side grant — so one ceremony admits both directions. Fails (no dial attempted) if the invite's suggested nickname is already yours for a *different* peer; see [Nickname collisions](#nickname-collisions) |
 | `peer_remove` | `{nickname}` | `{}` (ack) |
 | `peer_rename` | `{to, user_id?, nickname?}` — rename a person by `user_id`, else a provisional contact by `nickname` | `{}` (ack) |
 | `set_nickname` | `{nickname}` — rename **this node** live (#37, `api_minor >= 2`): validated (trimmed non-empty, no `/`), persisted to `[identity].nickname` under the daemon's own config lock (no lost-update window against a concurrent grant/registration), and effective for FUTURE invites/presentations immediately — no restart. Display-only: peers keep the nickname they stored at pairing time until a re-invite | `{}` (ack) |
@@ -1062,18 +1062,32 @@ more usefully the refusal carries `-32043`, so branch on the code and write the 
 *your* rename affordance.
 
 **The surviving invite is part of what `-32043` means**, not a detail of the prose. Two other
-`pair` failures are also nickname collisions and are deliberately NOT coded, because the remedy the
-code implies would be wrong for them:
+`pair` failures are also nickname collisions, and the remedy `-32043` implies would be wrong for
+both:
 
 - the inviter's post-redeem **race guard** — two redeemers claiming the same new name, where the
   loser's invite was already burned winning the race. Its reason says "ask the inviter for a fresh
-  invite", which is the correct advice; retrying the same invite would fail.
+  invite", which is the correct advice; retrying the same invite would fail. On a **multi-use**
+  invite the loser's invite survives, so that one *does* carry `-32043` and the rename-and-retry
+  advice is right. The uncoded burned case surfaces as `-32049` `ERR_INVITE_REFUSED`.
 - the **redeemer-side** squat check, which refuses adopting an invite's suggested nickname when you
   already use that name for a different peer. That is a condition on *your* node, not the
-  inviter's, and its reason names its own remedy (unpair the existing peer first).
+  inviter's. It carries **`-32048` `ERR_INVITE_NAME_CONFLICT`** (#159) — the paragraph above said
+  `-32000` through `api_minor` 38 and was stale.
 
-Both answer `-32000` and carry a specific, actionable reason. So: branch on `-32043` for the
-rename-and-retry case, and render the message for everything else.
+  **From `api_minor >= 39` this one is self-service:** retry the same `pair` with
+  `as_nickname` set (#87). Its message still says "ask them for an invite suggesting a different
+  name", which was the only remedy before; branch on `-32048` and offer the rename instead.
+
+So: branch on `-32043` for the rename-and-retry case, `-32048` to offer `as_nickname`, and render
+the message for everything else.
+
+> **A collision on the inviter's own `peer_nickname` (#87) is deliberately opaque.** When the
+> inviter aliased you and *its* alias collides, the refusal is the generic `pairing refused` with no
+> code — byte-identical to every other opaque refusal. Naming it would send you the inviter's
+> private name for you (and, when the clash is with a third party, disclose that name's existence),
+> and coding it `-32043` would have you rename and retry forever over a name you cannot influence.
+> The inviter's operator gets the detail in their own log.
 
 Every remaining `pair` refusal stays `-32000`. The one guarding the invite secret is also
 deliberately **opaque** — it does not distinguish unknown-vs-expired-vs-wrong-secret, because a
@@ -1124,7 +1138,9 @@ things:
   `mcpmesh/*` `_meta` namespace is enforced on every proxied frame, not just the session's first,
   at `api_minor >= 37` (#164) — guard on that before keying authorization on
   `_meta["mcpmesh/peer"]`; `SelfNetwork.presence_mode` and the `reachable: false` meaning change it
-  brings (#89) are `api_minor >= 38`.
+  brings (#89) are `api_minor >= 38`; `PairParams.as_nickname` + `InviteParams.peer_nickname`
+  (#87) are `api_minor >= 39` — below that `deny_unknown_fields` rejects the whole request, so
+  guard before offering an alias field in a UI.
   `api_minor` is itself additive: a pre-1.1 daemon omits it and it reads as `0`.
 
 Changes remain **additive within a major**: new response fields are optional (absent-tolerant), so a

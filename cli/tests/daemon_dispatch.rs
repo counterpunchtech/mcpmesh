@@ -141,6 +141,7 @@ fn decoy_invite(secret: [u8; 32]) -> Invite {
         expires_at_epoch: FUTURE,
         app_label: None,
         uses_remaining: 1,
+        peer_nickname: None,
     }
 }
 
