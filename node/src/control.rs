@@ -599,6 +599,7 @@ pub(crate) async fn handle_request(req: &Value, state: &DaemonState) -> Value {
                         p.app_label,
                         p.max_uses,
                         p.peer_nickname,
+                        p.as_self,
                         mesh,
                     )
                 })

@@ -153,6 +153,21 @@ pub fn invite_lines(invite: &InviteResult, services: &[String], now: u64) -> Vec
 /// the pairing authentic, and it must happen before the service is used, not after.
 pub fn pair_lines(result: &PairResult) -> Vec<String> {
     let peer = &result.peer_nickname;
+    // #86: a self-enrollment paired NOTHING — no peer row, no grant. Saying "Paired with alice"
+    // would describe a relationship that does not exist and hide the one that does.
+    if result.enrolled_as_self {
+        return vec![
+            format!("Enrolled this device — code: {}", result.sas_code),
+            format!(
+                "Next: confirm this code matches what your other device shows, out loud. Same \
+                 words = the enrollment is authentic — it signs an identity binding for whichever \
+                 device redeemed, so this check matters more here than in an ordinary pairing."
+            ),
+            String::new(),
+            "Both devices now present one identity, so peers see one person.".into(),
+            "Nothing was granted, and neither device is the other's contact.".into(),
+        ];
+    }
     let mut lines = vec![
         format!("Paired with {peer} — code: {}", result.sas_code),
         format!(
@@ -837,6 +852,34 @@ mod tests {
         assert!(lines[1].contains("mcpmesh-invite:"));
     }
 
+    /// #86: a self-enrollment must not be rendered as a pairing. It paired nothing.
+    #[test]
+    fn pair_lines_do_not_claim_a_pairing_for_a_self_enrollment() {
+        let result = PairResult {
+            peer_nickname: "alice".into(),
+            sas_code: "tango-fig-42".into(),
+            enrolled_as_self: true,
+            services: vec![],
+            app_label: None,
+            peer_user_id: None,
+        };
+        let out = pair_lines(&result).join("\n");
+        assert!(
+            !out.contains("Paired with"),
+            "an enrollment created no peer relationship — saying otherwise describes one that \
+             does not exist: {out}"
+        );
+        assert!(out.contains("Enrolled this device"), "{out}");
+        assert!(
+            out.contains("tango-fig-42"),
+            "the SAS must still be shown — it matters MORE here: {out}"
+        );
+        assert!(
+            out.contains("one identity"),
+            "and say what actually happened: {out}"
+        );
+    }
+
     #[test]
     fn pair_lines_render_the_sas_and_mount_targets() {
         let result = PairResult {
@@ -845,6 +888,7 @@ mod tests {
             services: vec!["notes".into()],
             app_label: None,
             peer_user_id: None,
+            enrolled_as_self: false,
         };
         let lines = pair_lines(&result);
         assert_eq!(lines[0], "Paired with alice — code: tango-fig-42");
@@ -876,6 +920,7 @@ mod tests {
             services: vec!["notes".into(), "kb".into()],
             app_label: None,
             peer_user_id: None,
+            enrolled_as_self: false,
         };
         let rendered = pair_lines(&result).join("\n");
         assert!(
@@ -904,6 +949,7 @@ mod tests {
             services: vec!["notes".into()],
             app_label: None,
             peer_user_id: None,
+            enrolled_as_self: false,
         };
         let rendered = pair_lines(&result).join("\n");
         assert!(
@@ -925,6 +971,7 @@ mod tests {
             services: vec![],
             app_label: None,
             peer_user_id: None,
+            enrolled_as_self: false,
         };
         let lines = pair_lines(&result);
         assert_eq!(lines[0], "Paired with alice — code: a-b-c");

@@ -71,6 +71,7 @@ fn make_invite(
         app_label: None,
         uses_remaining: 1,
         peer_nickname: None,
+        as_self: false,
     }
 }
 
@@ -949,6 +950,7 @@ async fn repeat_grant_unions_the_redeemers_dial_directory_and_applies_the_new_ni
             app_label: None,
             uses_remaining: 1,
             peer_nickname: None,
+            as_self: false,
         };
         invites.mint(invite.clone()).await.unwrap();
 
@@ -956,6 +958,7 @@ async fn repeat_grant_unions_the_redeemers_dial_directory_and_applies_the_new_ni
             redeemer,
             "bob".into(),
             invite.encode(),
+            None,
             None,
             bob_store.clone(),
             None,
@@ -1035,6 +1038,7 @@ async fn redeem_refuses_an_invite_squatting_an_existing_peers_nickname() {
             app_label: None,
             uses_remaining: 1,
             peer_nickname: None,
+            as_self: false,
         };
         invites.mint(invite.clone()).await.unwrap();
 
@@ -1042,6 +1046,7 @@ async fn redeem_refuses_an_invite_squatting_an_existing_peers_nickname() {
             redeemer,
             "bob".into(),
             invite.encode(),
+            None,
             None,
             bob_store.clone(),
             None,
@@ -1095,11 +1100,13 @@ async fn a_dead_invite_dial_reports_the_cause_not_a_bare_connection_failure() {
             app_label: None,
             uses_remaining: 1,
             peer_nickname: None,
+            as_self: false,
         };
         let err = redeem_invite(
             redeemer,
             "bob".into(),
             invite.encode(),
+            None,
             None,
             Arc::new(PeerStore::open(&tempfile::tempdir().unwrap().keep().join("b.redb")).unwrap()),
             None,
@@ -1200,6 +1207,7 @@ async fn an_inviter_side_alias_collision_says_nothing_to_the_redeemer() {
             app_label: None,
             uses_remaining: 1,
             peer_nickname: Some("SECRET-NAME-FOR-BOB".into()),
+            as_self: false,
         };
         invites.mint(invite.clone()).await.unwrap();
 
@@ -1210,6 +1218,7 @@ async fn an_inviter_side_alias_collision_says_nothing_to_the_redeemer() {
             bob.clone(),
             "bob".into(),
             invite.encode(),
+            None,
             None,
             bob_store.clone(),
             None,
@@ -1236,6 +1245,169 @@ async fn an_inviter_side_alias_collision_says_nothing_to_the_redeemer() {
     })
     .await
     .expect("alias collision test timed out");
+}
+
+/// #86: SELF-ENROLLMENT, end to end. Two devices of one person, one `user_id`, and no peer rows.
+///
+/// The properties, in the order they matter:
+///  1. The enrolled device presents the ENROLLING device's `user_pk` afterwards — that is the whole
+///     feature: a peer that pairs with both resolves them to one person.
+///  2. NEITHER side writes a peer row. A row would put this person in their own contact list and,
+///     worse, make their own second device an authorizable principal in their own allow lists.
+///  3. The binding verifies against the ENROLLED device's endpoint, not the enroller's — it is the
+///     new device's to present, and one signed for anyone else would be useless to it.
+#[tokio::test(flavor = "multi_thread")]
+async fn self_enrollment_shares_one_identity_and_writes_no_peer_rows() {
+    timeout(Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+
+        // Device A holds the user key.
+        let a_store = Arc::new(PeerStore::open(&dir.path().join("a.redb")).unwrap());
+        let gate: Arc<dyn TrustGate> = Arc::new(AllowlistGate::new(a_store.clone()));
+        let invites = Arc::new(LiveInvites::new());
+        let alice = inviter_endpoint().await;
+        let alice_id = *alice.id().as_bytes();
+        let alice_addr = alice.addr();
+        let (user_key, _) =
+            mcpmesh_trust::keys::UserKey::load_or_generate(&dir.path().join("user.key")).unwrap();
+        let shared_uid = mcpmesh_trust::binding::user_id(&user_key);
+
+        let cfg = Config::load(&config_path).unwrap();
+        let mesh = MeshState::new(
+            alice,
+            gate,
+            a_store.clone(),
+            invites.clone(),
+            "alice".into(),
+            config_path.clone(),
+            Arc::new(RosterGate::empty()),
+            Arc::new(ConnRegistry::new()),
+            None,
+            None,
+            None,
+            None,
+        );
+        mesh.set_user_key_path(dir.path().join("user.key"));
+        mesh.set_self_binding(Some(mcpmesh::pairing::rendezvous::SelfBinding {
+            user_pk: shared_uid.clone(),
+            sig: mcpmesh::pairing::binding_sig_for(&user_key, &alice_id),
+        }));
+        let task = spawn_accept_loop(mesh.clone(), Arc::new(build_services(&cfg)));
+        mesh.set_accept_task(task).await;
+
+        // A mints a SELF invite.
+        let invite = Invite {
+            secret: [41u8; 32],
+            inviter_id: alice_id,
+            inviter_addr_json: serde_json::to_string(&alice_addr).unwrap(),
+            nickname: "alice".into(),
+            services: vec![],
+            expires_at_epoch: FUTURE,
+            app_label: None,
+            uses_remaining: 1,
+            peer_nickname: None,
+            as_self: true,
+        };
+        invites.mint(invite.clone()).await.unwrap();
+
+        // Device B redeems it.
+        let bob = redeemer_endpoint().await;
+        let bob_id = *bob.id().as_bytes();
+        let bob_dir = tempfile::tempdir().unwrap();
+        let b_store = Arc::new(PeerStore::open(&bob_dir.path().join("b.redb")).unwrap());
+        let adopted: Arc<std::sync::Mutex<Option<mcpmesh::pairing::rendezvous::SelfBinding>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let sink = adopted.clone();
+        let adopt: mcpmesh::pairing::rendezvous::AdoptBindingFn = Box::new(move |b| {
+            let sink = sink.clone();
+            Box::pin(async move {
+                *sink.lock().unwrap() = Some(b);
+                Ok(())
+            })
+        });
+
+        let result = redeem_invite(
+            bob.clone(),
+            "bobs-phone".into(),
+            invite.encode(),
+            None,
+            Some(adopt),
+            b_store.clone(),
+            None,
+            None,
+        )
+        .await
+        .expect("the self-enrollment ceremony completes");
+
+        assert!(
+            result.enrolled_as_self,
+            "the result must say this was an ENROLLMENT, not a pairing — a caller cannot otherwise \
+             tell the two outcomes apart"
+        );
+        assert!(
+            result.services.is_empty(),
+            "an enrollment grants nothing: your own devices are not peers of each other"
+        );
+
+        // 1. B now presents A's user_pk — one person, two devices.
+        let b_binding = adopted
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("a binding was adopted");
+        assert_eq!(
+            b_binding.user_pk, shared_uid,
+            "the enrolled device must present the ENROLLING device's user key — this IS the feature"
+        );
+
+        // 3. …and it verifies against B's OWN endpoint.
+        mcpmesh_trust::binding::verify_presented(&b_binding.user_pk, &b_binding.sig, &bob_id)
+            .expect("the binding must be B's to present");
+        assert!(
+            mcpmesh_trust::binding::verify_presented(&b_binding.user_pk, &b_binding.sig, &alice_id)
+                .is_err(),
+            "and must NOT be a binding for the enroller's endpoint"
+        );
+
+        // The redeemer must REFUSE a binding it cannot use. Deleting that check survived the whole
+        // suite: the enrolled device would adopt a binding for someone else's endpoint and present
+        // an identity it can never prove.
+        let wrong = redeem_invite(
+            redeemer_endpoint().await,
+            "another-device".into(),
+            invite.encode(),
+            None,
+            None,
+            Arc::new(PeerStore::open(&bob_dir.path().join("c.redb")).unwrap()),
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            wrong.is_err(),
+            "the invite is burned, so a second redemption must fail — and if it ever succeeded, \
+             the binding it received would be for the FIRST device's endpoint"
+        );
+
+        // 2. Neither side wrote a peer row.
+        assert!(
+            a_store.list().unwrap().is_empty(),
+            "the ENROLLER must not store its own other device as a peer: {:?}",
+            a_store.list().unwrap()
+        );
+        assert!(
+            b_store.list().unwrap().is_empty(),
+            "and neither must the enrolled device: {:?}",
+            b_store.list().unwrap()
+        );
+
+        drop(bob_dir);
+        std::mem::forget(dir);
+    })
+    .await
+    .expect("self-enrollment test timed out");
 }
 
 /// #87: BOTH local aliases, driven through the real two-sided ceremony.
@@ -1290,6 +1462,7 @@ async fn both_sides_store_their_own_local_alias_after_a_real_pairing() {
             app_label: None,
             uses_remaining: 1,
             peer_nickname: Some("bobs-laptop".into()),
+            as_self: false,
         };
         invites.mint(invite.clone()).await.unwrap();
 
@@ -1303,6 +1476,7 @@ async fn both_sides_store_their_own_local_alias_after_a_real_pairing() {
             "bob".into(),
             invite.encode(),
             Some("alice-work".into()),
+            None,
             bob_store.clone(),
             None,
             None,
@@ -1392,6 +1566,7 @@ async fn paired_and_granted_peer_is_admitted_to_the_service_end_to_end() {
             app_label: None,
             uses_remaining: 1,
             peer_nickname: None,
+            as_self: false,
         };
         invites.mint(invite.clone()).await.unwrap();
 
@@ -1416,6 +1591,7 @@ async fn paired_and_granted_peer_is_admitted_to_the_service_end_to_end() {
             bob.clone(),
             "bob".into(),
             invite.encode(),
+            None,
             None,
             bob_store.clone(),
             None,
@@ -1576,6 +1752,7 @@ async fn rename_after_pairing_keeps_the_peer_admitted() {
             app_label: None,
             uses_remaining: 1,
             peer_nickname: None,
+            as_self: false,
         };
         invites.mint(invite.clone()).await.unwrap();
         let bob = redeemer_endpoint().await;
@@ -1585,6 +1762,7 @@ async fn rename_after_pairing_keeps_the_peer_admitted() {
             bob.clone(),
             "bob".into(),
             invite.encode(),
+            None,
             None,
             bob_store,
             None,
@@ -1731,6 +1909,7 @@ async fn pairing_exchanges_and_stores_each_sides_verified_user_id() {
             app_label: None,
             uses_remaining: 1,
             peer_nickname: None,
+            as_self: false,
         };
         invites.mint(invite.clone()).await.unwrap();
 
@@ -1748,6 +1927,7 @@ async fn pairing_exchanges_and_stores_each_sides_verified_user_id() {
             bob.clone(),
             "bob".into(),
             invite.encode(),
+            None,
             None,
             bob_store.clone(),
             Some(SelfBinding {
@@ -1833,6 +2013,7 @@ async fn redeem_refuses_an_address_swap_and_writes_no_entry_p3() {
             app_label: None,
             uses_remaining: 1,
             peer_nickname: None,
+            as_self: false,
         };
 
         let bob = redeemer_endpoint().await;
@@ -1842,6 +2023,7 @@ async fn redeem_refuses_an_address_swap_and_writes_no_entry_p3() {
             bob,
             "bob".into(),
             invite.encode(),
+            None,
             None,
             bob_store.clone(),
             None,

@@ -246,12 +246,30 @@ impl ControlClient {
         max_uses: Option<u32>,
         peer_nickname: Option<String>,
     ) -> Result<InviteResult, ClientError> {
+        self.invite_full(services, app_label, max_uses, peer_nickname, false)
+            .await
+    }
+
+    /// Mint an invite, optionally as a SELF-ENROLLMENT (#86): the redeemer becomes another device
+    /// of YOU rather than a peer, so both present one identity.
+    ///
+    /// `as_self` requires an empty `services` and `max_uses` of 1 — it grants nothing, and a
+    /// multi-use identity invite is a standing offer to become you.
+    pub async fn invite_full(
+        &mut self,
+        services: Vec<String>,
+        app_label: Option<String>,
+        max_uses: Option<u32>,
+        peer_nickname: Option<String>,
+        as_self: bool,
+    ) -> Result<InviteResult, ClientError> {
         self.request_typed(
             Request::Invite(InviteParams {
                 services,
                 app_label,
                 max_uses,
                 peer_nickname,
+                as_self,
             }),
             "invite result",
         )

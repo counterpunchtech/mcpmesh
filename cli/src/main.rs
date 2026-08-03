@@ -112,6 +112,19 @@ enum Cmd {
         /// the value actually applied is printed back.
         #[arg(long, value_name = "n")]
         uses: Option<u32>,
+        /// Enroll another of YOUR OWN devices instead of pairing with someone else (#86).
+        ///
+        /// The redeeming device becomes another device of you: both present the same identity, so
+        /// every peer sees one person. Nothing is granted and neither side becomes the other's
+        /// contact — your own devices are not peers of each other.
+        ///
+        /// **Compare the SAS words.** The inviter signs an identity binding for whichever device
+        /// redeems, so this matters more here than in an ordinary pairing.
+        ///
+        /// Single-use only, and grants no services. Enroll every device from the one that holds
+        /// your user key — an enrolled device cannot enroll a third.
+        #[arg(long, conflicts_with_all = ["uses", "peer_name"])]
+        as_self: bool,
         /// YOUR name for whoever redeems this invite, instead of the name their machine claims
         /// (#87).
         ///
@@ -520,7 +533,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             label,
             uses,
             peer_name,
-        }) => run_invite(services, label, uses, peer_name, cli.json),
+            as_self,
+        }) => run_invite(services, label, uses, peer_name, as_self, cli.json),
         Some(Cmd::Pair {
             invite,
             remove,
@@ -728,14 +742,23 @@ fn run_invite(
     label: Option<String>,
     uses: Option<u32>,
     peer_name: Option<String>,
+    as_self: bool,
     json: bool,
 ) -> anyhow::Result<()> {
-    if services.is_empty() {
+    // #86: a self-enrollment invite grants nothing by design, so the "name a service" requirement
+    // inverts — naming one is the error.
+    if as_self && !services.is_empty() {
+        anyhow::bail!(
+            "--as-self grants nothing: your own devices are not peers of each other. Drop the \
+             service arguments."
+        );
+    }
+    if services.is_empty() && !as_self {
         anyhow::bail!("specify at least one service to grant (e.g. `mcpmesh invite notes`)");
     }
     with_daemon(async move |mut client| {
         let invite = client
-            .invite_named(services.clone(), label, uses, peer_name)
+            .invite_full(services.clone(), label, uses, peer_name, as_self)
             .await?;
         if json {
             println!("{}", mcpmesh::json::invite_json(&invite, &services));

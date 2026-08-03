@@ -83,7 +83,7 @@ pub async fn mint_invite_for_test(
     mesh: &std::sync::Arc<MeshState>,
     services: &[String],
 ) -> anyhow::Result<mcpmesh_local_api::InviteResult> {
-    mint_invite(services.to_vec(), None, None, None, mesh).await
+    mint_invite(services.to_vec(), None, None, None, false, mesh).await
 }
 
 #[doc(hidden)]
@@ -338,6 +338,10 @@ pub struct MeshState {
     /// (else the default). `peer_endorse` reloads it to SIGN an endorsement — the key is never held
     /// in memory beyond a request, matching how boot uses it.
     pub(crate) user_key_path: std::sync::OnceLock<PathBuf>,
+    /// A self-enrollment binding ADOPTED from another device of this person (#86), overriding the
+    /// locally-derived one. `RwLock`, not `OnceLock`: enrolling installs it live, and a device may
+    /// later be re-enrolled into a different identity.
+    pub(crate) adopted_binding: std::sync::RwLock<Option<crate::pairing::rendezvous::SelfBinding>>,
     /// Recent INVITER-side pairing completions — a tiny in-memory ring (cap
     /// [`RECENT_PAIRINGS_CAP`]) `status` surfaces so the inviter's HUMAN can read the SAS and
     /// compare it with the redeemer's out-of-band ("both humans compare the code"; the
@@ -494,6 +498,7 @@ impl MeshState {
             roster_addr_book: std::sync::OnceLock::new(),
             self_binding: std::sync::OnceLock::new(),
             user_key_path: std::sync::OnceLock::new(),
+            adopted_binding: std::sync::RwLock::new(None),
             recent_pairings: std::sync::Mutex::new(std::collections::VecDeque::new()),
             reachability: std::sync::Mutex::new(std::collections::HashMap::new()),
             identity_conflict: std::sync::OnceLock::new(),
@@ -794,6 +799,28 @@ impl MeshState {
         self.audit.get().cloned().unwrap_or_default()
     }
 
+    /// Where an ADOPTED self-enrollment binding is persisted (#86) — beside the user key, so a
+    /// `--profile` root keeps its own.
+    pub(crate) fn adopted_binding_path(&self) -> PathBuf {
+        self.user_key_path
+            .get()
+            .cloned()
+            .unwrap_or_else(|| PathBuf::from("user.key"))
+            .with_extension("adopted-binding.json")
+    }
+
+    /// Install an adopted binding LIVE (#86), so an enrolled device presents the shared identity
+    /// without a restart.
+    pub(crate) fn set_self_binding_live(
+        &self,
+        binding: Option<crate::pairing::rendezvous::SelfBinding>,
+    ) {
+        *self
+            .adopted_binding
+            .write()
+            .expect("adopted_binding lock not poisoned") = binding;
+    }
+
     /// Install the resolved `UserKey` path (#65). Set once, at boot, like `self_binding`.
     pub fn set_user_key_path(&self, path: PathBuf) {
         let _ = self.user_key_path.set(path);
@@ -808,6 +835,17 @@ impl MeshState {
     /// A clone of this daemon's self-sovereign pairing identity, or `None` when unset (control-only /
     /// test daemon) or when this daemon has no user key. The pairing handlers present it to peers.
     pub(crate) fn self_binding(&self) -> Option<crate::pairing::rendezvous::SelfBinding> {
+        // An ADOPTED binding wins (#86): this device was enrolled into another device's identity,
+        // so presenting the locally-derived one would resolve it to a stranger again — the exact
+        // symptom the issue reports.
+        if let Some(adopted) = self
+            .adopted_binding
+            .read()
+            .expect("adopted_binding lock not poisoned")
+            .clone()
+        {
+            return Some(adopted);
+        }
         self.self_binding.get().cloned().flatten()
     }
 
@@ -886,6 +924,38 @@ impl MeshState {
             record_pairing: Box::new(move |nickname, sas, paired_at| {
                 record_mesh.record_pairing(nickname, sas, paired_at);
             }),
+            // #86: sign a binding for ANOTHER DEVICE of this person. Loads the key per call rather
+            // than holding it, matching `peer_endorse`. `None` when this daemon has no user key —
+            // there is then no identity to enroll into.
+            audit_trust: {
+                let mesh = self.clone();
+                Box::new(move |event: String, target: Option<String>| {
+                    mesh.audit().record(crate::audit::AuditRecord::trust(
+                        crate::audit::now_ts(),
+                        event,
+                        target,
+                        None,
+                    ));
+                })
+            },
+            sign_binding: {
+                let path = self.user_key_path.get().cloned();
+                // An ENROLLED device must not enroll a third (#86 gate). Boot always mints a LOCAL
+                // user key, so without this check `sign_binding` would sign with the local key
+                // while we PRESENT the adopted one — issuing bindings for an identity no peer has
+                // ever seen, and silently. The documented limitation was false until this returned
+                // `None`; now the refusal is real and the enrolling device is the one that holds
+                // the key.
+                let adopted = self.adopted_binding.read().ok().and_then(|g| g.clone());
+                Box::new(move |endpoint_id: &[u8; 32]| {
+                    if adopted.is_some() {
+                        return None;
+                    }
+                    let path = path.as_ref()?;
+                    let (user_key, _) = mcpmesh_trust::UserKey::load_or_generate(path).ok()?;
+                    Some(crate::pairing::binding_sig_for(&user_key, endpoint_id))
+                })
+            },
         }
     }
 

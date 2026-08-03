@@ -23,8 +23,28 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
 
+/// The `b64u:` half of a device→user binding this person's key makes for `endpoint_id` (#86).
+///
+/// The SAME primitive pairing presents for our OWN endpoint — `present` signs an arbitrary endpoint
+/// id, which is exactly why self-enrollment needs no key transfer.
+pub fn binding_sig_for(user_key: &mcpmesh_trust::UserKey, endpoint_id: &[u8; 32]) -> String {
+    mcpmesh_trust::binding::present(user_key, endpoint_id).1
+}
+
 /// The scheme prefix of the single copyable pairing artifact.
 const INVITE_SCHEME: &str = "mcpmesh-invite:";
+
+/// The scheme for a SELF-ENROLLMENT invite (#86). A DIFFERENT prefix, deliberately.
+///
+/// `as_self` alone is not enough: it is `#[serde(default)]`, so a redeemer on a pre-43 build
+/// decodes a self-invite as an ORDINARY one — writes a peer row and calls the unconditional
+/// grant-back, handing the inviter access to every service it serves — while the inviter takes the
+/// enrollment path and grants nothing. A silent, asymmetric, over-granting outcome across a version
+/// skew, which is exactly the shape a phone app pinned to an older node hits.
+///
+/// A distinct scheme makes that impossible: an older daemon fails `decode` with "not an mcpmesh
+/// invite", which is a clean refusal rather than a wrong ceremony.
+const ENROLL_SCHEME: &str = "mcpmesh-enroll:";
 
 /// A pairing invite. Serialized to the `mcpmesh-invite:` line, carried out-of-band, and redeemed
 /// over `mcpmesh/pair/1` — once by default, up to `uses_remaining` times (#87).
@@ -59,6 +79,14 @@ pub struct Invite {
     /// at redemption time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer_nickname: Option<String>,
+    /// SELF-ENROLLMENT (#86): the redeemer becomes another DEVICE of the inviter's person, not a
+    /// peer. Rides the line — the redeemer must know to adopt a binding rather than pair.
+    ///
+    /// `#[serde(default)]` so an invite minted by an older daemon decodes as an ordinary one; the
+    /// dangerous direction (an old daemon treating a self-invite as ordinary) is impossible because
+    /// an old daemon cannot have minted one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub as_self: bool,
     /// Redemptions still available on this invite (#87). `1` for an ordinary single-use invite,
     /// which is what an absent field means — so an invite line minted by an older daemon decodes
     /// as single-use rather than as unusable.
@@ -89,7 +117,12 @@ impl Invite {
         };
         let json = serde_json::to_vec(&wire).expect("invite serializes");
         format!(
-            "{INVITE_SCHEME}{}",
+            "{}{}",
+            if self.as_self {
+                ENROLL_SCHEME
+            } else {
+                INVITE_SCHEME
+            },
             data_encoding::BASE32_NOPAD.encode(&json)
         )
     }
@@ -97,13 +130,28 @@ impl Invite {
     /// Parse a `mcpmesh-invite:` line: strip the scheme, base32-decode, JSON-deserialize.
     /// Errors on a missing scheme, an undecodable payload, or JSON that is not an [`Invite`].
     pub fn decode(line: &str) -> anyhow::Result<Self> {
-        let payload = line.strip_prefix(INVITE_SCHEME).ok_or_else(|| {
-            anyhow::anyhow!("not an mcpmesh invite (missing {INVITE_SCHEME} scheme)")
-        })?;
+        let payload = line
+            .strip_prefix(INVITE_SCHEME)
+            .or_else(|| line.strip_prefix(ENROLL_SCHEME))
+            .ok_or_else(|| {
+                anyhow::anyhow!("not an mcpmesh invite (missing {INVITE_SCHEME} scheme)")
+            })?;
         let json = data_encoding::BASE32_NOPAD
             .decode(payload.as_bytes())
             .context("invite payload is not valid base32")?;
-        serde_json::from_slice(&json).context("invite payload is not a valid invite")
+        let invite: Self =
+            serde_json::from_slice(&json).context("invite payload is not a valid invite")?;
+        // The SCHEME and the FLAG must agree. Otherwise a hand-built line could carry
+        // `as_self: true` under the ordinary scheme (so an older peer pairs while we enroll) or the
+        // reverse — reintroducing exactly the version-skew hazard the separate scheme exists to
+        // prevent.
+        let scheme_says_self = line.starts_with(ENROLL_SCHEME);
+        anyhow::ensure!(
+            invite.as_self == scheme_says_self,
+            "invite scheme and as_self disagree — refusing rather than guessing which ceremony \
+             this line is for"
+        );
+        Ok(invite)
     }
 }
 
@@ -283,6 +331,13 @@ impl LiveInvites {
     /// The collision PRE-CHECK needs the alias, because the name that will actually be stored is
     /// the alias when one is set. Checking the redeemer's self-claim there instead would refuse a
     /// pairing over a name we were never going to use, and let one through over the name we were.
+    /// Is the live invite for `secret` a SELF-ENROLLMENT (#86)? `false` when not live.
+    pub fn peek_is_self(&self, secret: &[u8; 32], now_epoch: u64) -> bool {
+        self.guard()
+            .get(secret)
+            .is_some_and(|inv| inv.expires_at_epoch >= now_epoch && inv.as_self)
+    }
+
     pub fn peek_live_alias(&self, secret: &[u8; 32], now_epoch: u64) -> Option<Option<String>> {
         self.guard()
             .get(secret)
@@ -698,6 +753,7 @@ mod tests {
             app_label: None,
             uses_remaining: 1,
             peer_nickname: None,
+            as_self: false,
         }
     }
 

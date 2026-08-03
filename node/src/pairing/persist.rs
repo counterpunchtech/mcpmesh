@@ -120,6 +120,38 @@ impl InviteFile {
     }
 }
 
+/// Write `bytes` to `path` privately and atomically: 0600 at CREATE (never a widen-after-write
+/// race), fsync, rename, and remove the temp on every failure branch (#86).
+///
+/// Extracted from the invite writer above rather than duplicated — both files hold material that
+/// must not be world-readable, and a second hand-rolled copy is how one of them ends up 0644.
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), seq));
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let result = (|| -> io::Result<()> {
+        let mut f = opts.open(&tmp)?;
+        io::Write::write_all(&mut f, bytes)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,7 +170,31 @@ mod tests {
             // alias must survive a restart with the invite, since it is stripped from the LINE and
             // so cannot be recovered from anywhere else.
             peer_nickname: Some("their-laptop".into()),
+            as_self: false,
         }
+    }
+
+    /// #86 gate: `write_private` must create at 0600. It exists so a second hand-rolled copy of
+    /// this pattern cannot end up 0644 — and nothing pinned the mode, so widening it passed.
+    #[test]
+    #[cfg(unix)]
+    fn write_private_creates_at_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("secret.json");
+        write_private(&path, b"{}").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "an adopted binding is identity material; 0600 AT CREATE, never a widen-after-write \
+             race. Got {mode:o}"
+        );
+        // Overwriting an existing file must keep it private too — `create_new` on a temp then
+        // rename, so the mode comes from the temp rather than the pre-existing file.
+        write_private(&path, b"{\"a\":1}").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "…including on rewrite. Got {mode:o}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"a\":1}");
     }
 
     /// #87b: an invite written to disk is still there after the process that wrote it is gone —
