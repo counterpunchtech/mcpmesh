@@ -1677,7 +1677,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   thirty have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.36";
+pub const API_VERSION: &str = "1.37";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -1763,7 +1763,13 @@ pub const API_VERSION: &str = "1.36";
 /// refusals — expired line, no live invite, inviter unreachable, id mismatch, name conflict, and
 /// the deliberately-opaque refusal. `ERR_NICKNAME_TAKEN` had been the only coded pairing failure,
 /// so every other one arrived as `-32000` and an embedder could either forward our prose to end
-/// users or substring-match it (#159).
+/// users or substring-match it (#159); to 37 when the reserved `mcpmesh/*` `_meta` namespace began
+/// being enforced on EVERY proxied frame rather than the session's first. `run_session` treats
+/// frame 1 as the `initialize` whatever its method is, so a caller could send any other method
+/// first and put its real `initialize` — with a forged `mcpmesh/peer` naming another principal,
+/// forged `groups` and all — in frame 2, where nothing stripped or injected. No shape changed;
+/// what changed is whether `_meta["mcpmesh/peer"]` can be trusted, which is the entire reason a
+/// backend reads it. Guard on `api_minor >= 37` before keying authorization on that value (#164).
 ///
 /// **Not every semantic change gets a minor, and that is the gap to watch (#122).** A minor marks a
 /// change to this *surface*. A change to behaviour BEHIND the surface — same fields, same shapes,
@@ -1771,10 +1777,11 @@ pub const API_VERSION: &str = "1.36";
 /// be that class and did bump; do not infer from them that every such change will. When bumping
 /// several minors at once, read this block end to end AND the release notes, not the diff.
 ///
-/// That class is bigger than it looks: **10, 17, 21, 22, 23 and 24 all shipped with no change to
-/// any type in this file** — they moved meaning, not shape. Six of the thirty. A downstream
+/// That class is bigger than it looks: **10, 17, 21, 22, 23, 24 and 37 all shipped with no change
+/// to any type in this file** — they moved meaning, not shape. Seven of the thirty-seven, and 37 is
+/// a SECURITY fix, which is the case where a consumer most needs the guard. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 36;
+pub const API_MINOR: u32 = 37;
 
 #[cfg(test)]
 mod tests {

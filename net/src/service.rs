@@ -12,6 +12,56 @@ pub enum ServiceDecision {
     Refuse, // caller sends errors::synthesized(id, ERR_SERVICE, MSG_SERVICE)
 }
 
+/// Delete every caller-supplied `mcpmesh/*` key from a frame's `params._meta`.
+///
+/// **The single definition of "reserved".** Called by [`select_service`] on the session's first
+/// frame AND by the backend pump on every later one — #164 was exactly these two drifting apart:
+/// the rule held on frame 1 only, so a caller sent a `ping` first and its real `initialize` second,
+/// where nothing stripped and nothing injected. A shared server reading `_meta["mcpmesh/peer"]` out
+/// of `initialize` saw whatever the caller wrote.
+///
+/// A non-object `_meta` (array/string) has no keys in the reserved namespace and passes through
+/// untouched — deliberate asymmetry with `select_service`'s non-string-request refusal (D6: parse
+/// no further than the rule requires); the peer injector must therefore REPLACE a non-object
+/// `_meta`, never merge (seam note).
+///
+/// **A JSON-RPC batch is descended into.** A top-level array root resolves `params/_meta` to
+/// nothing, so a caller could wrap the forged frame in `[ ... ]` and the strip saw an array with no
+/// pointer to follow. Whether that reaches a request handler depends on the backend server — rmcp
+/// 3.1.0 does not unwrap batches (MCP removed them in 2025-06-18), but an older SDK or a custom
+/// NDJSON server does, and this daemon pumps rather than interprets. Each element is sanitized as a
+/// frame in its own right.
+///
+/// **Scope, stated rather than implied:** this covers `params._meta`, the seam MCP defines and the
+/// only one a backend reads. A top-level `_meta` sibling of `params` is not touched, and neither is
+/// `result._meta` on a client→server RESPONSE (to a `sampling/createMessage` or `roots/list`) —
+/// that is a reply, not a request, and no backend reads identity out of one.
+pub fn strip_reserved_meta(frame: &mut Value) {
+    strip_reserved_meta_to_depth(frame, 0);
+}
+
+/// Batch nesting is bounded so a pathological input cannot recurse without limit. `serde_json`
+/// already caps parse depth, and a valid JSON-RPC batch is exactly one level; anything past this is
+/// not a request any server would unwrap.
+const MAX_BATCH_DEPTH: usize = 8;
+
+fn strip_reserved_meta_to_depth(frame: &mut Value, depth: usize) {
+    if let Some(batch) = frame.as_array_mut() {
+        if depth < MAX_BATCH_DEPTH {
+            for element in batch {
+                strip_reserved_meta_to_depth(element, depth + 1);
+            }
+        }
+        return;
+    }
+    if let Some(meta) = frame
+        .pointer_mut("/params/_meta")
+        .and_then(Value::as_object_mut)
+    {
+        meta.retain(|k, _| !k.starts_with("mcpmesh/"));
+    }
+}
+
 pub fn select_service(init: &mut Value, caller_allowed: &[String]) -> ServiceDecision {
     // Read the request before stripping, distinguishing "key absent" (may default)
     // from "key present but not a string" (malformed → requested something
@@ -21,16 +71,7 @@ pub fn select_service(init: &mut Value, caller_allowed: &[String]) -> ServiceDec
     let requested: Option<String> = entry.and_then(Value::as_str).map(String::from);
 
     // Strip ALL reserved keys, always — before any decision is acted on.
-    // A non-object `_meta` (array/string) has no keys in the reserved namespace and
-    // passes through untouched — deliberate asymmetry with the non-string-request
-    // refusal above (D6: parse no further than the rule requires); the M2 peer
-    // injector must therefore REPLACE a non-object `_meta`, never merge (seam note).
-    if let Some(meta) = init
-        .pointer_mut("/params/_meta")
-        .and_then(Value::as_object_mut)
-    {
-        meta.retain(|k, _| !k.starts_with("mcpmesh/"));
-    }
+    strip_reserved_meta(init);
 
     if malformed {
         return ServiceDecision::Refuse;

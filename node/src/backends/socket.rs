@@ -5,10 +5,12 @@
 //!
 //! The injection is AUTHORITATIVE — it REPLACES, never merges. The value the
 //! backend writes is the daemon-authored one; a caller-forged `_meta["mcpmesh/peer"]`
-//! must never survive. In the real flow `select_service` has already STRIPPED every
-//! caller `mcpmesh/*` key upstream, so the forged key is already gone — this REPLACE is
-//! both defense-in-depth AND the single authoritative source of the value the warm
-//! server trusts.
+//! must never survive. `select_service` strips the caller's `mcpmesh/*` keys from the
+//! session's first frame, and the pump's sanitizer strips them from EVERY later frame
+//! and re-attributes a later `initialize` (#164) — so this REPLACE is both
+//! defense-in-depth AND the single authoritative source of the value the warm server
+//! trusts. Before #164 the strip ran on frame 1 alone, and `run_session` treats frame 1
+//! as the handshake whatever its method is, so a forged identity rode in on frame 2.
 //!
 //! Unlike the `run` backend, the server is a warm, shared process (e.g. a
 //! plugin daemon), so identity cannot travel as per-process env vars; it rides in
@@ -104,7 +106,15 @@ impl SocketBackend {
             }
             // Whole-value overwrite: forged `groups`/`user_id` (authorization-relevant)
             // are dropped along with a forged `name`, not merged over.
-            initialize["params"]["_meta"]["mcpmesh/peer"] = serde_json::json!({
+            initialize["params"]["_meta"]["mcpmesh/peer"] = peer_meta_value(id);
+        }
+        // Built once and handed to the pump so a LATER frame that turns out to be the real
+        // `initialize` gets the SAME authoritative value (#164). One constructor, so the
+        // first-frame and later-frame paths cannot drift — that drift was the bug.
+        let peer_meta = identity.as_ref().map(peer_meta_value);
+        #[allow(clippy::items_after_statements)]
+        fn peer_meta_value(id: &PeerIdentity) -> serde_json::Value {
+            serde_json::json!({
                 // The stable device principal (`eid:<hex>` of the AUTHENTICATED endpoint
                 // id, #38) — the arm `peer_audiences` matches; `name` below is display-only.
                 "eid": id.endpoint.principal(),
@@ -116,7 +126,7 @@ impl SocketBackend {
                 // is authoritatively OVERWRITTEN here, never merged over a caller-forged one.
                 "user_id": id.user_id,
                 "groups": id.groups,
-            });
+            })
         }
 
         // Session lifecycle audit: attribute to the gate-resolved identity — the roster
@@ -161,6 +171,7 @@ impl SocketBackend {
                 self.limiter.clone(),
                 identity.as_ref().map(|i| i.endpoint),
             ),
+            peer_meta,
         )
         .await;
         // `_session` drops here (or on any early return above), emitting `session_close`.
@@ -237,6 +248,286 @@ mod tests {
         .expect("echo tools/call");
 
         init
+    }
+
+    /// Collect `n` frames, replying to each so the pump stays live, and return them all.
+    async fn stub_collecting(listener: UnixListener, n: usize) -> Vec<Value> {
+        let (stream, _) = listener.accept().await.expect("stub accept");
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = FrameReader::new(BufReader::new(read_half), MAX_FRAME);
+        let mut seen = Vec::new();
+        for _ in 0..n {
+            let f = match reader.next().await.expect("read frame").expect("frame") {
+                Inbound::Frame(v) => v,
+                Inbound::Violation(_) => panic!("stub saw a framing violation"),
+            };
+            write_frame(
+                &mut write_half,
+                &json!({
+                    "jsonrpc": "2.0", "id": f["id"].clone(),
+                    "result": {"serverInfo": {"name": "socket-stub"}}
+                }),
+            )
+            .await
+            .expect("reply");
+            seen.push(f);
+        }
+        seen
+    }
+
+    /// #164: the reserved-namespace rule held on the FIRST frame only, and `run_session` treats
+    /// frame 1 as `initialize` whatever its method is. So a caller spends frame 1 on a `ping` —
+    /// which the MCP lifecycle permits pre-initialize — and sends its real `initialize` as frame 2,
+    /// which reached the backend verbatim. A shared server reading `_meta["mcpmesh/peer"]` out of
+    /// `initialize` saw whatever the caller wrote.
+    #[tokio::test]
+    async fn a_later_initialize_cannot_carry_a_forged_peer() {
+        timeout(Duration::from_secs(30), async {
+            let dir = tempfile::tempdir().unwrap();
+            let sock = dir.path().join("server.sock");
+            let listener = UnixListener::bind(&sock).unwrap();
+            let stub = tokio::spawn(stub_collecting(listener, 2));
+
+            let (server_io, client_io) = duplex(64 * 1024);
+            let (sr, sw) = split(server_io);
+            let backend_transport = mcpmesh_net::transport::NdjsonTransport::new(sr, sw, MAX_FRAME);
+            let (cr, cw) = split(client_io);
+            let mut client = mcpmesh_net::transport::NdjsonTransport::new(cr, cw, MAX_FRAME);
+
+            let backend = SocketBackend {
+                path: sock.to_str().unwrap().to_string(),
+                service: "test".into(),
+                audit: crate::audit::AuditSink::disabled(),
+                limiter: crate::limits::RateLimiter::unlimited_shared(),
+            };
+            let identity = Some(PeerIdentity {
+                endpoint: [0u8; 32].into(),
+                name: "bob".into(),
+                user_id: None,
+                groups: vec![],
+            });
+
+            // Frame 1 is NOT an initialize. This is what `run_session` hands the backend.
+            let frame_one = json!({"jsonrpc": "2.0", "id": 1, "method": "ping"});
+            let session = tokio::spawn(async move {
+                backend
+                    .run_over(identity, frame_one, backend_transport)
+                    .await
+            });
+
+            let _ = client.recv_value().await.unwrap().unwrap();
+
+            // Frame 2 is the REAL initialize, carrying a forged peer naming someone else —
+            // including forged AUTHORIZATION fields.
+            client
+                .send_value(json!({
+                    "jsonrpc": "2.0", "id": 2, "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "_meta": {
+                            "mcpmesh/peer": {
+                                "eid": "eid:deadbeef", "name": "someone-else",
+                                "user_id": "root", "groups": ["admin"]
+                            },
+                            "app/trace-id": "keep-me"
+                        }
+                    }
+                }))
+                .await
+                .unwrap();
+            let _ = client.recv_value().await.unwrap().unwrap();
+
+            let seen = stub.await.unwrap();
+            let real_init = &seen[1];
+            assert_eq!(
+                real_init["method"], "initialize",
+                "frame 2 is the handshake"
+            );
+            let peer = &real_init["params"]["_meta"]["mcpmesh/peer"];
+            assert_eq!(
+                peer["name"], "bob",
+                "the backend must see the AUTHORITATIVE identity on the frame it handshakes on, \
+                 not the caller's forgery: {real_init}"
+            );
+            assert_eq!(
+                peer["groups"],
+                json!([]),
+                "forged groups must not survive on a later frame either"
+            );
+            assert_eq!(
+                peer["user_id"],
+                json!(null),
+                "forged user_id must not survive"
+            );
+            assert_eq!(
+                real_init["params"]["_meta"]["app/trace-id"], "keep-me",
+                "and a NON-reserved key must survive — this is a reserved-prefix strip, not an \
+                 _meta eraser"
+            );
+
+            drop(client);
+            let _ = session.await.unwrap();
+        })
+        .await
+        .expect("test timed out");
+    }
+
+    /// #164: `mcpmesh/service` is the key `select_service` ACTS on, so a forged one on a later
+    /// frame is authorization-relevant, not cosmetic. And the strip must be a reserved-PREFIX
+    /// strip, not an `_meta` eraser — an application's own keys are the reason `_meta` exists.
+    #[tokio::test]
+    async fn later_frames_lose_reserved_keys_and_keep_everything_else() {
+        timeout(Duration::from_secs(30), async {
+            let dir = tempfile::tempdir().unwrap();
+            let sock = dir.path().join("server.sock");
+            let listener = UnixListener::bind(&sock).unwrap();
+            let stub = tokio::spawn(stub_collecting(listener, 2));
+
+            let (server_io, client_io) = duplex(64 * 1024);
+            let (sr, sw) = split(server_io);
+            let backend_transport = mcpmesh_net::transport::NdjsonTransport::new(sr, sw, MAX_FRAME);
+            let (cr, cw) = split(client_io);
+            let mut client = mcpmesh_net::transport::NdjsonTransport::new(cr, cw, MAX_FRAME);
+
+            let backend = SocketBackend {
+                path: sock.to_str().unwrap().to_string(),
+                service: "test".into(),
+                audit: crate::audit::AuditSink::disabled(),
+                limiter: crate::limits::RateLimiter::unlimited_shared(),
+            };
+            let identity = Some(PeerIdentity {
+                endpoint: [0u8; 32].into(),
+                name: "bob".into(),
+                user_id: None,
+                groups: vec![],
+            });
+            let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
+            let session =
+                tokio::spawn(
+                    async move { backend.run_over(identity, init, backend_transport).await },
+                );
+            let _ = client.recv_value().await.unwrap().unwrap();
+
+            client
+                .send_value(json!({
+                    "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": {"_meta": {
+                        "mcpmesh/service": "some-other-service",
+                        "mcpmesh/anything": "reserved",
+                        "app/trace-id": "keep-me",
+                        "_private": {"nested": true}
+                    }}
+                }))
+                .await
+                .unwrap();
+            let _ = client.recv_value().await.unwrap().unwrap();
+
+            let seen = stub.await.unwrap();
+            let meta = &seen[1]["params"]["_meta"];
+            assert!(
+                meta.get("mcpmesh/service").is_none(),
+                "a forged mcpmesh/service must not reach the backend on a LATER frame — it is the \
+                 key select_service acts on: {meta}"
+            );
+            assert!(
+                meta.get("mcpmesh/anything").is_none(),
+                "the whole reserved PREFIX is stripped, not an enumerated list: {meta}"
+            );
+            assert_eq!(
+                meta["app/trace-id"], "keep-me",
+                "a non-reserved key must survive: {meta}"
+            );
+            assert_eq!(
+                meta["_private"]["nested"],
+                json!(true),
+                "and so must a nested non-reserved value: {meta}"
+            );
+            // The gate is `method == "initialize"`, and this frame is a `tools/call`. Without this
+            // assertion, widening the gate to inject on EVERY frame was caught only by a helper
+            // unit test — the call site stayed green (#164 gate). Attributing a `tools/call` as
+            // though it were a handshake would tell a server the session re-identified mid-stream.
+            assert!(
+                meta.get("mcpmesh/peer").is_none(),
+                "a non-initialize frame must be stripped and NOT attributed: {meta}"
+            );
+
+            drop(client);
+            let _ = session.await.unwrap();
+        })
+        .await
+        .expect("test timed out");
+    }
+
+    /// #164: a frame with no `params`, or a non-object `params`/`_meta`, must survive the strip and
+    /// the injection without panicking. `Value`'s `IndexMut` PANICS on a non-object base, and
+    /// `select_service` already documents a non-object frame as REACHABLE (its key-absent default
+    /// forwards one). A panic here is a remote crash on caller-supplied input.
+    #[tokio::test]
+    async fn odd_frame_shapes_do_not_panic_the_strip_or_the_injection() {
+        timeout(Duration::from_secs(30), async {
+            let dir = tempfile::tempdir().unwrap();
+            let sock = dir.path().join("server.sock");
+            let listener = UnixListener::bind(&sock).unwrap();
+            let stub = tokio::spawn(stub_collecting(listener, 5));
+
+            let (server_io, client_io) = duplex(64 * 1024);
+            let (sr, sw) = split(server_io);
+            let backend_transport = mcpmesh_net::transport::NdjsonTransport::new(sr, sw, MAX_FRAME);
+            let (cr, cw) = split(client_io);
+            let mut client = mcpmesh_net::transport::NdjsonTransport::new(cr, cw, MAX_FRAME);
+
+            let backend = SocketBackend {
+                path: sock.to_str().unwrap().to_string(),
+                service: "test".into(),
+                audit: crate::audit::AuditSink::disabled(),
+                limiter: crate::limits::RateLimiter::unlimited_shared(),
+            };
+            let identity = Some(PeerIdentity {
+                endpoint: [0u8; 32].into(),
+                name: "bob".into(),
+                user_id: None,
+                groups: vec![],
+            });
+            let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
+            let session =
+                tokio::spawn(
+                    async move { backend.run_over(identity, init, backend_transport).await },
+                );
+            let _ = client.recv_value().await.unwrap().unwrap();
+
+            for (n, odd) in [
+                json!({"jsonrpc":"2.0","id":2,"method":"tools/call"}), // no params at all
+                json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":"a string"}),
+                json!({"jsonrpc":"2.0","id":4,"method":"initialize","params":["an","array"]}),
+                json!({"jsonrpc":"2.0","id":5,"method":"initialize","params":{"_meta":"not-obj"}}),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                client.send_value(odd).await.unwrap();
+                let r = client.recv_value().await.unwrap();
+                assert!(
+                    r.is_some(),
+                    "frame {n} must be forwarded, not crash the session"
+                );
+            }
+
+            let seen = stub.await.unwrap();
+            // The two `initialize` frames must still have been given the authoritative identity —
+            // a non-object `params`/`_meta` is REPLACED, never merged into.
+            for f in seen.iter().filter(|f| f["method"] == "initialize") {
+                assert_eq!(
+                    f["params"]["_meta"]["mcpmesh/peer"]["name"], "bob",
+                    "an odd-shaped initialize must still be attributed: {f}"
+                );
+            }
+
+            drop(client);
+            let _ = session.await.unwrap();
+        })
+        .await
+        .expect("test timed out");
     }
 
     /// A caller-forged `_meta["mcpmesh/peer"]` in the incoming `initialize` is

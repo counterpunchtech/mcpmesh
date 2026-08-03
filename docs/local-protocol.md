@@ -7,7 +7,7 @@ named pipe on Windows. Anything that can open the endpoint and parse JSON can sp
 language — [`local-api/examples/status.py`](../local-api/examples/status.py) is a complete client
 in ~60 lines of dependency-free Python.
 
-> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.36`, `api_minor` `36`) and evolves
+> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.37`, `api_minor` `37`) and evolves
 > **additively** (see [Versioning](#versioning)), but until a stable release this document — like the
 > wire format itself — may change without a migration path. Pin the mcpmesh version you build
 > against. Source of truth is the Rust in [`local-api/`](../local-api/src/protocol.rs); where this
@@ -982,9 +982,19 @@ per-process env. Instead the daemon injects it into the MCP `initialize` request
 {"name": "alice", "user_id": "b64u:…", "groups": ["team-eng"]}
 ```
 
-This value is **authoritative**: the daemon strips any caller-supplied `mcpmesh/*` `_meta` keys and
-overwrites this object, so a caller cannot forge who they are. `user_id` is `null` when a pairing peer
-presented no binding.
+This value is **authoritative**: the daemon strips any caller-supplied `mcpmesh/*` `_meta` key from
+**every** frame it proxies — not only the session's first — and overwrites this object on whichever
+frame is really the `initialize`, so a caller cannot forge who they are. `user_id` is `null` when a
+pairing peer presented no binding.
+
+> **`api_minor >= 37` is what guarantees this.** Below 37 the rule was enforced on the first frame
+> only, and `run_session` treats frame 1 as the `initialize` whatever its method is — so a caller
+> could send any other method first and put its real `initialize`, with a forged `mcpmesh/peer`, in
+> frame 2 (#164). A consumer that keys authorization on this value should require `>= 37`.
+
+The strip covers `params._meta`, including inside a JSON-RPC batch. It does not touch a top-level
+`_meta` sibling of `params`, nor `result._meta` on a client→server response — neither is a seam a
+backend reads identity from.
 
 ### Using it well
 
@@ -1110,7 +1120,10 @@ things:
   (#140) is `api_minor >= 33`; durable outstanding invites — `expires_at_epoch` became the real
   lifetime rather than an upper bound on process lifetime (#87b) — are `api_minor >= 34`;
   `InviteParams.max_uses` + `InviteResult.uses_remaining` (#87) are `api_minor >= 35`; the
-  onboarding refusal codes `-32044`..`-32049` (#159) are `api_minor >= 36`.
+  onboarding refusal codes `-32044`..`-32049` (#159) are `api_minor >= 36`; the reserved
+  `mcpmesh/*` `_meta` namespace is enforced on every proxied frame, not just the session's first,
+  at `api_minor >= 37` (#164) — guard on that before keying authorization on
+  `_meta["mcpmesh/peer"]`.
   `api_minor` is itself additive: a pre-1.1 daemon omits it and it reads as `0`.
 
 Changes remain **additive within a major**: new response fields are optional (absent-tolerant), so a

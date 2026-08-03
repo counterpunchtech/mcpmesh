@@ -52,8 +52,13 @@ fn main() {
         }
         let id = extract_id(&line);
         let resp = if line.contains("\"method\":\"initialize\"") {
+            // #164 test hook: report whether the `initialize` this child received carried a
+            // `mcpmesh/peer`. A `run` backend conveys identity through MCPMESH_PEER_* env vars and
+            // must NEVER be given an `_meta` seam — and a caller-forged one must never survive.
+            // Echoed so a test can pin the spawn backend's CALL SITE, not just the shared helper.
+            let saw_mesh_peer = line.contains("mcpmesh/peer");
             format!(
-                "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{{}},\"serverInfo\":{{\"name\":\"echo-stub\",\"version\":\"0.1.0\"}}}}}}"
+                "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{{}},\"serverInfo\":{{\"name\":\"echo-stub\",\"version\":\"0.1.0\"}},\"saw_mesh_peer\":{saw_mesh_peer}}}}}"
             )
         } else if line.contains("\"method\":\"tools/call\"") {
             let text = extract_text(&line);

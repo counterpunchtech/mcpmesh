@@ -89,9 +89,19 @@ pub trait SessionBackend: Send + Sync + 'static {
     /// `_meta["mcpmesh/peer"]` (`socket`); `None` injects nothing.
     ///
     /// The `initialize` frame — already reserved-`_meta` stripped — is handed in
-    /// next; the transport then carries the rest of the session verbatim. The
-    /// backend owns orderly teardown of the transport it consumes (raw path:
-    /// `transport.shutdown()`; rmcp path: `close()` → drop → finish).
+    /// next. The backend owns orderly teardown of the transport it consumes (raw
+    /// path: `transport.shutdown()`; rmcp path: `close()` → drop → finish).
+    ///
+    /// **A CUSTOM backend must enforce the reserved namespace itself.** The frames
+    /// this trait hands over after `initialize` are raw caller input, and frame 1 is
+    /// only *assumed* to be the handshake — `run_session` never checks its `method`.
+    /// #164 was exactly that gap: a caller sent another method first and forged
+    /// `mcpmesh/peer` in frame 2. The in-tree backends route every frame through
+    /// their pump's sanitizer; an embedder implementing this trait must call
+    /// [`crate::service::strip_reserved_meta`] on every frame it reads, and inject
+    /// its own authoritative identity into whichever frame carries
+    /// `method == "initialize"`. This doc previously said the transport "carries the
+    /// rest of the session verbatim", which described the defect.
     async fn run(
         &self,
         identity: Option<PeerIdentity>,
