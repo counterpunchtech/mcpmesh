@@ -19,11 +19,12 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use mcpmesh_local_api::transport::{LocalListener, LocalStream};
 use mcpmesh_local_api::{
-    API_NAME, API_VERSION, AuditListParams, AuditPruneParams, BlobFetchParams, BlobGrantParams,
-    BlobPublishParams, BlobRepublishParams, BlobRevokeParams, BlobUnpublishParams, Hello,
-    InviteParams, OpenSessionParams, OrgJoinParams, PairParams, PeerServicesParams,
-    RosterInstallParams, ServiceAllowParams, SetAppMetadataParams, SetNicknameParams,
-    SetRelaysParams, SetRosterUrlParams, StatusResult, UnregisterServiceParams, method_of,
+    API_NAME, API_VERSION, AuditListParams, AuditPruneParams, BlobFetchCancelParams,
+    BlobFetchParams, BlobGrantParams, BlobPublishParams, BlobRepublishParams, BlobRevokeParams,
+    BlobUnpublishParams, Hello, InviteParams, OpenSessionParams, OrgJoinParams, PairParams,
+    PeerServicesParams, RosterInstallParams, ServiceAllowParams, SetAppMetadataParams,
+    SetNicknameParams, SetRelaysParams, SetRosterUrlParams, StatusResult, UnregisterServiceParams,
+    method_of,
 };
 use mcpmesh_net::framing::{FrameReader, Inbound, write_frame};
 use serde_json::{Value, json};
@@ -191,11 +192,14 @@ async fn handle_conn(stream: LocalStream, state: Arc<DaemonState>) -> Result<()>
 /// transport-agnostic body of `handle_conn`, and what an embedded node's in-memory
 /// control connection runs (`Node::control` — a tokio duplex needs no peer gate: it
 /// never leaves the process).
-pub async fn serve_control_io(
+pub async fn serve_control_io<W>(
     read_half: impl tokio::io::AsyncRead + Unpin + Send + 'static,
-    mut write_half: impl tokio::io::AsyncWrite + Unpin + Send + 'static,
+    write_half: W,
     state: Arc<DaemonState>,
-) -> Result<()> {
+) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     // The server speaks first: a `Hello` frame identifies the api.
     let hello = Hello {
         api: API_NAME.into(),
@@ -203,7 +207,12 @@ pub async fn serve_control_io(
         api_minor: mcpmesh_local_api::API_MINOR,
         stack_version: state.stack_version.clone(),
     };
-    write_frame(&mut write_half, &serde_json::to_value(&hello)?).await?;
+    // ONE writer, shared by the read loop and every spawned request task (#172). A
+    // `tokio::sync::Mutex` rather than a `std` one because it is taken for a WHOLE frame across
+    // awaits: locking per `poll_write` would let two tasks interleave fragments of two frames,
+    // which is worse than the head-of-line blocking this change removes.
+    let writer = Arc::new(tokio::sync::Mutex::new(write_half));
+    write_frame(&mut *writer.lock().await, &serde_json::to_value(&hello)?).await?;
 
     let reader = FrameReader::new(tokio::io::BufReader::new(read_half), MAX_FRAME_BYTES);
     // NOTE: control connections carry no framing-violation strike bound (unlike the
@@ -218,15 +227,28 @@ pub async fn serve_control_io(
     let eph = ephemeral_registered.clone();
     let outcome: Result<()> = async move {
         let mut reader = reader;
-        let mut write_half = write_half;
+        // In-flight request tasks (#172). Dropping this JoinSet ABORTS them, which is what makes
+        // closing a control connection genuinely stop a `blob_fetch` — before this, the transfer
+        // ran to completion and only then discovered nobody was listening.
+        let mut tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+        // Per-CONNECTION in-flight bound. Never `acquire().await` on it in this loop: waiting for a
+        // permit here would reintroduce exactly the head-of-line blocking concurrency exists to
+        // remove. Over the cap we refuse immediately instead — see `ERR_TOO_MANY_INFLIGHT`.
+        let inflight = Arc::new(tokio::sync::Semaphore::new(
+            mcpmesh_local_api::MAX_INFLIGHT,
+        ));
         loop {
+            // Reap finished tasks so the set does not grow for the connection's whole life.
+            // Nothing to inspect: a handler panic is caught INSIDE the task and answered there
+            // (see the `catch_unwind` below), so a join error here cannot be a swallowed panic.
+            while tasks.try_join_next().is_some() {}
             match reader.next().await? {
                 None => return Ok(()), // client closed the connection
                 Some(Inbound::Violation(v)) => {
                     // A malformed/oversized request frame carries no recoverable id: answer a
                     // JSON-RPC parse error and keep the connection open for the next frame.
                     let resp = error(Value::Null, -32700, format!("invalid request frame: {v:?}"));
-                    write_frame(&mut write_half, &resp).await?;
+                    write_frame(&mut *writer.lock().await, &resp).await?;
                 }
                 Some(Inbound::Frame(req)) => {
                     // NOTE: the "shutdown" method string is matched here and in `dispatch`;
@@ -237,7 +259,7 @@ pub async fn serve_control_io(
                         // and closes without reading the ack must still stop the daemon.
                         loop_state.shutdown.notify_one();
                         let resp = dispatch(&req, &loop_state);
-                        let _ = write_frame(&mut write_half, &resp).await;
+                        let _ = write_frame(&mut *writer.lock().await, &resp).await;
                         // Abort every OTHER live control connection (this one's own task is
                         // included and about to return anyway — no correctness issue, the ack
                         // above already landed). Mirrors `Node::shutdown`'s programmatic path:
@@ -261,10 +283,11 @@ pub async fn serve_control_io(
                                 let id = req.get("id").cloned().unwrap_or(Value::Null);
                                 // Params shape error → -32602 (invalid params), matching `respond`.
                                 let resp = error(id, -32602, format!("open_session failed: {e}"));
-                                write_frame(&mut write_half, &resp).await?;
+                                write_frame(&mut *writer.lock().await, &resp).await?;
                                 continue;
                             }
                         };
+                        let write_half = reclaim_writer(&mut tasks, writer).await?;
                         return crate::daemon::open_session(
                             &loop_state,
                             &p.peer,
@@ -279,29 +302,91 @@ pub async fn serve_control_io(
                         // STOPS being request/response and becomes a one-way push stream of
                         // `StreamFrame`s (`crate::stream`). The loop cannot continue — `write_half`
                         // moves into the stream driver for the subscription's lifetime.
+                        let write_half = reclaim_writer(&mut tasks, writer).await?;
                         return run_subscription(&loop_state, write_half).await;
                     }
-                    let resp = handle_request(&req, &loop_state).await;
-                    // #36: remember a SUCCESSFUL ephemeral register_service so it is torn down
-                    // when this connection closes. Peeked from the request/response (register is a
-                    // normal request/response verb; only these upgrade paths above are special).
-                    if method_of(&req) == Some("register_service")
-                        && resp.get("result").is_some()
-                        && req
-                            .get("params")
-                            .and_then(|p| p.get("ephemeral"))
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false)
-                        && let Some(name) = req
-                            .get("params")
-                            .and_then(|p| p.get("name"))
-                            .and_then(|v| v.as_str())
-                    {
+                    // Everything else runs CONCURRENTLY (#172): the loop goes straight back to the
+                    // reader, so a minutes-long `blob_fetch` no longer stalls every other verb on
+                    // this connection. Responses consequently arrive in COMPLETION order — see
+                    // `API_MINOR` 44.
+                    let permit = match inflight.clone().try_acquire_owned() {
+                        Ok(p) => p,
+                        Err(_) => {
+                            let id = req.get("id").cloned().unwrap_or(Value::Null);
+                            let resp = error(
+                                id,
+                                mcpmesh_local_api::ERR_TOO_MANY_INFLIGHT,
+                                format!(
+                                    "connection already has {} requests in flight; retry after one completes, or use a second control connection",
+                                    mcpmesh_local_api::MAX_INFLIGHT
+                                ),
+                            );
+                            write_frame(&mut *writer.lock().await, &resp).await?;
+                            continue;
+                        }
+                    };
+                    // #36 teardown, recorded BEFORE the handler runs — the ordering is
+                    // load-bearing now that the handler can be ABORTED. `register_service` inserts
+                    // into `mesh.ephemeral_services` and then awaits a config reload; a client that
+                    // closes the socket in that window used to be impossible (the handler was
+                    // awaited inline) and now aborts the task mid-flight. Recording afterwards left
+                    // the registration live with an empty teardown list — an orphan service
+                    // pointing at a dead backend, and a name `register_service` then refused
+                    // forever. Recorded up front it is torn down whatever happens; the task removes
+                    // it again if the register turns out to have FAILED, so this connection never
+                    // tears down a name that belongs to another one.
+                    let pending_ephemeral = ephemeral_name(&req).map(|name| {
                         eph.lock()
                             .expect("ephemeral_registered lock not poisoned")
                             .push(name.to_string());
-                    }
-                    write_frame(&mut write_half, &resp).await?;
+                        name.to_string()
+                    });
+                    let task_state = loop_state.clone();
+                    let task_writer = writer.clone();
+                    let task_eph = eph.clone();
+                    tasks.spawn(async move {
+                        // Held for the request's lifetime; released when this task ends.
+                        let _permit = permit;
+                        // A panic must ANSWER, not hang. Before dispatch was concurrent a panicking
+                        // handler unwound the connection task and the client saw EOF immediately;
+                        // in a `JoinSet` it would instead be swallowed, leaving a client that sent
+                        // one request waiting on a response frame that can never arrive. Caught
+                        // here so the caller gets `-32603` — strictly better than the EOF it used
+                        // to get, and the connection stays usable for the requests behind it.
+                        let resp = match n0_future::FutureExt::catch_unwind(
+                            std::panic::AssertUnwindSafe(handle_request(&req, &task_state)),
+                        )
+                        .await
+                        {
+                            Ok(resp) => resp,
+                            Err(_) => {
+                                let id = req.get("id").cloned().unwrap_or(Value::Null);
+                                error(
+                                    id,
+                                    -32603,
+                                    "internal error: the request handler panicked (see the daemon log)",
+                                )
+                            }
+                        };
+                        // #36: a register that FAILED never took the name, so drop the teardown
+                        // entry this connection optimistically recorded — otherwise a refused
+                        // register (a name another connection holds) would tear down that other
+                        // connection's service when this one closes.
+                        if let Some(name) = pending_ephemeral
+                            && resp.get("result").is_none()
+                        {
+                            let mut held = task_eph
+                                .lock()
+                                .expect("ephemeral_registered lock not poisoned");
+                            if let Some(i) = held.iter().rposition(|n| *n == name) {
+                                held.remove(i);
+                            }
+                        }
+                        // A write failure cannot be propagated from here. It does not need to be:
+                        // the only reason it fails is that the client is gone, and the read loop
+                        // learns that from its very next `reader.next()`.
+                        let _ = write_frame(&mut *task_writer.lock().await, &resp).await;
+                    });
                 }
             }
         }
@@ -319,6 +404,56 @@ pub async fn serve_control_io(
         crate::daemon::unregister_ephemeral(mesh, &names).await;
     }
     outcome
+}
+
+/// The service name a request would register EPHEMERALLY (#36), or `None` for anything else.
+///
+/// Peeked from the REQUEST alone, because the teardown entry has to be recorded before the handler
+/// runs — see the call site.
+fn ephemeral_name(req: &Value) -> Option<&str> {
+    if method_of(req) != Some("register_service") {
+        return None;
+    }
+    let params = req.get("params")?;
+    params
+        .get("ephemeral")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        .then(|| params.get("name").and_then(|v| v.as_str()))
+        .flatten()
+}
+
+/// Take the write half back, by value, for an upgrade path that must OWN it (#172).
+///
+/// `open_session` and `subscribe` consume the connection for their lifetime, which is why
+/// concurrent dispatch could not be added alongside the rest of #82: once responses are written
+/// from spawned tasks the writer has to be shared, and a shared writer cannot be moved.
+///
+/// The resolution is to drain first. Every in-flight request runs to completion and writes its
+/// response, its `Arc` clone drops, and the sole remaining reference unwraps back into the plain
+/// writer — so the upgrade path keeps its existing by-value signature and no frame can interleave
+/// with the raw bytes that follow.
+///
+/// **An upgrade therefore WAITS for this connection's own in-flight requests.** A client that
+/// pipelines a `blob_fetch` and then a `subscribe` down one socket waits for the fetch. Upgrade on
+/// a fresh connection — which is what `ControlClient` does anyway, since `open_stream`/`open_session`
+/// consume `self`.
+///
+/// Taking the guard WITHOUT draining would be safe on the wire and wrong everywhere else: in-flight
+/// tasks would block on a mutex nobody ever releases, holding their responses forever.
+async fn reclaim_writer<W>(
+    tasks: &mut tokio::task::JoinSet<()>,
+    writer: Arc<tokio::sync::Mutex<W>>,
+) -> Result<W> {
+    while tasks.join_next().await.is_some() {}
+    // Unreachable given the drain above — every clone lived in a task that has now ended. Loud
+    // rather than silent: a leaked clone would mean an upgrade sharing a writer with something
+    // still writing frames into it.
+    Arc::try_unwrap(writer)
+        .map(tokio::sync::Mutex::into_inner)
+        .map_err(|_| {
+            anyhow::anyhow!("control writer still shared after draining in-flight requests")
+        })
 }
 
 /// Drive a live event stream over a subscribed control connection. Mirrors
@@ -803,6 +938,14 @@ pub(crate) async fn handle_request(req: &Value, state: &DaemonState) -> Value {
             })
             .await,
         ),
+        Some("blob_fetch_cancel") => respond(
+            id,
+            "blob_fetch_cancel",
+            with_params(&params, |p: BlobFetchCancelParams| async move {
+                crate::daemon::blob_fetch_cancel(state, &p.hash)
+            })
+            .await,
+        ),
         Some("audit_summary") => {
             // Summarize THIS node's LOCAL audit log: read the daemon's OWN
             // audit dir off the runtime (spawn_blocking — the fs house rule) and aggregate to
@@ -918,6 +1061,19 @@ pub(crate) async fn handle_request(req: &Value, state: &DaemonState) -> Value {
             .await;
             respond(id, "audit_list", r)
         }
+        // TEST-ONLY (#172). Concurrency, the in-flight cap, and abort-on-close can only be asserted
+        // against a verb whose latency the test CONTROLS; the real one is `blob_fetch`, which a
+        // control-only fixture cannot perform. Compiled out of every non-test build, so it is
+        // unreachable on any shipped daemon.
+        // TEST-ONLY (#172): the only way to reach the panic path without an actual bug.
+        #[cfg(test)]
+        Some("__test_panic") => panic!("deliberate test panic"),
+        #[cfg(test)]
+        Some("__test_block") => {
+            let gate = params.get("gate").and_then(|v| v.as_u64()).unwrap_or(0);
+            tests::test_block(gate).await;
+            ok(id, json!({}))
+        }
         _ => dispatch(req, state),
     }
 }
@@ -961,6 +1117,13 @@ fn respond<T: serde::Serialize>(id: Value, method: &str, r: anyhow::Result<T>) -
         Err(e) if e.downcast_ref::<crate::daemon::NoSuchBlob>().is_some() => error(
             id,
             mcpmesh_local_api::ERR_NO_SUCH_BLOB,
+            format!("{method} failed: {e}"),
+        ),
+        // #172: a request the CALLER stopped is not a failure. Its own code so a UI can close a
+        // progress bar quietly instead of raising an error for something its user asked for.
+        Err(e) if e.downcast_ref::<crate::daemon::Cancelled>().is_some() => error(
+            id,
+            mcpmesh_local_api::ERR_CANCELLED,
             format!("{method} failed: {e}"),
         ),
         // #159: an onboarding refusal that carries its own code. ONE arm for the whole family —
@@ -1447,5 +1610,467 @@ mod tests {
         let st = control_only();
         let r = handle_request(&req("status", json!({})), &st).await;
         assert_eq!(r["result"]["stack_version"], "0.1.0-test");
+    }
+
+    // ---- #172: concurrent dispatch ----------------------------------------------------------
+
+    /// A verb whose latency the TEST controls, standing in for `blob_fetch`. Registered per test so
+    /// tests sharing this process never gate on each other's token.
+    pub(super) struct Gate {
+        released: crate::cancel::CancelToken,
+        entered: std::sync::atomic::AtomicUsize,
+        completed: std::sync::atomic::AtomicUsize,
+    }
+
+    static GATES: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<u64, std::sync::Arc<Gate>>>,
+    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    static NEXT_GATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+    fn new_gate() -> (u64, std::sync::Arc<Gate>) {
+        let id = NEXT_GATE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let gate = std::sync::Arc::new(Gate {
+            released: crate::cancel::CancelToken::new(),
+            entered: std::sync::atomic::AtomicUsize::new(0),
+            completed: std::sync::atomic::AtomicUsize::new(0),
+        });
+        GATES.lock().unwrap().insert(id, gate.clone());
+        (id, gate)
+    }
+
+    /// The body of the `__test_block` verb: park until the owning test releases the gate.
+    ///
+    /// `completed` is incremented AFTER the wait, so it distinguishes "ran to completion" from
+    /// "was aborted mid-flight" — which is exactly what the close-aborts-in-flight test asserts.
+    pub(super) async fn test_block(id: u64) {
+        let gate = GATES
+            .lock()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .expect("__test_block names a registered gate");
+        gate.entered
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        gate.released.cancelled().await;
+        gate.completed
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn load(c: &std::sync::atomic::AtomicUsize) -> usize {
+        c.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Wait for a condition, BOUNDED, sleeping rather than spinning.
+    ///
+    /// Both properties are load-bearing under a loaded CI box. A `yield_now` spin busy-waits a
+    /// whole worker thread, which on a small runner running the suite in parallel starves the very
+    /// task it is waiting for; and an unbounded wait turns a broken assumption into a job that
+    /// hangs until the runner's own timeout kills it with no failing test named. One did.
+    async fn until(what: &str, mut cond: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while !cond() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for: {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    type ClientReader =
+        FrameReader<tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>;
+    type ClientWriter = tokio::io::WriteHalf<tokio::io::DuplexStream>;
+
+    /// A raw framed control connection — NOT `ControlClient`, which is one request at a time by
+    /// construction (`&mut self`) and therefore cannot express pipelining at all.
+    async fn raw_conn(
+        state: Arc<DaemonState>,
+    ) -> (
+        ClientReader,
+        ClientWriter,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
+        let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+        let (sr, sw) = tokio::io::split(server_io);
+        let server = tokio::spawn(serve_control_io(sr, sw, state));
+        let (cr, cw) = tokio::io::split(client_io);
+        let mut reader = FrameReader::new(tokio::io::BufReader::new(cr), MAX_FRAME_BYTES);
+        let hello = next_frame(&mut reader).await;
+        assert_eq!(hello["api"], API_NAME, "server speaks first with a Hello");
+        (reader, cw, server)
+    }
+
+    /// Read one frame, BOUNDED. The bound is load-bearing for the mutation checks: several of the
+    /// mutations these tests exist to catch (awaiting a permit instead of refusing over the cap,
+    /// skipping the upgrade drain) manifest as a frame that never arrives, and an unbounded read
+    /// would hang the suite instead of failing it.
+    async fn next_frame(r: &mut ClientReader) -> Value {
+        let read = tokio::time::timeout(Duration::from_secs(10), r.next())
+            .await
+            .expect("a frame should arrive within 10s");
+        match read.expect("read a frame") {
+            Some(Inbound::Frame(v)) => v,
+            other => panic!("expected a frame, got {other:?}"),
+        }
+    }
+
+    async fn send(w: &mut ClientWriter, v: &Value) {
+        write_frame(w, v).await.expect("write a request frame");
+    }
+
+    fn blocking_req(id: u64, gate: u64) -> Value {
+        json!({ "id": id, "method": "__test_block", "params": { "gate": gate } })
+    }
+
+    /// THE point of #172: a long request no longer stalls the ones behind it. A `status` issued
+    /// AFTER a blocked request answers FIRST, and the blocked one answers once released.
+    ///
+    /// Mutation anchor: awaiting a permit (or awaiting the handler inline) makes the first frame
+    /// read here carry id 1 and the assertion fail.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_slow_request_does_not_stall_the_ones_behind_it() {
+        let (gate_id, gate) = new_gate();
+        let (mut r, mut w, _server) = raw_conn(control_only()).await;
+        send(&mut w, &blocking_req(1, gate_id)).await;
+        send(&mut w, &json!({ "id": 2, "method": "status" })).await;
+
+        let first = next_frame(&mut r).await;
+        assert_eq!(
+            first["id"], 2,
+            "the fast request must answer first: {first}"
+        );
+        assert!(
+            first.get("result").is_some(),
+            "status should succeed: {first}"
+        );
+        assert_eq!(
+            load(&gate.completed),
+            0,
+            "the slow request is still running"
+        );
+
+        gate.released.cancel();
+        let second = next_frame(&mut r).await;
+        assert_eq!(
+            second["id"], 1,
+            "the released request answers second: {second}"
+        );
+    }
+
+    /// Over the per-connection cap the daemon refuses IMMEDIATELY with a branchable, retryable
+    /// code — it does not queue, and it does not stop reading. Every accepted request still
+    /// answers once released.
+    ///
+    /// Mutation anchor: `acquire().await` in place of `try_acquire_owned` never produces the
+    /// refusal and this test hangs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn over_the_inflight_cap_a_request_is_refused_not_queued() {
+        let (gate_id, gate) = new_gate();
+        let (mut r, mut w, _server) = raw_conn(control_only()).await;
+        let cap = mcpmesh_local_api::MAX_INFLIGHT as u64;
+        for id in 1..=cap {
+            send(&mut w, &blocking_req(id, gate_id)).await;
+        }
+        // One past the cap.
+        send(&mut w, &blocking_req(cap + 1, gate_id)).await;
+
+        let refusal = next_frame(&mut r).await;
+        assert_eq!(
+            refusal["id"],
+            cap + 1,
+            "the overflow request is the one refused"
+        );
+        assert_eq!(
+            refusal["error"]["code"],
+            mcpmesh_local_api::ERR_TOO_MANY_INFLIGHT,
+            "over the cap must be branchable, not -32000: {refusal}"
+        );
+
+        gate.released.cancel();
+        let mut answered = std::collections::HashSet::new();
+        for _ in 0..cap {
+            let f = next_frame(&mut r).await;
+            answered.insert(f["id"].as_u64().expect("id is a number"));
+        }
+        assert_eq!(
+            answered,
+            (1..=cap).collect::<std::collections::HashSet<_>>(),
+            "every accepted request answers"
+        );
+
+        // The connection is usable again once permits free.
+        send(&mut w, &json!({ "id": 999, "method": "status" })).await;
+        let after = next_frame(&mut r).await;
+        assert_eq!(after["id"], 999);
+        assert!(
+            after.get("result").is_some(),
+            "usable after the cap clears: {after}"
+        );
+    }
+
+    /// An upgrade DRAINS first: the pending response lands before the subscription's snapshot, so
+    /// no response frame can interleave with what the upgraded connection writes.
+    ///
+    /// Mutation anchor: skipping the drain in `reclaim_writer` (taking the writer straight back)
+    /// makes the snapshot arrive first — or, with a guard instead of `try_unwrap`, deadlocks.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_upgrade_waits_for_in_flight_responses_before_it_takes_the_writer() {
+        let (gate_id, gate) = new_gate();
+        let (mut r, mut w, _server) = raw_conn(control_only()).await;
+        send(&mut w, &blocking_req(1, gate_id)).await;
+        send(&mut w, &json!({ "method": "subscribe" })).await;
+        // Give the read loop time to reach the upgrade and start draining, so the ordering this
+        // asserts is the drain's and not merely the release's.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        gate.released.cancel();
+
+        let first = next_frame(&mut r).await;
+        assert_eq!(
+            first["id"], 1,
+            "the in-flight response lands first: {first}"
+        );
+        let snapshot = next_frame(&mut r).await;
+        assert!(
+            snapshot.get("id").is_none() && snapshot["type"] == "snapshot",
+            "the subscription snapshot follows it: {snapshot}"
+        );
+    }
+
+    /// `open_session` still reclaims the writer by value and answers over it — the OTHER upgrade
+    /// path through `reclaim_writer` (here on the control-only branch, which synthesizes an
+    /// unreachable answer). Pipelined behind an in-flight request, so it exercises the drain and
+    /// not merely the reclaim.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn open_session_drains_in_flight_requests_before_it_takes_the_writer() {
+        let (gate_id, gate) = new_gate();
+        let (mut r, mut w, _server) = raw_conn(control_only()).await;
+        send(&mut w, &blocking_req(7, gate_id)).await;
+        send(
+            &mut w,
+            &json!({ "id": 8, "method": "open_session", "params": { "peer": "bob", "service": "kb" } }),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        gate.released.cancel();
+
+        let first = next_frame(&mut r).await;
+        assert_eq!(
+            first["id"], 7,
+            "the in-flight response lands first: {first}"
+        );
+        let second = next_frame(&mut r).await;
+        assert!(
+            second.get("error").is_some(),
+            "a mesh-less daemon answers open_session with an error frame: {second}"
+        );
+    }
+
+    fn ephemeral_register(id: u64, name: &str) -> Value {
+        json!({
+            "id": id,
+            "method": "register_service",
+            "params": {
+                "name": name,
+                "backend": { "socket": { "path": "/run/nowhere.sock" } },
+                "allow": [],
+                "ephemeral": true,
+            }
+        })
+    }
+
+    /// `bulk` pads `config.toml` with N persistent services. `register_service` inserts into
+    /// `mesh.ephemeral_services` and THEN awaits a config reload; padding widens that reload so a
+    /// client closing the socket reliably lands INSIDE the window, instead of the test passing by
+    /// racing past it.
+    async fn mesh_state(
+        bulk: usize,
+    ) -> (
+        tempfile::TempDir,
+        Arc<crate::daemon::MeshState>,
+        Arc<DaemonState>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let mut cfg = String::new();
+        for i in 0..bulk {
+            cfg.push_str(&format!(
+                "[services.pad{i}]\nsocket = \"/run/pad{i}.sock\"\nallow = []\n"
+            ));
+        }
+        std::fs::write(&config_path, cfg).unwrap();
+        let mesh = crate::daemon::testutil::hermetic_mesh(config_path).await;
+        let state = Arc::new(DaemonState::with_mesh("test", mesh.clone()));
+        (dir, mesh, state)
+    }
+
+    fn ephemeral_names(mesh: &Arc<crate::daemon::MeshState>) -> Vec<String> {
+        let mut v: Vec<String> = mesh
+            .ephemeral_services
+            .lock()
+            .expect("ephemeral_services lock not poisoned")
+            .keys()
+            .cloned()
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// #36's invariant under #172's abort: an ephemeral registration is torn down even when the
+    /// connection closes MID-REGISTER.
+    ///
+    /// `register_service` inserts into `mesh.ephemeral_services` and then awaits a config reload.
+    /// That window did not exist while the handler was awaited inline; once it runs in an abortable
+    /// task, recording the teardown entry AFTER the handler returned left the registration live
+    /// with an empty teardown list — an orphan service pointing at a dead backend, and a name
+    /// `register_service` then refused forever.
+    ///
+    /// Mutation anchor: recording `pending_ephemeral` inside the spawned task (after
+    /// `handle_request`) instead of before the spawn fails this.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_ephemeral_registration_is_torn_down_even_if_the_connection_closes_mid_register() {
+        let (_dir, mesh, state) = mesh_state(300).await;
+        let (r, mut w, server) = raw_conn(state).await;
+        send(&mut w, &ephemeral_register(1, "leaky")).await;
+        // Close once the registration EXISTS but before the reload behind it has finished — the
+        // window itself, not merely "soon after sending". Closing earlier would abort the handler
+        // before it registered anything, which leaks nothing and proves nothing.
+        until("the ephemeral registration to appear", || {
+            !ephemeral_names(&mesh).is_empty()
+        })
+        .await;
+        // Close WITHOUT reading the ack — the whole point.
+        drop(w);
+        drop(r);
+        server
+            .await
+            .expect("connection task not panicked")
+            .expect("connection ends cleanly");
+        assert!(
+            ephemeral_names(&mesh).is_empty(),
+            "a registration must not outlive the connection that made it, however it ended: {:?}",
+            ephemeral_names(&mesh)
+        );
+    }
+
+    /// The other half of recording the teardown up front: a connection whose register was REFUSED
+    /// must not tear down that name on its way out — it belongs to whoever actually holds it.
+    ///
+    /// Mutation anchor: dropping the "remove it again if the register failed" branch makes the
+    /// second connection's close unregister the FIRST connection's live service.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_register_does_not_tear_down_a_name_another_connection_holds() {
+        let (_dir, mesh, state) = mesh_state(0).await;
+        let (mut r1, mut w1, _holder) = raw_conn(state.clone()).await;
+        send(&mut w1, &ephemeral_register(1, "contested")).await;
+        let ack = next_frame(&mut r1).await;
+        assert!(
+            ack.get("result").is_some(),
+            "the first register wins: {ack}"
+        );
+        assert_eq!(ephemeral_names(&mesh), vec!["contested".to_string()]);
+
+        // A register that names the same service but is REFUSED — `rate_limit_per_min: 0` is
+        // rejected rather than silently blocking every request (#63).
+        let (mut r2, mut w2, loser) = raw_conn(state).await;
+        let mut bad = ephemeral_register(2, "contested");
+        bad["params"]["rate_limit_per_min"] = json!(0);
+        send(&mut w2, &bad).await;
+        let refused = next_frame(&mut r2).await;
+        assert!(
+            refused.get("error").is_some(),
+            "the second register loses: {refused}"
+        );
+        drop(w2);
+        drop(r2);
+        loser
+            .await
+            .expect("connection task not panicked")
+            .expect("connection ends cleanly");
+
+        assert_eq!(
+            ephemeral_names(&mesh),
+            vec!["contested".to_string()],
+            "the holder's service must survive the loser closing"
+        );
+    }
+
+    /// A PANICKING handler answers `-32603` instead of hanging its caller (#172 gate).
+    ///
+    /// Before dispatch was concurrent a panic unwound the connection task and the client saw EOF at
+    /// once. In a `JoinSet` it would be swallowed: the ordinary one-request-at-a-time client would
+    /// wait forever on a response frame that can never arrive, with the connection still open.
+    ///
+    /// Mutation anchor: removing the `catch_unwind` makes this test time out on its first read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_panicking_handler_answers_instead_of_hanging_the_caller() {
+        let (mut r, mut w, _server) = raw_conn(control_only()).await;
+        send(&mut w, &json!({ "id": 5, "method": "__test_panic" })).await;
+        let f = next_frame(&mut r).await;
+        assert_eq!(f["id"], 5, "the panicking request still answers: {f}");
+        assert_eq!(f["error"]["code"], -32603, "as an internal error: {f}");
+
+        // And the connection survives it — the requests behind a panicking one are not collateral.
+        send(&mut w, &json!({ "id": 6, "method": "status" })).await;
+        let after = next_frame(&mut r).await;
+        assert_eq!(after["id"], 6);
+        assert!(after.get("result").is_some(), "still usable: {after}");
+    }
+
+    /// `respond` maps a [`Cancelled`](crate::daemon::Cancelled) handler error to `ERR_CANCELLED`,
+    /// not the generic `-32000` — the whole reason it is a distinct error type.
+    ///
+    /// Mutation anchor: deleting that arm in `respond` passed the entire suite before this test.
+    #[test]
+    fn a_cancelled_request_answers_err_cancelled() {
+        let r = respond::<()>(
+            json!(1),
+            "blob_fetch",
+            Err(crate::daemon::Cancelled("blake3:beef".into()).into()),
+        );
+        assert_eq!(
+            r["error"]["code"],
+            mcpmesh_local_api::ERR_CANCELLED,
+            "a cancel is branchable, not a generic failure: {r}"
+        );
+        assert!(
+            r["error"]["message"]
+                .as_str()
+                .expect("a message")
+                .contains("blake3:beef"),
+            "and it names what was cancelled: {r}"
+        );
+    }
+
+    /// Closing the control connection ABORTS its in-flight work (#172). Before this, a `blob_fetch`
+    /// ran to completion and only then discovered nobody was listening — which is why an embedder's
+    /// Cancel button could not stop the bytes.
+    ///
+    /// Mutation anchor: detaching the request with `tokio::spawn` instead of the connection-owned
+    /// `JoinSet` leaves it running, and `completed` reaches 1.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn closing_the_connection_aborts_its_in_flight_requests() {
+        let (gate_id, gate) = new_gate();
+        let (r, mut w, server) = raw_conn(control_only()).await;
+        send(&mut w, &blocking_req(1, gate_id)).await;
+        // Wait for the handler to actually be running before closing — otherwise this could pass
+        // by aborting something that had not started.
+        until("the handler to start", || load(&gate.entered) > 0).await;
+
+        drop(w);
+        drop(r);
+        server
+            .await
+            .expect("connection task not panicked")
+            .expect("connection ends cleanly on client close");
+
+        // Release AFTER the connection is gone: an aborted task can never observe it.
+        gate.released.cancel();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(load(&gate.entered), 1, "the handler did start");
+        assert_eq!(
+            load(&gate.completed),
+            0,
+            "an in-flight request must be aborted when its connection closes"
+        );
     }
 }

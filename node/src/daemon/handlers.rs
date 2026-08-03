@@ -10,8 +10,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use mcpmesh_local_api::{
-    BlobFetchResult, BlobPublishResult, BlobScopeList, InviteResult, PairResult, PeerAddParams,
-    PeerRemoveParams, PeerRenameParams, RegisterServiceParams, ScopeInfo, SetRelaysResult,
+    BlobFetchCancelResult, BlobFetchResult, BlobPublishResult, BlobScopeList, InviteResult,
+    PairResult, PeerAddParams, PeerRemoveParams, PeerRenameParams, RegisterServiceParams,
+    ScopeInfo, SetRelaysResult,
 };
 use mcpmesh_net::errors::{ERR_UNREACHABLE, synthesized};
 use mcpmesh_net::framing::{FrameReader, write_frame};
@@ -269,9 +270,109 @@ pub(crate) async fn blob_list(
     })
 }
 
+/// A request stopped on purpose before it finished (#172). A distinct error type so `respond` maps
+/// it to [`ERR_CANCELLED`](mcpmesh_local_api::ERR_CANCELLED) rather than the generic `-32000`: the
+/// caller asked for this, and "your fetch stopped because you cancelled it" is not a failure a
+/// client should surface as one.
+#[derive(Debug)]
+pub struct Cancelled(pub String);
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cancelled by blob_fetch_cancel: {} — partial chunks stay in the store, unlisted and \
+             unreclaimable (#80), exactly as they do when a fetch fails",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for Cancelled {}
+
+/// Registers an in-flight fetch in [`MeshState::fetches`] and DEREGISTERS on drop (#172).
+///
+/// Drop, not an explicit call at the end of `blob_fetch`: the fetch has several `?` early returns
+/// and a `select!` arm, and a leaked registration is worse than no registration at all — the hash
+/// would look permanently in-flight, so `blob_fetch_cancel` would answer `cancelled: true` for a
+/// fetch that ended long ago, and the next real fetch of that hash would inherit an
+/// already-tripped token and cancel itself instantly.
+struct FetchGuard {
+    mesh: Arc<MeshState>,
+    hash: String,
+    token: crate::cancel::CancelToken,
+    /// The provider, kept only so an UNFINISHED fetch can emit its terminal `Aborted` frame.
+    provider: Arc<crate::blobs::provider::AppBlobs>,
+    /// Set once the fetch has answered on its own. While false, dropping means "stopped".
+    finished: bool,
+}
+
+impl FetchGuard {
+    fn register(
+        mesh: &Arc<MeshState>,
+        hash: String,
+        provider: Arc<crate::blobs::provider::AppBlobs>,
+    ) -> Self {
+        let token = {
+            let mut map = mesh.fetches.lock().expect("fetches lock not poisoned");
+            let slot = map
+                .entry(hash.clone())
+                .or_insert_with(|| crate::daemon::FetchSlot {
+                    token: crate::cancel::CancelToken::new(),
+                    waiters: 0,
+                });
+            // A token that has ALREADY been tripped must not be inherited. Cancel-then-retry is the
+            // ordinary case — a user clicks Cancel and then Retry — and the cancelled fetch's guard
+            // does not deregister until its future is actually polled and dropped. Registering
+            // against the dead token in that window made the retry answer "cancelled" instantly,
+            // for no reason the user could see. `waiters` still counts LIVE registrations, so the
+            // winding-down sibling's drop decrements correctly against the new token's slot.
+            if slot.token.is_cancelled() {
+                slot.token = crate::cancel::CancelToken::new();
+            }
+            slot.waiters += 1;
+            slot.token.clone()
+        };
+        Self {
+            mesh: mesh.clone(),
+            hash,
+            token,
+            provider,
+            finished: false,
+        }
+    }
+}
+
+impl Drop for FetchGuard {
+    fn drop(&mut self) {
+        {
+            let mut map = self.mesh.fetches.lock().expect("fetches lock not poisoned");
+            if let Some(slot) = map.get_mut(&self.hash) {
+                slot.waiters = slot.waiters.saturating_sub(1);
+                // Only the LAST fetch of this hash removes the entry. Removing unconditionally
+                // would drop a token a concurrent sibling is still watching, leaving that sibling
+                // running and uncancellable.
+                if slot.waiters == 0 {
+                    map.remove(&self.hash);
+                }
+            }
+        }
+        // A fetch that stopped without answering owes its subscribers a terminal frame. Emitted
+        // from DROP rather than from the cancel arm so it covers both ways a fetch can be stopped:
+        // `blob_fetch_cancel`, and the control connection closing (which aborts the task — and an
+        // aborted future still runs its destructors).
+        if !self.finished {
+            self.provider.emit_fetch_aborted(&self.hash);
+        }
+    }
+}
+
 /// Handle a `blob_fetch` control request: fetch a `mcpmesh/blob/1` ticket THROUGH the daemon
 /// (BLAKE3-verified streaming into the gated store) and export the verified blob to `dest_path` (a
 /// local file the same-uid daemon writes — within the trust boundary). Returns the verified hash + byte length.
+///
+/// Cancellable (#172) via [`blob_fetch_cancel`], keyed by the ticket's hash — which is read up
+/// front so the dial itself is inside the cancellable region, not just the transfer after it.
 pub(crate) async fn blob_fetch(
     state: &DaemonState,
     ticket: String,
@@ -281,17 +382,68 @@ pub(crate) async fn blob_fetch(
     let provider = mesh.app_blobs().await.context(
         "app-blob provider not enabled (its store failed to build — check the daemon log)",
     )?;
-    let hash = provider.fetch(&ticket).await.context("fetch blob")?;
-    // STREAM to disk (#82). The previous `read_bytes` + `fs::write` held the entire blob in memory
-    // before a byte landed, so peak RSS was blob-sized and a large fetch OOM-killed the node rather
-    // than merely being slow. `export` writes incrementally and reports the size, so nothing here
-    // scales with the blob.
+    let hash_hex = crate::blobs::provider::AppBlobs::ticket_hash(&ticket)?
+        .to_hex()
+        .to_string();
+    let mut guard = FetchGuard::register(mesh, hash_hex.clone(), provider.clone());
     let dest = PathBuf::from(dest_path);
-    let bytes_len = provider.export_to(hash, &dest).await?;
-    Ok(BlobFetchResult {
-        hash: hash.to_hex().to_string(),
-        bytes_len,
-    })
+    let work = async {
+        let hash = provider.fetch(&ticket).await.context("fetch blob")?;
+        // STREAM to disk (#82). The previous `read_bytes` + `fs::write` held the entire blob in
+        // memory before a byte landed, so peak RSS was blob-sized and a large fetch OOM-killed the
+        // node rather than merely being slow. `export` writes incrementally and reports the size,
+        // so nothing here scales with the blob.
+        let bytes_len = provider.export_to(hash, &dest).await?;
+        anyhow::Ok(BlobFetchResult {
+            hash: hash.to_hex().to_string(),
+            bytes_len,
+        })
+    };
+    // Cooperative, not `abort()`: a cancelled fetch must still ANSWER, or the caller waits forever
+    // on work that has already stopped. Dropping `work` here is what actually halts the transfer —
+    // the iroh-blobs get stream and the export both stop when their future is dropped.
+    let outcome = tokio::select! {
+        r = work => r,
+        () = guard.token.cancelled() => Err(Cancelled(hash_hex).into()),
+    };
+    // The fetch ANSWERED — success or a genuine transfer failure, both of which the provider has
+    // already reported terminally on the transfer ring. Only a stop needs the guard's `Aborted`.
+    guard.finished = true;
+    outcome
+}
+
+/// Handle a `blob_fetch_cancel` control request (#172): trip the cancel token every in-flight
+/// [`blob_fetch`] of `hash` is watching.
+///
+/// `cancelled: false` — nothing was fetching that hash here — is a normal answer, not an error. A
+/// cancel that races a fetch to completion is indistinguishable from one for a hash that was never
+/// fetched, and inventing an error for the race would make a UI report a failure for a transfer
+/// that in fact succeeded.
+pub(crate) fn blob_fetch_cancel(state: &DaemonState, hash: &str) -> Result<BlobFetchCancelResult> {
+    let mesh = state.mesh_required()?;
+    // Parse through the SAME validator every other hash-taking verb uses, and key the lookup off
+    // its canonical rendering. The point is that a malformed hash is an ERROR: a raw map lookup
+    // answered `cancelled: false` for a typo, which reads as "that transfer already finished" and
+    // sends the caller looking in the wrong place while the fetch carries on. (It also future-
+    // proofs the lookup against the 52-char base32 rendering `parse_blob_hash` accepts; the
+    // iroh-blobs in this tree renders hex, so today the normalization itself is a no-op.)
+    let key = crate::blobs::parse_blob_hash(hash)?.to_hex().to_string();
+    let slot = mesh
+        .fetches
+        .lock()
+        .expect("fetches lock not poisoned")
+        .get(&key)
+        .cloned();
+    // The token is tripped OUTSIDE the map lock. `cancel()` wakes every waiter, and those waiters'
+    // guards take this same lock as they unwind — holding it across the trip invites the
+    // lock-ordering hazard for no benefit.
+    match slot {
+        Some(slot) => {
+            slot.token.cancel();
+            Ok(BlobFetchCancelResult { cancelled: true })
+        }
+        None => Ok(BlobFetchCancelResult { cancelled: false }),
+    }
 }
 
 /// Reload the config from disk and hot-swap the LIVE service registry with services rebuilt from
@@ -4092,6 +4244,258 @@ allow = []
             "no service named 'nosuchsvc' — nothing is served yet; register one with \
              'mcpmesh serve <name> -- <command>'"
         );
+    }
+
+    // ---- #172: cancelling an in-flight blob_fetch ------------------------------------------
+
+    /// A mesh with a live app-blob provider — what every cancel test needs, since the registry and
+    /// the terminal `Aborted` frame both hang off it.
+    async fn blob_mesh() -> (tempfile::TempDir, Arc<MeshState>, Arc<DaemonState>) {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        let provider = crate::blobs::provider::AppBlobs::open_fetcher_with_progress(
+            dir.path().join("blobs"),
+            mesh.endpoint.clone(),
+            Some(mesh.blob_bcast_for_test().clone()),
+        )
+        .await
+        .expect("fetcher opens");
+        mesh.set_app_blobs(provider).await;
+        let state = Arc::new(crate::control::DaemonState::with_mesh("test", mesh.clone()));
+        (dir, mesh, state)
+    }
+
+    async fn test_provider(mesh: &Arc<MeshState>) -> Arc<crate::blobs::provider::AppBlobs> {
+        mesh.app_blobs().await.expect("provider installed")
+    }
+
+    fn hex_of(seed: &[u8]) -> String {
+        iroh_blobs::Hash::new(seed).to_hex().to_string()
+    }
+
+    /// A cancel for a hash nothing is fetching answers `cancelled: false` — NOT an error. It is
+    /// the same answer a cancel gets when it loses the race to a fetch that just finished, and
+    /// erroring on it would make a UI report a failure for a transfer that in fact succeeded.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancel_for_a_hash_nothing_is_fetching_is_not_an_error() {
+        let (_dir, _mesh, state) = blob_mesh().await;
+        let r = blob_fetch_cancel(&state, &hex_of(b"absent")).expect("cancel answers");
+        assert!(!r.cancelled, "nothing was in flight");
+
+        // A malformed hash is a caller ERROR, distinct from "nothing in flight". Answering
+        // `cancelled: false` for a typo reads as "that transfer already finished" and sends the
+        // caller looking in the wrong place while the fetch carries on.
+        //
+        // Mutation anchor: a raw `HashMap::get(hash)` answers `Ok(cancelled: false)` here.
+        assert!(blob_fetch_cancel(&state, "not-a-hash").is_err());
+
+        // And control-only mode still errors rather than panicking, like every other mesh verb.
+        assert!(blob_fetch_cancel(&DaemonState::new("test"), &hex_of(b"absent")).is_err());
+    }
+
+    /// A cancel stops ONLY the hash it names. Nothing before this test could tell a per-hash
+    /// cancel from "stop every transfer on this node".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancel_does_not_touch_other_in_flight_fetches() {
+        let (_dir, mesh, state) = blob_mesh().await;
+        let provider = test_provider(&mesh).await;
+        let (one, two) = (hex_of(b"one"), hex_of(b"two"));
+        let a = FetchGuard::register(&mesh, one.clone(), provider.clone());
+        let provider2 = provider.clone();
+        let b = FetchGuard::register(&mesh, two.clone(), provider);
+
+        assert!(blob_fetch_cancel(&state, &one).unwrap().cancelled);
+        assert!(a.token.is_cancelled(), "the named hash is cancelled");
+        assert!(
+            !b.token.is_cancelled(),
+            "an unrelated in-flight fetch must be untouched"
+        );
+        assert!(
+            blob_fetch_cancel(&state, &two).unwrap().cancelled,
+            "and it is still cancellable on its own"
+        );
+
+        // The deterministic half. A lookup that ignores the hash and takes "whatever is in flight"
+        // survives the assertions above whenever it happens to pick the named entry; cancelling a
+        // hash that is REGISTERED NOWHERE cannot pick the right one, because there isn't one.
+        let three = hex_of(b"three");
+        let c = FetchGuard::register(&mesh, three, provider2);
+        assert!(
+            !blob_fetch_cancel(&state, &hex_of(b"absent"))
+                .unwrap()
+                .cancelled
+        );
+        assert!(
+            !c.token.is_cancelled(),
+            "a cancel for an absent hash must trip nothing"
+        );
+    }
+
+    /// The registry is REFCOUNTED: concurrent fetches of one hash share a token and cancel
+    /// together, and only the last one to finish deregisters.
+    ///
+    /// Mutation anchor: removing the entry unconditionally on drop makes the mid-test cancel
+    /// answer `false`, leaving a live sibling fetch uncancellable. A guard that never deregisters
+    /// makes the final assertion answer `true` for a fetch that ended.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_fetches_of_one_hash_share_a_token_and_the_last_one_deregisters() {
+        let (_dir, mesh, state) = blob_mesh().await;
+        let provider = test_provider(&mesh).await;
+        let hash = hex_of(b"shared");
+        let a = FetchGuard::register(&mesh, hash.clone(), provider.clone());
+        let b = FetchGuard::register(&mesh, hash.clone(), provider);
+        assert!(
+            !a.token.is_cancelled() && !b.token.is_cancelled(),
+            "a fresh registration starts live"
+        );
+
+        // One fetch finishing must NOT drop a token its sibling is still watching.
+        drop(a);
+        let r = blob_fetch_cancel(&state, &hash).expect("cancel answers");
+        assert!(r.cancelled, "the surviving fetch is still cancellable");
+        assert!(b.token.is_cancelled(), "the shared token was tripped");
+
+        drop(b);
+        let r = blob_fetch_cancel(&state, &hash).expect("cancel answers");
+        assert!(
+            !r.cancelled,
+            "the last fetch to finish deregisters the hash"
+        );
+    }
+
+    /// Cancel, then Retry. The retry must NOT inherit the tripped token — the cancelled fetch's
+    /// guard has not necessarily unwound yet, and registering against the dead token made the
+    /// retry answer "cancelled" instantly for no reason the user could see.
+    ///
+    /// Mutation anchor: a plain `or_insert_with` (no `is_cancelled` replacement) makes the retry's
+    /// token already cancelled here.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retry_started_before_the_cancelled_fetch_unwinds_gets_a_live_token() {
+        let (_dir, mesh, state) = blob_mesh().await;
+        let provider = test_provider(&mesh).await;
+        let hash = hex_of(b"retry-me");
+        let cancelled = FetchGuard::register(&mesh, hash.clone(), provider.clone());
+        assert!(blob_fetch_cancel(&state, &hash).unwrap().cancelled);
+        assert!(cancelled.token.is_cancelled());
+
+        // The retry starts while the cancelled one is still winding down.
+        let retry = FetchGuard::register(&mesh, hash.clone(), provider);
+        assert!(
+            !retry.token.is_cancelled(),
+            "a retry must not inherit a tripped token"
+        );
+        // The stale registration unwinding must not take the retry's entry with it.
+        drop(cancelled);
+        assert!(
+            blob_fetch_cancel(&state, &hash).unwrap().cancelled,
+            "the retry is still registered and cancellable"
+        );
+        assert!(retry.token.is_cancelled());
+    }
+
+    /// A stopped fetch emits a terminal `Aborted` transfer frame (#82 ask 2 + #172). Without it a
+    /// subscriber's progress bar sits at its last `Progress` value forever — which is exactly the
+    /// UI a Cancel button lives in. Emitted from DROP, so it covers a connection-close abort too,
+    /// not only an explicit cancel.
+    ///
+    /// Mutation anchor: emitting from the `select!`'s cancel arm instead of `Drop` leaves this
+    /// assertion (which drops the guard without going through the verb) with no frame.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stopped_fetch_emits_a_terminal_aborted_frame() {
+        let (_dir, mesh, _state) = blob_mesh().await;
+        let provider = test_provider(&mesh).await;
+        let mut rx = mesh.blob_bcast_for_test().subscribe();
+        let hash = hex_of(b"stopped");
+
+        let guard = FetchGuard::register(&mesh, hash.clone(), provider.clone());
+        drop(guard);
+        let frame = rx.try_recv().expect("a terminal frame was broadcast");
+        assert_eq!(frame.hash, hash);
+        assert_eq!(frame.state, mcpmesh_local_api::BlobTransferState::Aborted);
+        assert_eq!(frame.direction, mcpmesh_local_api::BlobDirection::Fetch);
+
+        // A fetch that ANSWERED reports its own terminal state from the provider's progress loop —
+        // a second `Aborted` from here would contradict a `Completed` already on the ring.
+        let mut finished = FetchGuard::register(&mesh, hash.clone(), provider);
+        finished.finished = true;
+        drop(finished);
+        assert!(
+            rx.try_recv().is_err(),
+            "a finished fetch must not also report Aborted"
+        );
+    }
+
+    /// End to end through the real verb: a `blob_fetch` whose provider is unreachable is stopped by
+    /// `blob_fetch_cancel` and ANSWERS with [`Cancelled`] — the whole point of cooperative
+    /// cancellation over `abort()`, which would deliver no answer at all.
+    ///
+    /// The ticket names a node that does not exist, so the DIAL is what gets cancelled. That is
+    /// deliberate: resolving the hash only from `fetch`'s return value would leave the dial — the
+    /// part that can hang longest — outside the cancellable region.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancelled_blob_fetch_answers_cancelled_rather_than_hanging() {
+        let (dir, mesh, state) = blob_mesh().await;
+
+        // A well-formed ticket for a node that is not there.
+        let nowhere = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
+        let hash = iroh_blobs::Hash::new(b"never-fetched");
+        // A BLACKHOLE direct address (TEST-NET-3, RFC 5737), so the dial hangs in its QUIC
+        // handshake instead of failing instantly. Without it the fetch can be over before a cancel
+        // could possibly arrive, and the test would be racing rather than asserting.
+        let addr = iroh::EndpointAddr::from_parts(
+            nowhere,
+            [iroh::TransportAddr::Ip(std::net::SocketAddr::from((
+                [203, 0, 113, 1],
+                44444,
+            )))],
+        );
+        let ticket = iroh_blobs::ticket::BlobTicket::new(addr, hash, iroh_blobs::BlobFormat::Raw)
+            .to_string();
+        let hash_hex = hash.to_hex().to_string();
+
+        let dest = dir.path().join("out.bin");
+        let fetch_state = state.clone();
+        let fetching = tokio::spawn(async move {
+            blob_fetch(&fetch_state, ticket, dest.to_string_lossy().into_owned()).await
+        });
+
+        // Wait until the fetch has registered itself, so the cancel cannot arrive before it starts.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            if mesh
+                .fetches
+                .lock()
+                .expect("fetches lock not poisoned")
+                .contains_key(&hash_hex)
+            {
+                break;
+            }
+            // Sleep, never `yield_now`: a spin busy-waits a worker thread, and on a small CI box
+            // running the suite in parallel that starves the very fetch task it waits for.
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the fetch never registered itself"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        let r = blob_fetch_cancel(&state, &hash_hex).expect("cancel answers");
+        assert!(r.cancelled, "the in-flight fetch was found and tripped");
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), fetching)
+            .await
+            .expect("a cancelled fetch answers promptly rather than running to completion")
+            .expect("fetch task not panicked");
+        let err = outcome.expect_err("a cancelled fetch is an Err, not a silent success");
+        assert!(
+            err.downcast_ref::<Cancelled>().is_some(),
+            "it must be the CANCELLED error, so `respond` codes it ERR_CANCELLED rather than \
+             -32000: {err:#}"
+        );
+
+        // The guard deregistered on unwind, so a later cancel does not claim a live fetch.
+        assert!(!blob_fetch_cancel(&state, &hash_hex).unwrap().cancelled);
     }
 
     /// The blob control operations fail gracefully (Err, never a panic) in control-only mode — the

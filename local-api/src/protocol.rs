@@ -964,6 +964,21 @@ pub struct BlobFetchParams {
     pub dest_path: String,
 }
 
+/// Params of [`Request::BlobFetchCancel`] (#172): stop every in-flight [`Request::BlobFetch`] of
+/// this blob.
+///
+/// Keyed by HASH, not by JSON-RPC id, and the reason is not aesthetic: [`crate::ControlClient`]
+/// borrows `&mut self` for a request's whole duration, so a client physically cannot send an
+/// id-keyed cancel down the connection whose request it would name. A hash is reachable from
+/// anywhere — including a fresh connection — and it is already the key a consumer holds, since
+/// every [`crate::StreamFrame::BlobTransfer`] carries it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobFetchCancelParams {
+    /// The blob's BLAKE3 hash, hex — as it appears on `BlobTransfer` frames and `BlobFetchResult`.
+    pub hash: String,
+}
+
 /// Control-API requests. Serialized as `{ "method": "...", "params": {...} }`
 /// (JSON-RPC-shaped; the id/jsonrpc envelope is added by the transport layer).
 ///
@@ -1124,6 +1139,10 @@ pub enum Request {
     /// verified blob to `dest_path` (a local file the same-uid daemon writes). Answers a
     /// [`BlobFetchResult`] with the verified hash + byte length. Tag `"blob_fetch"`.
     BlobFetch(BlobFetchParams),
+    /// Cancel every in-flight [`BlobFetch`](Self::BlobFetch) of one hash (#172). Answers a
+    /// [`BlobFetchCancelResult`]; the cancelled fetches themselves answer [`ERR_CANCELLED`].
+    /// Tag `"blob_fetch_cancel"`.
+    BlobFetchCancel(BlobFetchCancelParams),
     /// Summarize this node's LOCAL audit log into per-peer / per-service SESSION counts
     /// (local-only — the daemon reads its OWN audit dir, nothing is transmitted). The host Mesh surface
     /// renders these as "who serves me / whom I serve / session counts". Parameterless (like `Status`);
@@ -1238,6 +1257,15 @@ pub struct BlobScopeList {
 pub struct BlobFetchResult {
     pub hash: String,
     pub bytes_len: u64,
+}
+
+/// Result of [`Request::BlobFetchCancel`] (#172).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobFetchCancelResult {
+    /// True when a fetch of that hash was in flight and has been told to stop. False is NOT an
+    /// error — it means nothing was fetching that blob here, which is also what a caller sees when
+    /// it races a fetch that just finished.
+    pub cancelled: bool,
 }
 
 /// Params of [`Request::AuditPrune`] (#88): delete monthly audit files STRICTLY older than
@@ -1884,6 +1912,35 @@ pub const ERR_INVITE_NAME_CONFLICT: i64 = -32048;
 /// prober could use. Remedy: ask for a fresh invite.
 pub const ERR_INVITE_REFUSED: i64 = -32049;
 
+/// The request was stopped on purpose before it finished (#172) — today, a `blob_fetch` that
+/// [`Request::BlobFetchCancel`] tripped.
+///
+/// A cancelled request still ANSWERS. Cancellation is cooperative rather than a task abort
+/// precisely so this code can be delivered: an aborted task returns nothing, and the caller waits
+/// forever on work that already stopped. Distinct from `-32000` because it is not a failure — the
+/// caller (or its user) asked for it. Remedy: none; retry the fetch if the cancel was a mistake.
+///
+/// **What it does not promise:** partial chunks already streamed into the blob store stay there,
+/// unlisted and unreclaimable, exactly as they do when a fetch fails. That is #80's reclaim gap,
+/// unchanged by cancellation.
+pub const ERR_CANCELLED: i64 = -32050;
+
+/// This control connection already has [`MAX_INFLIGHT`] requests running, so this one was refused
+/// without being started (#172).
+///
+/// **Retryable, and cheap to retry** — retry after any response lands, or spread the load over a
+/// second control connection. It is refused rather than queued deliberately: a queue is invisible
+/// backpressure that a caller cannot tell apart from a slow daemon, and waiting for a permit inside
+/// the read loop would reintroduce the head-of-line blocking concurrent dispatch exists to remove.
+///
+/// Not a security boundary — the control socket is the daemon owner's. It bounds the work one
+/// connection can have outstanding so a buggy client cannot spawn unboundedly.
+pub const ERR_TOO_MANY_INFLIGHT: i64 = -32051;
+
+/// How many requests one control connection may have in flight at once (#172), after which it
+/// answers [`ERR_TOO_MANY_INFLIGHT`]. Per connection, not per daemon.
+pub const MAX_INFLIGHT: usize = 32;
+
 pub const API_NAME: &str = "mcpmesh-local/1";
 /// The protocol-compatibility version as `"MAJOR.MINOR"`, distinct from the crate/stack version.
 ///
@@ -1898,7 +1955,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   thirty have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.43";
+pub const API_VERSION: &str = "1.44";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -1984,7 +2041,16 @@ pub const API_VERSION: &str = "1.43";
 /// refusals — expired line, no live invite, inviter unreachable, id mismatch, name conflict, and
 /// the deliberately-opaque refusal. `ERR_NICKNAME_TAKEN` had been the only coded pairing failure,
 /// so every other one arrived as `-32000` and an embedder could either forward our prose to end
-/// users or substring-match it (#159); to 43 with `InviteParams::as_self` — SELF-ENROLLMENT, so one
+/// users or substring-match it (#159); to 44 when control responses stopped arriving in REQUEST
+/// order and the `blob_fetch_cancel` verb landed (#172). The daemon now dispatches each request
+/// CONCURRENTLY on its connection, so a `blob_fetch` no longer stalls every other verb behind it —
+/// and responses arrive in COMPLETION order. JSON-RPC ids make that legal and the in-tree
+/// `ControlClient` cannot observe it (one request at a time, by construction), but a hand-rolled
+/// client that pipelines and matches responses POSITIONALLY breaks. A connection also caps
+/// in-flight requests and refuses over it with [`ERR_TOO_MANY_INFLIGHT`], and closing a control
+/// connection now genuinely ABORTS its in-flight work rather than letting it run to completion
+/// unread. Guard on `>= 44` before pipelining, before sending `blob_fetch_cancel`, and before
+/// treating [`ERR_CANCELLED`] as unexpected; to 43 with `InviteParams::as_self` — SELF-ENROLLMENT, so one
 /// person's devices share a `user_id` instead of appearing as unrelated strangers (#86). The
 /// ceremony is ordinary pairing; the outcome is a device→user binding rather than a peer row, and
 /// the private key never moves. Guard on `>= 43`; to 42 with the `peer_introduce` + `peer_endorse`
@@ -1994,9 +2060,9 @@ pub const API_VERSION: &str = "1.43";
 /// is what bounds it. Guard on `>= 42`; to 41 with `StreamFrame::BlobTransfer` — live app-blob
 /// transfer progress on both the serving and fetching side (#82 ask 2), so an embedder can draw a
 /// real progress bar instead of an indeterminate spinner. Guard on `>= 41` before expecting the
-/// frame. NOTE what it does NOT bring: `blob_fetch` still blocks its whole control connection for
-/// the transfer, and cancellation still does not exist (#172) — progress arrives on the SUBSCRIBE
-/// connection, which is a different one; to 40 with `[services.<name>].rate_limit_per_min` +
+/// frame. NOTE what it did NOT bring, and 44 did: at 41 `blob_fetch` still blocked its whole
+/// control connection for the transfer and nothing could cancel it (#172) — progress arrived on the
+/// SUBSCRIBE connection, which is a different one; to 40 with `[services.<name>].rate_limit_per_min` +
 /// `RegisterServiceParams::rate_limit_per_min` — proxied-request buckets became per
 /// `(service, endpoint)` instead of one shared per-endpoint bucket, so a noisy service can no
 /// longer starve a quiet one (#63). `-32053` changes meaning with it: it is now per-service, so a
@@ -2031,7 +2097,7 @@ pub const API_VERSION: &str = "1.43";
 /// its REAL content is a meaning change to `reachable` — the field exists so the new meaning is
 /// observable at all. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 43;
+pub const API_MINOR: u32 = 44;
 
 #[cfg(test)]
 mod tests {

@@ -128,6 +128,25 @@ Error:
 Presence of `error` instead of `result` means the call failed; read `error.code` and
 `error.message`. See [Error codes](#error-codes).
 
+> **Responses arrive in COMPLETION order, not request order** (`api_minor >= 44`, #172).
+>
+> The daemon dispatches each request on a connection concurrently, so a slow verb no longer stalls
+> the ones behind it. **Match responses by `id`, never positionally.** Below 44 responses were
+> strictly in request order; a client that relied on that and pipelines will mis-pair them.
+>
+> Two consequences worth designing around:
+>
+> - **Pipelined mutations may run concurrently.** `register_service` immediately followed by
+>   `status`, without awaiting the first, no longer implies the status reflects it. Await the
+>   response if you depend on the order — which is what a one-request-at-a-time client does anyway.
+> - **A connection caps in-flight requests** (32). Past it a request is refused straight away with
+>   `ERR_TOO_MANY_INFLIGHT` (`-32051`), which is retryable — retry after any response lands, or
+>   spread the load over a second connection. It is refused rather than queued so a caller can tell
+>   saturation from a slow daemon.
+>
+> `open_session` and `subscribe` still consume the connection, and now **wait for that connection's
+> own in-flight requests** to answer before taking it over. Upgrade on a fresh connection.
+
 ## Methods
 
 Every method is one frame in, one frame out — **except `open_session` and `subscribe`**, which
@@ -202,23 +221,38 @@ Methods split into two groups by audience:
 
 | `blob_list` | `{scope?, hash?, limit?, offset?, counts_only?}` — the daemon's scopes (name → hashes + grants + withdrawn + counts). **All params optional; `blob_list {}` still works.** `scope` is an EXACT match, never a prefix. `hash` is normalized before comparing. **A DEFAULT LIMIT of 256 scopes applies when `limit` is absent (#84b, `api_minor >= 20`)** — unpaged, this verb rendered every scope into one frame against the 16 MiB cap; past it the CLIENT rejects the frame as malformed. The control surface carries **no** strike bound, so the connection survives — but you get an opaque error and no way to page, which is an unusable answer rather than a large one. **Note the cap counts SCOPES, not bytes:** one legacy scope holding very many hashes can still exceed the frame at `limit: 1` (see #84a). Check `truncated` and page with `offset`; `total` is the match count BEFORE limit/offset. `counts_only` omits the three vectors and keeps `hash_count`/`grant_count`/`withdrawn_count`. | `{scopes:[…], total, truncated}` |
 | `blob_fetch` | `{ticket, dest_path}` | `{hash, bytes_len}` |
+| `blob_fetch_cancel` | `{hash}` — stop every in-flight `blob_fetch` of that blob, `api_minor >= 44` (#172). Send it on a **different** control connection than the fetch (see below). | `{cancelled}` |
 
-> **`blob_fetch` blocks the control connection, and cannot be cancelled.**
+> **`blob_fetch` no longer blocks the connection, and IS cancellable — from `api_minor >= 44`**
+> (#172).
 >
-> The fetch streams to disk, so peak memory does not scale with blob size (#82). Two limits remain:
+> The fetch streams to disk, so peak memory does not scale with blob size (#82), and since 44 it is
+> dispatched concurrently, so a multi-GB transfer no longer stalls `status`, reachability or grants
+> on the same connection.
 >
-> - **It is awaited inline on the control connection.** A multi-GB transfer stalls every other verb
->   on *that* connection — status, reachability, grants. Use a separate control connection for a
->   large fetch if you need the daemon responsive meanwhile.
-> - **There is no cancellation.** Dropping the client does not abort an in-flight transfer; the
->   reader only errors at the next frame. A Cancel button cannot currently stop the work.
+> **Cancelling.** `blob_fetch_cancel {hash}` trips every in-flight fetch of that hash; each answers
+> `ERR_CANCELLED` (`-32050`) on its own connection. Two things follow from how clients work:
 >
-> - **A partially fetched blob's chunks stay in the store.** They are not listed by `blob_list`
->   (which lists published scopes, not raw store contents) and there is no reclaim path yet (#80),
->   so an abandoned fetch leaves bytes on disk that nothing surfaces or frees.
+> - **Send it on a different connection.** A control client holds its connection for a request's
+>   whole duration, so a cancel issued on the same one can only run after the thing it would cancel
+>   is already over.
+> - **`cancelled: false` is not an error.** It means nothing was fetching that hash here — which is
+>   also the honest answer when a cancel races a fetch to completion.
 >
-> The first two are tracked in
-> [#172](https://github.com/counterpunchtech/mcpmesh/issues/172).
+> Closing the control connection also aborts its in-flight work now, so "cancel by dropping the
+> socket" is a real mechanism rather than a transfer that runs on unread. **That applies to every
+> verb, not just `blob_fetch`** — a request whose connection closes before it answers is stopped
+> wherever it happens to be. Its effects up to that point stand; nothing is rolled back.
+>
+> A stopped fetch — cancelled *or* aborted by a closing connection — broadcasts a terminal
+> `BlobTransfer` frame with `state: "aborted"`, so a subscriber's progress bar resolves instead of
+> freezing at its last `Progress`. `bytes_done` on that frame is `0`: the real count died with the
+> transfer, and a stale one would be worse than none.
+>
+> **What cancellation does NOT clean up.** A partially fetched blob's chunks stay in the store.
+> They are not listed by `blob_list` (which lists published scopes, not raw store contents) and
+> there is no reclaim path yet (#80), so an abandoned fetch — cancelled *or* failed — leaves bytes
+> on disk that nothing surfaces or frees.
 >
 > **Progress IS reported, from `api_minor >= 41`** (#82): subscribe on a *separate* control
 > connection and read `StreamFrame::BlobTransfer` — it arrives on both the serving and the fetching
@@ -1150,6 +1184,8 @@ Reference: [`cli/src/backends/spawn.rs`](../cli/src/backends/spawn.rs) (`run`),
 | `-32047` | `pair` — **the address-swap defense fired**: the machine that answered is not the endpoint the invite names (#159). **Do not render this as "try again"** — get the invite again through a channel you trust. |
 | `-32048` | `pair` — the invite asks to be called a name this node already uses for a different peer (#159). The redeemer-side mirror of `-32043`. Ask for an invite suggesting a different name. |
 | `-32049` | `pair` — the inviter refused and the cause is **deliberately withheld** (#159). Ask for a fresh invite. |
+| `-32050` | the request was **cancelled on purpose** before it finished — today, a `blob_fetch` that `blob_fetch_cancel` tripped (#172, `api_minor >= 44`). Not a failure: the caller asked for it. Partial chunks stay in the store (#80). |
+| `-32051` | this control connection already has 32 requests in flight, so this one was refused without being started (#172, `api_minor >= 44`). **Retryable** — retry after any response lands, or use a second connection. |
 | `-32000` | operation failed — `message` carries the detail. One common instance: the daemon is in control-only mode with no mesh (e.g. `invite`/`pair` before a mesh exists) |
 | `-32055` | *(session only)* peer unreachable |
 | `-32054` | *(session only)* session refused |

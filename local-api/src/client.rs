@@ -9,13 +9,14 @@ use serde_json::Value;
 
 use crate::codec::{FrameReader, Inbound, MAX_FRAME_BYTES, write_frame};
 use crate::protocol::{
-    AuditSummaryResult, BackendSpec, BlobFetchParams, BlobFetchResult, BlobGrantParams,
-    BlobPublishParams, BlobPublishResult, BlobScopeList, Hello, InviteParams, InviteResult,
-    OpenSessionParams, OrgJoinParams, OrgJoinResult, PairParams, PairResult, PeerEndorseParams,
-    PeerEndorseResult, PeerIntroduceParams, PeerRemoveParams, PeerRenameParams, PeerServicesParams,
-    PeerServicesResult, RegisterServiceParams, Request, RosterInstallParams, RosterInstallResult,
-    ServiceAllowParams, SetAppMetadataParams, SetNicknameParams, SetRelaysParams, SetRelaysResult,
-    SetRosterUrlParams, StatusResult, StreamFrame, UnregisterServiceParams,
+    AuditSummaryResult, BackendSpec, BlobFetchCancelParams, BlobFetchCancelResult, BlobFetchParams,
+    BlobFetchResult, BlobGrantParams, BlobPublishParams, BlobPublishResult, BlobScopeList, Hello,
+    InviteParams, InviteResult, OpenSessionParams, OrgJoinParams, OrgJoinResult, PairParams,
+    PairResult, PeerEndorseParams, PeerEndorseResult, PeerIntroduceParams, PeerRemoveParams,
+    PeerRenameParams, PeerServicesParams, PeerServicesResult, RegisterServiceParams, Request,
+    RosterInstallParams, RosterInstallResult, ServiceAllowParams, SetAppMetadataParams,
+    SetNicknameParams, SetRelaysParams, SetRelaysResult, SetRosterUrlParams, StatusResult,
+    StreamFrame, UnregisterServiceParams,
 };
 use crate::transport::{connect_local, split_local};
 
@@ -552,6 +553,30 @@ impl ControlClient {
                 dest_path: dest_path.to_string(),
             }),
             "blob_fetch result",
+        )
+        .await
+    }
+
+    /// Stop every in-flight [`blob_fetch`](Self::blob_fetch) of `hash` (#172).
+    ///
+    /// **Send this on a DIFFERENT connection than the fetch it cancels.** This client is one
+    /// request at a time — `&mut self` is borrowed until the fetch answers — so a cancel issued on
+    /// the same client can only run after the thing it would cancel is already over. The cancelled
+    /// fetch answers [`ERR_CANCELLED`](crate::ERR_CANCELLED) on its own connection.
+    ///
+    /// `cancelled: false` means nothing was fetching that blob here. That is the honest answer to a
+    /// cancel that raced a fetch to completion, not an error.
+    ///
+    /// Needs `api_minor >= 44`; below it the method is unknown.
+    pub async fn blob_fetch_cancel(
+        &mut self,
+        hash: &str,
+    ) -> Result<BlobFetchCancelResult, ClientError> {
+        self.request_typed(
+            Request::BlobFetchCancel(BlobFetchCancelParams {
+                hash: hash.to_string(),
+            }),
+            "blob_fetch_cancel result",
         )
         .await
     }
