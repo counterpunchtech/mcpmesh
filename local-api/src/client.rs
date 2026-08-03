@@ -252,6 +252,7 @@ impl ControlClient {
                 app_label,
                 max_uses,
                 peer_nickname,
+                as_self: false,
             }),
             "invite result",
         )

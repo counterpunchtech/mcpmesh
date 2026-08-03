@@ -391,7 +391,7 @@ enum PairReply {
 /// [`binding::present`](mcpmesh_trust::binding::present). A `None` at a call site means this daemon
 /// has no user key and presents no identity, so the peer stores `user_id: None` — exactly how a
 /// pre-identity peer is stored.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SelfBinding {
     pub user_pk: String,
     pub sig: String,
@@ -448,7 +448,22 @@ pub struct InviterCtx {
     pub grant: GrantFn,
     /// The ceremony-surface hook (see [`RecordPairingFn`]).
     pub record_pairing: RecordPairingFn,
+    /// #86: sign a device→user binding for another device of THIS person, given that device's
+    /// TLS-authenticated endpoint id. `None` when this daemon has no user key — there is then no
+    /// identity to enroll into, and a self-enrollment is refused rather than silently completing.
+    ///
+    /// A hook rather than the key itself, so this module never learns where the key lives.
+    pub sign_binding: SignBindingFn,
 }
+
+/// Persist an adopted self-enrollment binding (#86) — the ONLY copy, since the enrolled device
+/// cannot re-derive it (it holds no user key).
+pub type AdoptBindingFn = Box<
+    dyn Fn(SelfBinding) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> + Send + Sync,
+>;
+
+/// See [`InviterCtx::sign_binding`] (#86). `endpoint_id` → the `b64u:` signature, or `None`.
+pub type SignBindingFn = Box<dyn Fn(&[u8; 32]) -> Option<String> + Send + Sync>;
 
 /// Verify a peer's OPTIONAL presented binding against the TLS-authenticated peer id, returning the
 /// peer's proven `user_id` if — and only if — it presented a binding that verifies. Absent fields →
@@ -547,6 +562,63 @@ pub async fn handle_inviter_side(
     }
 
     match ctx.invites.try_redeem(&hello.secret, now).await {
+        Redeem::Ok(invite) if invite.as_self => {
+            // #86 SELF-ENROLLMENT. The redeemer is another DEVICE of this person, so the whole
+            // peer-row/grant path below is skipped: writing a row would put this person in their
+            // own contact list and — worse — make their own second device an authorizable
+            // principal in their own allow lists.
+            //
+            // What we hand over is a device→user binding for the redeemer's TLS-AUTHENTICATED
+            // endpoint, signed with our user key. The KEY NEVER MOVES: `present` signs an arbitrary
+            // endpoint id, so the new device can present this signature as its own and every peer
+            // resolves both devices to one `user_id`.
+            //
+            // Signed for `tls_id`, never a self-asserted id: a binding for an endpoint the redeemer
+            // does not control would be useless to them and dangerous to issue.
+            let Some(self_binding) = ctx.self_binding.as_ref() else {
+                // No user key here means there is no identity to enroll INTO. Refuse rather than
+                // complete a ceremony that silently achieves nothing.
+                let _ = send_reply(
+                    &mut send,
+                    &PairReply::Refused {
+                        reason: "this device has no user identity to enroll into".into(),
+                        code: None,
+                    },
+                )
+                .await;
+                return Ok(());
+            };
+            let sig = match (ctx.sign_binding)(&tls_id) {
+                Some(sig) => sig,
+                None => {
+                    let _ = send_reply(
+                        &mut send,
+                        &PairReply::Refused {
+                            reason: REASON_REFUSED.into(),
+                            code: None,
+                        },
+                    )
+                    .await;
+                    return Ok(());
+                }
+            };
+            let sas = short_auth_code(&invite.inviter_id, &tls_id, &hello.secret);
+            tracing::info!(code = %sas, "enrolled another device of this person (#86)");
+            // Recorded on the ceremony surface like any pairing, so the inviter's human can read
+            // the SAS off `status` and compare it — the check that makes this safe.
+            (ctx.record_pairing)("(this person's device)".into(), sas.clone(), epoch_now());
+            let _ = send_reply(
+                &mut send,
+                &PairReply::Ok {
+                    inviter_id: invite.inviter_id,
+                    inviter_nickname: invite.nickname.clone(),
+                    user_pk: Some(self_binding.user_pk.clone()),
+                    binding_sig: Some(sig),
+                },
+            )
+            .await;
+            Ok(())
+        }
         Redeem::Ok(invite) => {
             // Resolve any EXISTING entry for the TLS-authenticated redeemer id FIRST — a same-id
             // re-pair, or the REVERSE pairing of an earlier redeem (we redeemed THEIR invite
@@ -802,6 +874,10 @@ async fn send_reply(
 /// that reaches a swapped address never reveals the bearer credential to the wrong peer.
 ///
 /// [`grant_service_access`]: crate::daemon::grant_service_access
+// Eight collaborators, each a distinct capability the redeemer needs (endpoint, our name, the line,
+// our alias for them, the adopt hook, the store, our binding, the grant-back hook). A params struct
+// would rename them without reducing them, and the signature is pinned by the integration tests.
+#[allow(clippy::too_many_arguments)]
 pub async fn redeem_invite(
     endpoint: iroh::Endpoint,
     self_nickname: String,
@@ -809,6 +885,9 @@ pub async fn redeem_invite(
     // #87: OUR local name for the inviter, overriding the one its invite suggests. Local only —
     // never sent, and it does not bypass the squat check below.
     as_nickname: Option<String>,
+    // #86: install an adopted self-enrollment binding. `None` = a caller that cannot persist one
+    // (a fixture), in which case a self-enrollment still verifies but is not retained.
+    adopt_binding: Option<AdoptBindingFn>,
     store: Arc<PeerStore>,
     self_binding: Option<SelfBinding>,
     grant_back: Option<GrantBackFn>,
@@ -966,6 +1045,50 @@ pub async fn redeem_invite(
             ..
         } => verified_user_id(user_pk, binding_sig, &invite.inviter_id),
     };
+    // #86 SELF-ENROLLMENT: this was not a pairing at all — we are another DEVICE of the inviter's
+    // person. Adopt the binding they signed for OUR endpoint and write NO peer row: a row would put
+    // this person in their own contact list and make their own other device an authorizable
+    // principal here.
+    //
+    // The binding is verified against OUR endpoint (`self_id`), not the inviter's — it is ours to
+    // present from now on, and one signed for anyone else would be useless to us.
+    if invite.as_self {
+        let self_id = *endpoint.id().as_bytes();
+        let PairReply::Ok {
+            user_pk,
+            binding_sig,
+            ..
+        } = &reply
+        else {
+            unreachable!("the Refused arm returned above")
+        };
+        let (Some(user_pk), Some(sig)) = (user_pk, binding_sig) else {
+            bail!(PairRefusal::new(
+                mcpmesh_local_api::ERR_INVITE_REFUSED,
+                "the inviter completed a self-enrollment without issuing a binding",
+            ));
+        };
+        mcpmesh_trust::binding::verify_presented(user_pk, sig, &self_id).map_err(|e| {
+            anyhow::anyhow!("the enrollment binding does not verify for THIS device: {e}")
+        })?;
+        if let Some(adopt) = adopt_binding {
+            adopt(SelfBinding {
+                user_pk: user_pk.clone(),
+                sig: sig.clone(),
+            })
+            .await?;
+        }
+        let sas_code = short_auth_code(&invite.inviter_id, &self_id, &invite.secret);
+        return Ok(PairResult {
+            peer_nickname: local_name,
+            sas_code,
+            enrolled_as_self: true,
+            services: vec![],
+            app_label: invite.app_label,
+            peer_user_id: Some(user_pk.clone()),
+        });
+    }
+
     // Returned to the redeemer in PairResult (#30) so it learns the peer's STABLE identity at
     // pair time — cloned before `inviter_user_id` is moved into the stored PeerEntry below.
     let peer_user_id = inviter_user_id.clone();
@@ -1043,6 +1166,7 @@ pub async fn redeem_invite(
         // The inviter's proven stable user_id (#30) — the redeemer's portable handle for it, and
         // what it may pass to open_session to dial by identity rather than nickname.
         peer_user_id,
+        enrolled_as_self: false,
     })
 }
 
@@ -1261,6 +1385,7 @@ mod tests {
             app_label: None,
             uses_remaining: 1,
             peer_nickname: None,
+            as_self: false,
         }
     }
 
@@ -1303,6 +1428,7 @@ mod tests {
             "me".into(),
             expired.encode(),
             None,
+            None,
             store(),
             None,
             None,
@@ -1333,6 +1459,7 @@ mod tests {
             "me".into(),
             named.encode(),
             None,
+            None,
             s.clone(),
             None,
             None,
@@ -1354,6 +1481,7 @@ mod tests {
             "me".into(),
             named.encode(),
             Some("their-laptop".into()),
+            None,
             s.clone(),
             None,
             None,
@@ -1375,6 +1503,7 @@ mod tests {
             "me".into(),
             fresh.encode(),
             Some("taken".into()),
+            None,
             s,
             None,
             None,
@@ -1395,6 +1524,7 @@ mod tests {
             ep().await,
             "me".into(),
             dead.encode(),
+            None,
             None,
             store(),
             None,

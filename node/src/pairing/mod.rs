@@ -23,6 +23,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
 
+/// The `b64u:` half of a device→user binding this person's key makes for `endpoint_id` (#86).
+///
+/// The SAME primitive pairing presents for our OWN endpoint — `present` signs an arbitrary endpoint
+/// id, which is exactly why self-enrollment needs no key transfer.
+pub fn binding_sig_for(user_key: &mcpmesh_trust::UserKey, endpoint_id: &[u8; 32]) -> String {
+    mcpmesh_trust::binding::present(user_key, endpoint_id).1
+}
+
 /// The scheme prefix of the single copyable pairing artifact.
 const INVITE_SCHEME: &str = "mcpmesh-invite:";
 
@@ -59,6 +67,14 @@ pub struct Invite {
     /// at redemption time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer_nickname: Option<String>,
+    /// SELF-ENROLLMENT (#86): the redeemer becomes another DEVICE of the inviter's person, not a
+    /// peer. Rides the line — the redeemer must know to adopt a binding rather than pair.
+    ///
+    /// `#[serde(default)]` so an invite minted by an older daemon decodes as an ordinary one; the
+    /// dangerous direction (an old daemon treating a self-invite as ordinary) is impossible because
+    /// an old daemon cannot have minted one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub as_self: bool,
     /// Redemptions still available on this invite (#87). `1` for an ordinary single-use invite,
     /// which is what an absent field means — so an invite line minted by an older daemon decodes
     /// as single-use rather than as unusable.
@@ -698,6 +714,7 @@ mod tests {
             app_label: None,
             uses_remaining: 1,
             peer_nickname: None,
+            as_self: false,
         }
     }
 

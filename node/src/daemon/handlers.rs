@@ -497,6 +497,29 @@ pub(crate) async fn add_peer(state: &DaemonState, params: PeerAddParams) -> Resu
     Ok(())
 }
 
+/// The #86 hook that PERSISTS an adopted self-enrollment binding and installs it live.
+///
+/// The enrolled device cannot re-derive this — it holds no user key — so the file is the only copy.
+/// Written before the ceremony returns, so a caller that sees `enrolled_as_self: true` can rely on
+/// the identity surviving a restart.
+fn adopt_hook(mesh: &Arc<MeshState>) -> crate::pairing::rendezvous::AdoptBindingFn {
+    let mesh = mesh.clone();
+    Box::new(move |binding: crate::pairing::rendezvous::SelfBinding| {
+        let mesh = mesh.clone();
+        Box::pin(async move {
+            let path = mesh.adopted_binding_path();
+            let json = serde_json::to_vec(&binding)?;
+            blocking("join adopt binding write", move || {
+                crate::pairing::persist::write_private(&path, &json)
+            })
+            .await??;
+            // Live, so this device presents the adopted identity without a restart.
+            mesh.set_self_binding_live(Some(binding));
+            anyhow::Ok(())
+        })
+    })
+}
+
 /// Handle a `peer_endorse` control request (#65): sign a statement vouching for `subject`, for a
 /// third party to redeem with `peer_introduce`.
 ///
@@ -1044,6 +1067,8 @@ pub(crate) async fn mint_invite(
     app_label: Option<String>,
     max_uses: Option<u32>,
     peer_nickname: Option<String>,
+    // #86: mint a SELF-ENROLLMENT invite — the redeemer becomes another device of this person.
+    as_self: bool,
     mesh: &MeshState,
 ) -> Result<InviteResult> {
     use rand::RngCore;
@@ -1062,6 +1087,24 @@ pub(crate) async fn mint_invite(
 
     // #87: OUR local name for whoever redeems. Validated here so a bad one is a clean -32602
     // rather than a ceremony that fails halfway through, on the other machine, minutes later.
+    // #86: a self-enrollment invite mints IDENTITY, not access. A multi-use one is a standing
+    // offer to become this person, so it is refused at mint — the same call `peer_nickname` makes,
+    // for a much higher-value payload.
+    if as_self && max_uses.is_some_and(|n| n > 1) {
+        anyhow::bail!(crate::control::InvalidParams(format!(
+            "as_self cannot be combined with max_uses = {}: a multi-use SELF-ENROLLMENT invite is \
+             a standing offer to become this person. Mint one per device.",
+            max_uses.unwrap_or(1)
+        )));
+    }
+    // A self-invite grants nothing — the two devices are the same person, not peers — so a
+    // services list on one is a caller error rather than something to silently ignore.
+    if as_self && !services.is_empty() {
+        anyhow::bail!(crate::control::InvalidParams(
+            "as_self grants nothing: your own devices are not peers of each other. Omit services."
+                .into()
+        ));
+    }
     let peer_nickname = validated_alias("peer_nickname", peer_nickname)?;
     // One alias applied to EVERY redeemer of a multi-use invite collides on the second redemption.
     // Refused at mint rather than producing an invite that works exactly once. Reports the value
@@ -1112,7 +1155,10 @@ pub(crate) async fn mint_invite(
     // (#34). Reject it before minting, matching the CLI porcelain which already makes the
     // service arg required. `deny_unknown_fields` on `InviteParams` catches the typo at parse
     // time; this is the belt-and-braces guard on the value itself.
-    if services.is_empty() {
+    //
+    // #86: NOT for a self-enrollment invite. There, granting nothing is the whole point — your own
+    // devices are not peers of each other — so the "useless" reasoning inverts.
+    if services.is_empty() && !as_self {
         anyhow::bail!(
             "invite must name at least one registered service (an invite granting nothing is useless)"
         );
@@ -1152,6 +1198,7 @@ pub(crate) async fn mint_invite(
     let now = epoch_now_u64();
     let expires_at_epoch = now + INVITE_TTL.as_secs();
     let invite = Invite {
+        as_self,
         peer_nickname,
         secret,
         inviter_id,
@@ -1238,6 +1285,8 @@ pub(crate) async fn redeem(
         mesh.self_nickname(),
         invite_line,
         as_nickname,
+        // #86: persist an adopted self-enrollment binding — the only copy there will ever be.
+        Some(adopt_hook(mesh)),
         mesh.store.clone(),
         mesh.self_binding(),
         Some(grant_back),
@@ -3166,6 +3215,61 @@ mod tests {
         }
     }
 
+    /// #86: a self-enrollment invite mints IDENTITY, so both guards are refusals, not warnings.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_self_invite_must_be_single_use_and_grant_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[services.notes]\nsocket = \"/run/n.sock\"\nallow = []\n",
+        )
+        .unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        let svc = || vec!["notes".to_string()];
+
+        // Multi-use: a standing offer to become this person.
+        let e = mint_invite(vec![], None, Some(3), None, true, &mesh)
+            .await
+            .expect_err("a multi-use SELF invite must be refused");
+        let msg = format!("{e:#}");
+        assert!(
+            msg.contains("as_self") && msg.contains('3'),
+            "the error must name the flag and the max_uses: {msg}"
+        );
+        assert!(
+            msg.contains("become this person"),
+            "and say WHY, since the caller asked for something reasonable-looking: {msg}"
+        );
+
+        // Services: your own devices are not peers of each other.
+        let e = mint_invite(svc(), None, None, None, true, &mesh)
+            .await
+            .expect_err("a SELF invite that grants services must be refused");
+        assert!(format!("{e:#}").contains("grants nothing"), "{e:#}");
+
+        // The legal shape mints, and the flag reaches the LINE — the redeemer reads it from there
+        // to know it must adopt rather than pair.
+        let minted = mint_invite(vec![], None, None, None, true, &mesh)
+            .await
+            .expect("a single-use, grant-free self invite is legal");
+        let decoded = crate::pairing::Invite::decode(&minted.invite_line).unwrap();
+        assert!(
+            decoded.as_self,
+            "as_self must ride the invite line, or the redeemer pairs instead of enrolling"
+        );
+
+        // And an ORDINARY invite is unaffected — the flag must not change the default path.
+        let ordinary = mint_invite(svc(), None, None, None, false, &mesh)
+            .await
+            .expect("an ordinary invite still mints");
+        assert!(
+            !crate::pairing::Invite::decode(&ordinary.invite_line)
+                .unwrap()
+                .as_self
+        );
+    }
+
     /// #87: `peer_nickname` is the inviter's PRIVATE local name for the redeemer. Two properties,
     /// and the second is the one a reviewer should check hardest: it must never ride the invite
     /// LINE, which is a copyable artifact people paste into chats.
@@ -3180,7 +3284,7 @@ mod tests {
         .unwrap();
         let mesh = hermetic_mesh(config_path).await;
         let svc = || vec!["notes".to_string()];
-        let minted = mint_invite(svc(), None, None, Some("their-laptop".into()), &mesh)
+        let minted = mint_invite(svc(), None, None, Some("their-laptop".into()), false, &mesh)
             .await
             .expect("an alias on a single-use invite is fine");
 
@@ -3224,7 +3328,7 @@ mod tests {
         let mesh = hermetic_mesh(config_path).await;
         let svc = || vec!["notes".to_string()];
 
-        let e = mint_invite(svc(), None, Some(3), Some("them".into()), &mesh)
+        let e = mint_invite(svc(), None, Some(3), Some("them".into()), false, &mesh)
             .await
             .expect_err("an alias on a multi-use invite must be refused at MINT");
         let msg = format!("{e:#}");
@@ -3240,7 +3344,7 @@ mod tests {
         // Blank is rejected rather than treated as absent — a UI passing through an untouched
         // field must not silently get the name it was trying to avoid.
         for blank in ["", "   "] {
-            mint_invite(svc(), None, None, Some(blank.into()), &mesh)
+            mint_invite(svc(), None, None, Some(blank.into()), false, &mesh)
                 .await
                 .expect_err("a blank alias must be a clean error, not a silent fallback");
         }
@@ -3258,15 +3362,17 @@ mod tests {
         let mesh = hermetic_mesh(config_path).await;
         let svc = || vec!["notes".to_string()];
 
-        let one = mint_invite(svc(), None, None, None, &mesh).await.unwrap();
+        let one = mint_invite(svc(), None, None, None, false, &mesh)
+            .await
+            .unwrap();
         assert_eq!(one.uses_remaining, 1, "absent means single-use");
 
-        let three = mint_invite(svc(), None, Some(3), None, &mesh)
+        let three = mint_invite(svc(), None, Some(3), None, false, &mesh)
             .await
             .unwrap();
         assert_eq!(three.uses_remaining, 3);
 
-        let capped = mint_invite(svc(), None, Some(10_000), None, &mesh)
+        let capped = mint_invite(svc(), None, Some(10_000), None, false, &mesh)
             .await
             .unwrap();
         assert_eq!(
@@ -3275,7 +3381,7 @@ mod tests {
             "over the cap is clamped, and the caller is told the value it ACTUALLY got"
         );
 
-        let err = mint_invite(svc(), None, Some(0), None, &mesh)
+        let err = mint_invite(svc(), None, Some(0), None, false, &mesh)
             .await
             .expect_err("zero redemptions is a caller bug, not a valid invite");
         assert!(
@@ -3315,7 +3421,7 @@ allow = []
         )
         .await;
 
-        let res = mint_invite(vec!["notes".into()], None, None, None, &mesh)
+        let res = mint_invite(vec!["notes".into()], None, None, None, false, &mesh)
             .await
             .expect("mint");
         assert!(res.invite_line.starts_with("mcpmesh-invite:"));

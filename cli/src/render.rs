@@ -845,6 +845,7 @@ mod tests {
             services: vec!["notes".into()],
             app_label: None,
             peer_user_id: None,
+            enrolled_as_self: false,
         };
         let lines = pair_lines(&result);
         assert_eq!(lines[0], "Paired with alice — code: tango-fig-42");
@@ -876,6 +877,7 @@ mod tests {
             services: vec!["notes".into(), "kb".into()],
             app_label: None,
             peer_user_id: None,
+            enrolled_as_self: false,
         };
         let rendered = pair_lines(&result).join("\n");
         assert!(
@@ -904,6 +906,7 @@ mod tests {
             services: vec!["notes".into()],
             app_label: None,
             peer_user_id: None,
+            enrolled_as_self: false,
         };
         let rendered = pair_lines(&result).join("\n");
         assert!(
@@ -925,6 +928,7 @@ mod tests {
             services: vec![],
             app_label: None,
             peer_user_id: None,
+            enrolled_as_self: false,
         };
         let lines = pair_lines(&result);
         assert_eq!(lines[0], "Paired with alice — code: a-b-c");

@@ -218,6 +218,7 @@ async fn four_command_hero_flow() {
                 app_label: None,
                 max_uses: None,
                 peer_nickname: None,
+                as_self: false,
             }))
             .await
             .expect("invite over mcpmesh-local/1");

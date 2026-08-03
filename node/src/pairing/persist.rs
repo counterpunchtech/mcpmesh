@@ -120,6 +120,38 @@ impl InviteFile {
     }
 }
 
+/// Write `bytes` to `path` privately and atomically: 0600 at CREATE (never a widen-after-write
+/// race), fsync, rename, and remove the temp on every failure branch (#86).
+///
+/// Extracted from the invite writer above rather than duplicated — both files hold material that
+/// must not be world-readable, and a second hand-rolled copy is how one of them ends up 0644.
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), seq));
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let result = (|| -> io::Result<()> {
+        let mut f = opts.open(&tmp)?;
+        io::Write::write_all(&mut f, bytes)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,6 +170,7 @@ mod tests {
             // alias must survive a restart with the invite, since it is stripped from the LINE and
             // so cannot be recovered from anywhere else.
             peer_nickname: Some("their-laptop".into()),
+            as_self: false,
         }
     }
 

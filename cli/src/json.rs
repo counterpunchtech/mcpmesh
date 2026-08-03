@@ -207,6 +207,7 @@ mod tests {
             services: vec!["notes".into(), "kb".into()],
             app_label: None,
             peer_user_id: None,
+            enrolled_as_self: false,
         };
         let v = pair_json(&result);
         assert_eq!(v["peer_nickname"], "alice");

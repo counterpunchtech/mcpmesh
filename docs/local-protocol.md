@@ -7,7 +7,7 @@ named pipe on Windows. Anything that can open the endpoint and parse JSON can sp
 language — [`local-api/examples/status.py`](../local-api/examples/status.py) is a complete client
 in ~60 lines of dependency-free Python.
 
-> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.42`, `api_minor` `42`) and evolves
+> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.43`, `api_minor` `43`) and evolves
 > **additively** (see [Versioning](#versioning)), but until a stable release this document — like the
 > wire format itself — may change without a migration path. Pin the mcpmesh version you build
 > against. Source of truth is the Rust in [`local-api/`](../local-api/src/protocol.rs); where this
@@ -147,7 +147,7 @@ Methods split into two groups by audience:
 | `audit_summary` | *(none)* | `{per_peer:[[name,count],…], per_service:[[name,count],…], total_sessions}` — this node's **local** session tallies; nothing is transmitted |
 | `audit_prune` | `{before:"YYYY-MM"}` — delete audit months **strictly older** than `before` (that month itself is kept), `api_minor >= 27` (#88). The month shape is validated up front: a malformed key is an error, never a silent no-op. Idempotent; local-only; owner-only (the control socket). | `{deleted_months:[…]}` ascending |
 | `audit_list` | `{since?, until?, kind?, peer?, limit?, offset?}` — read this node's **local** audit records, filtered (AND-combined) and paged, `api_minor >= 27` (#88): the "show me everything you hold about me" verb. `since`/`until` are inclusive `YYYY-MM` month keys (the rotation unit). `kind` is one of `session_open` / `session_close` / `request` / `blob_fetch` / `trust` — an unknown kind **errors** rather than silently matching all. `limit` defaults to 500 and is **clamped to 1000** (the response is one JSON frame; `blob_list`'s minor-20 lesson). `total` counts ALL matches, so a caller pages without a second counting call. | `{records:[AuditRecord…], total}` chronological (oldest month first) |
-| `invite` | `{services:[…], max_uses?, peer_nickname?}` — mint a pairing invite. **`peer_nickname`** (#87, `api_minor >= 39`) is YOUR local name for whoever redeems, overriding the nickname they claim for themselves — for two same-model laptops, the fix that does not require the other person to rename their machine. Never sent to them (it is stripped from the invite line) and it does **not** bypass the collision check: an alias that itself collides is refused identically. Rejected with `max_uses > 1`, since one alias applied to every redeemer would collide on the second redemption. **Outstanding invites survive a daemon restart** (`api_minor >= 34`, #87b): they are persisted, so `expires_at_epoch` is the real lifetime rather than an upper bound on process lifetime, and a mint that cannot be persisted is an ERROR rather than an invite that will quietly not survive. **`max_uses`** (#87, `api_minor >= 35`) makes it redeemable that many times, each redemption running its OWN SAS ceremony and writing its own peer rows — N independent pairings sharing one secret, never a group identity. Absent = 1. `0` is rejected (`-32602`); above `MAX_INVITE_USES` (64) is clamped, and `uses_remaining` in the result is the value ACTUALLY applied — read it rather than assuming your request was honoured. Sending `max_uses` to an `api_minor < 35` daemon FAILS with `-32602 unknown field` rather than degrading to single-use (params are strict), so omit it unless you have checked. | `{invite_line, expires_at_epoch, uses_remaining}` |
+| `invite` | `{services:[…], max_uses?, peer_nickname?, as_self?}` — mint a pairing invite. **`as_self`** (#86, `api_minor >= 43`) mints a **SELF-ENROLLMENT** invite instead: the redeemer becomes another *device of you*, not a peer. Neither side writes a peer row and nothing is granted — your own devices are not peers of each other — and the inviter signs a device→user binding for the redeemer's authenticated endpoint, so both devices thereafter present the same `user_id`. **The private key never moves**; the consequence is that an enrolled device cannot enroll a third, so enroll every device from the one that holds the key. Requires `max_uses = 1` and an empty `services`, both refused otherwise: a multi-use identity invite is a standing offer to become you. **`peer_nickname`** (#87, `api_minor >= 39`) is YOUR local name for whoever redeems, overriding the nickname they claim for themselves — for two same-model laptops, the fix that does not require the other person to rename their machine. Never sent to them (it is stripped from the invite line) and it does **not** bypass the collision check: an alias that itself collides is refused identically. Rejected with `max_uses > 1`, since one alias applied to every redeemer would collide on the second redemption. **Outstanding invites survive a daemon restart** (`api_minor >= 34`, #87b): they are persisted, so `expires_at_epoch` is the real lifetime rather than an upper bound on process lifetime, and a mint that cannot be persisted is an ERROR rather than an invite that will quietly not survive. **`max_uses`** (#87, `api_minor >= 35`) makes it redeemable that many times, each redemption running its OWN SAS ceremony and writing its own peer rows — N independent pairings sharing one secret, never a group identity. Absent = 1. `0` is rejected (`-32602`); above `MAX_INVITE_USES` (64) is clamped, and `uses_remaining` in the result is the value ACTUALLY applied — read it rather than assuming your request was honoured. Sending `max_uses` to an `api_minor < 35` daemon FAILS with `-32602 unknown field` rather than degrading to single-use (params are strict), so omit it unless you have checked. | `{invite_line, expires_at_epoch, uses_remaining}` |
 | `pair` | `{invite_line, as_nickname?}` — **`as_nickname`** (#87, `api_minor >= 39`) is YOUR local name for the inviter, overriding the one its invite suggests. This is how you resolve a name collision yourself instead of asking them to re-mint; `set_nickname` is not the answer, it rewrites your own GLOBAL self-name. Never sent to the inviter, and it does not bypass the collision check. | `{peer_nickname, sas_code, services:[…], app_label?, peer_user_id?}` — `app_label` echoes any opaque label the inviter attached (#31); `peer_user_id` is the inviter's stable `b64u:` identity when it presented a binding (#30). **Grants MUTUALLY (#43):** redemption grants the inviter access to ALL services THIS (redeemer) node serves — under the same stable-principal rule as the inviter-side grant — so one ceremony admits both directions. Fails (no dial attempted) if the invite's suggested nickname is already yours for a *different* peer; see [Nickname collisions](#nickname-collisions) |
 | `peer_endorse` | `{subject, subject_user_id?}` — **produce** an endorsement of a peer for someone else to redeem (#65, `api_minor >= 42`). Signs with your user key; it changes nothing about your own trust in the subject. Hand both result fields to the recipient. | `{endorsed_by, evidence}` |
 | `peer_introduce` | `{subject, endorsed_by, evidence, subject_user_id?, subject_binding?, nickname}` — install a peer from a **signed endorsement** by someone you are already paired with (#65, `api_minor >= 42`). Onboards a small group in O(N) instead of O(N²) two-human ceremonies. **It installs IDENTITY, not authorization**: service access stays principal-keyed in config (#38) and an explicit, separate act. `endorsed_by` must be the `user_id` of a peer you are **currently paired** with, so the chain terminates at a ceremony you performed yourself — unpairing them revokes their power to introduce, even though the signature stays cryptographically valid, and an **introduced peer cannot introduce others**. `subject_user_id` requires `subject_binding` (the subject's OWN device→user binding): a `user_id` is authorization-bearing and public, so an endorser alone must not be able to attach one. Refused for: an unpaired endorser, a signature naming a different subject, your own endpoint id, a peer you are **already paired with** (it would replace a SAS-proven row with a weaker one), or a nickname you already use for a different peer. Recorded as a `trust` audit event naming the endorser. | `{}` |
@@ -387,7 +387,30 @@ than the connect-register-disconnect pattern (which would tear the registration 
 An ephemeral name that collides with an existing persistent (config) service is refused. Everything
 else — the `allow` list, dialing, invites granting it — works identically to a persistent service.
 
-#### Introductions and what they give up (#65)
+#### Self-enrollment: one person, several devices (#86)
+
+Each node root mints its own user key, so one person's laptop and phone are unrelated strangers to
+the mesh. `invite { as_self: true }` fixes that: the ceremony is ordinary pairing — same secret, same
+SAS — and the outcome is that both devices present the **same `user_id`**.
+
+> **The SAS matters more here than anywhere else.** The inviter signs a binding for whichever
+> endpoint redeems, so a redemption by an impostor mints *that impostor* a binding for your identity.
+> Compare the words.
+
+**No key is transferred.** The enrolling device signs a device→user binding for the new device's
+endpoint and hands over only that signature. Two consequences worth designing around:
+
+- **An enrolled device cannot enroll a third** — it holds no private key. Enroll every device from
+  the one that does. That is a limitation *and* the security property: one copy of the key, in one
+  place.
+- **There is no revocation.** A binding, once issued, verifies forever. A lost enrolled device means
+  rotating the user key, which changes your `user_id` and means re-pairing with everyone.
+
+**Refreshing a binding a peer already stored: re-pair.** A peer records your `user_id` at pairing and
+re-pairing rewrites it. There is no push-refresh, deliberately — an unsolicited identity update
+arriving from a peer is a worse trust story than a fresh ceremony.
+
+### Introductions and what they give up (#65)
 
 Pairing's SAS defends **first contact** against a man-in-the-middle: two humans read the same words
 aloud, so a substituted key is caught. `peer_introduce` replaces that defence with a different one —
@@ -1230,7 +1253,7 @@ things:
   (#87) are `api_minor >= 39`; `RegisterServiceParams.rate_limit_per_min` and the per-service
   meaning of `-32053` (#63) are `api_minor >= 40` — below that `deny_unknown_fields` rejects the
   whole request, so guard before sending the field; `StreamFrame::BlobTransfer` (#82) is
-  `api_minor >= 41`; the `peer_introduce` + `peer_endorse` verbs (#65) are `api_minor >= 42` — below that they answer `-32601 unknown method`. For REQUEST fields, `deny_unknown_fields` rejects the whole request, so
+  `api_minor >= 41`; the `peer_introduce` + `peer_endorse` verbs (#65) are `api_minor >= 42`; `InviteParams.as_self` and `PairResult.enrolled_as_self` (#86) are `api_minor >= 43` — below that they answer `-32601 unknown method`. For REQUEST fields, `deny_unknown_fields` rejects the whole request, so
   guard before offering an alias field in a UI.
   `api_minor` is itself additive: a pre-1.1 daemon omits it and it reads as `0`.
 

@@ -387,6 +387,30 @@ async fn boot_node(paths: NodePaths, config: Option<Config>) -> Result<BootedNod
     mesh.set_self_binding(self_binding);
     // #65: `peer_endorse` reloads the key from here to sign an endorsement.
     mesh.set_user_key_path(user_key_path);
+    // #86: an ADOPTED binding — this device was enrolled into another device's identity — wins over
+    // the locally-derived one. It is the ONLY copy (an enrolled device holds no user key and cannot
+    // re-derive it), so a read failure is logged loudly rather than silently reverting this device
+    // to being a stranger to its own person.
+    let adopted_path = mesh.adopted_binding_path();
+    if adopted_path.exists() {
+        match std::fs::read(&adopted_path)
+            .map_err(anyhow::Error::from)
+            .and_then(|b| {
+                serde_json::from_slice::<crate::pairing::rendezvous::SelfBinding>(&b)
+                    .map_err(anyhow::Error::from)
+            }) {
+            Ok(b) => {
+                tracing::info!("presenting an adopted device identity (#86)");
+                mesh.set_self_binding_live(Some(b));
+            }
+            Err(e) => tracing::error!(
+                %e,
+                path = %adopted_path.display(),
+                "an adopted device binding exists but could not be read; this device will present \
+                 its OWN identity and appear to peers as a different person"
+            ),
+        }
+    }
     // Build the gated per-scope app-blob provider in roster mode and install it on the
     // mesh BEFORE the accept loop starts. Uses the SAME trust gate the mesh resolves inbound MCP
     // with, so the request-time scope check keys on the exact authenticated identity. A build
@@ -1527,6 +1551,49 @@ mod tests {
              Raising keep_alive_secs may now genuinely reduce ping traffic — revisit the refusal \
              in build_transport_config and the metered-link note in docs/config.md. Got: {over}"
         );
+    }
+
+    /// #86: an ADOPTED binding must survive a restart and WIN over the locally-derived one.
+    ///
+    /// The enrolled device holds no user key, so it cannot re-derive this — the file is the only
+    /// copy. If boot ignored it, the device would silently go back to presenting its OWN identity
+    /// and appear to every peer as a different person, which is the exact symptom #86 reports.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_adopted_binding_survives_a_restart_and_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::paths::NodePaths::under_root(dir.path());
+        std::fs::create_dir_all(paths.config_path.parent().unwrap()).unwrap();
+        std::fs::write(&paths.config_path, "[network]\nrelay_mode = \"disabled\"\n").unwrap();
+
+        // The path is derived from the user-key path, so it is knowable WITHOUT booting first —
+        // which matters, because a second boot on the same root races the first one's redb lock.
+        let adopted_path = paths
+            .user_key_path
+            .clone()
+            .with_extension("adopted-binding.json");
+
+        // A DIFFERENT key from the one this root will mint for itself, so "adopted wins" is
+        // distinguishable from "derived its own".
+        let (other, _) =
+            mcpmesh_trust::keys::UserKey::load_or_generate(&dir.path().join("other.key")).unwrap();
+        let other_pk = mcpmesh_trust::binding::user_id(&other);
+        let adopted = crate::pairing::rendezvous::SelfBinding {
+            user_pk: other_pk.clone(),
+            sig: "b64u:placeholder".into(),
+        };
+        std::fs::create_dir_all(adopted_path.parent().unwrap()).unwrap();
+        std::fs::write(&adopted_path, serde_json::to_vec(&adopted).unwrap()).unwrap();
+
+        // Boot: the adopted binding must be what we present.
+        let booted = super::boot_node(paths, None).await.expect("boots");
+        let mesh = booted.state.mesh_required().expect("mesh");
+        assert_eq!(
+            mesh.self_binding().expect("a binding").user_pk,
+            other_pk,
+            "an ADOPTED binding must win over the locally-derived one — otherwise an enrolled \
+             device silently reverts to being a stranger to its own person after a restart"
+        );
+        super::shutdown_booted(booted).await;
     }
 
     /// #63 gate: `rate_limit_per_min = 0` on a service must be a STARTUP ERROR.

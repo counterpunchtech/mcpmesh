@@ -561,6 +561,25 @@ pub struct InviteParams {
     /// invite that works exactly once. `api_minor >= 39`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer_nickname: Option<String>,
+    /// Mint a SELF-ENROLLMENT invite (#86): the redeemer becomes another device of **you**, not a
+    /// peer.
+    ///
+    /// The ceremony is the ordinary one — same secret, same SAS. What differs is the outcome:
+    /// neither side writes a peer row and nothing is granted, and the inviter signs a device→user
+    /// binding for the redeemer's authenticated endpoint. Both devices then present the same
+    /// `user_pk`, so every peer resolves them to ONE `user_id`.
+    ///
+    /// **The private key never moves.** The enrolling device signs a binding for the new device's
+    /// endpoint and hands over only that signature, so a second copy of the identity never exists.
+    /// The consequence: an enrolled device cannot enroll a third — enroll every device from the one
+    /// that holds the key.
+    ///
+    /// **The SAS matters more here than anywhere else.** The inviter signs a binding for whichever
+    /// endpoint redeems, so a redemption by an impostor mints *that impostor* a binding for your
+    /// identity. Requires `max_uses = 1` and an empty `services`, both refused otherwise.
+    /// `api_minor >= 43`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub as_self: bool,
 }
 
 /// The ceiling on [`InviteParams::max_uses`] (#87). Comfortably above "a team", far below "a
@@ -1350,6 +1369,12 @@ pub struct PairResult {
     /// sides for the out-of-band human check. Never sent on the wire, never checked
     /// programmatically.
     pub sas_code: String,
+    /// TRUE when this redemption was a SELF-ENROLLMENT (#86): you are now another device of the
+    /// inviter's person, not their peer. No peer row was written and nothing was granted.
+    ///
+    /// Reported so a caller can tell the two outcomes apart without inspecting its own store.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub enrolled_as_self: bool,
     /// The services this pairing granted the redeemer — each mountable as `<peer>/<service>`.
     /// Populated from the invite (`invite.services`) by the redeemer-side `redeem_invite`, so
     /// the porcelain can print the "You can mount: alice/notes" line without re-decoding the
@@ -1873,7 +1898,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   thirty have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.42";
+pub const API_VERSION: &str = "1.43";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -1959,7 +1984,11 @@ pub const API_VERSION: &str = "1.42";
 /// refusals — expired line, no live invite, inviter unreachable, id mismatch, name conflict, and
 /// the deliberately-opaque refusal. `ERR_NICKNAME_TAKEN` had been the only coded pairing failure,
 /// so every other one arrived as `-32000` and an embedder could either forward our prose to end
-/// users or substring-match it (#159); to 42 with the `peer_introduce` + `peer_endorse` verbs — install a peer from a
+/// users or substring-match it (#159); to 43 with `InviteParams::as_self` — SELF-ENROLLMENT, so one
+/// person's devices share a `user_id` instead of appearing as unrelated strangers (#86). The
+/// ceremony is ordinary pairing; the outcome is a device→user binding rather than a peer row, and
+/// the private key never moves. Guard on `>= 43`; to 42 with the `peer_introduce` + `peer_endorse`
+/// verbs — install a peer from a
 /// SIGNED endorsement by someone you are already paired with, so a small group onboards in O(N)
 /// instead of O(N²) two-human ceremonies (#65). It installs IDENTITY only and grants nothing, which
 /// is what bounds it. Guard on `>= 42`; to 41 with `StreamFrame::BlobTransfer` — live app-blob
@@ -2002,7 +2031,7 @@ pub const API_VERSION: &str = "1.42";
 /// its REAL content is a meaning change to `reachable` — the field exists so the new meaning is
 /// observable at all. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 42;
+pub const API_MINOR: u32 = 43;
 
 #[cfg(test)]
 mod tests {
@@ -2386,6 +2415,8 @@ mod tests {
     #[test]
     fn invite_params_reject_singular_service_typo() {
         // The reported bug: `{"service":"kb"}` (singular) used to deserialize to
+        // InviteParams { services: []
+        // InviteParams { services: []     as_self: false,
         // InviteParams { services: [] } and mint a grants-nothing invite that looked
         // successful. With deny_unknown_fields the typo is a loud parse error instead.
         let err = serde_json::from_value::<InviteParams>(serde_json::json!({"service": "kb"}));
@@ -2686,6 +2717,7 @@ mod tests {
             // #87: seeded NON-None so the round-trip actually carries it — `None` rides
             // `skip_serializing_if` straight past the assertion and proves nothing.
             peer_nickname: Some("laptop-of-alice".into()),
+            as_self: false,
         });
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["method"], "invite");
@@ -2747,6 +2779,7 @@ mod tests {
             services: vec!["notes".into(), "kb".into()],
             app_label: None,
             peer_user_id: None,
+            enrolled_as_self: false,
         };
         let v = serde_json::to_value(&res).unwrap();
         assert_eq!(v["peer_nickname"], "alice");
