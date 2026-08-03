@@ -29,9 +29,14 @@
 //!
 //! Use the re-export — `mcpmesh_net::rmcp::…` — and never add your own `rmcp` dependency.
 //!
-//! Tracking a prerelease is deliberate: we want the SDK ahead of the coming MCP spec change (it
-//! already knows `ProtocolVersion::V_2026_07_28` while still defaulting to `V_2025_11_25`). This
-//! re-export is what keeps that choice from being a hard break for embedders.
+//! We track the SDK ahead of the coming MCP spec change: it already knows
+//! `ProtocolVersion::V_2026_07_28` while still defaulting to `V_2025_11_25`, so the constant is
+//! available before we opt into the stateless revision (#45). This re-export is what keeps that
+//! choice from being a hard break for embedders.
+//!
+//! The pin is on a STABLE release as of `=3.1.0` (#46) — it was a `3.0.0-beta` while the stateless
+//! revision was still settling. `LATEST` is the same `V_2025_11_25` in both, so moving off the
+//! prerelease changed nothing about what we negotiate.
 pub use iroh;
 pub use rmcp;
 
