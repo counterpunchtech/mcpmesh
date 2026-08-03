@@ -7,7 +7,7 @@ named pipe on Windows. Anything that can open the endpoint and parse JSON can sp
 language — [`local-api/examples/status.py`](../local-api/examples/status.py) is a complete client
 in ~60 lines of dependency-free Python.
 
-> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.37`, `api_minor` `37`) and evolves
+> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.38`, `api_minor` `38`) and evolves
 > **additively** (see [Versioning](#versioning)), but until a stable release this document — like the
 > wire format itself — may change without a migration path. Pin the mcpmesh version you build
 > against. Source of truth is the Rust in [`local-api/`](../local-api/src/protocol.rs); where this
@@ -1123,7 +1123,8 @@ things:
   onboarding refusal codes `-32044`..`-32049` (#159) are `api_minor >= 36`; the reserved
   `mcpmesh/*` `_meta` namespace is enforced on every proxied frame, not just the session's first,
   at `api_minor >= 37` (#164) — guard on that before keying authorization on
-  `_meta["mcpmesh/peer"]`.
+  `_meta["mcpmesh/peer"]`; `SelfNetwork.presence_mode` and the `reachable: false` meaning change it
+  brings (#89) are `api_minor >= 38`.
   `api_minor` is itself additive: a pre-1.1 daemon omits it and it reads as `0`.
 
 Changes remain **additive within a major**: new response fields are optional (absent-tolerant), so a

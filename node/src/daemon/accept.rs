@@ -197,6 +197,59 @@ pub fn spawn_accept_loop(mesh: Arc<MeshState>, services: Arc<Services>) -> JoinH
                             conn.close(mcpmesh_net::CLOSE_UNAUTHORIZED.into(), b"unauthorized");
                             return;
                         };
+                        // #89 ask 2: the presence POLICY, before the limiter and before any work.
+                        //
+                        // The arm is otherwise gated by PAIRING alone, so `service_allow_revoke`
+                        // never reached it: a peer whose every service was revoked still learned
+                        // you were online right now, your RTT, your stack_version and your app
+                        // metadata — on demand, forever. The only lever was a full unpair, a
+                        // relationship-destroying action used to express a privacy preference.
+                        //
+                        // `Granted` reads `caller_admitted_services`, which this arm already
+                        // computes for the pong, so an embedder's existing per-peer sharing switch
+                        // now controls presence too — LIVE, since grants are, with no restart.
+                        //
+                        // The refusal matches the trust gate's above (same code, same bytes) so
+                        // this arm does not itself distinguish "not paired" from "hidden" from "no
+                        // grants". Same discipline as the pairing redemption oracle.
+                        //
+                        // THIS IS NOT INVISIBILITY, and the docs must not claim it is (#89 gate).
+                        // A QUIC application close happens only AFTER the handshake completes, so
+                        // `connect()` returning Ok already proves this node is up. `ALPN_PAIR` is
+                        // advertised unconditionally and answers ANY stranger; a paired peer still
+                        // gets a served `ALPN_MCP` session and an application-layer refusal frame.
+                        // What this mode actually withholds is the pong PAYLOAD — `stack_version`,
+                        // `meta` (#40), and the caller's admitted `services` (#52) — and it makes
+                        // mcpmesh's own probe report the peer unreachable.
+                        //
+                        // BEFORE the limiter's VERDICT deliberately: `PING_THROTTLE_CLOSE` is
+                        // distinguishable on purpose (#142 — a throttled probe must not be written
+                        // down as "offline"), so answering the throttle close here would tell a
+                        // prober that it is paired and the node is up. The token is still SPENT
+                        // (below) so a refused peer stays metered.
+                        let mode = mesh.presence_mode();
+                        // Skipped entirely under `Off`: the value is unused there, and it is a live
+                        // registry scan per dial on a path an unmetered peer can drive.
+                        let admitted = if mode == crate::daemon::PresenceMode::Off {
+                            Vec::new()
+                        } else {
+                            crate::daemon::caller_admitted_services(&mesh, &identity)
+                        };
+                        let pong_allowed = match mode {
+                            crate::daemon::PresenceMode::Paired => true,
+                            crate::daemon::PresenceMode::Granted => !admitted.is_empty(),
+                            crate::daemon::PresenceMode::Off => false,
+                        };
+                        if !pong_allowed {
+                            // SPEND a token, then discard the verdict. Returning early without
+                            // metering left the arm completely unmetered for exactly the peers a
+                            // hidden node most wants bounded — undoing #89 ask 1 for this mode
+                            // (#89 gate). Discarding the verdict is what keeps the close identical
+                            // whether or not the bucket is empty.
+                            let _ = mesh.limits().admit_ping(&remote);
+                            conn.close(mcpmesh_net::CLOSE_UNAUTHORIZED.into(), b"unauthorized");
+                            return;
+                        }
                         // #89: meter the probe per authenticated endpoint. The arm was gated but
                         // UNMETERED, so a paired peer could pong-flood and the only bound was its
                         // own politeness. AFTER the gate, so an unpaired scanner still allocates
@@ -233,8 +286,7 @@ pub fn spawn_accept_loop(mesh: Arc<MeshState>, services: Arc<Services>) -> JoinH
                             // admitted to — the discovery answer, computed on the side that owns
                             // the truth. Only the caller's own admitted services (never the full
                             // registry). Empty list omitted (keeps a no-share pong compact).
-                            let services =
-                                crate::daemon::caller_admitted_services(&mesh, &identity);
+                            let services = &admitted;
                             let mut pong = serde_json::json!({ "stack_version": STACK_VERSION });
                             if !meta.is_empty() {
                                 pong["meta"] = serde_json::json!(meta);

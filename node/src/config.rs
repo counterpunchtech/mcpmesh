@@ -120,6 +120,31 @@ pub struct NetworkCfg {
     /// `PathSelector` cannot reach). A direct path may still form — it simply never carries data,
     /// and `status` reports `relay` because #64 derives the path from `is_selected()`.
     pub relay_only: bool,
+    /// `[network].presence_mode` (#89) — who gets a reachability pong on `mcpmesh/ping/1`.
+    ///
+    /// - `"paired"` (default): any paired peer, today's behaviour.
+    /// - `"granted"`: only a caller currently holding at least one service grant. This is what
+    ///   makes an embedder's per-peer sharing switch control presence too — revoking the last
+    ///   service takes presence with it, live, with no restart and no new verb.
+    /// - `"off"`: never pong.
+    ///
+    /// The arm is gated by PAIRING alone otherwise, so `service_allow_revoke` has no effect on it:
+    /// a peer whose every service was revoked still learns you are online right now, your RTT, your
+    /// `stack_version` and your app metadata, on demand and forever. The only lever was a full
+    /// unpair — a relationship-destroying action to express a privacy preference (#89).
+    ///
+    /// A refusal under `"off"`/`"granted"` matches the trust gate's, so this arm does not
+    /// distinguish "not paired" from "hidden" from "no grants".
+    ///
+    /// **This is NOT "appear offline".** It withholds the pong payload (`stack_version`, app
+    /// metadata, the caller's services) and makes our own probe report you unreachable. It does not
+    /// hide that the node is running: a QUIC application close implies a completed handshake,
+    /// `mcpmesh/pair/1` answers any stranger by design, and a paired peer still gets a served
+    /// `mcpmesh/mcp/1` session. Do not describe it to users as invisibility (#89 gate).
+    ///
+    /// Read at BOOT — changing the mode needs a restart. The per-peer effect under `"granted"` is
+    /// live, because grants are.
+    pub presence_mode: String,
     /// QUIC idle timeout in seconds (#56) — how long a connection survives with NO traffic and no
     /// keepalive before the transport closes it. `None` = iroh's default, **30s** on iroh 1.0.3.
     ///
@@ -165,6 +190,7 @@ impl Default for NetworkCfg {
             discovery_mode: "default".into(),
             discovery_urls: Vec::new(),
             relay_only: false,
+            presence_mode: "paired".into(),
             idle_timeout_secs: None,
             keep_alive_secs: None,
         }

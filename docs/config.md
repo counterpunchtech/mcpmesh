@@ -62,6 +62,7 @@ are in the [operator runbook §5](operator.md#5-self-hosting-relay--discovery-10
 | `discovery_urls` | `[]` | Your self-hosted discovery URLs, used for both publishing and resolving peer addresses. Required when `discovery_mode = "custom"`. |
 | `idle_timeout_secs` | iroh's (**30 s**) | QUIC idle timeout. **Negotiated** — the connection uses the minimum of both peers' values, so raising it needs every node configured. See [Idle timeout and keepalive](#idle-timeout-and-keepalive-56). |
 | `keep_alive_secs` | iroh's (**5 s**) | QUIC keepalive interval. **Legal range is `1`–`5`** — iroh caps the per-path keepalive at 5 s, so a larger value is a **startup error**, not a slower ping. `0` is refused too (a PING storm, not "disabled"). Must additionally be less than the effective idle timeout. See [Idle timeout and keepalive](#idle-timeout-and-keepalive-56). |
+| `presence_mode` | `"paired"` | **Who gets a reachability pong** on `mcpmesh/ping/1` (#89). `"paired"` = any paired peer (today's behaviour) \| `"granted"` = only a peer currently holding at least one service grant \| `"off"` = never pong. See [Presence](#presence-who-can-see-that-you-are-online-89). |
 | `relay_only` | `false` | **TESTING ONLY (#116).** Force application data over the **relay** even when a direct path exists. Requires building with the `unstable-relay-only` cargo feature — without it the field still parses (configs stay portable) but is **ignored with a warning**, never a startup error. See the caveats below. |
 
 An unknown mode, or a `"custom"` mode without its URL list, is a **startup error** — the daemon
@@ -88,6 +89,58 @@ nothing is detectably wrong at config time.
 #116 was filed to escape. The issue remains open.
 
 
+
+### Presence: who can see that you are online (#89)
+
+The reachability probe (`mcpmesh/ping/1`) is gated by **pairing alone**, so `service_allow_revoke`
+never reached it. Before this knob, a peer from whom you had revoked *every* service still received,
+on demand: **that you are online right now**, your RTT (a coarse geography signal), your
+`stack_version`, and whatever you set via `set_app_metadata`. The only way to stop it was a full
+unpair — a relationship-destroying action to express a privacy preference.
+
+| Value | Who gets a pong |
+|---|---|
+| `"paired"` *(default)* | Any paired peer. Unchanged behaviour. |
+| `"granted"` | Only a peer currently holding **at least one service grant**. |
+| `"off"` | Nobody. |
+
+**`"granted"` is the useful one for a product with a per-peer sharing switch.** It makes that
+existing switch control presence too: revoking a peer's last service takes their view of your
+presence with it, **live** — grants are already applied without a restart.
+
+> ### This is not "appear offline". Read this before you build a UI on it.
+>
+> **What it does:** withholds the pong *payload* — your `stack_version`, your `set_app_metadata`
+> value, the services that peer may use, and the probe's RTT measurement — and makes mcpmesh's own
+> reachability probe report you as unreachable, so you vanish from that peer's `status` list.
+>
+> **What it does NOT do: hide that your node is running.** A determined peer still learns you are up:
+>
+> - A QUIC **application** close only happens *after* the handshake completes, so a bare
+>   `connect(you, "mcpmesh/ping/1")` returning success already proves you are online — and times.
+> - **`mcpmesh/pair/1` answers anyone**, by design (it must, to receive an invite redemption). A
+>   total stranger with only your endpoint id gets a distinguishable close from it.
+> - A **paired** peer, even with every service revoked, still gets a served `mcpmesh/mcp/1` session
+>   and an application-layer refusal frame back — proof of life within one RTT.
+>
+> So `"off"` is **not** an invisibility cloak, and a product must not describe it as one. It stops
+> the *presence feature* from reporting you, which is a real and useful thing; it does not defeat an
+> adversary who dials you directly.
+>
+> **A refusal does not say which reason applied.** Within this arm, `"off"` and
+> `"granted"`-without-a-grant close identically to the trust gate's refusal of a stranger, so the
+> probe itself does not distinguish "not paired" from "hidden" from "no grants".
+
+**Changing the mode needs a restart** — it is read at boot. The *per-peer* effect under `"granted"`
+does not, because grants are live. An unknown value is a **startup error**, never a silent fall back
+to `"paired"`: a privacy knob that fails open is worse than no knob, and `presence_mode = "of"` must
+not quietly leave you visible.
+
+**Other presence surfaces this knob does not govern.** Roster-mode presence gossip (#39) is a
+separate mechanism with its own surface, and app-blob **scope grants** (#62) are not service grants —
+under `"granted"`, a peer you are actively sharing blobs with is hidden from the probe while still
+being able to fetch those blobs, which proves you are online. If your per-peer switch is about file
+sharing rather than services, `"granted"` will not track it.
 
 ### Idle timeout and keepalive (#56)
 

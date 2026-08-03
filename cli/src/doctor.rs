@@ -1176,6 +1176,31 @@ mod tests {
             over.message
         );
 
+        // #89: an unknown presence_mode is a startup error, so doctor must catch it too — a
+        // privacy knob the daemon rejects must not read as healthy.
+        let bad_presence = crate::config::NetworkCfg {
+            presence_mode: "of".into(),
+            ..net("default", &[], "default", &[])
+        };
+        let v = check_network(&bad_presence);
+        assert_eq!(v.level, Level::Error, "{}", v.message);
+        assert!(
+            v.message.contains("presence_mode") && v.message.contains("refuse to start"),
+            "and must name the key: {}",
+            v.message
+        );
+        for good in ["paired", "granted", "off"] {
+            let ok = crate::config::NetworkCfg {
+                presence_mode: good.into(),
+                ..net("default", &[], "default", &[])
+            };
+            assert_eq!(
+                check_network(&ok).level,
+                Level::Ok,
+                "{good:?} is legal and must not be flagged"
+            );
+        }
+
         // Zero: the PING storm, not "disabled".
         assert_eq!(
             check_network(&with(Some(1200), Some(0))).level,
