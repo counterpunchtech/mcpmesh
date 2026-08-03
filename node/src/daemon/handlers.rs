@@ -2114,6 +2114,29 @@ mod tests {
              is the #55 shape: a per-service feature that silently does nothing for ephemerals"
         );
 
+        // The PERSISTENT path (`ephemeral: false`, which is the DEFAULT) must carry the rate too.
+        // Passing `None` to `write_service_to_config` there passed the whole workspace: the new
+        // tests used `ephemeral: true` exclusively, and the config-writer test called the writer
+        // directly without crossing the handler. One path over from the #55 shape again.
+        let persistent = RegisterServiceParams {
+            name: "persisted".into(),
+            backend: mcpmesh_local_api::BackendSpec::Socket {
+                path: "/run/p.sock".into(),
+            },
+            allow: vec![],
+            ephemeral: false,
+            rate_limit_per_min: Some(3),
+        };
+        register_service(&state, persistent)
+            .await
+            .expect("a persistent registration with a rate succeeds");
+        assert_eq!(
+            mesh.limits().tracked_rpm("persisted"),
+            Some(Some(3)),
+            "a PERSISTENT registration's rate must survive the config write and the reload — \
+             `ephemeral` defaults to false, so this is the default path"
+        );
+
         // A wildly-over-ceiling request is ACCEPTED but CLAMPED — again through the real bucket.
         register_service(&state, params(Some(1_000_000)))
             .await

@@ -65,26 +65,6 @@ are in the [operator runbook §5](operator.md#5-self-hosting-relay--discovery-10
 | `presence_mode` | `"paired"` | **Who gets a reachability pong** on `mcpmesh/ping/1` (#89). `"paired"` = any paired peer (today's behaviour) \| `"granted"` = only a peer currently holding at least one service grant \| `"off"` = never pong. See [Presence](#presence-who-can-see-that-you-are-online-89). |
 | `relay_only` | `false` | **TESTING ONLY (#116).** Force application data over the **relay** even when a direct path exists. Requires building with the `unstable-relay-only` cargo feature — without it the field still parses (configs stay portable) but is **ignored with a warning**, never a startup error. See the caveats below. |
 
-### `[services.<name>].rate_limit_per_min` — isolating a noisy service (#63)
-
-| Key | Default | Meaning |
-|---|---|---|
-| `rate_limit_per_min` | `[limits].rate_limit_per_min` | Proxied-request rate for THIS service, per peer. |
-
-Before this, every service a peer could reach drew from **one shared bucket**: an agent hammering a
-browser or filesystem service exhausted it, and your own low-rate control traffic to a *different*
-service on the same node started failing. Buckets are now per `(service, peer)`.
-
-> **It can only LOWER the rate.** `[limits].rate_limit_per_min` is a hard ceiling — a larger value
-> here is clamped, not honoured, and neither a config edit nor a `register_service` call can raise
-> it. `0` is rejected rather than silently blocking every request.
-
-**What this changes about the old guarantee.** `[limits].rate_limit_per_min` used to bound a peer's
-*aggregate* rate across every mount. It now bounds a peer's rate **per service**, so the aggregate is
-bounded by (services that peer is granted) × (their limits) — both operator-chosen, neither
-peer-influenced. That is a real weakening, and it is the minimum one that delivers the isolation:
-also consulting a shared bucket would restore the old ceiling and restore the starvation with it.
-
 An unknown mode, or a `"custom"` mode without its URL list, is a **startup error** — the daemon
 refuses to run rather than silently falling back to public infrastructure.
 
@@ -260,6 +240,39 @@ config: who you trust lives in the daemon's state store, and only the *names* gr
 here.
 
 ---
+
+
+### `rate_limit_per_min` — isolating a noisy service (#63)
+
+| Key | Default | Meaning |
+|---|---|---|
+| `rate_limit_per_min` | `[limits].rate_limit_per_min` | Proxied-request rate for THIS service, per peer. |
+
+Before this, every service a peer could reach drew from **one shared bucket**: an agent hammering a
+browser or filesystem service exhausted it, and your own low-rate control traffic to a *different*
+service on the same node started failing. Buckets are now per `(service, peer)`.
+
+> **It can only LOWER the rate.** `[limits].rate_limit_per_min` is a hard ceiling — a larger value
+> here is clamped, not honoured, and neither a config edit nor a `register_service` call can raise
+> it.
+>
+> **`0` is a startup error, and does NOT mean unlimited here.** Note the asymmetry with
+> `[limits].blob_bytes_per_min`, where `0` *does* mean unlimited: a `0` rate would floor to
+> 1 request/minute — the most restrictive setting there is — so it is refused rather than silently
+> giving an operator the opposite of what they asked for.
+
+**Changing it needs a daemon restart to affect an OPEN session.** A backend captures its limiter
+when the registry is built, so a session already in flight keeps the old rate until it ends — and
+MCP sessions are long-lived by design. New sessions pick up the change on the next reload.
+
+**Observing your remaining budget is not implemented.** #63's second ask is still open: a caller
+learns the limit by receiving `-32053`, not by querying it.
+
+**What this changes about the old guarantee.** `[limits].rate_limit_per_min` used to bound a peer's
+*aggregate* rate across every mount. It now bounds a peer's rate **per service**, so the aggregate is
+bounded by (services that peer is granted) × (their limits) — both operator-chosen, neither
+peer-influenced. That is a real weakening, and it is the minimum one that delivers the isolation:
+also consulting a shared bucket would restore the old ceiling and restore the starvation with it.
 
 ## A complete example
 

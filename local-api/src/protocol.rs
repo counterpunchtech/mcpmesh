@@ -1847,7 +1847,7 @@ pub const API_VERSION: &str = "1.40";
 /// several minors at once, read this block end to end AND the release notes, not the diff.
 ///
 /// That class is bigger than it looks: **10, 17, 21, 22, 23, 24 and 37 all shipped with no change
-/// to any type in this file** — they moved meaning, not shape. Seven of the thirty-nine, and 37 is
+/// to any type in this file** — they moved meaning, not shape. Seven of the forty, and 37 is
 /// a SECURITY fix, which is the case where a consumer most needs the guard. 38 adds a field, but
 /// its REAL content is a meaning change to `reachable` — the field exists so the new meaning is
 /// observable at all. A downstream

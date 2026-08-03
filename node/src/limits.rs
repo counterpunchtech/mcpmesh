@@ -276,13 +276,21 @@ struct ServiceBucket {
     limiter: Arc<RateLimiter>,
 }
 
-/// Cap on distinct service names tracked (#63). Beyond it the least-recently-used entry is evicted,
+/// Cap on distinct service names tracked (#63). Beyond it an entry is evicted,
 /// exactly as the endpoint map does — NOT a fall back to the global limiter, which would RAISE the
 /// rate of a service configured lower and undo the only-lower rule.
 ///
-/// Eviction resets that service's buckets. Reaching it needs more than this many distinct names,
-/// which is a LOCAL, owner-only control-socket operation (the socket is 0600) — a caller who can do
-/// it already owns the node.
+/// Eviction resets that service's buckets. Reaching it needs more than this many distinct names
+/// **ever seen** — entries are not removed when a service is unregistered or drops out of config —
+/// which is a LOCAL, owner-only control-socket operation (the socket is 0600); a caller who can do
+/// it already owns the node. Note a REMOTE peer can trigger the reload that re-creates entries (a
+/// first-time pairing grant reaches `reload_services_from_disk`), so on a node whose map is already
+/// full that chains into remote-triggered bucket resets.
+///
+/// **Aggregate memory.** Each entry carries its own endpoint map at `MAX_BUCKETS`, so the bundle's
+/// worst case is this many × `MAX_BUCKETS` buckets — 256× the pre-#63 ceiling. Per-map bounds and
+/// `IDLE_TTL` pruning are unchanged; what moved is the total, and a quiet service retains its map
+/// until something calls `check` on it again.
 const MAX_TRACKED_SERVICES: usize = 256;
 
 impl MeshLimiters {
@@ -345,7 +353,12 @@ impl MeshLimiters {
     }
 
     /// The effective per-minute rate a service would get (#63) — the clamp, without building a
-    /// limiter. Reported on the reachability pong so a caller can pace instead of retrying.
+    /// limiter. THE single place the ceiling is applied, so the config and control paths cannot
+    /// enforce it differently.
+    ///
+    /// Not reported anywhere yet. #63's second ask — "a way to observe remaining budget so an
+    /// embedder can pace rather than retry" — is NOT implemented; a consumer still learns the limit
+    /// only by hitting `-32053`.
     pub fn effective_rpm(&self, configured: Option<u32>) -> Option<u32> {
         self.global_rpm
             .map(|global| configured.map_or(global, |c| c.min(global)))
@@ -799,9 +812,14 @@ mod tests {
                 "service {i} past the cap must still enforce its OWN 1/min, not the global 100"
             );
         }
-        assert!(
-            ml.services.lock().expect("not poisoned").len() <= MAX_TRACKED_SERVICES,
-            "the map must stay bounded"
+        // Bounded AND bounded-in-damage. `<= cap` alone passed a `map.clear()` on every cap hit,
+        // which wipes every service's buckets for every peer — a far bigger reset than the single
+        // eviction this is meant to be.
+        let len = ml.services.lock().expect("not poisoned").len();
+        assert_eq!(
+            len, MAX_TRACKED_SERVICES,
+            "the map must sit AT the cap after overflowing it — a smaller size means eviction \
+             removed more than the one entry it needed to, resetting buckets it had no reason to"
         );
     }
 

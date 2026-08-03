@@ -204,6 +204,9 @@ async fn boot_node(paths: NodePaths, config: Option<Config>) -> Result<BootedNod
     // startup error rather than a node that silently pongs to everyone while its operator believes
     // they are hidden. A privacy knob that fails open is worse than no knob.
     let presence = presence_mode(&cfg.network)?;
+    // #63: a `0` per-service rate is the most restrictive setting there is, not unlimited. Refused
+    // before binding, like every other config error.
+    validate_service_rates(&cfg)?;
     let endpoint = build_endpoint(secret, &cfg.network, roster_mode).await?;
     let our_id = endpoint.id();
 
@@ -801,6 +804,23 @@ fn build_transport_config(
 /// These knobs are validated inside `build_endpoint`, which doctor must never call — it is
 /// read-only and binding a socket is not. This is the same validation with the endpoint left out,
 /// so the two cannot drift: both go through `build_transport_config`.
+/// Reject `[services.<name>].rate_limit_per_min = 0` (#63 gate).
+///
+/// `RateLimiter::per_minute` floors at 1, so `0` silently became **1 request/minute** — while
+/// `docs/config.md` said it was rejected, AND while `blob_bytes_per_min = 0` in the same file means
+/// UNLIMITED. An operator writing `0` expecting "no limit" got the most restrictive setting there
+/// is. Refused at boot, where the person who wrote it finds out.
+pub fn validate_service_rates(cfg: &crate::config::Config) -> Result<()> {
+    for (name, svc) in &cfg.services {
+        anyhow::ensure!(
+            svc.rate_limit_per_min != Some(0),
+            "[services.{name}] rate_limit_per_min must be at least 1 \
+             (omit it to inherit [limits].rate_limit_per_min; 0 does NOT mean unlimited here)"
+        );
+    }
+    Ok(())
+}
+
 pub fn validate_transport_config(net: &crate::config::NetworkCfg) -> Result<()> {
     // #89: presence_mode rides the same pre-flight — doctor must not bless a config whose privacy
     // knob the daemon will reject, and a typo there is exactly the case where the operator most
@@ -1501,6 +1521,39 @@ mod tests {
             "iroh no longer caps the per-path keepalive at {IROH_MAX_PATH_KEEP_ALIVE_SECS}s. \
              Raising keep_alive_secs may now genuinely reduce ping traffic — revisit the refusal \
              in build_transport_config and the metered-link note in docs/config.md. Got: {over}"
+        );
+    }
+
+    /// #63 gate: `rate_limit_per_min = 0` on a service must be a STARTUP ERROR.
+    ///
+    /// `RateLimiter::per_minute` floors at 1, so `0` silently became 1 request/minute — the most
+    /// restrictive setting there is — while `docs/config.md` claimed it was rejected AND while
+    /// `blob_bytes_per_min = 0` in the same file means UNLIMITED. An operator writing `0` expecting
+    /// "no limit" got the exact opposite, with nothing said.
+    #[test]
+    fn a_zero_service_rate_is_a_startup_error() {
+        let cfg = |rate: &str| {
+            crate::config::Config::from_toml_str(&format!(
+                "[services.kb]\nsocket = \"/run/kb.sock\"\nallow = []\n{rate}"
+            ))
+            .unwrap()
+        };
+        validate_service_rates(&cfg("")).expect("an absent rate inherits the global");
+        validate_service_rates(&cfg("rate_limit_per_min = 1\n")).expect("1 is the floor and legal");
+        validate_service_rates(&cfg("rate_limit_per_min = 500\n"))
+            .expect("above the ceiling is CLAMPED later, not refused here");
+
+        let e = validate_service_rates(&cfg("rate_limit_per_min = 0\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("kb") && e.contains("at least 1"),
+            "the error must name the service and the floor: {e}"
+        );
+        assert!(
+            e.contains("does NOT mean unlimited"),
+            "and correct the reading, since `blob_bytes_per_min = 0` in the same file DOES mean \
+             unlimited: {e}"
         );
     }
 

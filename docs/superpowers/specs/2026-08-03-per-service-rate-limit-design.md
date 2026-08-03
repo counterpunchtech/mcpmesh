@@ -96,11 +96,36 @@ one is now backing off further than it needs to.
 7. `MeshLimiters::unlimited()` stays unlimited per-service.
 8. `0` is refused.
 
-Mutation, seven run and seven caught: dropping the clamp fails 2 and 5; re-creating the limiter on
+Mutation, eleven run and eleven caught: dropping the clamp fails 2 and 5; re-creating the limiter on
 every reload fails 3; the config-writer dropping the field fails 6; `unlimited()` carrying a real
 rate fails 7; the map falling back to the global past the cap fails the bounded-ness test.
 
-**Two escaped on the first pass, both the call-site-vs-helper trap:**
+### The gate round: three more escaped, and one of them was the whole feature
+
+**`tracked_rpm` was not the call-site assertion it claimed to be.** It reads the limiter *map*, so
+it proves `for_service` was CALLED with the right arguments — and nothing about the returned `Arc`
+being installed. `{ let _ = limiters.for_service(name, rate); limiters.requests.clone() }` passed
+the entire workspace with every backend back on one shared bucket, i.e. with the bug fully restored.
+A side-effect assertion is not a call-site assertion. The backend constructors now return the
+concrete type so a test can `Arc::ptr_eq` the limiter the backend actually holds.
+
+**The PERSISTENT register path dropped the rate**, and `ephemeral` defaults to `false`, so that is
+the default path. The new tests used `ephemeral: true` exclusively and the config-writer test called
+the writer directly, so nothing crossed the handler. One step over from the #55 shape again.
+
+**`rate_limit_per_min = 0` silently became 1/min.** `RateLimiter::per_minute` floors at 1, so the
+most restrictive setting possible — while `docs/config.md` claimed `0` was rejected AND while
+`blob_bytes_per_min = 0` in the same file means UNLIMITED. Now a startup error that corrects the
+reading. The eviction test also only asserted `len() <= cap`, so wiping the whole map passed; it now
+pins that the map sits AT the cap.
+
+Also corrected: three doc sites still asserting the old invariant verbatim; a rustdoc claiming
+`effective_rpm` is "reported on the reachability pong", which is a surface that does not exist
+(**#63's second ask is NOT implemented** — a consumer still learns the limit only by receiving
+`-32053`); the 256× aggregate memory bound; that a rate change does not reach an already-open
+session; and that map entries are never removed on unregister, so the cap counts names *ever seen*.
+
+**Two escaped on the first pass before that, both the same trap:**
 
 - **Sharing one limiter across services.** The starvation test called `for_service` directly, so
   reverting `build_services` to the shared `requests` limiter — the entire bug — passed it.
