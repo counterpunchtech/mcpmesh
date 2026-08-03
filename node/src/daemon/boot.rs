@@ -413,6 +413,9 @@ async fn boot_node(paths: NodePaths, config: Option<Config>) -> Result<BootedNod
                     // `unlimited()` on a OnceCell miss, so a wiring mistake would silently disable
                     // a security control. Fail closed, like everything else here (#84a review).
                     limiters.clone(),
+                    // #82 ask 2: the mesh's transfer ring, so served-side progress reaches every
+                    // `subscribe` consumer.
+                    Some(mesh.blob_bcast.clone()),
                 )
                 .await
                 {

@@ -108,6 +108,22 @@ downstreams break. `api_minor` **40 → 41**: a consumer must guard on `>= 41` b
    weaken authorization.
 6. An aborted transfer emits `Aborted`, not a silent stop.
 
-Mutation: dropping the coalescing fails 2; leaving `get: Intercept` fails 1 and 4; discarding
-`GetProgress` fails 4; broadcasting `Completed` without the final count fails 3; downgrading
-`InterceptLog` to `NotifyLog` fails 5.
+Mutation, five run and five caught: dropping the coalescing gate fails 2; downgrading
+`InterceptLog` to `NotifyLog` fails 5; dropping the `Aborted` emit fails 6; dropping the
+final-count clamp fails 3.
+
+**Test 3 was vacuous in its first form** — the fixture's chunk loop landed exactly on the size, so
+`done` already equalled the total when `Completed` arrived and the clamp was a no-op. It now uses a
+deliberately LAGGING last progress (400 of 1000), which is the case the clamp exists for: the stride
+skips the tail, so a consumer rendering the last `Progress` as the total stops at 40% on a fully
+successful transfer.
+
+## A regression the existing AC tests caught
+
+Under `InterceptLog` the per-request update receiver **must be drained**. The first version spawned
+the drainer only when a broadcast existed, so every fixture built with `transfers: None` dropped
+`rx` — which makes the provider's own `transfer_started` send fail and **aborts the transfer**. An
+authorized fetch failed with "fetch app blob". `granted_caller_fetches_but_ungranted_and_uncontained_are_denied`
+failed immediately, which is the value of having an authorization test that drives real bytes.
+
+The receiver is now drained unconditionally; only the FRAMES are optional.
