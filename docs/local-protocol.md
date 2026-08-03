@@ -7,7 +7,7 @@ named pipe on Windows. Anything that can open the endpoint and parse JSON can sp
 language — [`local-api/examples/status.py`](../local-api/examples/status.py) is a complete client
 in ~60 lines of dependency-free Python.
 
-> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.41`, `api_minor` `41`) and evolves
+> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.42`, `api_minor` `42`) and evolves
 > **additively** (see [Versioning](#versioning)), but until a stable release this document — like the
 > wire format itself — may change without a migration path. Pin the mcpmesh version you build
 > against. Source of truth is the Rust in [`local-api/`](../local-api/src/protocol.rs); where this
@@ -149,6 +149,8 @@ Methods split into two groups by audience:
 | `audit_list` | `{since?, until?, kind?, peer?, limit?, offset?}` — read this node's **local** audit records, filtered (AND-combined) and paged, `api_minor >= 27` (#88): the "show me everything you hold about me" verb. `since`/`until` are inclusive `YYYY-MM` month keys (the rotation unit). `kind` is one of `session_open` / `session_close` / `request` / `blob_fetch` / `trust` — an unknown kind **errors** rather than silently matching all. `limit` defaults to 500 and is **clamped to 1000** (the response is one JSON frame; `blob_list`'s minor-20 lesson). `total` counts ALL matches, so a caller pages without a second counting call. | `{records:[AuditRecord…], total}` chronological (oldest month first) |
 | `invite` | `{services:[…], max_uses?, peer_nickname?}` — mint a pairing invite. **`peer_nickname`** (#87, `api_minor >= 39`) is YOUR local name for whoever redeems, overriding the nickname they claim for themselves — for two same-model laptops, the fix that does not require the other person to rename their machine. Never sent to them (it is stripped from the invite line) and it does **not** bypass the collision check: an alias that itself collides is refused identically. Rejected with `max_uses > 1`, since one alias applied to every redeemer would collide on the second redemption. **Outstanding invites survive a daemon restart** (`api_minor >= 34`, #87b): they are persisted, so `expires_at_epoch` is the real lifetime rather than an upper bound on process lifetime, and a mint that cannot be persisted is an ERROR rather than an invite that will quietly not survive. **`max_uses`** (#87, `api_minor >= 35`) makes it redeemable that many times, each redemption running its OWN SAS ceremony and writing its own peer rows — N independent pairings sharing one secret, never a group identity. Absent = 1. `0` is rejected (`-32602`); above `MAX_INVITE_USES` (64) is clamped, and `uses_remaining` in the result is the value ACTUALLY applied — read it rather than assuming your request was honoured. Sending `max_uses` to an `api_minor < 35` daemon FAILS with `-32602 unknown field` rather than degrading to single-use (params are strict), so omit it unless you have checked. | `{invite_line, expires_at_epoch, uses_remaining}` |
 | `pair` | `{invite_line, as_nickname?}` — **`as_nickname`** (#87, `api_minor >= 39`) is YOUR local name for the inviter, overriding the one its invite suggests. This is how you resolve a name collision yourself instead of asking them to re-mint; `set_nickname` is not the answer, it rewrites your own GLOBAL self-name. Never sent to the inviter, and it does not bypass the collision check. | `{peer_nickname, sas_code, services:[…], app_label?, peer_user_id?}` — `app_label` echoes any opaque label the inviter attached (#31); `peer_user_id` is the inviter's stable `b64u:` identity when it presented a binding (#30). **Grants MUTUALLY (#43):** redemption grants the inviter access to ALL services THIS (redeemer) node serves — under the same stable-principal rule as the inviter-side grant — so one ceremony admits both directions. Fails (no dial attempted) if the invite's suggested nickname is already yours for a *different* peer; see [Nickname collisions](#nickname-collisions) |
+| `peer_endorse` | `{subject, subject_user_id?}` — **produce** an endorsement of a peer for someone else to redeem (#65, `api_minor >= 42`). Signs with your user key; it changes nothing about your own trust in the subject. Hand both result fields to the recipient. | `{endorsed_by, evidence}` |
+| `peer_introduce` | `{subject, endorsed_by, evidence, subject_user_id?, subject_binding?, nickname}` — install a peer from a **signed endorsement** by someone you are already paired with (#65, `api_minor >= 42`). Onboards a small group in O(N) instead of O(N²) two-human ceremonies. **It installs IDENTITY, not authorization**: service access stays principal-keyed in config (#38) and an explicit, separate act. `endorsed_by` must be the `user_id` of a peer you are **currently paired** with, so the chain terminates at a ceremony you performed yourself — unpairing them revokes their power to introduce, even though the signature stays cryptographically valid, and an **introduced peer cannot introduce others**. `subject_user_id` requires `subject_binding` (the subject's OWN device→user binding): a `user_id` is authorization-bearing and public, so an endorser alone must not be able to attach one. Refused for: an unpaired endorser, a signature naming a different subject, your own endpoint id, a peer you are **already paired with** (it would replace a SAS-proven row with a weaker one), or a nickname you already use for a different peer. Recorded as a `trust` audit event naming the endorser. | `{}` |
 | `peer_remove` | `{nickname}` | `{}` (ack) |
 | `peer_rename` | `{to, user_id?, nickname?}` — rename a person by `user_id`, else a provisional contact by `nickname` | `{}` (ack) |
 | `set_nickname` | `{nickname}` — rename **this node** live (#37, `api_minor >= 2`): validated (trimmed non-empty, no `/`), persisted to `[identity].nickname` under the daemon's own config lock (no lost-update window against a concurrent grant/registration), and effective for FUTURE invites/presentations immediately — no restart. Display-only: peers keep the nickname they stored at pairing time until a re-invite | `{}` (ack) |
@@ -385,7 +387,38 @@ than the connect-register-disconnect pattern (which would tear the registration 
 An ephemeral name that collides with an existing persistent (config) service is refused. Everything
 else — the `allow` list, dialing, invites granting it — works identically to a persistent service.
 
-### Reserved / internal methods
+#### Introductions and what they give up (#65)
+
+Pairing's SAS defends **first contact** against a man-in-the-middle: two humans read the same words
+aloud, so a substituted key is caught. `peer_introduce` replaces that defence with a different one —
+the endorser's signature — which means you are trusting:
+
+1. that the endorser's key is theirs (established when *you* paired with them, with a SAS), **and**
+2. **their judgment and their key hygiene.** A compromised endorser can introduce anyone.
+
+That is a real reduction, and it is the point of the feature. What bounds it is the **`user_id`
+discipline**, not the empty service list: `[services.*].allow` matches on a peer's principals — its
+`eid:` and its `user_id` — so an introduction may only set a `user_id` the **subject itself proved**
+with its own device binding (`subject_binding`). An endorser vouching for a `user_id` is not enough,
+because a `user_id` is public: without the subject's proof, an endorser could name a *victim's*
+`user_id` for an attacker's endpoint and the attacker would inherit that victim's grants.
+
+With that in place, the worst a compromised endorser achieves is that your node knows an `eid:` it
+should not — and an `eid:` grant is a deliberate act about that specific peer. Grant deliberately, as
+you would for any peer.
+
+Two further limits, both deliberate:
+
+- **Introductions do not chain.** An introduced peer cannot introduce others; the endorser must be
+  someone you *paired* with. Otherwise the chain reaches unbounded depth and terminates at no
+  ceremony you performed.
+- **An introduction cannot overwrite a paired peer.** It is refused rather than replacing a row
+  proven by a SAS with a weaker one.
+
+If you need the stronger guarantee for a particular person, pair with them directly — the two paths
+coexist and a later pairing simply updates the same row.
+
+## Reserved / internal methods
 
 The daemon answers two further methods that are **not** part of the stable surface; they are listed
 here only so a third-party implementer is not surprised to see them on the wire:
@@ -662,7 +695,13 @@ when it applies:
   `status` (`"ok"` \| `"error"`), and `latency_ms`.
 - On a `blob_fetch` or `trust`: `target` — the blob's `"blake3:…"` hash, or the trust operation's
   target (a nickname or `org/serial`) — and, on a `trust`, `event` (the trust verb: `pair`, `unpair`,
-  `roster_install`, `revoke`).
+  `roster_install`, `revoke`, `peer_introduce`).
+
+  **`peer_introduce` (#65) puts the ENDORSER in `principal`, not the subject** — the one deliberate
+  exception. An introduction's security question is *who vouched for this peer*, and the subject is
+  already in `target`. So `audit_list --peer <endorser>` finds every introduction that endorser
+  caused, which is the query worth running; filtering by the subject's own principal will not find
+  it.
 
 A **failed dial** surfaces as a `session_open` with `status: "error"` — it reached no backend, so it
 is otherwise never session-audited; this frame records the attempted-and-failed reach.
@@ -1191,7 +1230,7 @@ things:
   (#87) are `api_minor >= 39`; `RegisterServiceParams.rate_limit_per_min` and the per-service
   meaning of `-32053` (#63) are `api_minor >= 40` — below that `deny_unknown_fields` rejects the
   whole request, so guard before sending the field; `StreamFrame::BlobTransfer` (#82) is
-  `api_minor >= 41`, and being a server-PUSHED frame it simply never arrives below that — below that `deny_unknown_fields` rejects the whole request, so
+  `api_minor >= 41`; the `peer_introduce` + `peer_endorse` verbs (#65) are `api_minor >= 42` — below that they answer `-32601 unknown method`. For REQUEST fields, `deny_unknown_fields` rejects the whole request, so
   guard before offering an alias field in a UI.
   `api_minor` is itself additive: a pre-1.1 daemon omits it and it reads as `0`.
 

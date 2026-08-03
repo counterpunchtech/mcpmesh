@@ -620,6 +620,72 @@ pub struct PeerAddParams {
     pub allow: Vec<String>,
 }
 
+/// Params of [`Request::PeerEndorse`] (#65): vouch for a peer so a third party can install them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerEndorseParams {
+    /// The subject's endpoint id, `eid:<hex>` — usually a peer you are paired with, though the
+    /// daemon does not require that: an endorsement is YOUR statement, and the recipient decides
+    /// what it is worth.
+    pub subject: String,
+    /// The subject's user key, `b64u:`, when you are also vouching for that. The recipient will
+    /// additionally require the SUBJECT's own device binding before trusting it — see
+    /// [`PeerIntroduceParams::subject_binding`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_user_id: Option<String>,
+}
+
+/// Result of [`Request::PeerEndorse`] (#65) — hand both fields to the recipient.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerEndorseResult {
+    /// YOUR user id, `b64u:` — what the recipient passes as `endorsed_by`. They must already be
+    /// paired with you for it to resolve.
+    pub endorsed_by: String,
+    /// The signature, `b64u:` — what the recipient passes as `evidence`.
+    pub evidence: String,
+}
+
+/// Params of [`Request::PeerIntroduce`] (#65): install a peer vouched for by someone you are
+/// already paired with.
+///
+/// The endorsement replaces pairing's SAS with the endorser's signature, so you are trusting that
+/// endorser's judgment and key hygiene as well as their identity. It buys identity resolution only
+/// — see [`Request::PeerIntroduce`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerIntroduceParams {
+    /// The subject's endpoint id, `eid:<hex>` — who is being introduced.
+    pub subject: String,
+    /// The endorser's user public key, `b64u:`. MUST be the `user_id` of a CURRENTLY paired peer:
+    /// the chain has to terminate at someone you paired with yourself, so an endorsement from a
+    /// stranger — or from someone you have since unpaired — is refused.
+    pub endorsed_by: String,
+    /// The endorser's signature over the domain-separated preimage, `b64u:`.
+    pub evidence: String,
+    /// The subject's OWN user key, `b64u:`, so several of the subject's devices resolve to one
+    /// person. Part of the endorser's signed statement, so it cannot be added or removed after
+    /// the fact.
+    ///
+    /// **Requires `subject_binding` too, and is REFUSED without it.** A `user_id` is
+    /// authorization-bearing — service `allow` lists match on it — so the endorser vouching for it
+    /// is not enough: an endorser could otherwise name a *victim's* `user_id` (which is public, on
+    /// `status` and every audit record) for an attacker's endpoint, and the attacker would inherit
+    /// that victim's grants. The subject must prove the key is theirs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_user_id: Option<String>,
+    /// The SUBJECT's own device→user binding for `subject_user_id`, `b64u:` — the same signature a
+    /// peer presents at pairing (`mcpmesh/join/device-binding/1`), proving *it* controls that user
+    /// key and that the key is bound to *this* endpoint.
+    ///
+    /// Two independent signatures are required for a `user_id`, and they say different things: the
+    /// endorser's says "I vouch for this endpoint", the subject's says "this user key is mine".
+    /// Neither alone is sufficient.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_binding: Option<String>,
+    /// YOUR local name for the subject. Same rules and the same collision guard as pairing (#87).
+    pub nickname: String,
+}
+
 /// Params of [`Request::OpenSession`]: the `peer/service` target to dial. Both fields are
 /// defaultable — an empty target simply fails the dial (a clean `-32055` error).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -936,6 +1002,25 @@ pub enum Request {
     /// (raw endpoint identifiers otherwise never cross this socket); NOT part of the stable
     /// vocabulary — do not build on it. Tag `"peer_add"`.
     PeerAdd(PeerAddParams),
+    /// Install a peer from a SIGNED endorsement by someone you are already paired with (#65) —
+    /// O(N) onboarding for a small group, without a fresh two-human SAS ceremony per pair.
+    ///
+    /// **It installs IDENTITY, never AUTHORIZATION.** The subject becomes resolvable; it is granted
+    /// nothing. Service access stays principal-keyed in config (#38) and an explicit, separate act.
+    /// That is what bounds the feature: a compromised endorser can make you KNOW about an attacker,
+    /// it cannot make you SERVE one.
+    ///
+    /// Unlike [`PeerAdd`](Self::PeerAdd) — which is reserved precisely because the caller merely
+    /// ASSERTS an id — this is verifiable: the endorsement is checked against a user key you
+    /// already hold from pairing with the endorser. Tag `"peer_introduce"`.
+    PeerIntroduce(PeerIntroduceParams),
+    /// PRODUCE an endorsement of a peer, for someone else to redeem with
+    /// [`PeerIntroduce`](Self::PeerIntroduce) (#65). The other half of an introduction: without it
+    /// nothing can generate `evidence`, and the install half is unusable.
+    ///
+    /// Signs with THIS node's user key, so the result is only meaningful to someone who has paired
+    /// with you. Endorsing does not change your own trust in the subject. Tag `"peer_endorse"`.
+    PeerEndorse(PeerEndorseParams),
     /// Open a mesh session to `peer/service`; the daemon dials and pipes.
     /// Distinct from the proxy's job: this returns a session the client streams.
     /// Named `open_session` rather than `connect` to avoid colliding
@@ -1361,6 +1446,11 @@ pub struct AuditRecord {
     /// its allow entry therefore goes through the `status` peers list (which carries BOTH the
     /// device principal and the `user_id`), not string equality on this field alone.
     ///
+    /// **`peer_introduce` (#65) is the one exception, deliberately:** it carries the ENDORSER, not
+    /// the subject. An introduction's whole security question is *who vouched for this peer*, and
+    /// the subject is already in `target`. So `audit_list --peer <endorser>` finds the
+    /// introductions that endorser caused, which is the query an operator actually runs.
+    ///
     /// Deliberately absent on: `unpair` (may tear down several devices — no single subject),
     /// `roster_install` (purely local), and the failed-outbound-dial session record (our own
     /// dial, not a gate-resolved caller). Absent on every record written before 0.24.0.
@@ -1783,7 +1873,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   thirty have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.41";
+pub const API_VERSION: &str = "1.42";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -1869,7 +1959,10 @@ pub const API_VERSION: &str = "1.41";
 /// refusals — expired line, no live invite, inviter unreachable, id mismatch, name conflict, and
 /// the deliberately-opaque refusal. `ERR_NICKNAME_TAKEN` had been the only coded pairing failure,
 /// so every other one arrived as `-32000` and an embedder could either forward our prose to end
-/// users or substring-match it (#159); to 41 with `StreamFrame::BlobTransfer` — live app-blob
+/// users or substring-match it (#159); to 42 with the `peer_introduce` + `peer_endorse` verbs — install a peer from a
+/// SIGNED endorsement by someone you are already paired with, so a small group onboards in O(N)
+/// instead of O(N²) two-human ceremonies (#65). It installs IDENTITY only and grants nothing, which
+/// is what bounds it. Guard on `>= 42`; to 41 with `StreamFrame::BlobTransfer` — live app-blob
 /// transfer progress on both the serving and fetching side (#82 ask 2), so an embedder can draw a
 /// real progress bar instead of an indeterminate spinner. Guard on `>= 41` before expecting the
 /// frame. NOTE what it does NOT bring: `blob_fetch` still blocks its whole control connection for
@@ -1909,7 +2002,7 @@ pub const API_VERSION: &str = "1.41";
 /// its REAL content is a meaning change to `reachable` — the field exists so the new meaning is
 /// observable at all. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 41;
+pub const API_MINOR: u32 = 42;
 
 #[cfg(test)]
 mod tests {
@@ -2799,6 +2892,58 @@ mod tests {
     /// The reserved/internal `peer_add` rides the SAME typed vocabulary as every other method —
     /// `{ "method": "peer_add", "params": { nickname, endpoint_id, allow } }` — with `allow`
     /// defaulting to empty when absent.
+    /// #65: the wire tags for the introduction pair. The serde tag must equal the dispatch string
+    /// the daemon matches on — nothing else checks that they agree.
+    #[test]
+    fn peer_introduce_and_endorse_roundtrip() {
+        let r = Request::PeerIntroduce(PeerIntroduceParams {
+            subject: "eid:aa".into(),
+            endorsed_by: "b64u:carol".into(),
+            evidence: "b64u:sig".into(),
+            subject_user_id: Some("b64u:bob".into()),
+            subject_binding: Some("b64u:bind".into()),
+            nickname: "bob".into(),
+        });
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(
+            v["method"], "peer_introduce",
+            "the tag must match the daemon's dispatch string exactly"
+        );
+        assert_eq!(v["params"]["subject"], "eid:aa");
+        assert_eq!(v["params"]["subject_binding"], "b64u:bind");
+        assert_eq!(serde_json::from_value::<Request>(v).unwrap(), r);
+
+        // The two proof fields are OPTIONAL on the wire and omitted when absent.
+        let minimal = Request::PeerIntroduce(PeerIntroduceParams {
+            subject: "eid:aa".into(),
+            endorsed_by: "b64u:carol".into(),
+            evidence: "b64u:sig".into(),
+            subject_user_id: None,
+            subject_binding: None,
+            nickname: "bob".into(),
+        });
+        let v = serde_json::to_value(&minimal).unwrap();
+        assert!(v["params"].get("subject_user_id").is_none());
+        assert!(v["params"].get("subject_binding").is_none());
+        assert_eq!(serde_json::from_value::<Request>(v).unwrap(), minimal);
+
+        let e = Request::PeerEndorse(PeerEndorseParams {
+            subject: "eid:aa".into(),
+            subject_user_id: None,
+        });
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["method"], "peer_endorse");
+        assert_eq!(serde_json::from_value::<Request>(v).unwrap(), e);
+
+        let res = PeerEndorseResult {
+            endorsed_by: "b64u:me".into(),
+            evidence: "b64u:sig".into(),
+        };
+        let v = serde_json::to_value(&res).unwrap();
+        assert_eq!(v["endorsed_by"], "b64u:me");
+        assert_eq!(serde_json::from_value::<PeerEndorseResult>(v).unwrap(), res);
+    }
+
     #[test]
     fn peer_add_request_roundtrip() {
         let r = Request::PeerAdd(PeerAddParams {

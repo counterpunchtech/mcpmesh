@@ -11,11 +11,11 @@ use crate::codec::{FrameReader, Inbound, MAX_FRAME_BYTES, write_frame};
 use crate::protocol::{
     AuditSummaryResult, BackendSpec, BlobFetchParams, BlobFetchResult, BlobGrantParams,
     BlobPublishParams, BlobPublishResult, BlobScopeList, Hello, InviteParams, InviteResult,
-    OpenSessionParams, OrgJoinParams, OrgJoinResult, PairParams, PairResult, PeerRemoveParams,
-    PeerRenameParams, PeerServicesParams, PeerServicesResult, RegisterServiceParams, Request,
-    RosterInstallParams, RosterInstallResult, ServiceAllowParams, SetAppMetadataParams,
-    SetNicknameParams, SetRelaysParams, SetRelaysResult, SetRosterUrlParams, StatusResult,
-    StreamFrame, UnregisterServiceParams,
+    OpenSessionParams, OrgJoinParams, OrgJoinResult, PairParams, PairResult, PeerEndorseParams,
+    PeerEndorseResult, PeerIntroduceParams, PeerRemoveParams, PeerRenameParams, PeerServicesParams,
+    PeerServicesResult, RegisterServiceParams, Request, RosterInstallParams, RosterInstallResult,
+    ServiceAllowParams, SetAppMetadataParams, SetNicknameParams, SetRelaysParams, SetRelaysResult,
+    SetRosterUrlParams, StatusResult, StreamFrame, UnregisterServiceParams,
 };
 use crate::transport::{connect_local, split_local};
 
@@ -256,6 +256,34 @@ impl ControlClient {
             "invite result",
         )
         .await
+    }
+
+    /// Produce an endorsement of `subject` for someone else to redeem (#65).
+    ///
+    /// Signs with THIS node's user key. It is a statement for the recipient — it changes nothing
+    /// about your own trust in the subject, and only resolves for someone paired with you.
+    pub async fn endorse_peer(
+        &mut self,
+        subject: &str,
+        subject_user_id: Option<String>,
+    ) -> Result<PeerEndorseResult, ClientError> {
+        self.request_typed(
+            Request::PeerEndorse(PeerEndorseParams {
+                subject: subject.to_string(),
+                subject_user_id,
+            }),
+            "peer endorse result",
+        )
+        .await
+    }
+
+    /// Install a peer from an endorsement by someone you are already paired with (#65).
+    ///
+    /// Installs IDENTITY, not authorization — the peer becomes resolvable and is granted nothing.
+    /// `subject_user_id` requires `subject_binding`, the subject's OWN device→user binding: a
+    /// `user_id` is authorization-bearing and public, so an endorser alone must not attach one.
+    pub async fn introduce_peer(&mut self, params: PeerIntroduceParams) -> Result<(), ClientError> {
+        self.request_ack(Request::PeerIntroduce(params)).await
     }
 
     /// Redeem a pairing invite; return the inviter's suggested nickname, the display-only SAS

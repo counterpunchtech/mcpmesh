@@ -47,8 +47,132 @@ pub fn verify_presented(
     Ok(encode_b64u(&user_pk))
 }
 
+/// Sign an introduction of `subject` (#65): "I, the holder of this user key, vouch that this
+/// endpoint id is that peer's."
+///
+/// Domain-separated from [`present`]: a device binding says "this endpoint is MINE", an
+/// introduction says "this endpoint is SOMEONE ELSE'S". Without separation a binding C made for its
+/// own device would verify as C endorsing that device to anyone.
+pub fn endorse(
+    user_key: &UserKey,
+    subject_endpoint_id: &[u8; 32],
+    subject_user_pk_b64u: Option<&str>,
+) -> Result<String, RosterError> {
+    let subject_pk = subject_user_pk_b64u.map(decode32).transpose()?;
+    let sig = crate::roster::sign::sign_introduction(
+        user_key.signing_key(),
+        subject_endpoint_id,
+        subject_pk.as_ref(),
+    );
+    Ok(encode_b64u(&sig))
+}
+
+/// Verify an introduction (#65). `endorser_pk_b64u` MUST be a key the caller already trusts — the
+/// daemon requires it to be a currently-paired peer's `user_id`, which is what terminates the trust
+/// chain at someone the operator paired with themselves.
+pub fn verify_endorsement(
+    endorser_pk_b64u: &str,
+    evidence_b64u: &str,
+    subject_endpoint_id: &[u8; 32],
+    subject_user_pk_b64u: Option<&str>,
+) -> Result<(), RosterError> {
+    let endorser_pk = decode32(endorser_pk_b64u)?;
+    let subject_pk = subject_user_pk_b64u.map(decode32).transpose()?;
+    let sig = decode_b64u(evidence_b64u)?;
+    crate::roster::sign::verify_introduction(
+        &endorser_pk,
+        subject_endpoint_id,
+        subject_pk.as_ref(),
+        &sig,
+    )
+}
+
+/// `b64u` → a 32-byte key, refusing anything else rather than truncating or padding.
+fn decode32(b64u: &str) -> Result<[u8; 32], RosterError> {
+    decode_b64u(b64u)?
+        .as_slice()
+        .try_into()
+        .map_err(|_| RosterError::BadSignature)
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// #65: an endorsement verifies only for the exact (endorser, subject) pair it was signed for.
+    #[test]
+    fn an_endorsement_binds_the_endorser_and_the_subject() {
+        let carol = user_key();
+        let carol_pk = encode_b64u(&carol.public_bytes());
+        let bob_eid = [0xBB; 32];
+
+        let ev = endorse(&carol, &bob_eid, None).unwrap();
+        verify_endorsement(&carol_pk, &ev, &bob_eid, None).expect("the real pair verifies");
+
+        // A DIFFERENT subject: no transplanting an endorsement onto another endpoint.
+        assert!(
+            verify_endorsement(&carol_pk, &ev, &[0xCC; 32], None).is_err(),
+            "an endorsement must not verify for a subject it does not name"
+        );
+        // A DIFFERENT endorser: the endorser's own key is in the preimage, so a signature cannot
+        // be lifted onto someone else's identity by supplying a mismatched `endorsed_by`.
+        let mallory = user_key();
+        assert!(
+            verify_endorsement(&encode_b64u(&mallory.public_bytes()), &ev, &bob_eid, None).is_err(),
+            "an endorsement must not verify under an endorser who did not sign it"
+        );
+        // The subject's user key is covered too: vouching for a user_id is part of the statement.
+        let bob_user = user_key();
+        let bob_user_pk = encode_b64u(&bob_user.public_bytes());
+        assert!(
+            verify_endorsement(&carol_pk, &ev, &bob_eid, Some(&bob_user_pk)).is_err(),
+            "an endorsement signed WITHOUT a subject user key must not verify WITH one"
+        );
+        let ev_with = endorse(&carol, &bob_eid, Some(&bob_user_pk)).unwrap();
+        verify_endorsement(&carol_pk, &ev_with, &bob_eid, Some(&bob_user_pk)).unwrap();
+        assert!(
+            verify_endorsement(&carol_pk, &ev_with, &bob_eid, None).is_err(),
+            "…and the reverse"
+        );
+    }
+
+    /// #65: THE domain-separation property. A device binding says "this endpoint is MINE"; an
+    /// introduction says "this endpoint is SOMEONE ELSE'S". Both are signed by a `UserKey`, so
+    /// without separation C's binding for its OWN device would verify as C endorsing that device
+    /// to anyone — turning every paired peer into an unwitting introducer of itself.
+    #[test]
+    fn a_device_binding_is_not_an_endorsement_and_vice_versa() {
+        let carol = user_key();
+        let carol_pk = encode_b64u(&carol.public_bytes());
+        let eid = [0xDD; 32];
+
+        let (binding_pk, binding_sig) = present(&carol, &eid);
+        assert!(
+            verify_endorsement(&binding_pk, &binding_sig, &eid, None).is_err(),
+            "a device BINDING must not verify as an introduction — otherwise every peer that ever \
+             presented one has silently endorsed its own endpoint to everybody"
+        );
+
+        let ev = endorse(&carol, &eid, None).unwrap();
+        assert!(
+            verify_presented(&carol_pk, &ev, &eid).is_err(),
+            "…and an introduction must not verify as a device binding"
+        );
+    }
+
+    /// A malformed key or signature must ERROR, never panic — this parses caller-supplied b64u.
+    #[test]
+    fn malformed_endorsement_inputs_error_rather_than_panic() {
+        let carol = user_key();
+        let ev = endorse(&carol, &[1u8; 32], None).unwrap();
+        let pk = encode_b64u(&carol.public_bytes());
+        for bad_pk in ["", "!!!!", "AAAA"] {
+            assert!(verify_endorsement(bad_pk, &ev, &[1u8; 32], None).is_err());
+        }
+        for bad_sig in ["", "!!!!", "AAAA"] {
+            assert!(verify_endorsement(&pk, bad_sig, &[1u8; 32], None).is_err());
+        }
+        assert!(endorse(&carol, &[1u8; 32], Some("not-b64u!!")).is_err());
+    }
     use super::*;
 
     fn user_key() -> UserKey {
