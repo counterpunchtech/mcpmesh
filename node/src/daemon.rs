@@ -361,6 +361,13 @@ pub struct MeshState {
     /// [`path_watch::commit_observation`] — are the only places that know which one ran, so the
     /// attribution is stamped at the `send` rather than guessed at the subscription.
     pub(crate) reach_bcast: tokio::sync::broadcast::Sender<ReachTransition>,
+    /// App-blob transfer progress (#82 ask 2). Its OWN ring, for the same reason `reach_bcast` is
+    /// separate from audit: a transfer emits many frames over its life and must not evict audit
+    /// records, which are the compliance surface.
+    ///
+    /// The producer COALESCES — iroh-blobs reports per ~16 KiB chunk, so an uncoalesced 4 GiB
+    /// transfer would push ~262k frames and every subscriber would see `Lagged`.
+    pub(crate) blob_bcast: tokio::sync::broadcast::Sender<BlobTransfer>,
     /// Monotonic probe ticket source (#58 review). Probes of one peer overlap and complete out of
     /// order; each takes a ticket at START so a slow earlier probe cannot overwrite a fast later
     /// one — see [`ReachEntry::seq`].
@@ -393,6 +400,25 @@ pub struct EphemeralService {
 /// records — a peer going up or down, not every request — so a shallow ring is ample; a subscriber
 /// that still falls behind gets the same `Lagged` frame the audit ring uses.
 const REACH_BROADCAST_DEPTH: usize = 64;
+
+/// Ring depth for app-blob transfer progress (#82). Deeper than the reachability ring: a transfer
+/// emits ~102 coalesced frames over its life and several can be in flight, so a shallow ring would
+/// make a subscriber that pauses briefly miss the middle of a transfer.
+const BLOB_BROADCAST_DEPTH: usize = 256;
+
+/// One coalesced app-blob transfer observation (#82), as it rides [`MeshState::blob_bcast`].
+///
+/// Carries the STABLE principal, never a display nickname (#38) — `control` maps it to
+/// `StreamFrame::BlobTransfer` unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobTransfer {
+    pub direction: mcpmesh_local_api::BlobDirection,
+    pub hash: String,
+    pub bytes_done: u64,
+    pub bytes_total: Option<u64>,
+    pub state: mcpmesh_local_api::BlobTransferState,
+    pub peer: Option<String>,
+}
 
 /// Cap on the [`MeshState::recent_pairings`] ring: enough for a burst of ceremonies (a person
 /// pairing several devices back-to-back) while keeping `status` output and memory tiny.
@@ -466,6 +492,7 @@ impl MeshState {
             reachability: std::sync::Mutex::new(std::collections::HashMap::new()),
             identity_conflict: std::sync::OnceLock::new(),
             reach_bcast: tokio::sync::broadcast::channel(REACH_BROADCAST_DEPTH).0,
+            blob_bcast: tokio::sync::broadcast::channel(BLOB_BROADCAST_DEPTH).0,
             // Same depth as the reachability ring: posture transitions are rarer still.
             self_net_bcast: tokio::sync::broadcast::channel(REACH_BROADCAST_DEPTH).0,
             self_net_change: std::sync::Mutex::new(None),
@@ -504,6 +531,13 @@ impl MeshState {
     /// opens the session, or the transition it exists to observe can land in the gap between open
     /// and subscribe and the test passes or fails on timing rather than on behaviour.
     #[doc(hidden)]
+    /// The app-blob transfer ring (#82), so an integration test can assert that frames produced by
+    /// the provider actually REACH a subscriber. Without it nothing pins the wiring: deleting the
+    /// `blob_frame` mapping passed the whole workspace.
+    pub fn blob_bcast_for_test(&self) -> &tokio::sync::broadcast::Sender<BlobTransfer> {
+        &self.blob_bcast
+    }
+
     pub fn reach_bcast_for_test(&self) -> &tokio::sync::broadcast::Sender<ReachTransition> {
         &self.reach_bcast
     }

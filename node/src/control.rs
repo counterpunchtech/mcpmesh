@@ -367,6 +367,9 @@ async fn run_subscription(
     let mut reach_rx = mesh.map(|m| m.reach_bcast.subscribe());
     // The self-network ring (#90), registered before the snapshot for the same gap-loss reason.
     let mut self_rx = mesh.map(|m| m.self_net_bcast.subscribe());
+    // The app-blob transfer ring (#82 ask 2), registered before the snapshot for the same
+    // gap-loss reason as the other two.
+    let mut blob_rx = mesh.map(|m| m.blob_bcast.subscribe());
     let snapshot = StreamFrame::Snapshot {
         active_sessions: audit.active_sessions(),
         reachability: mesh.map(crate::daemon::reachability_of).unwrap_or_default(),
@@ -397,6 +400,29 @@ async fn run_subscription(
         match r {
             Ok(record) => Some(StreamFrame::Event {
                 record: Box::new(record),
+            }),
+            Err(RecvError::Lagged(n)) => Some(StreamFrame::Lagged { dropped: n }),
+            Err(RecvError::Closed) => {
+                *closed = true;
+                None
+            }
+        }
+    }
+
+    /// The app-blob transfer-ring equivalent (#82 ask 2). The producer coalesces, so a `Lagged`
+    /// here means a genuinely slow consumer rather than a large transfer.
+    fn blob_frame(
+        r: Result<crate::daemon::BlobTransfer, RecvError>,
+        closed: &mut bool,
+    ) -> Option<StreamFrame> {
+        match r {
+            Ok(t) => Some(StreamFrame::BlobTransfer {
+                direction: t.direction,
+                hash: t.hash,
+                bytes_done: t.bytes_done,
+                bytes_total: t.bytes_total,
+                state: t.state,
+                peer: t.peer,
             }),
             Err(RecvError::Lagged(n)) => Some(StreamFrame::Lagged { dropped: n }),
             Err(RecvError::Closed) => {
@@ -454,19 +480,21 @@ async fn run_subscription(
     }
 
     let (mut closed_audit, mut closed_reach, mut closed_self) = (false, false, false);
+    let mut closed_blob = false;
     loop {
-        // Three independent rings — audit records, peer-reachability transitions (#58), and
+        // Four independent rings — audit records, peer-reachability transitions (#58), and
         // self-network transitions (#90) — merged here rather than at the source, so the audit
         // broadcast (which is the same call that appends to the on-disk log) keeps its schema
         // untouched. Lag on ANY ring reports the same `Lagged` frame and never drops the
         // subscriber.
-        if rx.is_none() && reach_rx.is_none() && self_rx.is_none() {
+        if rx.is_none() && reach_rx.is_none() && self_rx.is_none() && blob_rx.is_none() {
             return Ok(());
         }
         let frame = tokio::select! {
             r = tap(&mut rx) => audit_frame(r, &mut closed_audit),
             r = tap(&mut reach_rx) => reach_frame(r, &mut closed_reach),
             r = tap(&mut self_rx) => self_net_frame(r, &mut closed_self),
+            r = tap(&mut blob_rx) => blob_frame(r, &mut closed_blob),
         };
         // A tap whose sender is gone is dropped rather than ending the stream — the OTHERS may
         // still be healthy. When all are gone the check at the loop top returns.
@@ -477,6 +505,10 @@ async fn run_subscription(
         if closed_reach {
             reach_rx = None;
             closed_reach = false;
+        }
+        if closed_blob {
+            blob_rx = None;
+            closed_blob = false;
         }
         if closed_self {
             self_rx = None;

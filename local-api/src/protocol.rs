@@ -1534,11 +1534,36 @@ pub struct ActiveSession {
     pub principal: Option<String>,
 }
 
+/// Which side of an app-blob transfer a [`StreamFrame::BlobTransfer`] describes (#82).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlobDirection {
+    /// We are SERVING bytes to a peer that dialed our app-blob ALPN.
+    Serve,
+    /// We are FETCHING bytes from a peer, via `blob_fetch`.
+    Fetch,
+}
+
+/// Where an app-blob transfer is in its life (#82).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlobTransferState {
+    /// The transfer began; `bytes_total` is known from here on.
+    Started,
+    /// Bytes advanced. COALESCED — see [`StreamFrame::BlobTransfer`].
+    Progress,
+    /// Finished successfully. Carries the FINAL byte count.
+    Completed,
+    /// Ended without completing (peer went away, refused, or the store errored).
+    Aborted,
+}
+
 /// One frame of the [`Request::Subscribe`] stream (pairing liveness & health telemetry). Tagged on
 /// `type` (snake_case), so a frame is `{"type":"snapshot",...}` / `{"type":"event",...}` /
 /// `{"type":"lagged",...}`. `Event.record` is the [`AuditRecord`] verbatim, so the stream and the
 /// on-disk log carry ONE schema. The daemon serializes these; an embedding consumer deserializes
 /// them (see `docs/local-protocol.md` "Live event stream").
+///
 /// **`#[non_exhaustive]`**: a future frame kind must not break a downstream `match`. Adding
 /// `Reachability` in 0.13.0 DID break exhaustive matches — which is why that release is a MINOR,
 /// per `RELEASING.md`'s pre-1.0 rule that breaking changes bump the minor. Consumers now write a
@@ -1619,6 +1644,33 @@ pub enum StreamFrame {
     /// The subscriber fell `dropped` records behind the broadcast ring; the stream continues (a
     /// fresh reconnect would re-`Snapshot`). Never drops the subscriber — lag is reported, never fatal.
     Lagged { dropped: u64 },
+    /// An app-blob transfer advanced (#82). Emitted on BOTH sides: `Serve` while we send bytes to
+    /// a peer, `Fetch` while `blob_fetch` pulls them.
+    ///
+    /// **`Progress` is COALESCED, deliberately.** iroh-blobs reports progress per ~16 KiB chunk, so
+    /// a 4 GiB transfer would push ~262k frames through a bounded ring and every subscriber would
+    /// see `Lagged` — losing the audit events that share it. A frame is emitted on `Started`, on
+    /// `Completed`/`Aborted`, and on `Progress` only after at least `max(1 MiB, total/100)` more
+    /// bytes, so a transfer costs at most ~102 frames whatever its size.
+    ///
+    /// **Do not treat the last `Progress` as the total** — the final stride is usually skipped.
+    /// `Completed` carries the final `bytes_done`.
+    BlobTransfer {
+        direction: BlobDirection,
+        /// The blob's hash, hex.
+        hash: String,
+        bytes_done: u64,
+        /// Known from `Started` onward; `None` only if the size was never reported.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bytes_total: Option<u64>,
+        state: BlobTransferState,
+        /// SERVING side only: the STABLE `eid:` device principal we are serving (#38 — never a
+        /// display nickname). Always `eid:<hex>`: this comes from the authenticated endpoint, so it
+        /// is NOT the same namespace as a grant written as a user_id or roster name. Absent when fetching, where the counterparty is named
+        /// by the ticket rather than by a resolved identity.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer: Option<String>,
+    },
 }
 
 /// Extract the `method` tag from a raw request value without deserializing the whole
@@ -1731,7 +1783,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   thirty have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.40";
+pub const API_VERSION: &str = "1.41";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -1817,7 +1869,12 @@ pub const API_VERSION: &str = "1.40";
 /// refusals — expired line, no live invite, inviter unreachable, id mismatch, name conflict, and
 /// the deliberately-opaque refusal. `ERR_NICKNAME_TAKEN` had been the only coded pairing failure,
 /// so every other one arrived as `-32000` and an embedder could either forward our prose to end
-/// users or substring-match it (#159); to 40 with `[services.<name>].rate_limit_per_min` +
+/// users or substring-match it (#159); to 41 with `StreamFrame::BlobTransfer` — live app-blob
+/// transfer progress on both the serving and fetching side (#82 ask 2), so an embedder can draw a
+/// real progress bar instead of an indeterminate spinner. Guard on `>= 41` before expecting the
+/// frame. NOTE what it does NOT bring: `blob_fetch` still blocks its whole control connection for
+/// the transfer, and cancellation still does not exist (#172) — progress arrives on the SUBSCRIBE
+/// connection, which is a different one; to 40 with `[services.<name>].rate_limit_per_min` +
 /// `RegisterServiceParams::rate_limit_per_min` — proxied-request buckets became per
 /// `(service, endpoint)` instead of one shared per-endpoint bucket, so a noisy service can no
 /// longer starve a quiet one (#63). `-32053` changes meaning with it: it is now per-service, so a
@@ -1852,7 +1909,7 @@ pub const API_VERSION: &str = "1.40";
 /// its REAL content is a meaning change to `reachable` — the field exists so the new meaning is
 /// observable at all. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 40;
+pub const API_MINOR: u32 = 41;
 
 #[cfg(test)]
 mod tests {

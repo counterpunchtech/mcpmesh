@@ -338,6 +338,59 @@ async fn dial_failure_emits_error_event() {
 ///
 /// The mesh here has auditing ENABLED, so the subscribe loop is running its two-ring `select!`
 /// (audit + reachability) rather than the single-tap path.
+/// #82 gate: a `BlobTransfer` frame must actually REACH a subscriber.
+///
+/// The producer side is covered end to end in `blob_ac.rs`; this pins the other half — the
+/// `blob_frame` mapping and the `select!` arm in `run_subscription`. Making `blob_frame` return
+/// `None` for every value passed the entire workspace: frames were produced and silently dropped
+/// on the way out.
+#[tokio::test(flavor = "multi_thread")]
+async fn blob_transfer_frames_reach_a_subscriber() {
+    timeout(Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(&config, "").unwrap();
+        let ep = local_endpoint().await;
+        let store = Arc::new(PeerStore::open(&dir.path().join("s.redb")).unwrap());
+        let mesh = assemble_mesh(ep, store, config);
+        let state = Arc::new(DaemonState::with_mesh(STACK_VERSION, mesh.clone()));
+
+        let socket = dir.path().join("s.sock");
+        let listener = mcpmesh::ipc::bind_control_socket(&socket).await.unwrap();
+        let _control = tokio::spawn(serve_control(listener, state));
+
+        let mut sub = SubClient::connect(&socket).await;
+        assert_eq!(sub.next().await["type"], "snapshot");
+
+        // Push one observation onto the ring the provider writes to.
+        mesh.blob_bcast_for_test()
+            .send(mcpmesh::daemon::BlobTransfer {
+                direction: mcpmesh_local_api::BlobDirection::Serve,
+                hash: "abc123".into(),
+                bytes_done: 512,
+                bytes_total: Some(2048),
+                state: mcpmesh_local_api::BlobTransferState::Progress,
+                peer: Some("eid:deadbeef".into()),
+            })
+            .expect("a subscriber is attached, so the send has a receiver");
+
+        let frame = sub.next().await;
+        assert_eq!(
+            frame["type"], "blob_transfer",
+            "the frame must arrive tagged `blob_transfer`, or no non-Rust client can dispatch on \
+             it: {frame}"
+        );
+        assert_eq!(frame["direction"], "serve");
+        assert_eq!(frame["hash"], "abc123");
+        assert_eq!(frame["bytes_done"], 512);
+        assert_eq!(frame["bytes_total"], 2048);
+        assert_eq!(frame["state"], "progress");
+        assert_eq!(frame["peer"], "eid:deadbeef");
+    })
+    .await
+    .expect("blob frame subscribe test timed out");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn reachability_flips_are_pushed_to_subscribers() {
     timeout(Duration::from_secs(60), async {

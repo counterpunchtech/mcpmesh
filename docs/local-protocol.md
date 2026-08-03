@@ -7,7 +7,7 @@ named pipe on Windows. Anything that can open the endpoint and parse JSON can sp
 language — [`local-api/examples/status.py`](../local-api/examples/status.py) is a complete client
 in ~60 lines of dependency-free Python.
 
-> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.40`, `api_minor` `40`) and evolves
+> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.41`, `api_minor` `41`) and evolves
 > **additively** (see [Versioning](#versioning)), but until a stable release this document — like the
 > wire format itself — may change without a migration path. Pin the mcpmesh version you build
 > against. Source of truth is the Rust in [`local-api/`](../local-api/src/protocol.rs); where this
@@ -211,8 +211,22 @@ Methods split into two groups by audience:
 > - **There is no cancellation.** Dropping the client does not abort an in-flight transfer; the
 >   reader only errors at the next frame. A Cancel button cannot currently stop the work.
 >
-> Neither end reports progress, so a stalled transfer is indistinguishable from a slow one. Tracked
-> in [#82](https://github.com/counterpunchtech/mcpmesh/issues/82).
+> - **A partially fetched blob's chunks stay in the store.** They are not listed by `blob_list`
+>   (which lists published scopes, not raw store contents) and there is no reclaim path yet (#80),
+>   so an abandoned fetch leaves bytes on disk that nothing surfaces or frees.
+>
+> The first two are tracked in
+> [#172](https://github.com/counterpunchtech/mcpmesh/issues/172).
+>
+> **Progress IS reported, from `api_minor >= 41`** (#82): subscribe on a *separate* control
+> connection and read `StreamFrame::BlobTransfer` — it arrives on both the serving and the fetching
+> side, so a stalled transfer is now distinguishable from a slow one even while the fetching
+> connection is blocked. `Progress` frames are **coalesced** (at most ~102 per transfer whatever its
+> size), and the last one before `Completed` is usually skipped by the stride — read the final byte
+> count off `Completed`, never off the last `Progress`.
+>
+> On the fetching side `bytes_total` is `None`: the size is learned as bytes arrive, so render an
+> indeterminate bar until `Completed`. The serving side knows it from `Started`.
 
 > **`blob_unpublish` withdraws access, it does not delete data.** The bytes stay in the provider's
 > local store. The authorization effect applies to **new requests from that scope**: a subsequent
@@ -577,7 +591,7 @@ socket **stops being request/response** after this call. The client sends:
 newline-delimited frames — a live view of the mesh for an embedding UI to render — until the client
 disconnects. There is no request channel back; to stop, close the connection.
 
-Every frame is a JSON object tagged by a `"type"` field, in one of four shapes.
+Every frame is a JSON object tagged by a `"type"` field, in one of six shapes.
 
 **`snapshot`** — always the **first** frame: a point-in-time picture, so a fresh subscriber renders
 immediately without replaying history. It carries the currently-open sessions and the paired-peer
@@ -912,7 +926,8 @@ through `status`; it is not (yet) an event here.
 were skipped. The stream is **not** dropped and continues; **reconnect** to get a fresh `snapshot`
 and resume in sync.
 
-A `lagged` frame may account for skipped **audit events or reachability transitions** — it does not
+A `lagged` frame may account for skipped **audit events, reachability transitions, self-network
+changes, or blob-transfer progress** — it does not
 say which. That matters for liveness: a missed `reachability` transition is **never re-asserted**
 (the next frame comes only on the next flip), so a consumer that shrugs off `lagged` can hold a
 stale online/offline indicator indefinitely. If you render liveness, treat `lagged` as "resync":
@@ -921,6 +936,40 @@ reconnect, or fall back to a `status` read.
 ```json
 {"type": "lagged", "dropped": 12}
 ```
+
+### `blob_transfer` (`api_minor >= 41`, #82)
+
+Live app-blob transfer progress, on **both** sides — `serve` while this node sends bytes to a peer,
+`fetch` while `blob_fetch` pulls them.
+
+```json
+{"type": "blob_transfer", "direction": "serve", "hash": "5f2b…", "bytes_done": 1048576,
+ "bytes_total": 4194304, "state": "progress", "peer": "eid:9f3c…"}
+```
+
+| field | meaning |
+|---|---|
+| `direction` | `"serve"` \| `"fetch"` |
+| `hash` | the blob's hash, hex |
+| `bytes_done` | see the caveats below — the two directions do NOT mean the same thing |
+| `bytes_total` | present on `serve` from `started`; **always absent on `fetch`** (the size is not known until the transfer ends) |
+| `state` | `"started"` \| `"progress"` \| `"completed"` \| `"aborted"` |
+| `peer` | `serve` only: the STABLE `eid:` principal being served. Absent when fetching. |
+
+**`progress` is coalesced.** A serve emits ~102 frames whatever the size (1% strides); a fetch, which
+cannot know the size, starts at 1 MiB and doubles its stride every 16 frames, so it is bounded by the
+LOG of the size (~128 frames for 4 GiB). Either way the last `progress` before `completed` is
+normally skipped — **read the final count off `completed`, never off the last `progress`.**
+
+**Two caveats on `bytes_done` you must not paper over:**
+
+- On `serve` it is an **absolute offset in the blob**, and `bytes_total` is the **whole** blob. A
+  peer may legitimately request a sub-range, in which case `completed` still reports the full size —
+  it is a position, not an egress meter.
+- On `fetch` it counts **bytes downloaded by this call**. iroh-blobs fetches only what is missing
+  locally, so a resumed fetch under-reports and a re-fetch of a blob you already hold completes with
+  `bytes_done: 0`. That is not an error.
+
 
 Typed Rust bindings for these frames (`StreamFrame`, `ActiveSession`, and the audit record) ship in
 [`mcpmesh-local-api`](../local-api/src/protocol.rs), and `ControlClient::subscribe` yields them
@@ -1140,7 +1189,9 @@ things:
   `_meta["mcpmesh/peer"]`; `SelfNetwork.presence_mode` and the `reachable: false` meaning change it
   brings (#89) are `api_minor >= 38`; `PairParams.as_nickname` + `InviteParams.peer_nickname`
   (#87) are `api_minor >= 39`; `RegisterServiceParams.rate_limit_per_min` and the per-service
-  meaning of `-32053` (#63) are `api_minor >= 40` — below that `deny_unknown_fields` rejects the whole request, so
+  meaning of `-32053` (#63) are `api_minor >= 40` — below that `deny_unknown_fields` rejects the
+  whole request, so guard before sending the field; `StreamFrame::BlobTransfer` (#82) is
+  `api_minor >= 41`, and being a server-PUSHED frame it simply never arrives below that — below that `deny_unknown_fields` rejects the whole request, so
   guard before offering an alias field in a UI.
   `api_minor` is itself additive: a pre-1.1 daemon omits it and it reads as `0`.
 

@@ -23,7 +23,7 @@ use crate::daemon::RELAY_READY_TIMEOUT;
 ///
 /// SECURITY — deny-by-default on every non-GET request type, made EXPLICIT (not left to a vestigial
 /// routing quirk). In the pinned iroh-blobs 0.103.0 the generic `EventSender::request()` reads ONLY
-/// `mask.get` for EVERY request type (get/get_many/push/observe), so `get: Intercept` currently
+/// `mask.get` for EVERY request type (get/get_many/push/observe), so `get: InterceptLog` currently
 /// routes all four to the drain loop, which denies the non-GET kinds explicitly.
 /// To keep the deny-by-default INDEPENDENT of that single-field
 /// routing, each non-GET request type is ALSO pinned to its most-refusing mask mode, so a FUTURE
@@ -40,12 +40,16 @@ use crate::daemon::RELAY_READY_TIMEOUT;
 ///    `ObserveMode::None` (the default) would mean "no event, request served normally" → a silent
 ///    bypass, so it is explicitly the WRONG choice here.
 ///
-/// `connected: Intercept` records the authenticated endpoint id; `get: Intercept` scope-checks every
+/// `connected: Intercept` records the authenticated endpoint id; `get: InterceptLog` scope-checks every
 /// single-blob GET (the AC fetch path — unchanged). `throttle` stays at its default
 /// (`ThrottleMode::None`) — it is a transfer-throttling knob, not a request-serving gate.
 const APP_BLOB_EVENT_MASK: EventMask = EventMask {
     connected: ConnectMode::Intercept,
-    get: RequestMode::Intercept,
+    // `InterceptLog`, not `Intercept` (#82 ask 2): STRICTLY additive — it is Intercept plus the
+    // per-request transfer-event stream. The scope check that authorizes every single-blob GET is
+    // unchanged; what it adds is `msg.rx`, which the drain loop turns into `BlobTransfer` frames so
+    // an embedder can draw a real progress bar instead of an indeterminate spinner.
+    get: RequestMode::InterceptLog,
     get_many: RequestMode::Disabled,
     push: RequestMode::Disabled,
     observe: ObserveMode::Intercept,
@@ -63,6 +67,168 @@ const APP_BLOB_EVENT_MASK_METERED: EventMask = EventMask {
     ..APP_BLOB_EVENT_MASK
 };
 
+/// Fold ONE transfer update into the coalescing state, emitting a frame when it warrants one (#82).
+///
+/// Returns `true` when the transfer is over (terminal event), so the caller stops draining.
+///
+/// A free function rather than inline in the drain task so the COALESCING RULE — the property that
+/// keeps a 4 GiB transfer from pushing ~262k frames through a bounded ring — is directly testable
+/// without a live provider and two endpoints.
+fn apply_transfer_update(
+    st: &mut Option<TransferProgressState>,
+    update: &iroh_blobs::provider::events::RequestUpdate,
+    bcast: &tokio::sync::broadcast::Sender<crate::daemon::BlobTransfer>,
+    peer: &Option<String>,
+) -> bool {
+    use iroh_blobs::provider::events::RequestUpdate;
+    use mcpmesh_local_api::BlobTransferState as S;
+
+    match update {
+        RequestUpdate::Started(started) => {
+            let cur = TransferProgressState {
+                hash: started.hash.to_hex().to_string(),
+                peer: peer.clone(),
+                total: Some(started.size),
+                done: 0,
+                last_emitted: 0,
+                epochs: 0,
+                in_epoch: 0,
+            };
+            emit_transfer(bcast, &cur, S::Started);
+            *st = Some(cur);
+            false
+        }
+        RequestUpdate::Progress(p) => {
+            if let Some(cur) = st.as_mut() {
+                cur.done = p.end_offset;
+                // THE coalescing gate. Without it a 4 GiB transfer emits ~262k frames and every
+                // subscriber lags out, losing the audit records that share their stream.
+                if cur.done.saturating_sub(cur.last_emitted) >= cur.stride() {
+                    cur.note_emitted();
+                    emit_transfer(bcast, cur, S::Progress);
+                }
+            }
+            false
+        }
+        RequestUpdate::Completed(_) => {
+            if let Some(cur) = st.as_mut() {
+                // The final count, ALWAYS emitted — the last `Progress` before this is usually
+                // skipped by the stride, so a consumer treating it as the total stops short.
+                if let Some(total) = cur.total {
+                    cur.done = cur.done.max(total);
+                }
+                emit_transfer(bcast, cur, S::Completed);
+            }
+            true
+        }
+        RequestUpdate::Aborted(_) => {
+            if let Some(cur) = st.as_ref() {
+                // Reported, not a silent stop: a stalled transfer must be distinguishable from a
+                // slow one, which is the issue's fourth consequence.
+                emit_transfer(bcast, cur, S::Aborted);
+            }
+            true
+        }
+    }
+}
+
+/// Minimum byte advance between two coalesced `Progress` frames (#82 ask 2).
+///
+/// iroh-blobs reports progress per ~16 KiB chunk. Broadcasting each one would push ~262k frames for
+/// a 4 GiB transfer through a bounded ring, so every subscriber would see `Lagged` and lose the
+/// reachability/audit signal sharing their stream. The stride is `max(this, total / 100)`, so a
+/// transfer costs at most ~102 frames whatever its size — and a SMALL blob still gets its
+/// `Started`/`Completed` pair, which is what a progress bar actually needs.
+const PROGRESS_STRIDE_BYTES: u64 = 1024 * 1024;
+
+/// Coalescing state for ONE in-flight served transfer (#82).
+struct TransferProgressState {
+    hash: String,
+    peer: Option<String>,
+    total: Option<u64>,
+    done: u64,
+    /// `done` as of the last frame emitted — the coalescing anchor.
+    last_emitted: u64,
+    /// How many times the stride has doubled (unknown-total transfers only).
+    epochs: u32,
+    /// Frames emitted within the current epoch.
+    in_epoch: u32,
+}
+
+/// Frames allowed per stride "epoch" before the stride DOUBLES (#82 gate).
+///
+/// Only reachable when the total is unknown — which is every FETCH, since `GetProgressItem` carries
+/// no size. Without it the stride stayed at the 1 MiB floor forever, so a 4 GiB fetch emitted ~4098
+/// frames into a 256-deep ring: the direction #82 is actually about was the one still flooding.
+/// Doubling per epoch bounds it logarithmically — ~128 frames for 4 GiB, ~256 for 1 TiB.
+const FRAMES_PER_EPOCH: u32 = 16;
+
+impl TransferProgressState {
+    /// The byte advance required before another `Progress` frame is worth sending.
+    ///
+    /// With a known total (the SERVE side) this is 1% of it, so the frame count is ~100 flat. With
+    /// an unknown total (every FETCH) it starts at the floor and doubles every
+    /// [`FRAMES_PER_EPOCH`] frames, so the count grows with the LOG of the size rather than
+    /// linearly.
+    fn stride(&self) -> u64 {
+        match self.total {
+            Some(t) => (t / 100).max(PROGRESS_STRIDE_BYTES),
+            None => PROGRESS_STRIDE_BYTES
+                .saturating_mul(1u64 << self.epochs.min(40))
+                .max(PROGRESS_STRIDE_BYTES),
+        }
+    }
+
+    /// Record that a `Progress` frame went out, widening the stride when an epoch fills.
+    fn note_emitted(&mut self) {
+        self.last_emitted = self.done;
+        if self.total.is_none() {
+            self.in_epoch += 1;
+            if self.in_epoch >= FRAMES_PER_EPOCH {
+                self.in_epoch = 0;
+                self.epochs = self.epochs.saturating_add(1);
+            }
+        }
+    }
+}
+
+/// [`emit_transfer`] for the FETCHING side (#82) — same frame, `direction: Fetch`, and no `peer`:
+/// the counterparty is named by the ticket, not by an identity we resolved.
+fn emit_fetch(
+    bcast: &tokio::sync::broadcast::Sender<crate::daemon::BlobTransfer>,
+    st: &TransferProgressState,
+    state: mcpmesh_local_api::BlobTransferState,
+) {
+    let _ = bcast.send(crate::daemon::BlobTransfer {
+        direction: mcpmesh_local_api::BlobDirection::Fetch,
+        hash: st.hash.clone(),
+        bytes_done: st.done,
+        bytes_total: st.total,
+        state,
+        peer: None,
+    });
+}
+
+/// Broadcast one transfer observation, never blocking (#82).
+///
+/// `send` on a `broadcast::Sender` does not await and errors only when there are no receivers, so a
+/// slow or absent subscriber can never stall a transfer — preserving the `try_send` property
+/// iroh-blobs itself relies on for progress.
+fn emit_transfer(
+    bcast: &tokio::sync::broadcast::Sender<crate::daemon::BlobTransfer>,
+    st: &TransferProgressState,
+    state: mcpmesh_local_api::BlobTransferState,
+) {
+    let _ = bcast.send(crate::daemon::BlobTransfer {
+        direction: mcpmesh_local_api::BlobDirection::Serve,
+        hash: st.hash.clone(),
+        bytes_done: st.done,
+        bytes_total: st.total,
+        state,
+        peer: st.peer.clone(),
+    });
+}
+
 /// iroh-blobs' leaf/chunk size (`IROH_BLOCK_SIZE`, 16 KiB) — the unit a `Throttle` event reports,
 /// and the amount reserved at request admission (#84a review).
 const IROH_CHUNK_BYTES: u64 = 16 * 1024;
@@ -79,6 +245,9 @@ const IROH_CHUNK_BYTES: u64 = 16 * 1024;
 pub struct AppBlobs {
     store: FsStore,
     endpoint: Endpoint,
+    /// Where coalesced transfer progress goes (#82 ask 2). `None` on a fetcher-only or fixture
+    /// provider, which then does no progress work at all.
+    transfers: Option<tokio::sync::broadcast::Sender<crate::daemon::BlobTransfer>>,
     events: Option<EventSender>,
     scopes: Arc<ScopeStore>,
     /// The request-time gate loop's handle, so shutdown can END it deterministically (#61).
@@ -136,9 +305,20 @@ impl AppBlobs {
 }
 
 impl AppBlobs {
+    /// [`open_fetcher_with_progress`](Self::open_fetcher_with_progress) with no progress ring.
+    pub async fn open_fetcher(blobs_dir: PathBuf, endpoint: Endpoint) -> Result<Arc<Self>> {
+        Self::open_fetcher_with_progress(blobs_dir, endpoint, None).await
+    }
+
     /// A caller-only fetcher: an `FsStore` + endpoint, NO scope gate (`events: None`), an empty
     /// scopes table it never persists. Used caller-side (the fetch path) and by the ungated tests.
-    pub async fn open_fetcher(blobs_dir: PathBuf, endpoint: Endpoint) -> Result<Arc<Self>> {
+    ///
+    /// `transfers` is where fetch-side progress goes (#82); `None` does no progress work at all.
+    pub async fn open_fetcher_with_progress(
+        blobs_dir: PathBuf,
+        endpoint: Endpoint,
+        transfers: Option<tokio::sync::broadcast::Sender<crate::daemon::BlobTransfer>>,
+    ) -> Result<Arc<Self>> {
         tokio::fs::create_dir_all(&blobs_dir)
             .await
             .with_context(|| format!("create blobs dir {}", blobs_dir.display()))?;
@@ -148,6 +328,7 @@ impl AppBlobs {
         Ok(Arc::new(Self {
             store,
             endpoint,
+            transfers,
             events: None,
             relay_wait: std::sync::atomic::AtomicBool::new(false),
             hash_membership: tokio::sync::Mutex::new(()),
@@ -171,6 +352,9 @@ impl AppBlobs {
         endpoint: Endpoint,
         audit: AuditSink,
         limits: Arc<crate::limits::MeshLimiters>,
+        // #82 ask 2: the ring coalesced transfer progress rides. `None` for fixtures that build a
+        // provider without a mesh — the gate loop then does no progress work at all.
+        transfers: Option<tokio::sync::broadcast::Sender<crate::daemon::BlobTransfer>>,
     ) -> Result<Arc<Self>> {
         tokio::fs::create_dir_all(&blobs_dir)
             .await
@@ -180,7 +364,7 @@ impl AppBlobs {
             .with_context(|| format!("load blob store {}", blobs_dir.display()))?;
         // The request-time scope gate: `APP_BLOB_EVENT_MASK` intercepts connect + single-blob GET,
         // and pins every non-GET request type to deny-by-default (Disabled/Intercept — see the
-        // const's SECURITY note). Since `get: Intercept` also routes
+        // const's SECURITY note). Since `get: InterceptLog` also routes
         // get_many/observe/push to the drain loop today; the pinned fields keep them refused even if
         // a future iroh-blobs honors the per-type fields directly.
         // Only pay the per-chunk intercept when a budget is actually configured (#84a).
@@ -190,10 +374,11 @@ impl AppBlobs {
             APP_BLOB_EVENT_MASK
         };
         let (events, rx) = EventSender::channel(64, mask);
-        let gate_loop = spawn_gate_loop(rx, gate, scopes.clone(), audit, limits);
+        let gate_loop = spawn_gate_loop(rx, gate, scopes.clone(), audit, limits, transfers.clone());
         Ok(Arc::new(Self {
             store,
             endpoint,
+            transfers,
             events: Some(events),
             scopes,
             gate_loop: tokio::sync::Mutex::new(Some(gate_loop)),
@@ -468,11 +653,61 @@ impl AppBlobs {
             .connect(ticket.addr().clone(), APP_BLOB_ALPN)
             .await
             .context("dial app-blob provider")?;
-        self.store
-            .remote()
-            .fetch(conn, ticket.hash())
-            .await
-            .context("fetch app blob")?;
+        // #82 ask 2: consume the progress stream instead of dropping it on the floor. Same
+        // coalescing rule as the serving side — `GetProgressItem::Progress` arrives per chunk, so
+        // an uncoalesced fetch would flood the ring exactly as an uncoalesced serve would.
+        //
+        // `bytes_total` is NOT known here: the fetch side learns the size only as bytes arrive, so
+        // the frame carries `None` and a consumer renders an indeterminate bar until `Completed`.
+        // Reporting the ticket's hash as a size, or guessing, would be worse than saying so.
+        use n0_future::StreamExt as _;
+        let hash_hex = ticket.hash().to_hex().to_string();
+        let mut stream = std::pin::pin!(self.store.remote().fetch(conn, ticket.hash()).stream());
+        let mut st = TransferProgressState {
+            hash: hash_hex,
+            peer: None,
+            total: None,
+            done: 0,
+            last_emitted: 0,
+            epochs: 0,
+            in_epoch: 0,
+        };
+        if let Some(b) = &self.transfers {
+            emit_fetch(b, &st, mcpmesh_local_api::BlobTransferState::Started);
+        }
+        // Starts as an ERROR, not Ok: the old `.complete()` returned `LocalFailure("stream closed
+        // without result")` when the stream ended with neither Done nor Error. Defaulting to Ok
+        // turned that into a silent success — a fail-OPEN where the previous code failed closed
+        // (#82 gate). Practically unreachable; the direction of the default is the point.
+        let mut outcome: Result<()> = Err(anyhow::anyhow!("fetch stream closed without a result"));
+        while let Some(item) = stream.next().await {
+            match item {
+                iroh_blobs::api::remote::GetProgressItem::Progress(done) => {
+                    st.done = done;
+                    if let Some(b) = &self.transfers
+                        && st.done.saturating_sub(st.last_emitted) >= st.stride()
+                    {
+                        st.note_emitted();
+                        emit_fetch(b, &st, mcpmesh_local_api::BlobTransferState::Progress);
+                    }
+                }
+                iroh_blobs::api::remote::GetProgressItem::Done(_) => {
+                    if let Some(b) = &self.transfers {
+                        emit_fetch(b, &st, mcpmesh_local_api::BlobTransferState::Completed);
+                    }
+                    outcome = Ok(());
+                }
+                iroh_blobs::api::remote::GetProgressItem::Error(e) => {
+                    if let Some(b) = &self.transfers {
+                        emit_fetch(b, &st, mcpmesh_local_api::BlobTransferState::Aborted);
+                    }
+                    // `{e:#}` keeps the GetError source chain that `.context(..)` used to
+                    // preserve; `{e}` alone flattened it to the outermost message.
+                    outcome = Err(anyhow::anyhow!("{e:#}"));
+                }
+            }
+        }
+        outcome.context("fetch app blob")?;
         Ok(ticket.hash())
     }
 
@@ -630,6 +865,8 @@ fn spawn_gate_loop(
     scopes: Arc<ScopeStore>,
     audit: AuditSink,
     limits: Arc<crate::limits::MeshLimiters>,
+    // #82 ask 2: where coalesced transfer progress goes. `None` in fixtures that do not care.
+    transfers: Option<tokio::sync::broadcast::Sender<crate::daemon::BlobTransfer>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut conns: HashMap<u64, mcpmesh_net::EndpointId> = HashMap::new();
@@ -734,7 +971,64 @@ fn spawn_gate_loop(
                             conn_eid.map(|eid| eid.principal()),
                         ));
                     }
+                    let admitted = decision.is_ok();
                     msg.tx.send(decision).await.ok();
+                    // #82 ask 2: `InterceptLog` hands us this request's transfer-event stream.
+                    // Drained in its OWN task — draining inline would block the gate loop for the
+                    // whole transfer, and the gate loop is what authorizes every OTHER request.
+                    // Only for an ADMITTED request: a refused one transfers nothing, so its stream
+                    // yields nothing and a `Started` frame would be a lie.
+                    // The update receiver MUST be consumed, whether or not anyone wants the
+                    // frames. Dropping it makes the provider's own `transfer_started` send fail,
+                    // which ABORTS the transfer — an admitted, authorized fetch then errors with
+                    // "fetch app blob". Only spawning this when a broadcast existed is exactly that
+                    // bug: every fixture built with `transfers: None` broke.
+                    if admitted {
+                        let bcast = transfers.clone();
+                        let peer_principal = conn_eid.map(|eid| eid.principal());
+                        // Drained in its OWN task: doing it inline would block the gate loop —
+                        // which authorizes every OTHER request — for the whole transfer. The
+                        // receiver's type is irpc-internal, so it is captured rather than named.
+                        //
+                        // DETACHED, and `shutdown()` does not join it (#82 gate). It holds only a
+                        // broadcast sender clone and this request's receiver, so it ends when the
+                        // transfer does or when the provider drops its side — it holds no store or
+                        // redb handle, which is what `shutdown`'s determinism guarantee is about.
+                        // An in-flight one can still outlive `Node::shutdown` by the length of a
+                        // transfer; tracking them belongs with the cancellation work in #172.
+                        let mut updates = msg.rx;
+                        tokio::spawn(async move {
+                            let mut st = None;
+                            while let Ok(Some(update)) = updates.recv().await {
+                                // Drained unconditionally; only the FRAMES are optional.
+                                let terminal = match &bcast {
+                                    Some(b) => {
+                                        apply_transfer_update(&mut st, &update, b, &peer_principal)
+                                    }
+                                    None => matches!(
+                                        update,
+                                        iroh_blobs::provider::events::RequestUpdate::Completed(_)
+                                            | iroh_blobs::provider::events::RequestUpdate::Aborted(
+                                                _
+                                            )
+                                    ),
+                                };
+                                if terminal {
+                                    return;
+                                }
+                            }
+                            // The stream ended with no terminal event (peer vanished, tracker
+                            // dropped). A consumer waiting on Completed/Aborted would hang, so
+                            // synthesize Aborted rather than leave a transfer open forever.
+                            if let (Some(b), Some(cur)) = (&bcast, st.as_ref()) {
+                                emit_transfer(
+                                    b,
+                                    cur,
+                                    mcpmesh_local_api::BlobTransferState::Aborted,
+                                );
+                            }
+                        });
+                    }
                 }
                 // Deny-by-default for every non-GET request type.
                 ProviderMessage::GetManyRequestReceived(msg) => {
@@ -757,6 +1051,242 @@ fn spawn_gate_loop(
 
 #[cfg(test)]
 mod tests {
+    use super::{PROGRESS_STRIDE_BYTES, TransferProgressState, apply_transfer_update};
+    use iroh_blobs::provider::events::{RequestUpdate, TransferProgress, TransferStarted};
+    use mcpmesh_local_api::BlobTransferState as S;
+
+    fn started(size: u64) -> RequestUpdate {
+        RequestUpdate::Started(TransferStarted {
+            index: 0,
+            hash: iroh_blobs::Hash::new(b"blob"),
+            size,
+        })
+    }
+    fn progress(end_offset: u64) -> RequestUpdate {
+        RequestUpdate::Progress(TransferProgress { end_offset })
+    }
+
+    /// Drive a sequence of updates and return every frame that came out.
+    fn frames_for(size: u64, chunk: u64) -> Vec<crate::daemon::BlobTransfer> {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(4096);
+        let mut st = None;
+        let peer = Some("eid:abc".to_string());
+        apply_transfer_update(&mut st, &started(size), &tx, &peer);
+        let mut at = 0;
+        while at < size {
+            at = (at + chunk).min(size);
+            apply_transfer_update(&mut st, &progress(at), &tx, &peer);
+        }
+        apply_transfer_update(
+            &mut st,
+            &RequestUpdate::Completed(iroh_blobs::provider::events::TransferCompleted {
+                stats: Box::new(iroh_blobs::provider::TransferStats {
+                    payload_bytes_sent: 0,
+                    other_bytes_sent: 0,
+                    other_bytes_read: 0,
+                    duration: std::time::Duration::ZERO,
+                }),
+            }),
+            &tx,
+            &peer,
+        );
+        let mut out = Vec::new();
+        while let Ok(f) = rx.try_recv() {
+            out.push(f);
+        }
+        out
+    }
+
+    /// #82 ask 2: COALESCING is the property that keeps the ring usable.
+    ///
+    /// iroh-blobs reports progress per ~16 KiB chunk. A 4 GiB transfer is ~262k updates; emitting a
+    /// frame for each would overrun a bounded ring many times over and every subscriber would see
+    /// `Lagged`, losing the audit records that share their stream.
+    #[test]
+    fn progress_frames_are_coalesced_not_one_per_chunk() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let chunks = 4 * GIB / (16 * 1024);
+        let frames = frames_for(4 * GIB, 16 * 1024);
+
+        assert!(
+            frames.len() <= 110,
+            "a 4 GiB transfer produced {} frames from {chunks} chunks — the stride must bound this \
+             to ~102 (Started + ~100 Progress + Completed), or every subscriber lags out",
+            frames.len()
+        );
+        assert!(
+            frames.len() >= 3,
+            "…but it must still report PROGRESS, not just start and end: {}",
+            frames.len()
+        );
+        assert_eq!(frames.first().unwrap().state, S::Started);
+        assert_eq!(frames.last().unwrap().state, S::Completed);
+        assert!(
+            frames
+                .windows(2)
+                .all(|w| w[0].bytes_done <= w[1].bytes_done),
+            "bytes_done must never go backwards"
+        );
+        assert_eq!(
+            frames.last().unwrap().bytes_done,
+            4 * GIB,
+            "Completed must carry the FINAL count — the last Progress is skipped by the stride, so \
+             a consumer treating it as the total would stop short of 100%"
+        );
+    }
+
+    /// #82: `Completed` reports the FINAL count even when the last `Progress` fell short.
+    ///
+    /// The stride skips the tail of a transfer, and a provider need not emit a progress event for
+    /// the final chunk — so a consumer that renders the last `Progress` as the total stops short of
+    /// 100% and the bar never fills. Asserted with a deliberately LAGGING last progress, because a
+    /// fixture whose chunks land exactly on the size makes this a no-op: the first version of this
+    /// test did that and the mutation escaped.
+    #[test]
+    fn completed_reports_the_total_even_when_the_last_progress_lagged() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        let mut st = None;
+        apply_transfer_update(&mut st, &started(1000), &tx, &None);
+        apply_transfer_update(&mut st, &progress(400), &tx, &None);
+        apply_transfer_update(
+            &mut st,
+            &RequestUpdate::Completed(iroh_blobs::provider::events::TransferCompleted {
+                stats: Box::new(iroh_blobs::provider::TransferStats {
+                    payload_bytes_sent: 0,
+                    other_bytes_sent: 0,
+                    other_bytes_read: 0,
+                    duration: std::time::Duration::ZERO,
+                }),
+            }),
+            &tx,
+            &None,
+        );
+        let frames: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let last = frames.last().unwrap();
+        assert_eq!(last.state, S::Completed);
+        assert_eq!(
+            last.bytes_done, 1000,
+            "Completed must report the total, not the 400 the last Progress reached — otherwise \
+             the consumer's bar stops at 40% on a fully successful transfer"
+        );
+    }
+
+    /// A SMALL blob must still get its Started/Completed pair — a progress bar needs both ends even
+    /// when no Progress frame ever clears the stride.
+    #[test]
+    fn a_small_transfer_still_reports_both_ends() {
+        let frames = frames_for(1024, 512);
+        assert_eq!(frames.first().unwrap().state, S::Started);
+        assert_eq!(frames.last().unwrap().state, S::Completed);
+        assert_eq!(frames.last().unwrap().bytes_done, 1024);
+        assert_eq!(
+            frames.first().unwrap().bytes_total,
+            Some(1024),
+            "bytes_total is known from Started onward"
+        );
+        assert_eq!(
+            frames.first().unwrap().peer.as_deref(),
+            Some("eid:abc"),
+            "the SERVING side attributes the stable principal (#38), never a nickname"
+        );
+    }
+
+    /// The stride scales with size, so a big transfer does not emit proportionally more frames.
+    #[test]
+    fn the_stride_scales_with_the_transfer_size() {
+        let small = TransferProgressState {
+            hash: "h".into(),
+            peer: None,
+            total: Some(1024),
+            done: 0,
+            last_emitted: 0,
+            epochs: 0,
+            in_epoch: 0,
+        };
+        assert_eq!(
+            small.stride(),
+            PROGRESS_STRIDE_BYTES,
+            "a tiny transfer floors at the fixed stride rather than emitting per byte"
+        );
+        let big = TransferProgressState {
+            total: Some(4 * 1024 * 1024 * 1024),
+            ..small
+        };
+        assert_eq!(
+            big.stride(),
+            4 * 1024 * 1024 * 1024 / 100,
+            "a big one uses 1% so the frame COUNT stays bounded instead of the byte gap"
+        );
+    }
+
+    /// #82 gate: the FETCH side never learns the total, so the stride must widen on its own.
+    ///
+    /// It did not: `stride()` fell to the fixed 1 MiB floor forever, so a 4 GiB fetch emitted ~4098
+    /// frames into a 256-deep ring — the direction #82 is actually about was the one still
+    /// flooding, while three doc sites claimed "~102 whatever its size".
+    #[test]
+    fn an_unknown_total_still_bounds_the_frame_count() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let mut st = TransferProgressState {
+            hash: "h".into(),
+            peer: None,
+            total: None, // every fetch
+            done: 0,
+            last_emitted: 0,
+            epochs: 0,
+            in_epoch: 0,
+        };
+        let mut frames = 0u32;
+        let mut at = 0u64;
+        let chunk = 16 * 1024;
+        while at < 4 * GIB {
+            at += chunk;
+            st.done = at;
+            if st.done.saturating_sub(st.last_emitted) >= st.stride() {
+                st.note_emitted();
+                frames += 1;
+            }
+        }
+        assert!(
+            frames <= 200,
+            "a 4 GiB FETCH emitted {frames} progress frames into a {}-deep ring — the stride must \
+             widen when the total is unknown, or a subscriber lags out on the very transfer this \
+             feature exists to show",
+            256
+        );
+        assert!(
+            frames >= 20,
+            "…but it must still report meaningfully often: {frames}"
+        );
+    }
+
+    /// #82: a transfer that ends without a terminal event must still be reported ABORTED — a
+    /// consumer waiting on Completed/Aborted would otherwise wait forever, which is the "stalled is
+    /// indistinguishable from slow" complaint.
+    #[test]
+    fn an_aborted_transfer_is_reported_not_silently_dropped() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        let mut st = None;
+        apply_transfer_update(&mut st, &started(4096), &tx, &None);
+        let terminal = apply_transfer_update(
+            &mut st,
+            &RequestUpdate::Aborted(iroh_blobs::provider::events::TransferAborted {
+                stats: Box::new(iroh_blobs::provider::TransferStats {
+                    payload_bytes_sent: 0,
+                    other_bytes_sent: 0,
+                    other_bytes_read: 0,
+                    duration: std::time::Duration::ZERO,
+                }),
+            }),
+            &tx,
+            &None,
+        );
+        assert!(terminal, "Aborted must end the drain");
+        let frames: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[1].state, S::Aborted);
+    }
+
     /// #84a fourth review: the three audit statuses, and the dedup.
     ///
     /// All three of these survived a fully green 595-test suite as mutations: recording "ok" for a
@@ -1156,6 +1686,7 @@ mod tests {
                 b_ep.clone(),
                 crate::audit::AuditSink::disabled(),
                 crate::limits::MeshLimiters::unlimited(),
+                None,
             )
             .await
             .unwrap();
@@ -1230,6 +1761,7 @@ mod tests {
                 b_ep.clone(),
                 crate::audit::AuditSink::disabled(),
                 crate::limits::MeshLimiters::unlimited(),
+                None,
             )
             .await
             .unwrap();
@@ -1581,7 +2113,12 @@ mod tests {
     #[test]
     fn app_blob_event_mask_pins_non_get_request_types_to_deny_by_default() {
         assert_eq!(APP_BLOB_EVENT_MASK.connected, ConnectMode::Intercept);
-        assert_eq!(APP_BLOB_EVENT_MASK.get, RequestMode::Intercept);
+        // #82 ask 2: `InterceptLog`, NOT `Intercept` — and the distinction is the security one
+        // worth pinning. `InterceptLog` is Intercept PLUS transfer events, so the scope check that
+        // authorizes every single-blob GET still runs. Anything that merely NOTIFIES
+        // (`Notify`/`NotifyLog`) would give up the veto and serve bytes to an ungranted caller.
+        assert_eq!(APP_BLOB_EVENT_MASK.get, RequestMode::InterceptLog);
+
         // get_many/push refuse at the protocol level with Permission (events.rs:504-506), no event.
         assert_eq!(APP_BLOB_EVENT_MASK.get_many, RequestMode::Disabled);
         assert_eq!(APP_BLOB_EVENT_MASK.push, RequestMode::Disabled);
@@ -1666,6 +2203,7 @@ mod tests {
                 provider_ep.clone(),
                 crate::audit::AuditSink::disabled(),
                 crate::limits::MeshLimiters::unlimited(),
+                None,
             )
             .await
             .unwrap();
@@ -1748,6 +2286,7 @@ mod tests {
                 provider_ep.clone(),
                 crate::audit::AuditSink::disabled(),
                 crate::limits::MeshLimiters::unlimited(),
+                None,
             )
             .await
             .unwrap();
@@ -1830,6 +2369,7 @@ mod tests {
                 provider_ep.clone(),
                 sink,
                 crate::limits::MeshLimiters::unlimited(),
+                None,
             )
             .await
             .unwrap();
