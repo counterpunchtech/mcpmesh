@@ -367,6 +367,15 @@ enum BlobCmd {
         /// Local path to write the verified blob to.
         dest: PathBuf,
     },
+    /// Stop an in-flight `blob fetch` of this hash (#172).
+    ///
+    /// Run it from a SECOND terminal: the fetching command holds its own control connection for the
+    /// transfer's duration, so the cancel necessarily arrives on a different one. The fetch exits
+    /// non-zero with a "cancelled" error; partial chunks stay in the store (#80).
+    Cancel {
+        /// The blob's hash, as printed by `blob fetch`/`blob list` or carried on transfer frames.
+        hash: String,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -1139,6 +1148,21 @@ fn run_internal_blob(command: BlobCmd, json: bool) -> anyhow::Result<()> {
                         r.hash,
                         dest.display()
                     );
+                }
+            }
+            BlobCmd::Cancel { hash } => {
+                let r = client.blob_fetch_cancel(&hash).await?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({ "cancelled": r.cancelled, "hash": hash })
+                    );
+                } else if r.cancelled {
+                    println!("Cancelling fetch of {hash}");
+                } else {
+                    // Not an error, and worth saying why: it is the same answer a cancel gets when
+                    // it loses the race to a fetch that just finished.
+                    println!("No fetch of {hash} is in flight here (it may have just finished)");
                 }
             }
         }

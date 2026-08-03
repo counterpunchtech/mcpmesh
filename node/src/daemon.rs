@@ -61,9 +61,9 @@ pub use accept::spawn_accept_loop;
 pub use boot::serve_forever;
 pub use dial::{dial_service, pipe_session, race_dial};
 pub use handlers::{
-    BlobWithdrawn, NoSuchBlob, NoSuchBlobScope, NoSuchService, endorse_peer, grant_service_access,
-    grant_service_allow, introduce_peer, remove_peer, rename_peer, revoke_service_access,
-    revoke_service_allow,
+    BlobWithdrawn, Cancelled, NoSuchBlob, NoSuchBlobScope, NoSuchService, endorse_peer,
+    grant_service_access, grant_service_allow, introduce_peer, remove_peer, rename_peer,
+    revoke_service_access, revoke_service_allow,
 };
 pub(crate) use reach::caller_admitted_services;
 /// The services this identity is admitted to, as the accept path computes them (#100). Test seam:
@@ -123,9 +123,10 @@ pub use handlers::RELAY_READY_TIMEOUT;
 /// ephemeral registration and `config.toml` once the overlay goes away (#55/#94).
 pub use handlers::unregister_ephemeral;
 pub(crate) use handlers::{
-    add_peer, blob_fetch, blob_grant, blob_list, blob_publish, blob_republish, blob_revoke,
-    blob_unpublish, mint_invite, open_session, peer_diagnostics, peer_services, redeem,
-    register_service, service_allow_grant, service_allow_revoke, set_relays, unregister_service,
+    add_peer, blob_fetch, blob_fetch_cancel, blob_grant, blob_list, blob_publish, blob_republish,
+    blob_revoke, blob_unpublish, mint_invite, open_session, peer_diagnostics, peer_services,
+    redeem, register_service, service_allow_grant, service_allow_revoke, set_relays,
+    unregister_service,
 };
 pub(crate) use roster_install::{
     install_roster, org_join, set_app_metadata, set_nickname, set_roster_url,
@@ -389,6 +390,26 @@ pub struct MeshState {
     /// design — an embedder re-registers per boot.
     pub(crate) ephemeral_services:
         std::sync::Mutex<std::collections::HashMap<String, EphemeralService>>,
+    /// In-flight `blob_fetch`es, hash → its cancel token + how many fetches share it (#172).
+    ///
+    /// Keyed by HASH rather than by request, because a hash is the only handle a cancelling caller
+    /// can hold: `ControlClient` is one-request-at-a-time, so the cancel necessarily arrives on a
+    /// DIFFERENT connection than the fetch, where no per-request identity is in scope. Concurrent
+    /// fetches of one hash therefore share one token and cancel together — the semantic a UI with
+    /// one progress bar per blob wants.
+    ///
+    /// Refcounted so the LAST fetch to finish removes the entry: a plain remove-on-finish would let
+    /// one completing fetch drop the token a sibling is still watching, and that sibling would
+    /// become uncancellable.
+    pub(crate) fetches: std::sync::Mutex<std::collections::HashMap<String, FetchSlot>>,
+}
+
+/// One hash's in-flight-fetch registration (#172) — see [`MeshState::fetches`].
+#[derive(Clone)]
+pub struct FetchSlot {
+    pub token: crate::cancel::CancelToken,
+    /// How many `blob_fetch` calls are currently watching `token`.
+    pub waiters: usize,
 }
 
 /// One ephemeral (connection-scoped) service registration (#36): the backend to serve and the
@@ -509,6 +530,7 @@ impl MeshState {
             self_net_change: std::sync::Mutex::new(None),
             probe_seq: std::sync::atomic::AtomicU64::new(0),
             ephemeral_services: std::sync::Mutex::new(std::collections::HashMap::new()),
+            fetches: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 

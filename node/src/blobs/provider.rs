@@ -711,6 +711,16 @@ impl AppBlobs {
         Ok(ticket.hash())
     }
 
+    /// The hash a `mcpmesh/blob/1` ticket names, read WITHOUT dialing anything (#172).
+    ///
+    /// `blob_fetch` needs the hash before it starts, not after: the hash is the cancellation key,
+    /// so resolving it only from [`fetch`](Self::fetch)'s return value would leave the whole dial +
+    /// transfer — the slow part, and the part worth cancelling — unaddressable.
+    pub fn ticket_hash(ticket_str: &str) -> Result<Hash> {
+        let ticket: BlobTicket = ticket_str.parse().context("parse blob ticket")?;
+        Ok(ticket.hash())
+    }
+
     /// Read a fully-present blob's bytes out of the store (callers/tests consume the fetched content).
     pub async fn read_bytes(&self, hash: Hash) -> Result<Bytes> {
         self.store

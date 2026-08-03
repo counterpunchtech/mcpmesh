@@ -10,8 +10,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use mcpmesh_local_api::{
-    BlobFetchResult, BlobPublishResult, BlobScopeList, InviteResult, PairResult, PeerAddParams,
-    PeerRemoveParams, PeerRenameParams, RegisterServiceParams, ScopeInfo, SetRelaysResult,
+    BlobFetchCancelResult, BlobFetchResult, BlobPublishResult, BlobScopeList, InviteResult,
+    PairResult, PeerAddParams, PeerRemoveParams, PeerRenameParams, RegisterServiceParams,
+    ScopeInfo, SetRelaysResult,
 };
 use mcpmesh_net::errors::{ERR_UNREACHABLE, synthesized};
 use mcpmesh_net::framing::{FrameReader, write_frame};
@@ -269,9 +270,81 @@ pub(crate) async fn blob_list(
     })
 }
 
+/// A request stopped on purpose before it finished (#172). A distinct error type so `respond` maps
+/// it to [`ERR_CANCELLED`](mcpmesh_local_api::ERR_CANCELLED) rather than the generic `-32000`: the
+/// caller asked for this, and "your fetch stopped because you cancelled it" is not a failure a
+/// client should surface as one.
+#[derive(Debug)]
+pub struct Cancelled(pub String);
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cancelled by blob_fetch_cancel: {} — partial chunks stay in the store, unlisted and \
+             unreclaimable (#80), exactly as they do when a fetch fails",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for Cancelled {}
+
+/// Registers an in-flight fetch in [`MeshState::fetches`] and DEREGISTERS on drop (#172).
+///
+/// Drop, not an explicit call at the end of `blob_fetch`: the fetch has several `?` early returns
+/// and a `select!` arm, and a leaked registration is worse than no registration at all — the hash
+/// would look permanently in-flight, so `blob_fetch_cancel` would answer `cancelled: true` for a
+/// fetch that ended long ago, and the next real fetch of that hash would inherit an
+/// already-tripped token and cancel itself instantly.
+struct FetchGuard {
+    mesh: Arc<MeshState>,
+    hash: String,
+    token: crate::cancel::CancelToken,
+}
+
+impl FetchGuard {
+    fn register(mesh: &Arc<MeshState>, hash: String) -> Self {
+        let token = {
+            let mut map = mesh.fetches.lock().expect("fetches lock not poisoned");
+            let slot = map
+                .entry(hash.clone())
+                .or_insert_with(|| crate::daemon::FetchSlot {
+                    token: crate::cancel::CancelToken::new(),
+                    waiters: 0,
+                });
+            slot.waiters += 1;
+            slot.token.clone()
+        };
+        Self {
+            mesh: mesh.clone(),
+            hash,
+            token,
+        }
+    }
+}
+
+impl Drop for FetchGuard {
+    fn drop(&mut self) {
+        let mut map = self.mesh.fetches.lock().expect("fetches lock not poisoned");
+        if let Some(slot) = map.get_mut(&self.hash) {
+            slot.waiters = slot.waiters.saturating_sub(1);
+            // Only the LAST fetch of this hash removes the entry. Removing unconditionally would
+            // drop a token a concurrent sibling is still watching, leaving that sibling running and
+            // uncancellable.
+            if slot.waiters == 0 {
+                map.remove(&self.hash);
+            }
+        }
+    }
+}
+
 /// Handle a `blob_fetch` control request: fetch a `mcpmesh/blob/1` ticket THROUGH the daemon
 /// (BLAKE3-verified streaming into the gated store) and export the verified blob to `dest_path` (a
 /// local file the same-uid daemon writes — within the trust boundary). Returns the verified hash + byte length.
+///
+/// Cancellable (#172) via [`blob_fetch_cancel`], keyed by the ticket's hash — which is read up
+/// front so the dial itself is inside the cancellable region, not just the transfer after it.
 pub(crate) async fn blob_fetch(
     state: &DaemonState,
     ticket: String,
@@ -281,17 +354,57 @@ pub(crate) async fn blob_fetch(
     let provider = mesh.app_blobs().await.context(
         "app-blob provider not enabled (its store failed to build — check the daemon log)",
     )?;
-    let hash = provider.fetch(&ticket).await.context("fetch blob")?;
-    // STREAM to disk (#82). The previous `read_bytes` + `fs::write` held the entire blob in memory
-    // before a byte landed, so peak RSS was blob-sized and a large fetch OOM-killed the node rather
-    // than merely being slow. `export` writes incrementally and reports the size, so nothing here
-    // scales with the blob.
+    let hash_hex = crate::blobs::provider::AppBlobs::ticket_hash(&ticket)?
+        .to_hex()
+        .to_string();
+    let guard = FetchGuard::register(mesh, hash_hex.clone());
     let dest = PathBuf::from(dest_path);
-    let bytes_len = provider.export_to(hash, &dest).await?;
-    Ok(BlobFetchResult {
-        hash: hash.to_hex().to_string(),
-        bytes_len,
-    })
+    let work = async {
+        let hash = provider.fetch(&ticket).await.context("fetch blob")?;
+        // STREAM to disk (#82). The previous `read_bytes` + `fs::write` held the entire blob in
+        // memory before a byte landed, so peak RSS was blob-sized and a large fetch OOM-killed the
+        // node rather than merely being slow. `export` writes incrementally and reports the size,
+        // so nothing here scales with the blob.
+        let bytes_len = provider.export_to(hash, &dest).await?;
+        anyhow::Ok(BlobFetchResult {
+            hash: hash.to_hex().to_string(),
+            bytes_len,
+        })
+    };
+    // Cooperative, not `abort()`: a cancelled fetch must still ANSWER, or the caller waits forever
+    // on work that has already stopped. Dropping `work` here is what actually halts the transfer —
+    // the iroh-blobs get stream and the export both stop when their future is dropped.
+    tokio::select! {
+        r = work => r,
+        () = guard.token.cancelled() => Err(Cancelled(hash_hex).into()),
+    }
+}
+
+/// Handle a `blob_fetch_cancel` control request (#172): trip the cancel token every in-flight
+/// [`blob_fetch`] of `hash` is watching.
+///
+/// `cancelled: false` — nothing was fetching that hash here — is a normal answer, not an error. A
+/// cancel that races a fetch to completion is indistinguishable from one for a hash that was never
+/// fetched, and inventing an error for the race would make a UI report a failure for a transfer
+/// that in fact succeeded.
+pub(crate) fn blob_fetch_cancel(state: &DaemonState, hash: &str) -> Result<BlobFetchCancelResult> {
+    let mesh = state.mesh_required()?;
+    let slot = mesh
+        .fetches
+        .lock()
+        .expect("fetches lock not poisoned")
+        .get(hash)
+        .cloned();
+    // The token is tripped OUTSIDE the map lock. `cancel()` wakes every waiter, and those waiters'
+    // guards take this same lock as they unwind — holding it across the trip invites the
+    // lock-ordering hazard for no benefit.
+    match slot {
+        Some(slot) => {
+            slot.token.cancel();
+            Ok(BlobFetchCancelResult { cancelled: true })
+        }
+        None => Ok(BlobFetchCancelResult { cancelled: false }),
+    }
 }
 
 /// Reload the config from disk and hot-swap the LIVE service registry with services rebuilt from
@@ -4092,6 +4205,129 @@ allow = []
             "no service named 'nosuchsvc' — nothing is served yet; register one with \
              'mcpmesh serve <name> -- <command>'"
         );
+    }
+
+    // ---- #172: cancelling an in-flight blob_fetch ------------------------------------------
+
+    /// A cancel for a hash nothing is fetching answers `cancelled: false` — NOT an error. It is
+    /// the same answer a cancel gets when it loses the race to a fetch that just finished, and
+    /// erroring on it would make a UI report a failure for a transfer that in fact succeeded.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancel_for_a_hash_nothing_is_fetching_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        let state = crate::control::DaemonState::with_mesh("test", mesh);
+        let r = blob_fetch_cancel(&state, "deadbeef").expect("cancel answers");
+        assert!(!r.cancelled, "nothing was in flight");
+
+        // And control-only mode still errors rather than panicking, like every other mesh verb.
+        assert!(blob_fetch_cancel(&DaemonState::new("test"), "deadbeef").is_err());
+    }
+
+    /// The registry is REFCOUNTED: concurrent fetches of one hash share a token and cancel
+    /// together, and only the last one to finish deregisters.
+    ///
+    /// Mutation anchor: removing the entry unconditionally on drop makes the mid-test cancel
+    /// answer `false`, leaving a live sibling fetch uncancellable. A guard that never deregisters
+    /// makes the final assertion answer `true` for a fetch that ended.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_fetches_of_one_hash_share_a_token_and_the_last_one_deregisters() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+
+        let a = FetchGuard::register(&mesh, "cafe".into());
+        let b = FetchGuard::register(&mesh, "cafe".into());
+        assert!(
+            !a.token.is_cancelled() && !b.token.is_cancelled(),
+            "a fresh registration starts live"
+        );
+
+        // One fetch finishing must NOT drop a token its sibling is still watching.
+        drop(a);
+        let r = blob_fetch_cancel(&state, "cafe").expect("cancel answers");
+        assert!(r.cancelled, "the surviving fetch is still cancellable");
+        assert!(b.token.is_cancelled(), "the shared token was tripped");
+
+        drop(b);
+        let r = blob_fetch_cancel(&state, "cafe").expect("cancel answers");
+        assert!(
+            !r.cancelled,
+            "the last fetch to finish deregisters the hash"
+        );
+    }
+
+    /// End to end through the real verb: a `blob_fetch` whose provider is unreachable is stopped by
+    /// `blob_fetch_cancel` and ANSWERS with [`Cancelled`] — the whole point of cooperative
+    /// cancellation over `abort()`, which would deliver no answer at all.
+    ///
+    /// The ticket names a node that does not exist, so the DIAL is what gets cancelled. That is
+    /// deliberate: resolving the hash only from `fetch`'s return value would leave the dial — the
+    /// part that can hang longest — outside the cancellable region.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancelled_blob_fetch_answers_cancelled_rather_than_hanging() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        let provider = crate::blobs::provider::AppBlobs::open_fetcher(
+            dir.path().join("blobs"),
+            mesh.endpoint.clone(),
+        )
+        .await
+        .expect("fetcher opens");
+        mesh.set_app_blobs(provider).await;
+        let state = Arc::new(crate::control::DaemonState::with_mesh("test", mesh.clone()));
+
+        // A well-formed ticket for a node that is not there.
+        let nowhere = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
+        let hash = iroh_blobs::Hash::new(b"never-fetched");
+        let ticket = iroh_blobs::ticket::BlobTicket::new(
+            iroh::EndpointAddr::from(nowhere),
+            hash,
+            iroh_blobs::BlobFormat::Raw,
+        )
+        .to_string();
+        let hash_hex = hash.to_hex().to_string();
+
+        let dest = dir.path().join("out.bin");
+        let fetch_state = state.clone();
+        let fetching = tokio::spawn(async move {
+            blob_fetch(&fetch_state, ticket, dest.to_string_lossy().into_owned()).await
+        });
+
+        // Wait until the fetch has registered itself, so the cancel cannot arrive before it starts.
+        loop {
+            if mesh
+                .fetches
+                .lock()
+                .expect("fetches lock not poisoned")
+                .contains_key(&hash_hex)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let r = blob_fetch_cancel(&state, &hash_hex).expect("cancel answers");
+        assert!(r.cancelled, "the in-flight fetch was found and tripped");
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), fetching)
+            .await
+            .expect("a cancelled fetch answers promptly rather than running to completion")
+            .expect("fetch task not panicked");
+        let err = outcome.expect_err("a cancelled fetch is an Err, not a silent success");
+        assert!(
+            err.downcast_ref::<Cancelled>().is_some(),
+            "it must be the CANCELLED error, so `respond` codes it ERR_CANCELLED rather than \
+             -32000: {err:#}"
+        );
+
+        // The guard deregistered on unwind, so a later cancel does not claim a live fetch.
+        assert!(!blob_fetch_cancel(&state, &hash_hex).unwrap().cancelled);
     }
 
     /// The blob control operations fail gracefully (Err, never a panic) in control-only mode — the

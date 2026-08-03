@@ -52,6 +52,8 @@ pub mod backends;
 #[doc(hidden)]
 pub mod blobs;
 #[doc(hidden)]
+pub mod cancel;
+#[doc(hidden)]
 pub mod config;
 #[doc(hidden)]
 pub mod control;
