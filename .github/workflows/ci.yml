@@ -27,6 +27,45 @@ jobs:
       # whole point of the feature gate is that production is unaffected; this is what tells us the
       # gated code still builds at all.
       - run: cargo clippy -p mcpmesh-node -p mcpmesh --all-targets --locked --features unstable-relay-only -- -D warnings
+  # #95: mobile is a roadmap target, so keep the CHEAPEST possible regression signal on it.
+  #
+  # `cargo check`, not test — there is no runner to execute on, and the point is dependency-level
+  # breakage: a ring/redb/iroh change that stops cross-compiling would otherwise be discovered by
+  # whoever first attempts a real port, months later and with no idea which bump caused it.
+  #
+  # This proves the tree COMPILES for these targets. It proves nothing about runtime — see the
+  # platform-support section in the README for what is still unvalidated (backgrounding, iOS
+  # process termination under redb's file lock, Android Doze).
+  mobile-targets:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-latest, target: aarch64-apple-ios }
+          - { os: ubuntu-latest, target: aarch64-linux-android }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env: { CARGO_INCREMENTAL: 0 }
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - run: rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with: { key: "${{ matrix.target }}" }
+      # `ring` builds C, so the Android target needs the NDK's clang on PATH. The runner ships the
+      # NDK; this points cc-rs at it. Without it the failure is a missing `aarch64-linux-android-clang`,
+      # which reads like a code problem and is not one.
+      - name: Point cc-rs at the Android NDK
+        if: matrix.target == 'aarch64-linux-android'
+        run: |
+          NDK="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "CC_aarch64_linux_android=$NDK/aarch64-linux-android21-clang" >> "$GITHUB_ENV"
+          echo "AR_aarch64_linux_android=$NDK/llvm-ar" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$NDK/aarch64-linux-android21-clang" >> "$GITHUB_ENV"
+      # The embeddable library is what a mobile app links; the CLI is a desktop daemon binary and
+      # is deliberately not built here.
+      - run: cargo check -p mcpmesh-node --locked --target ${{ matrix.target }}
+
   deny:
     runs-on: ubuntu-latest
     timeout-minutes: 10
