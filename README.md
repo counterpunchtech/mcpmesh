@@ -284,9 +284,31 @@ shapes.
 
 ## 💻 Platform support
 
-macOS, Linux, and Windows 10+ (x86_64 / aarch64). Rust ≥ 1.95 to build from source. On Windows, the
-local control plane uses a per-user named pipe with an owner-only DACL instead of a Unix socket —
-same-user-only access, enforced by the kernel either way.
+**Supported today:** macOS, Linux, and Windows 10+ (x86_64 / aarch64). Rust ≥ 1.95 to build from
+source. On Windows, the local control plane uses a per-user named pipe with an owner-only DACL
+instead of a Unix socket — same-user-only access, enforced by the kernel either way. These are the
+three CI runs the full test suite gates on.
+
+**iOS and Android are intended targets, on the roadmap.** If you are an embedder deciding whether a
+phone client is possible: it is not an architectural dead end, and you can plan around it. Be
+precise about what that does and does not mean today:
+
+- ✅ `mcpmesh-node` **cross-compiles** for `aarch64-apple-ios` and `aarch64-linux-android`, and CI
+  keeps it that way — a `cargo check` job on both, so a dependency bump that breaks
+  cross-compilation is caught here rather than by whoever first attempts a port.
+- ❌ **No runtime behaviour on mobile is validated.** Compiling is not working, and the open
+  questions are the load-bearing ones:
+  - **Backgrounding.** iroh holds long-lived QUIC sessions and a relay connection. iOS revokes
+    sockets and freezes the process; Android Doze exists specifically to kill this pattern.
+  - **Process termination.** `state.redb` takes an exclusive file lock. Neither OS promises a
+    clean shutdown, and we have not established what a hard kill leaves behind.
+  - **Discovery.** pkarr publish and DNS lookup assume a socket that outlives a foreground app.
+  - **Paths.** The `config` / `data` / `state` / `runtime` split has no mapping onto an iOS app
+    container, including which parts must be excluded from backup — a bearer-credential file
+    (`invites.json`) and the device key both live under it.
+
+So: build against it, but do not ship a phone client assuming a background mesh works. When those
+questions are answered they will be answered here.
 
 ## 🚦 Status
 
