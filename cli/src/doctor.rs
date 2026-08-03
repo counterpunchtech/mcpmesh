@@ -100,6 +100,9 @@ pub fn check_network(net: &crate::config::NetworkCfg) -> Verdict {
     // #56: these are validated inside `build_endpoint`, which doctor never calls. Without this,
     // `keep_alive_secs = 60` gets a clean [network] verdict and then refuses to boot on restart —
     // doctor blessing a config the daemon rejects is worse than no check at all.
+    // #63: doctor lints the per-service rates too — same reason as the transport knobs, a config
+    // the daemon refuses must not read as healthy. Checked in `check_config`'s caller which has the
+    // whole Config; here only `[network]` is in scope.
     if let Err(e) = crate::daemon::validate_transport_config(net) {
         return Verdict::error(format!(
             "[network] invalid — the daemon will refuse to start: {e:#}"

@@ -233,7 +233,25 @@ pub const MIN_BLOB_BYTES_PER_MIN: u64 = 2 * 16 * 1024;
 /// on `MeshState`. Bundled so `MeshState` gains ONE handle. Every map is bounded.
 pub struct MeshLimiters {
     /// Per-authenticated-endpoint proxied-request buckets (`[limits].rate_limit_per_min`).
+    ///
+    /// Retained as the DEFAULT and the CEILING. Since #63 the bucket a session actually consults is
+    /// per (service, endpoint) — see [`for_service`](Self::for_service) — and this one is what a
+    /// service without an override gets.
     pub requests: Arc<RateLimiter>,
+    /// The global `[limits].rate_limit_per_min`, or `None` for an unlimited bundle (#63).
+    ///
+    /// The **ceiling**: a per-service override may only LOWER the rate. Before #63 this value was a
+    /// bound on a peer's aggregate rate across every mount; now it bounds a peer's rate PER SERVICE,
+    /// and no config entry or control call can raise it. `None` propagates, so
+    /// [`unlimited`](Self::unlimited) stays unlimited whatever a service configures.
+    global_rpm: Option<u32>,
+    /// Per-service `(service, endpoint)` request buckets (#63).
+    ///
+    /// Lives HERE, not in `build_services`, because `MeshLimiters` is built once and survives
+    /// hot-reloads while `build_services` runs on every one (grant, revoke, register, roster
+    /// install). Creating these there would reset every peer's bucket on each reload, so a local
+    /// caller could spam grants to clear its own rate limit.
+    services: Mutex<HashMap<String, ServiceBucket>>,
     /// A GLOBAL pair-ALPN accept bucket (bounds a distinct-id stranger flood).
     pair_accept: Mutex<TokenBucket>,
     /// Per-authenticated-endpoint app-blob BYTE budget (`[limits].blob_bytes_per_min`, #84a).
@@ -251,7 +269,101 @@ pub struct MeshLimiters {
     ping_refused: std::sync::atomic::AtomicU64,
 }
 
+/// One service's request limiter plus the effective rate it was built for (#63). The rate is kept
+/// so a reload can tell "unchanged" from "changed" — recreating on every reload would reset buckets.
+struct ServiceBucket {
+    effective_rpm: Option<u32>,
+    limiter: Arc<RateLimiter>,
+}
+
+/// Cap on distinct service names tracked (#63). Beyond it an entry is evicted,
+/// exactly as the endpoint map does — NOT a fall back to the global limiter, which would RAISE the
+/// rate of a service configured lower and undo the only-lower rule.
+///
+/// Eviction resets that service's buckets. Reaching it needs more than this many distinct names
+/// **ever seen** — entries are not removed when a service is unregistered or drops out of config —
+/// which is a LOCAL, owner-only control-socket operation (the socket is 0600); a caller who can do
+/// it already owns the node. Note a REMOTE peer can trigger the reload that re-creates entries (a
+/// first-time pairing grant reaches `reload_services_from_disk`), so on a node whose map is already
+/// full that chains into remote-triggered bucket resets.
+///
+/// **Aggregate memory.** Each entry carries its own endpoint map at `MAX_BUCKETS`, so the bundle's
+/// worst case is this many × `MAX_BUCKETS` buckets — 256× the pre-#63 ceiling. Per-map bounds and
+/// `IDLE_TTL` pruning are unchanged; what moved is the total, and a quiet service retains its map
+/// until something calls `check` on it again.
+const MAX_TRACKED_SERVICES: usize = 256;
+
 impl MeshLimiters {
+    /// The request limiter for one service (#63): its own `(service, endpoint)` buckets.
+    ///
+    /// `configured` is `[services.<name>].rate_limit_per_min`. It may only LOWER the rate —
+    /// `[limits].rate_limit_per_min` is a hard ceiling no config entry and no control call can
+    /// exceed, which is what keeps an unclamped `register_service` from uncapping a service.
+    ///
+    /// Returns the EXISTING limiter when the effective rate is unchanged, so a reload preserves
+    /// every bucket; a changed rate replaces it (and necessarily resets it, which is the point).
+    pub fn for_service(&self, name: &str, configured: Option<u32>) -> Arc<RateLimiter> {
+        // `effective_rpm` is the single place the ceiling is applied — the config path and the
+        // control path must not be able to enforce it differently. `None` = unlimited bundle, which
+        // stays unlimited whatever a service asks for.
+        let effective = self.effective_rpm(configured);
+        let mut map = self
+            .services
+            .lock()
+            .expect("service limiter map not poisoned");
+        if let Some(existing) = map.get(name)
+            && existing.effective_rpm == effective
+        {
+            return existing.limiter.clone();
+        }
+        if map.len() >= MAX_TRACKED_SERVICES && !map.contains_key(name) {
+            // No LRU stamp on this map (it is touched once per session build, not per request), so
+            // evict an arbitrary entry. Bounded-ness is the property; WHICH one goes is not
+            // security-bearing, and reaching the cap is owner-only (see the const).
+            if let Some(victim) = map.keys().next().cloned() {
+                map.remove(&victim);
+            }
+        }
+        let limiter = match effective {
+            None => RateLimiter::unlimited_shared(),
+            Some(rpm) => Arc::new(RateLimiter::per_minute(rpm, rpm)),
+        };
+        map.insert(
+            name.to_string(),
+            ServiceBucket {
+                effective_rpm: effective,
+                limiter: limiter.clone(),
+            },
+        );
+        limiter
+    }
+
+    /// The effective rate CURRENTLY TRACKED for `name`, or `None` if this service has no bucket
+    /// yet (#63). `Some(None)` = tracked and unlimited.
+    ///
+    /// Exists so a test can pin that `build_services` actually routes each backend through
+    /// [`for_service`](Self::for_service). Asserting on `for_service` directly proves only that the
+    /// helper works — reverting the call site to the one shared limiter passed that test.
+    pub fn tracked_rpm(&self, name: &str) -> Option<Option<u32>> {
+        self.services
+            .lock()
+            .expect("service limiter map not poisoned")
+            .get(name)
+            .map(|b| b.effective_rpm)
+    }
+
+    /// The effective per-minute rate a service would get (#63) — the clamp, without building a
+    /// limiter. THE single place the ceiling is applied, so the config and control paths cannot
+    /// enforce it differently.
+    ///
+    /// Not reported anywhere yet. #63's second ask — "a way to observe remaining budget so an
+    /// embedder can pace rather than retry" — is NOT implemented; a consumer still learns the limit
+    /// only by hitting `-32053`.
+    pub fn effective_rpm(&self, configured: Option<u32>) -> Option<u32> {
+        self.global_rpm
+            .map(|global| configured.map_or(global, |c| c.min(global)))
+    }
+
     /// Build from `[limits]`. Burst == the per-minute rate (a full minute of instantaneous allowance,
     /// then the sustained rate caps at `per_min`).
     pub fn from_config(limits: &crate::config::LimitsCfg) -> Arc<Self> {
@@ -261,6 +373,8 @@ impl MeshLimiters {
                 limits.rate_limit_per_min,
                 limits.rate_limit_per_min,
             )),
+            global_rpm: Some(limits.rate_limit_per_min),
+            services: Mutex::new(HashMap::new()),
             pair_accept: Mutex::new(TokenBucket::new(
                 f64::from(PAIR_ACCEPT_PER_MIN),
                 f64::from(PAIR_ACCEPT_PER_MIN) / 60.0,
@@ -292,6 +406,10 @@ impl MeshLimiters {
         let now = Instant::now();
         Arc::new(Self {
             requests: RateLimiter::unlimited_shared(),
+            // `None`, not `Some(u32::MAX)`: it must PROPAGATE, so a service configuring 10/min in a
+            // test daemon still gets unlimited rather than silently starting to throttle (#63).
+            global_rpm: None,
+            services: Mutex::new(HashMap::new()),
             pair_accept: Mutex::new(TokenBucket::new(
                 f64::from(u32::MAX),
                 f64::from(u32::MAX),
@@ -562,6 +680,147 @@ mod tests {
         for _ in 0..1000 {
             assert!(open.admit_at(t).is_ok());
         }
+    }
+
+    /// #63, THE ISSUE: a noisy service must not starve a quiet one. Before this, every service a
+    /// peer could reach drew from one shared bucket, so an agent hammering a filesystem service
+    /// exhausted the embedder's own low-rate control traffic to a *different* service.
+    #[test]
+    fn exhausting_one_service_leaves_another_admitting() {
+        let ml = MeshLimiters::from_config(&crate::config::LimitsCfg {
+            rate_limit_per_min: 2,
+            ..Default::default()
+        });
+        let eid = EndpointId::from_bytes([7u8; 32]);
+        let t = Instant::now();
+        let noisy = ml.for_service("browser", None);
+        let quiet = ml.for_service("control", None);
+
+        // Drain the noisy service for this peer.
+        assert!(noisy.check(&eid, t).is_ok());
+        assert!(noisy.check(&eid, t).is_ok());
+        assert!(
+            noisy.check(&eid, t).is_err(),
+            "the noisy service's own bucket must be exhausted"
+        );
+
+        // The quiet one is untouched. THIS is the property #63 asks for.
+        assert!(
+            quiet.check(&eid, t).is_ok(),
+            "a different service must have its OWN budget — a shared bucket is what lets one \
+             mount starve another"
+        );
+    }
+
+    /// #63: a per-service value may only LOWER the rate. `[limits].rate_limit_per_min` stays a hard
+    /// ceiling, which is what stops an unclamped `register_service` from uncapping a service — the
+    /// vector that got the first attempt at this parked.
+    #[test]
+    fn a_per_service_rate_can_lower_but_never_raise() {
+        let ml = MeshLimiters::from_config(&crate::config::LimitsCfg {
+            rate_limit_per_min: 10,
+            ..Default::default()
+        });
+        assert_eq!(ml.effective_rpm(None), Some(10), "absent = the global");
+        assert_eq!(ml.effective_rpm(Some(3)), Some(3), "lower is honoured");
+        assert_eq!(
+            ml.effective_rpm(Some(1_000_000)),
+            Some(10),
+            "HIGHER IS CLAMPED — the global is a ceiling no config entry or control call can raise"
+        );
+
+        // …and observably so, through the real limiter rather than the arithmetic.
+        let eid = EndpointId::from_bytes([8u8; 32]);
+        let t = Instant::now();
+        let greedy = ml.for_service("greedy", Some(1_000_000));
+        for _ in 0..10 {
+            assert!(greedy.check(&eid, t).is_ok());
+        }
+        assert!(
+            greedy.check(&eid, t).is_err(),
+            "an over-ceiling request must be clamped to 10, not honoured"
+        );
+    }
+
+    /// #63: a reload with an UNCHANGED rate must preserve bucket state. `build_services` runs on
+    /// every grant/revoke/register/roster-install, so re-creating limiters there would let a local
+    /// caller spam grants to clear its own rate limit — a cheaper version of the hole this closes.
+    #[test]
+    fn a_reload_preserves_buckets_unless_the_rate_actually_changes() {
+        // Global 10, service 1: high enough that raising the service rate to 5 later is a REAL
+        // change rather than another clamp back to the same effective value. With global == 1 the
+        // "changed" half of this test was vacuous — Some(5) clamps to 1 and nothing moves.
+        let ml = MeshLimiters::from_config(&crate::config::LimitsCfg {
+            rate_limit_per_min: 10,
+            ..Default::default()
+        });
+        let eid = EndpointId::from_bytes([9u8; 32]);
+        let t = Instant::now();
+
+        let first = ml.for_service("svc", Some(1));
+        assert!(first.check(&eid, t).is_ok());
+        assert!(first.check(&eid, t).is_err(), "budget of 1 is spent");
+
+        // A reload: same name, same rate. The bucket must still be empty.
+        let again = ml.for_service("svc", Some(1));
+        assert!(
+            again.check(&eid, t).is_err(),
+            "a reload must NOT mint a fresh limiter — that resets every peer's bucket, so a local \
+             caller could spam grants to clear its own rate limit"
+        );
+
+        // A reload that CHANGES the rate applies the new one (and necessarily resets — the point).
+        let changed = ml.for_service("svc", Some(5));
+        assert!(
+            changed.check(&eid, t).is_ok(),
+            "a changed rate must take effect"
+        );
+    }
+
+    /// #63: `unlimited()` must STAY unlimited per-service. The first attempt at this had
+    /// `build_services` enforce 120/min on a bundle documented as unlimited.
+    #[test]
+    fn an_unlimited_bundle_stays_unlimited_per_service() {
+        let ml = MeshLimiters::unlimited();
+        assert_eq!(ml.effective_rpm(Some(1)), None, "unlimited PROPAGATES");
+        let eid = EndpointId::from_bytes([10u8; 32]);
+        let t = Instant::now();
+        let l = ml.for_service("svc", Some(1));
+        for _ in 0..1000 {
+            assert!(
+                l.check(&eid, t).is_ok(),
+                "an unlimited bundle must not start throttling because a service configured a rate"
+            );
+        }
+    }
+
+    /// #63: the map is bounded, and over the cap it must NOT fall back to the global limiter —
+    /// that would RAISE the rate of a service configured lower and undo the only-lower rule.
+    #[test]
+    fn the_service_map_is_bounded_and_never_falls_back_upward() {
+        let ml = MeshLimiters::from_config(&crate::config::LimitsCfg {
+            rate_limit_per_min: 100,
+            ..Default::default()
+        });
+        for i in 0..(MAX_TRACKED_SERVICES + 20) {
+            let l = ml.for_service(&format!("svc-{i}"), Some(1));
+            let eid = EndpointId::from_bytes([11u8; 32]);
+            let t = Instant::now();
+            assert!(l.check(&eid, t).is_ok());
+            assert!(
+                l.check(&eid, t).is_err(),
+                "service {i} past the cap must still enforce its OWN 1/min, not the global 100"
+            );
+        }
+        // Bounded AND bounded-in-damage. `<= cap` alone passed a `map.clear()` on every cap hit,
+        // which wipes every service's buckets for every peer — a far bigger reset than the single
+        // eviction this is meant to be.
+        let len = ml.services.lock().expect("not poisoned").len();
+        assert_eq!(
+            len, MAX_TRACKED_SERVICES,
+            "the map must sit AT the cap after overflowing it — a smaller size means eviction \
+             removed more than the one entry it needed to, resetting buckets it had no reason to"
+        );
     }
 
     #[test]

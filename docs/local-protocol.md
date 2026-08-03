@@ -7,7 +7,7 @@ named pipe on Windows. Anything that can open the endpoint and parse JSON can sp
 language — [`local-api/examples/status.py`](../local-api/examples/status.py) is a complete client
 in ~60 lines of dependency-free Python.
 
-> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.39`, `api_minor` `39`) and evolves
+> **Status: pre-release.** The API is versioned `mcpmesh-local/1` (`api_version` `1.40`, `api_minor` `40`) and evolves
 > **additively** (see [Versioning](#versioning)), but until a stable release this document — like the
 > wire format itself — may change without a migration path. Pin the mcpmesh version you build
 > against. Source of truth is the Rust in [`local-api/`](../local-api/src/protocol.rs); where this
@@ -491,7 +491,7 @@ connected peer, not only responses. This is a contract, not an accident (#91): i
 agent *react* to an incoming message instead of polling for one.
 
 **Outbound frames are NOT metered.** `[limits].rate_limit_per_min` applies only to what the REMOTE
-peer sends inbound. The limiter is keyed on the authenticated endpoint (SECURITY invariant 1), and
+peer sends inbound. The limiter is keyed on `(service, authenticated endpoint)` since #63 — before that one bucket was shared across every service a peer could reach, so a noisy service starved a quiet one, and
 an outbound frame originates from YOUR local server — charging it against the peer's budget would
 let a chatty local server exhaust the allowance of the peer it is talking to. So push is free and
 polling is not; budget accordingly.
@@ -1139,7 +1139,8 @@ things:
   at `api_minor >= 37` (#164) — guard on that before keying authorization on
   `_meta["mcpmesh/peer"]`; `SelfNetwork.presence_mode` and the `reachable: false` meaning change it
   brings (#89) are `api_minor >= 38`; `PairParams.as_nickname` + `InviteParams.peer_nickname`
-  (#87) are `api_minor >= 39` — below that `deny_unknown_fields` rejects the whole request, so
+  (#87) are `api_minor >= 39`; `RegisterServiceParams.rate_limit_per_min` and the per-service
+  meaning of `-32053` (#63) are `api_minor >= 40` — below that `deny_unknown_fields` rejects the whole request, so
   guard before offering an alias field in a UI.
   `api_minor` is itself additive: a pre-1.1 daemon omits it and it reads as `0`.
 

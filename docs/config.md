@@ -200,7 +200,7 @@ is uncharacterised, and a knob we cannot explain is worse than no knob.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `rate_limit_per_min` | `120` | Per-peer request rate (token bucket; this value is also the burst allowance). An over-limit **request** is refused with a `-32053` retry hint — never served. An over-limit **notification** is dropped without a reply, since JSON-RPC gives it no reply channel — but **not silently**: it is recorded with `status: "rate_limited"` in the audit log and on the `subscribe` stream (#76), so the loss is visible to the node operator even though the *sender* cannot detect it. That record is **latched** — one per throttle episode, not one per dropped notification (deliberately, so a flood cannot turn the audit log into a DoS): you learn that throttling happened, not how many notifications it ate. Notification delivery is not guaranteed under load (see `docs/local-protocol.md`). |
+| `rate_limit_per_min` | `120` | Per-peer, **per-service** request rate (token bucket; this value is also the burst allowance). Since #63 each service has its own `(service, peer)` bucket, so a noisy service cannot starve a quiet one — see `[services.<name>].rate_limit_per_min` below. This value is the **ceiling**: a per-service entry may only lower it. An over-limit **request** is refused with a `-32053` retry hint — never served. An over-limit **notification** is dropped without a reply, since JSON-RPC gives it no reply channel — but **not silently**: it is recorded with `status: "rate_limited"` in the audit log and on the `subscribe` stream (#76), so the loss is visible to the node operator even though the *sender* cannot detect it. That record is **latched** — one per throttle episode, not one per dropped notification (deliberately, so a flood cannot turn the audit log into a DoS): you learn that throttling happened, not how many notifications it ate. Notification delivery is not guaranteed under load (see `docs/local-protocol.md`). |
 | `blob_bytes_per_min` | `0` | Per-peer **app-blob byte budget**, bytes per minute. `0` = unlimited (the default), so upgrading changes nothing. The other blob limiter counts *connections*, which cannot see one granted peer re-pulling a 4 GB blob on each of 60 connections a minute; this bounds the bytes. A peer that exceeds it has its transfer **aborted** (retryable — `RateLimited`, not a permission failure), not paced: pacing holds the request open and turns a bandwidth problem into an unbounded-concurrency one. **The consequence is a partial transfer**, so size the budget above the largest blob you expect a peer to fetch in a minute. Setting it non-zero also arms a per-chunk intercept (~16 KiB granularity), which costs an in-process round trip per chunk — that cost is not paid at the default. **Requires a daemon restart** (the mask and the limiter are built once at boot), and **use 0 or at least 32768** (two chunks) — a value in `1..32768` is **floored to 32768**. Admission reserves one chunk before any bytes, so a sub-floor budget would not fail closed: it would silently cap every servable blob at about `budget - 16384` bytes and truncate anything larger (measured: 20480 serves a 4 KiB blob and nothing bigger). Note the budget also caps GETs at roughly `blob_bytes_per_min / 16384` per minute regardless of blob size. |
 | `audit_retain_months` | `0` | Audit-log retention window in calendar months (#88). **`0` = keep forever (the default)** — upgrading changes nothing. `N > 0` deletes monthly audit files older than the last `N` months **at daemon boot** (the current month counts as month 1); a long-running daemon prunes on its next start, and the `audit_prune` control verb covers live needs. The audit log grows with **inbound peer traffic** and shares a filesystem with `state.redb` and the device key — watch it via `status.storage.audit_bytes`. |
 | `max_sessions` | `4` | Per-service cap on concurrently spawned sessions for a `run` service (a `socket` service is one warm process that manages its own concurrency). `0` is floored to `1`. |
@@ -240,6 +240,39 @@ config: who you trust lives in the daemon's state store, and only the *names* gr
 here.
 
 ---
+
+
+### `rate_limit_per_min` — isolating a noisy service (#63)
+
+| Key | Default | Meaning |
+|---|---|---|
+| `rate_limit_per_min` | `[limits].rate_limit_per_min` | Proxied-request rate for THIS service, per peer. |
+
+Before this, every service a peer could reach drew from **one shared bucket**: an agent hammering a
+browser or filesystem service exhausted it, and your own low-rate control traffic to a *different*
+service on the same node started failing. Buckets are now per `(service, peer)`.
+
+> **It can only LOWER the rate.** `[limits].rate_limit_per_min` is a hard ceiling — a larger value
+> here is clamped, not honoured, and neither a config edit nor a `register_service` call can raise
+> it.
+>
+> **`0` is a startup error, and does NOT mean unlimited here.** Note the asymmetry with
+> `[limits].blob_bytes_per_min`, where `0` *does* mean unlimited: a `0` rate would floor to
+> 1 request/minute — the most restrictive setting there is — so it is refused rather than silently
+> giving an operator the opposite of what they asked for.
+
+**Changing it needs a daemon restart to affect an OPEN session.** A backend captures its limiter
+when the registry is built, so a session already in flight keeps the old rate until it ends — and
+MCP sessions are long-lived by design. New sessions pick up the change on the next reload.
+
+**Observing your remaining budget is not implemented.** #63's second ask is still open: a caller
+learns the limit by receiving `-32053`, not by querying it.
+
+**What this changes about the old guarantee.** `[limits].rate_limit_per_min` used to bound a peer's
+*aggregate* rate across every mount. It now bounds a peer's rate **per service**, so the aggregate is
+bounded by (services that peer is granted) × (their limits) — both operator-chosen, neither
+peer-influenced. That is a real weakening, and it is the minimum one that delivers the isolation:
+also consulting a shared bucket would restore the old ceiling and restore the starvation with it.
 
 ## A complete example
 

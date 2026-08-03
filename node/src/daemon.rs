@@ -110,7 +110,10 @@ pub use roster_install::{
     install_roster_view_and_sever, should_staleness_sever, staleness_sweep_once,
 };
 
-pub use boot::{NetPlan, PresenceMode, net_plan, presence_mode, validate_transport_config};
+pub use boot::{
+    NetPlan, PresenceMode, net_plan, presence_mode, validate_service_rates,
+    validate_transport_config,
+};
 /// The mint-path relay-readiness cap. `pub` so the #125 suite can pin it against a MEASURED
 /// `online()` rather than a hardcoded number — the ordering is the contract, not the value.
 pub use handlers::RELAY_READY_TIMEOUT;
@@ -378,6 +381,12 @@ pub struct MeshState {
 pub struct EphemeralService {
     pub backend: mcpmesh_local_api::BackendSpec,
     pub allow: Vec<String>,
+    /// Per-service request rate (#63), CLAMPED to `[limits].rate_limit_per_min` when applied.
+    ///
+    /// Carried on the ephemeral path deliberately: #55 was filed because a per-service feature (the
+    /// allow list) silently did nothing for ephemeral registrations, and repeating that shape would
+    /// earn the same report.
+    pub rate_limit_per_min: Option<u32>,
 }
 
 /// Ring depth of the reachability transition fan-out (#58). Transitions are rare relative to audit
@@ -952,9 +961,14 @@ pub fn build_services(cfg: &Config) -> Services {
     )
 }
 
-/// Build the service registry, giving every backend its service NAME, the audit sink,
-/// and the shared per-identity request limiter. The limiter is ONE `Arc` shared
-/// across ALL backends so a peer's rate spans every mount (SECURITY invariant 1, keyed on endpoint).
+/// Build the service registry, giving every backend its service NAME, the audit sink, and its OWN
+/// request limiter — one `Arc` per service, keyed internally by endpoint, so the effective bucket is
+/// `(service, endpoint)` and one mount can no longer starve another (#63). The invariant this
+/// restates:
+/// pre-#63 a peer's AGGREGATE rate across every mount was bounded by `rate_limit_per_min`; now that
+/// value bounds a peer's rate PER SERVICE and a per-service entry may only LOWER it. Aggregate is
+/// bounded by (services granted) × (their limits) — both operator-chosen, neither peer-influenced.
+/// A shared bucket is what let a noisy service starve a quiet one, which is what #63 reports.
 pub fn build_services_audited(
     cfg: &Config,
     audit: &AuditSink,
@@ -976,7 +990,7 @@ pub fn build_services_with_ephemeral(
     let mut map: HashMap<String, ServiceEntry> = HashMap::new();
     for (name, svc) in &cfg.services {
         let backend = match svc.backend_result() {
-            Ok(Backend::Run(cmd)) => session_backend_run(
+            Ok(Backend::Run(cmd)) => Arc::new(session_backend_run(
                 cmd,
                 &svc.env,
                 svc.cwd.as_deref(),
@@ -984,8 +998,15 @@ pub fn build_services_with_ephemeral(
                 cfg,
                 audit,
                 limiters,
-            ),
-            Ok(Backend::Socket(path)) => session_backend_socket(path, name, audit, limiters),
+                svc.rate_limit_per_min,
+            )) as Arc<dyn SessionBackend>,
+            Ok(Backend::Socket(path)) => Arc::new(session_backend_socket(
+                path,
+                name,
+                audit,
+                limiters,
+                svc.rate_limit_per_min,
+            )) as Arc<dyn SessionBackend>,
             Err(e) => {
                 tracing::warn!(service = %name, %e, "skipping malformed service");
                 continue;
@@ -1008,12 +1029,25 @@ pub fn build_services_with_ephemeral(
     // shape; map it to the same SpawnBackend/SocketBackend the config path builds.
     for (name, eph) in ephemeral {
         let backend = match &eph.backend {
-            mcpmesh_local_api::BackendSpec::Run { cmd, env, cwd } => {
-                session_backend_run(cmd, env, cwd.as_deref(), name, cfg, audit, limiters)
-            }
-            mcpmesh_local_api::BackendSpec::Socket { path } => {
-                session_backend_socket(path, name, audit, limiters)
-            }
+            mcpmesh_local_api::BackendSpec::Run { cmd, env, cwd } => Arc::new(session_backend_run(
+                cmd,
+                env,
+                cwd.as_deref(),
+                name,
+                cfg,
+                audit,
+                limiters,
+                eph.rate_limit_per_min,
+            ))
+                as Arc<dyn SessionBackend>,
+            mcpmesh_local_api::BackendSpec::Socket { path } => Arc::new(session_backend_socket(
+                path,
+                name,
+                audit,
+                limiters,
+                eph.rate_limit_per_min,
+            ))
+                as Arc<dyn SessionBackend>,
         };
         map.insert(
             name.clone(),
@@ -1042,16 +1076,18 @@ fn session_backend_run(
     cfg: &Config,
     audit: &AuditSink,
     limiters: &Arc<crate::limits::MeshLimiters>,
-) -> Arc<dyn SessionBackend> {
-    Arc::new(SpawnBackend {
+    // #63: `[services.<name>].rate_limit_per_min`, or an ephemeral registration's clamped value.
+    rate: Option<u32>,
+) -> SpawnBackend {
+    SpawnBackend {
         cmd: cmd.to_vec(),
         env: env.clone(),
         cwd: cwd.map(str::to_string),
         concurrency: Arc::new(Semaphore::new(spawn_concurrency(cfg))),
         service: name.to_string(),
         audit: audit.clone(),
-        limiter: limiters.requests.clone(),
-    })
+        limiter: limiters.for_service(name, rate),
+    }
 }
 
 fn session_backend_socket(
@@ -1059,13 +1095,14 @@ fn session_backend_socket(
     name: &str,
     audit: &AuditSink,
     limiters: &Arc<crate::limits::MeshLimiters>,
-) -> Arc<dyn SessionBackend> {
-    Arc::new(SocketBackend {
+    rate: Option<u32>,
+) -> SocketBackend {
+    SocketBackend {
         path: path.to_string(),
         service: name.to_string(),
         audit: audit.clone(),
-        limiter: limiters.requests.clone(),
-    })
+        limiter: limiters.for_service(name, rate),
+    }
 }
 
 /// A short, human-glanceable fingerprint of an endpoint id: the first 8 chars of its base32
@@ -1215,6 +1252,92 @@ pub(crate) mod testutil {
 
 #[cfg(test)]
 mod tests {
+
+    /// #63 gate: pin the Arc the backend actually HOLDS, not a side effect of building it.
+    ///
+    /// The first version asserted on `MeshLimiters::tracked_rpm`, which proves `for_service` was
+    /// CALLED with the right arguments — and nothing about the returned limiter being installed.
+    /// `{ let _ = limiters.for_service(name, rate); limiters.requests.clone() }` passed the whole
+    /// workspace with every backend back on one shared bucket, i.e. with the entire bug restored.
+    /// A side-effect assertion is not a call-site assertion.
+    #[test]
+    fn each_backend_holds_its_own_service_limiter() {
+        let cfg = crate::config::Config::from_toml_str(
+            "[limits]\nrate_limit_per_min = 50\n\
+             [services.noisy]\nsocket = \"/run/a.sock\"\nallow = []\nrate_limit_per_min = 2\n\
+             [services.quiet]\nrun = [\"true\"]\nallow = []\n",
+        )
+        .unwrap();
+        let limiters = crate::limits::MeshLimiters::from_config(&cfg.limits);
+        let audit = crate::audit::AuditSink::disabled();
+
+        let noisy = session_backend_socket("/run/a.sock", "noisy", &audit, &limiters, Some(2));
+        let quiet = session_backend_run(
+            &["true".to_string()],
+            &Default::default(),
+            None,
+            "quiet",
+            &cfg,
+            &audit,
+            &limiters,
+            None,
+        );
+
+        // The INSTALLED limiter must be the service's own, by pointer.
+        assert!(
+            Arc::ptr_eq(&noisy.limiter, &limiters.for_service("noisy", Some(2))),
+            "the socket backend must hold the limiter `for_service` returned for ITS name"
+        );
+        assert!(
+            Arc::ptr_eq(&quiet.limiter, &limiters.for_service("quiet", None)),
+            "and so must the run backend"
+        );
+        assert!(
+            !Arc::ptr_eq(&noisy.limiter, &quiet.limiter),
+            "two services must NOT share one bucket — a shared bucket is the whole of #63"
+        );
+        assert!(
+            !Arc::ptr_eq(&noisy.limiter, &limiters.requests),
+            "and neither may be the old shared `requests` limiter"
+        );
+
+        // …and behaviourally: draining the noisy service leaves the quiet one untouched.
+        let eid = mcpmesh_net::EndpointId::from_bytes([3u8; 32]);
+        let t = std::time::Instant::now();
+        assert!(noisy.limiter.check(&eid, t).is_ok());
+        assert!(noisy.limiter.check(&eid, t).is_ok());
+        assert!(noisy.limiter.check(&eid, t).is_err(), "noisy is drained");
+        assert!(
+            quiet.limiter.check(&eid, t).is_ok(),
+            "the quiet service must still admit"
+        );
+    }
+
+    /// #63: `build_services` must reach the same seam for every configured service.
+    #[test]
+    fn build_services_gives_each_service_its_own_bucket() {
+        let cfg = crate::config::Config::from_toml_str(
+            "[limits]\nrate_limit_per_min = 50\n\
+             [services.noisy]\nsocket = \"/run/a.sock\"\nallow = []\nrate_limit_per_min = 2\n\
+             [services.quiet]\nsocket = \"/run/b.sock\"\nallow = []\n",
+        )
+        .unwrap();
+        let limiters = crate::limits::MeshLimiters::from_config(&cfg.limits);
+        let _ = build_services_audited(&cfg, &crate::audit::AuditSink::disabled(), &limiters);
+
+        assert_eq!(
+            limiters.tracked_rpm("noisy"),
+            Some(Some(2)),
+            "the per-service rate must reach the BACKEND's limiter, not just parse — a backend \
+             still holding the shared `requests` limiter tracks nothing here"
+        );
+        assert_eq!(
+            limiters.tracked_rpm("quiet"),
+            Some(Some(50)),
+            "a service with no override gets its OWN bucket at the global rate — sharing one \
+             bucket is what let the noisy service starve it"
+        );
+    }
     use super::*;
 
     #[tokio::test]

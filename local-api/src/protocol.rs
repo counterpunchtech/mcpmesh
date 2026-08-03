@@ -499,6 +499,16 @@ pub struct RegisterServiceParams {
     /// accumulation that comes with no unregister. Default false = the persistent behavior.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ephemeral: bool,
+    /// Per-service proxied-request rate (#63), falling back to `[limits].rate_limit_per_min`.
+    ///
+    /// **CLAMPED, never honoured upward.** `[limits].rate_limit_per_min` is a hard ceiling: a
+    /// larger value here is reduced to it, so a control call cannot uncap a service. Before #63
+    /// every service a peer could reach drew from one shared bucket, so a noisy service starved a
+    /// quiet one; buckets are now per `(service, endpoint)`.
+    ///
+    /// `0` is rejected rather than silently blocking every request. `api_minor >= 40`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_per_min: Option<u32>,
 }
 
 /// Params of [`Request::Invite`]: the services the minted invite grants. Rejects unknown
@@ -1721,7 +1731,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   thirty have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.39";
+pub const API_VERSION: &str = "1.40";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -1807,7 +1817,12 @@ pub const API_VERSION: &str = "1.39";
 /// refusals — expired line, no live invite, inviter unreachable, id mismatch, name conflict, and
 /// the deliberately-opaque refusal. `ERR_NICKNAME_TAKEN` had been the only coded pairing failure,
 /// so every other one arrived as `-32000` and an embedder could either forward our prose to end
-/// users or substring-match it (#159); to 39 with `PairParams::as_nickname` +
+/// users or substring-match it (#159); to 40 with `[services.<name>].rate_limit_per_min` +
+/// `RegisterServiceParams::rate_limit_per_min` — proxied-request buckets became per
+/// `(service, endpoint)` instead of one shared per-endpoint bucket, so a noisy service can no
+/// longer starve a quiet one (#63). `-32053` changes meaning with it: it is now per-service, so a
+/// consumer that backs off globally on one is backing off further than it needs to. Guard on
+/// `>= 40` before sending the field or narrowing a back-off; to 39 with `PairParams::as_nickname` +
 /// `InviteParams::peer_nickname` — LOCAL aliases for the other party, so a nickname collision is
 /// resolvable by the person who hit it instead of requiring the other human to rename a machine or
 /// re-mint. #147 made the collision diagnosable; this makes it fixable. Guard on `>= 39` before
@@ -1832,12 +1847,12 @@ pub const API_VERSION: &str = "1.39";
 /// several minors at once, read this block end to end AND the release notes, not the diff.
 ///
 /// That class is bigger than it looks: **10, 17, 21, 22, 23, 24 and 37 all shipped with no change
-/// to any type in this file** — they moved meaning, not shape. Seven of the thirty-nine, and 37 is
+/// to any type in this file** — they moved meaning, not shape. Seven of the forty, and 37 is
 /// a SECURITY fix, which is the case where a consumer most needs the guard. 38 adds a field, but
 /// its REAL content is a meaning change to `reachable` — the field exists so the new meaning is
 /// observable at all. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 39;
+pub const API_MINOR: u32 = 40;
 
 #[cfg(test)]
 mod tests {
@@ -2494,6 +2509,7 @@ mod tests {
             },
             allow: vec!["alice".into()],
             ephemeral: false,
+            rate_limit_per_min: None,
         });
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(

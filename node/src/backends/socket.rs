@@ -44,7 +44,7 @@ pub struct SocketBackend {
     pub service: String,
     /// The audit sink. `AuditSink::disabled()` in tests / a non-audited build.
     pub audit: AuditSink,
-    /// The per-authenticated-endpoint request limiter, shared across all backends.
+    /// The request limiter for THIS service (#63): per `(service, endpoint)`, not shared across backends.
     /// Consulted per proxied request line in `super::pump`. Keyed on `identity.endpoint`.
     pub limiter: std::sync::Arc<crate::limits::RateLimiter>,
 }

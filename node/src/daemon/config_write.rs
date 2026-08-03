@@ -180,6 +180,11 @@ pub(crate) fn write_service_to_config(
     name: &str,
     backend: &BackendSpec,
     allow: &[String],
+    // #63: `None` means "leave whatever is on disk alone", NOT "clear it". The entry table is
+    // rebuilt from scratch below, so an unmerged field is silently erased — and every shipped
+    // client sends `None`, which makes erasure the DEFAULT path rather than an edge case. `allow`
+    // already had to learn this lesson; this is the same one.
+    rate_limit_per_min: Option<u32>,
 ) -> Result<()> {
     let existing = read_config_for_rmw(path)?;
     let mut doc: toml::Table = toml::from_str(&existing)
@@ -237,6 +242,18 @@ pub(crate) fn write_service_to_config(
         "allow".into(),
         toml::Value::Array(merged_allow.into_iter().map(toml::Value::String).collect()),
     );
+    // #63: carry the persisted rate across a re-registration. Supplied value wins; otherwise
+    // whatever is already on disk survives.
+    let preserved_rate = rate_limit_per_min.map(i64::from).or_else(|| {
+        services
+            .get(name)
+            .and_then(toml::Value::as_table)
+            .and_then(|t| t.get("rate_limit_per_min"))
+            .and_then(toml::Value::as_integer)
+    });
+    if let Some(rate) = preserved_rate {
+        entry.insert("rate_limit_per_min".into(), toml::Value::Integer(rate));
+    }
     services.insert(name.to_string(), toml::Value::Table(entry));
 
     write_config_doc(path, &doc)
@@ -404,6 +421,7 @@ mod tests {
                 path: "/run/kb.sock".into(),
             },
             &[],
+            None,
         )
         .unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
@@ -577,6 +595,60 @@ mod tests {
     /// EMPTY allow) must PRESERVE the grants a prior pairing appended to its `allow`. Otherwise a
     /// kb daemon restart silently revokes every paired peer's access to kb — the bug the Jetson
     /// P2P proof hit (a paired peer then gets `-32054 unknown or unauthorized service`).
+    /// #63: a re-registration must PRESERVE a persisted `rate_limit_per_min`.
+    ///
+    /// The entry table is rebuilt from scratch, so an unmerged field is silently erased — and every
+    /// shipped client sends `None`, which makes erasure the DEFAULT path rather than an edge case.
+    /// `allow` already had to learn this; the first attempt at #63 shipped the same bug for the
+    /// rate and the review caught it.
+    #[test]
+    fn reregistering_a_service_preserves_a_persisted_rate_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let socket = BackendSpec::Socket {
+            path: "/run/kb.sock".into(),
+        };
+
+        // Registered WITH a rate.
+        write_service_to_config(&path, "kb", &socket, &[], Some(7)).unwrap();
+        assert_eq!(
+            Config::load(&path)
+                .unwrap()
+                .services
+                .get("kb")
+                .unwrap()
+                .rate_limit_per_min,
+            Some(7)
+        );
+
+        // The daemon restarts and re-registers idempotently — with `None`, like every client does.
+        write_service_to_config(&path, "kb", &socket, &[], None).unwrap();
+        assert_eq!(
+            Config::load(&path)
+                .unwrap()
+                .services
+                .get("kb")
+                .unwrap()
+                .rate_limit_per_min,
+            Some(7),
+            "a re-registration that says nothing about the rate must not ERASE it — `None` means \
+             'leave it alone', not 'clear it'"
+        );
+
+        // An explicit new value still wins.
+        write_service_to_config(&path, "kb", &socket, &[], Some(3)).unwrap();
+        assert_eq!(
+            Config::load(&path)
+                .unwrap()
+                .services
+                .get("kb")
+                .unwrap()
+                .rate_limit_per_min,
+            Some(3),
+            "a supplied value must override the persisted one"
+        );
+    }
+
     #[test]
     fn reregistering_a_service_preserves_existing_allow_grants() {
         let dir = tempfile::tempdir().unwrap();
@@ -586,11 +658,11 @@ mod tests {
         };
 
         // 1. kb registers itself with an empty allow (reachability is a separate user grant).
-        write_service_to_config(&path, "kb", &socket, &[]).unwrap();
+        write_service_to_config(&path, "kb", &socket, &[], None).unwrap();
         // 2. Pairing grants "alice" access (appends to [services.kb].allow).
         append_allow_to_config(&path, "alice", &["kb".to_string()], &HashSet::new()).unwrap();
         // 3. The kb daemon RESTARTS → re-registers idempotently, again with an empty allow.
-        write_service_to_config(&path, "kb", &socket, &[]).unwrap();
+        write_service_to_config(&path, "kb", &socket, &[], None).unwrap();
 
         // The grant must survive the re-registration.
         let cfg = Config::load(&path).unwrap();
@@ -615,6 +687,7 @@ mod tests {
                 path: "/a.sock".into(),
             },
             &["alice".to_string()],
+            None,
         )
         .unwrap();
         // Re-register: a new socket path + a new allow entry "bob".
@@ -625,6 +698,7 @@ mod tests {
                 path: "/b.sock".into(),
             },
             &["bob".to_string()],
+            None,
         )
         .unwrap();
 
@@ -651,7 +725,7 @@ mod tests {
             env,
             cwd: Some("/home/me/code".into()),
         };
-        write_service_to_config(&path, "gh", &spec, &["eid:beef".to_string()]).unwrap();
+        write_service_to_config(&path, "gh", &spec, &["eid:beef".to_string()], None).unwrap();
         let cfg = Config::load(&path).unwrap();
         let svc = cfg.services.get("gh").unwrap();
         assert_eq!(svc.cwd.as_deref(), Some("/home/me/code"));
