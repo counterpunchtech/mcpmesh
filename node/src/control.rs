@@ -556,6 +556,13 @@ pub(crate) async fn handle_request(req: &Value, state: &DaemonState) -> Value {
                 .await
                 .map(unit),
         ),
+        // #65: PRODUCE an endorsement for someone else to redeem. The other half of an
+        // introduction — without it nothing can generate `evidence`.
+        Some("peer_endorse") => respond(
+            id,
+            "peer_endorse",
+            with_params(&params, |p| crate::daemon::endorse_peer(state, p)).await,
+        ),
         // Unpair a peer: the nickname to drop.
         // `remove_peer` revokes the peer's service authorization AND drops its identity row
         // (the inverse of the pairing grant) — see its fail-safe ordering.
@@ -1355,6 +1362,10 @@ mod tests {
         for method in [
             "register_service",
             "peer_add",
+            // #65: both halves of an introduction. Without these the dispatch arms could be
+            // DELETED with a green suite — the verbs would answer -32601 over the wire.
+            "peer_introduce",
+            "peer_endorse",
             "peer_remove",
             "peer_rename",
             "invite",

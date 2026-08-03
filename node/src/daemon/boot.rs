@@ -385,6 +385,8 @@ async fn boot_node(paths: NodePaths, config: Option<Config>) -> Result<BootedNod
         }
     };
     mesh.set_self_binding(self_binding);
+    // #65: `peer_endorse` reloads the key from here to sign an endorsement.
+    mesh.set_user_key_path(user_key_path);
     // Build the gated per-scope app-blob provider in roster mode and install it on the
     // mesh BEFORE the accept loop starts. Uses the SAME trust gate the mesh resolves inbound MCP
     // with, so the request-time scope check keys on the exact authenticated identity. A build

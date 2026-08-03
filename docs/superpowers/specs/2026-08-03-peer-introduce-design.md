@@ -44,6 +44,30 @@ buys an attacker.
 
 ### What bounds it: an introduction installs IDENTITY, never AUTHORIZATION
 
+**The first draft got the MECHANISM wrong, and review demonstrated the exploit.** It claimed the
+empty `services` list was the bound. It is not: `PeerEntry.services` is display/bookkeeping only —
+the trust gate never reads it. Authorization matches on **principals**: the peer's `eid:` and its
+`user_id`. And the draft let the ENDORSER assert `subject_user_id`.
+
+A `user_id` is public — it is on `status`, on `PairResult`, on every audit record. So a compromised
+endorser could endorse an *attacker's* endpoint carrying a *victim's* `user_id`, and the attacker
+inherited that victim's grants. A PoC installed such a row and the peer was admitted to a real
+service. That is the exact inverse of the claim.
+
+**The fix: a `user_id` may only be set when the SUBJECT proves it**, with the same device→user
+binding a peer presents at pairing (`subject_binding`). Two independent signatures saying different
+things — the endorser's "I vouch for this endpoint", the subject's "this user key is mine" — and
+neither alone suffices.
+
+Two further bounds review forced:
+
+- **Introductions do not chain.** The endorser check now requires `paired_at.is_some()`; without it
+  an introduced peer became an endorser as soon as it had a `user_id`, so the chain reached
+  unbounded depth and terminated at no ceremony the operator performed.
+- **An introduction cannot overwrite a paired peer.** `PeerStore::add` is an upsert, so it was
+  replacing a SAS-proven row — destroying its verified `user_id`, `paired_at`, and dial hint. That
+  is the same downgrade `set_last_addr` was rewritten to prevent. Refused now.
+
 This is the decision that makes the reduced check safe enough to ship, and it means **no new trust
 tier is needed**:
 
@@ -108,7 +132,13 @@ guard on `>= 42`.
 7. Introducing our own endpoint id is refused.
 8. A colliding nickname is refused, exactly as pairing refuses it.
 
-Mutation, four run and four caught: skipping the paired-endorser check fails 3 and 4; granting on
+### The other half: `peer_endorse`
+
+The first draft shipped only the INSTALL half — `binding::endorse` had no caller, no CLI, no verb —
+so nothing could produce `evidence` and the feature was unusable end to end. `peer_endorse` +
+`mcpmesh internal peer endorse` now produce it, and `internal peer introduce` redeems it.
+
+Mutation, eight run and eight caught: skipping the paired-endorser check fails 3 and 4; granting on
 install fails 2; swapping the domain and dropping `endorser_pk` from the preimage both fail the
 golden-vector test.
 

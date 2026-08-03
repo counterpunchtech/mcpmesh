@@ -61,7 +61,7 @@ pub use accept::spawn_accept_loop;
 pub use boot::serve_forever;
 pub use dial::{dial_service, pipe_session, race_dial};
 pub use handlers::{
-    BlobWithdrawn, NoSuchBlob, NoSuchBlobScope, NoSuchService, grant_service_access,
+    BlobWithdrawn, NoSuchBlob, NoSuchBlobScope, NoSuchService, endorse_peer, grant_service_access,
     grant_service_allow, introduce_peer, remove_peer, rename_peer, revoke_service_access,
     revoke_service_allow,
 };
@@ -334,6 +334,10 @@ pub struct MeshState {
     /// `None` (unset) in a control-only/test daemon or when no user key exists → the pairing handlers
     /// present nothing and paired peers store `user_id: None` (the pre-identity behavior).
     pub(crate) self_binding: std::sync::OnceLock<Option<crate::pairing::rendezvous::SelfBinding>>,
+    /// Where this person's `UserKey` lives (#65), resolved once at boot from `[identity].user_key`
+    /// (else the default). `peer_endorse` reloads it to SIGN an endorsement — the key is never held
+    /// in memory beyond a request, matching how boot uses it.
+    pub(crate) user_key_path: std::sync::OnceLock<PathBuf>,
     /// Recent INVITER-side pairing completions — a tiny in-memory ring (cap
     /// [`RECENT_PAIRINGS_CAP`]) `status` surfaces so the inviter's HUMAN can read the SAS and
     /// compare it with the redeemer's out-of-band ("both humans compare the code"; the
@@ -489,6 +493,7 @@ impl MeshState {
             limits: std::sync::OnceLock::new(),
             roster_addr_book: std::sync::OnceLock::new(),
             self_binding: std::sync::OnceLock::new(),
+            user_key_path: std::sync::OnceLock::new(),
             recent_pairings: std::sync::Mutex::new(std::collections::VecDeque::new()),
             reachability: std::sync::Mutex::new(std::collections::HashMap::new()),
             identity_conflict: std::sync::OnceLock::new(),
@@ -787,6 +792,11 @@ impl MeshState {
     /// The audit sink, or the disabled no-op sink if none was installed (control-only test daemon).
     pub(crate) fn audit(&self) -> AuditSink {
         self.audit.get().cloned().unwrap_or_default()
+    }
+
+    /// Install the resolved `UserKey` path (#65). Set once, at boot, like `self_binding`.
+    pub fn set_user_key_path(&self, path: PathBuf) {
+        let _ = self.user_key_path.set(path);
     }
 
     /// Install this daemon's self-sovereign pairing identity, once, before serving (like

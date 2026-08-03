@@ -414,6 +414,40 @@ enum PeerCmd {
         #[arg(long)]
         allow: Option<String>,
     },
+    /// Vouch for a peer so someone you are paired with can install them (#65).
+    ///
+    /// Prints the two values they pass to `internal peer introduce`. It is a statement for THEM —
+    /// it changes nothing about your own trust in the subject.
+    Endorse {
+        /// The subject's endpoint id (from that machine's `internal id`).
+        subject: String,
+        /// The subject's user id, when you are vouching for that too. The recipient will
+        /// additionally require the SUBJECT's own binding before trusting it.
+        #[arg(long)]
+        subject_user_id: Option<String>,
+    },
+    /// Install a peer from an endorsement by someone you are already paired with (#65).
+    ///
+    /// Onboards a small group in O(N) rather than O(N²) pairing ceremonies. It installs IDENTITY,
+    /// not authorization — grant services separately, as you would for any peer.
+    Introduce {
+        /// The subject's endpoint id.
+        subject: String,
+        /// Your local name for them.
+        nickname: String,
+        /// The endorser's user id, from their `internal peer endorse`.
+        #[arg(long)]
+        endorsed_by: String,
+        /// The endorsement signature, from their `internal peer endorse`.
+        #[arg(long)]
+        evidence: String,
+        /// The subject's user id. Requires `--subject-binding`.
+        #[arg(long)]
+        subject_user_id: Option<String>,
+        /// The SUBJECT's own device→user binding for `--subject-user-id`.
+        #[arg(long)]
+        subject_binding: Option<String>,
+    },
     /// Dump the DURABLE state this node stores for one peer (#140) — a diagnostic.
     ///
     /// Answers "what is this node about to dial, and where did that come from": the
@@ -535,6 +569,38 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                         },
                 },
         }) => run_peer_add(nickname, endpoint_id, allow, cli.json),
+        Some(Cmd::Internal {
+            command:
+                Internal::Peer {
+                    command:
+                        PeerCmd::Endorse {
+                            subject,
+                            subject_user_id,
+                        },
+                },
+        }) => run_peer_endorse(subject, subject_user_id, cli.json),
+        Some(Cmd::Internal {
+            command:
+                Internal::Peer {
+                    command:
+                        PeerCmd::Introduce {
+                            subject,
+                            nickname,
+                            endorsed_by,
+                            evidence,
+                            subject_user_id,
+                            subject_binding,
+                        },
+                },
+        }) => run_peer_introduce(
+            subject,
+            nickname,
+            endorsed_by,
+            evidence,
+            subject_user_id,
+            subject_binding,
+            cli.json,
+        ),
         Some(Cmd::Internal {
             command:
                 Internal::Peer {
@@ -788,6 +854,61 @@ fn run_peer_add(
 /// The human form is laid out to be READ SIDE BY SIDE with the same output from the other end of a
 /// stuck pairing, which is how the state that differs becomes visible. `--json` is the shape to
 /// attach to an issue.
+/// #65: produce an endorsement for someone else to redeem.
+fn run_peer_endorse(
+    subject: String,
+    subject_user_id: Option<String>,
+    json: bool,
+) -> anyhow::Result<()> {
+    with_daemon(async move |mut client| {
+        let res = client.endorse_peer(&subject, subject_user_id).await?;
+        if json {
+            println!("{}", serde_json::to_string(&res)?);
+            return Ok(());
+        }
+        println!("Endorsement created. Give BOTH of these to the person installing:");
+        println!("  --endorsed-by {}", res.endorsed_by);
+        println!("  --evidence    {}", res.evidence);
+        println!();
+        println!("They must already be paired with you, or it will not resolve.");
+        Ok(())
+    })
+}
+
+/// #65: install a peer from an endorsement.
+#[allow(clippy::too_many_arguments)]
+fn run_peer_introduce(
+    subject: String,
+    nickname: String,
+    endorsed_by: String,
+    evidence: String,
+    subject_user_id: Option<String>,
+    subject_binding: Option<String>,
+    json: bool,
+) -> anyhow::Result<()> {
+    with_daemon(async move |mut client| {
+        client
+            .introduce_peer(mcpmesh_local_api::PeerIntroduceParams {
+                subject,
+                endorsed_by,
+                evidence,
+                subject_user_id,
+                subject_binding,
+                nickname: nickname.clone(),
+            })
+            .await?;
+        if json {
+            println!("{}", serde_json::json!({"ok": true, "peer": nickname}));
+            return Ok(());
+        }
+        println!("Installed '{nickname}' from an endorsement.");
+        println!();
+        println!("They are now resolvable but have access to NOTHING — an introduction installs");
+        println!("identity, not authorization. Grant a service explicitly when you mean to.");
+        Ok(())
+    })
+}
+
 fn run_peer_state(peer: String, json: bool) -> anyhow::Result<()> {
     with_daemon(async move |mut client| {
         let v = client
