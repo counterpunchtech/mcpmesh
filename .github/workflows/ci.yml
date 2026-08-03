@@ -51,7 +51,7 @@ jobs:
       - run: rustup toolchain install
       - run: rustup target add ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-        with: { key: ${{ matrix.target }} }
+        with: { key: "${{ matrix.target }}" }
       # `ring` builds C, so the Android target needs the NDK's clang on PATH. The runner ships the
       # NDK; this points cc-rs at it. Without it the failure is a missing `aarch64-linux-android-clang`,
       # which reads like a code problem and is not one.
