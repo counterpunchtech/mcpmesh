@@ -62,6 +62,7 @@ are in the [operator runbook §5](operator.md#5-self-hosting-relay--discovery-10
 | `discovery_urls` | `[]` | Your self-hosted discovery URLs, used for both publishing and resolving peer addresses. Required when `discovery_mode = "custom"`. |
 | `idle_timeout_secs` | iroh's (**30 s**) | QUIC idle timeout. **Negotiated** — the connection uses the minimum of both peers' values, so raising it needs every node configured. See [Idle timeout and keepalive](#idle-timeout-and-keepalive-56). |
 | `keep_alive_secs` | iroh's (**5 s**) | QUIC keepalive interval. **Legal range is `1`–`5`** — iroh caps the per-path keepalive at 5 s, so a larger value is a **startup error**, not a slower ping. `0` is refused too (a PING storm, not "disabled"). Must additionally be less than the effective idle timeout. See [Idle timeout and keepalive](#idle-timeout-and-keepalive-56). |
+| `presence_mode` | `"paired"` | **Who gets a reachability pong** on `mcpmesh/ping/1` (#89). `"paired"` = any paired peer (today's behaviour) \| `"granted"` = only a peer currently holding at least one service grant \| `"off"` = never pong. See [Presence](#presence-who-can-see-that-you-are-online-89). |
 | `relay_only` | `false` | **TESTING ONLY (#116).** Force application data over the **relay** even when a direct path exists. Requires building with the `unstable-relay-only` cargo feature — without it the field still parses (configs stay portable) but is **ignored with a warning**, never a startup error. See the caveats below. |
 
 An unknown mode, or a `"custom"` mode without its URL list, is a **startup error** — the daemon
@@ -88,6 +89,39 @@ nothing is detectably wrong at config time.
 #116 was filed to escape. The issue remains open.
 
 
+
+### Presence: who can see that you are online (#89)
+
+The reachability probe (`mcpmesh/ping/1`) is gated by **pairing alone**, so `service_allow_revoke`
+never reached it. Before this knob, a peer from whom you had revoked *every* service still received,
+on demand: **that you are online right now**, your RTT (a coarse geography signal), your
+`stack_version`, and whatever you set via `set_app_metadata`. The only way to stop it was a full
+unpair — a relationship-destroying action to express a privacy preference.
+
+| Value | Who gets a pong |
+|---|---|
+| `"paired"` *(default)* | Any paired peer. Unchanged behaviour. |
+| `"granted"` | Only a peer currently holding **at least one service grant**. |
+| `"off"` | Nobody. |
+
+**`"granted"` is the useful one for a product with a per-peer sharing switch.** It makes that
+existing switch control presence too: revoking a peer's last service takes their view of your
+presence with it, **live** — grants are already applied without a restart.
+
+> **A refusal never says why.** Under `"off"` or `"granted"`, a refused probe is closed
+> **byte-identically** to the trust gate's refusal of a total stranger. A prober cannot distinguish
+> "not paired" from "hidden" from "no grants" — all three read as *offline*, which is what the
+> probe records. If a hidden node answered distinguishably, the prober would learn "this peer is
+> online and deliberately hiding", which is exactly the fact the mode exists to withhold.
+
+**Changing the mode needs a restart** — it is read at boot. The *per-peer* effect under `"granted"`
+does not, because grants are live. An unknown value is a **startup error**, never a silent fall back
+to `"paired"`: a privacy knob that fails open is worse than no knob, and `presence_mode = "of"` must
+not quietly leave you visible.
+
+**What this does not hide.** Presence here means the probe answer. A peer can still observe that
+your endpoint completes a QUIC handshake, and roster-mode presence gossip (#39) is a separate
+mechanism with its own surface. This knob governs the pairing-mode reachability probe.
 
 ### Idle timeout and keepalive (#56)
 

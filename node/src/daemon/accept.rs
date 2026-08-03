@@ -197,6 +197,41 @@ pub fn spawn_accept_loop(mesh: Arc<MeshState>, services: Arc<Services>) -> JoinH
                             conn.close(mcpmesh_net::CLOSE_UNAUTHORIZED.into(), b"unauthorized");
                             return;
                         };
+                        // #89 ask 2: the presence POLICY, before the limiter and before any work.
+                        //
+                        // The arm is otherwise gated by PAIRING alone, so `service_allow_revoke`
+                        // never reached it: a peer whose every service was revoked still learned
+                        // you were online right now, your RTT, your stack_version and your app
+                        // metadata — on demand, forever. The only lever was a full unpair, a
+                        // relationship-destroying action used to express a privacy preference.
+                        //
+                        // `Granted` reads `caller_admitted_services`, which this arm already
+                        // computes for the pong, so an embedder's existing per-peer sharing switch
+                        // now controls presence too — LIVE, since grants are, with no restart.
+                        //
+                        // The refusal is BYTE-IDENTICAL to the trust gate's above. A prober must
+                        // not be able to tell "not paired" from "hidden" from "no grants": all
+                        // three read as offline (`probe_peer` records a gate refusal as a clean
+                        // `reachable:false`). A distinguishable close would tell the prober "this
+                        // peer is online and deliberately hiding" — precisely the fact the mode
+                        // exists to withhold. Same discipline as the pairing redemption oracle.
+                        //
+                        // BEFORE the limiter deliberately: `PING_THROTTLE_CLOSE` is distinguishable
+                        // on purpose (#142 — a throttled probe must not be written down as
+                        // "offline"), so metering a hidden node first would leak its presence
+                        // through the throttle close. The cost is that a hidden node still pays one
+                        // `gate.resolve` per dial — identical to the unpaired-scanner path that
+                        // already exists and is accepted under "strangers stay cheap".
+                        let admitted = crate::daemon::caller_admitted_services(&mesh, &identity);
+                        let pong_allowed = match mesh.presence_mode() {
+                            crate::daemon::PresenceMode::Paired => true,
+                            crate::daemon::PresenceMode::Granted => !admitted.is_empty(),
+                            crate::daemon::PresenceMode::Off => false,
+                        };
+                        if !pong_allowed {
+                            conn.close(mcpmesh_net::CLOSE_UNAUTHORIZED.into(), b"unauthorized");
+                            return;
+                        }
                         // #89: meter the probe per authenticated endpoint. The arm was gated but
                         // UNMETERED, so a paired peer could pong-flood and the only bound was its
                         // own politeness. AFTER the gate, so an unpaired scanner still allocates
@@ -233,8 +268,7 @@ pub fn spawn_accept_loop(mesh: Arc<MeshState>, services: Arc<Services>) -> JoinH
                             // admitted to — the discovery answer, computed on the side that owns
                             // the truth. Only the caller's own admitted services (never the full
                             // registry). Empty list omitted (keeps a no-share pong compact).
-                            let services =
-                                crate::daemon::caller_admitted_services(&mesh, &identity);
+                            let services = &admitted;
                             let mut pong = serde_json::json!({ "stack_version": STACK_VERSION });
                             if !meta.is_empty() {
                                 pong["meta"] = serde_json::json!(meta);

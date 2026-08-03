@@ -27,7 +27,8 @@ use mcpmesh::client::connect_control;
 use mcpmesh::config::Config;
 use mcpmesh::control::{DaemonState, serve_control};
 use mcpmesh::daemon::{
-    MeshState, STACK_VERSION, build_services, probe_peer, reachability_of, spawn_accept_loop,
+    MeshState, PresenceMode, STACK_VERSION, build_services, probe_peer, reachability_of,
+    spawn_accept_loop,
 };
 use mcpmesh::pairing::LiveInvites;
 use mcpmesh::roster::gate::RosterGate;
@@ -133,6 +134,223 @@ fn assemble_mesh(
         None,
         None,
     )
+}
+
+/// Dial the target's `ALPN_PING` and report the close reason bytes, or `None` if a pong arrived.
+///
+/// #89 needs the RAW bytes, not just "unreachable": the whole property is that a hidden node's
+/// refusal is INDISTINGUISHABLE from the trust gate's, and `probe_peer` collapses every refusal to
+/// `reachable: false` — which would pass even if the close said "presence disabled".
+async fn ping_refusal_reason(dialer: &iroh::Endpoint, target: [u8; 32]) -> Option<Vec<u8>> {
+    let conn = match dialer
+        .connect(iroh::EndpointId::from_bytes(&target).unwrap(), ALPN_PING)
+        .await
+    {
+        Ok(c) => c,
+        // A refusal at handshake carries the reason too.
+        Err(e) => return Some(format!("{e}").into_bytes()),
+    };
+    let Ok((mut send, mut recv)) = conn.open_bi().await else {
+        return close_reason_bytes(&conn);
+    };
+    let _ = mcpmesh_net::framing::write_frame(&mut send, &serde_json::json!({"ping": 1})).await;
+    let _ = send.finish();
+    let mut buf = Vec::new();
+    match tokio::io::AsyncReadExt::read_to_end(&mut recv, &mut buf).await {
+        Ok(_) if !buf.is_empty() => None, // a pong arrived
+        _ => close_reason_bytes(&conn),
+    }
+}
+
+fn close_reason_bytes(conn: &iroh::endpoint::Connection) -> Option<Vec<u8>> {
+    match conn.close_reason() {
+        Some(iroh::endpoint::ConnectionError::ApplicationClosed(ac)) => {
+            Some(ac.reason.as_ref().to_vec())
+        }
+        other => Some(format!("{other:?}").into_bytes()),
+    }
+}
+
+/// #89: the presence policy must be consulted BEFORE the rate limiter.
+///
+/// `PING_THROTTLE_CLOSE` is distinguishable ON PURPOSE (#142 — a throttled probe must not be
+/// written down as "peer offline"). So if a hidden node metered first, a prober that exhausted the
+/// bucket would get "ping rate limited" back and learn the peer is online and merely hiding. The
+/// ordering IS the property; asserting the constant differs is not enough, because with an
+/// unlimited bucket the throttle branch is never reached and the assertion is vacuous.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hidden_node_never_leaks_presence_through_the_throttle_close() {
+    timeout(Duration::from_secs(120), async {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(&config, "").unwrap();
+
+        let a_ep = target_endpoint().await;
+        let a_id = *a_ep.id().as_bytes();
+        let a_addr = a_ep.addr();
+        let a_store = Arc::new(PeerStore::open(&dir.path().join("ta.redb")).unwrap());
+
+        let b_ep = dialer_endpoint().await;
+        let b_id = *b_ep.id().as_bytes();
+        seed_lookup(&b_ep, a_addr.clone());
+        seed_peer(&a_store, b_id, "flooder");
+
+        let a_mesh = assemble_mesh(a_ep, a_store, config.clone());
+        // A REAL limiter — `unlimited()` would make the throttle branch unreachable and the whole
+        // test vacuous, which is the trap the sibling throttle test documents.
+        a_mesh.set_limits(mcpmesh::limits::MeshLimiters::from_config(
+            &mcpmesh::config::LimitsCfg::default(),
+        ));
+        let accept = spawn_accept_loop(
+            a_mesh.clone(),
+            Arc::new(build_services(&Config::from_toml_str("").unwrap())),
+        );
+
+        // Drain the per-endpoint ping bucket while still in `paired`, so tokens are actually
+        // consumed (under `off` the policy refuses first and spends nothing — which is the point).
+        let mut throttled = None;
+        for _ in 0..120 {
+            if let Some(reason) = ping_refusal_reason(&b_ep, a_id).await
+                && reason == b"ping rate limited".to_vec()
+            {
+                throttled = Some(reason);
+                break;
+            }
+        }
+        assert!(
+            throttled.is_some(),
+            "the bucket must actually be exhausted, or the ordering below proves nothing"
+        );
+
+        // NOW hide. The refusal must be the gate's, not the throttle's.
+        a_mesh.set_presence_mode(PresenceMode::Off);
+        let hidden = ping_refusal_reason(&b_ep, a_id)
+            .await
+            .expect("an off node must refuse");
+        assert_eq!(
+            hidden,
+            b"unauthorized".to_vec(),
+            "a hidden node with an EXHAUSTED bucket must still answer like the trust gate. Got \
+             {:?} — if this is the throttle close, the policy is being consulted after the limiter \
+             and 'appear offline' announces itself to anyone who floods first.",
+            String::from_utf8_lossy(&hidden)
+        );
+
+        accept.abort();
+        std::mem::forget(dir);
+    })
+    .await
+    .expect("throttle-ordering test timed out");
+}
+
+/// #89 ask 2: `[network].presence_mode` makes presence REVOCABLE.
+///
+/// The ping arm is gated by pairing alone, so `service_allow_revoke` never reached it: a peer whose
+/// every service was revoked still learned you were online, your RTT, your stack_version and your
+/// app metadata, on demand and forever. The only lever was a full unpair.
+///
+/// The load-bearing assertion is 4 — a refusal must not say WHY. If a hidden node answered
+/// distinguishably, a prober would learn "online and deliberately hiding", which is the exact fact
+/// the mode withholds.
+#[tokio::test(flavor = "multi_thread")]
+async fn presence_mode_controls_who_gets_a_pong_and_never_says_why() {
+    timeout(Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(&config, "").unwrap();
+
+        let a_ep = target_endpoint().await;
+        let a_id = *a_ep.id().as_bytes();
+        let a_addr = a_ep.addr();
+        let a_store = Arc::new(PeerStore::open(&dir.path().join("pa.redb")).unwrap());
+
+        // B is PAIRED with A and holds a service grant.
+        let b_ep = dialer_endpoint().await;
+        let b_id = *b_ep.id().as_bytes();
+        seed_lookup(&b_ep, a_addr.clone());
+        let b_store = Arc::new(PeerStore::open(&dir.path().join("pb.redb")).unwrap());
+        seed_peer(&b_store, a_id, "alice");
+        seed_peer(&a_store, b_id, "granted-peer");
+
+        // D is PAIRED with A but holds NO grant — the revoked-peer case.
+        let d_ep = dialer_endpoint().await;
+        let d_id = *d_ep.id().as_bytes();
+        seed_lookup(&d_ep, a_addr.clone());
+        let d_store = Arc::new(PeerStore::open(&dir.path().join("pd.redb")).unwrap());
+        seed_peer(&d_store, a_id, "alice");
+        seed_peer(&a_store, d_id, "revoked-peer");
+
+        // C is a STRANGER — the existing trust-gate refusal, and the reference bytes.
+        let c_ep = dialer_endpoint().await;
+        seed_lookup(&c_ep, a_addr.clone());
+
+        // One service, admitting B's stable principal only.
+        let b_principal = mcpmesh_net::EndpointId::from_bytes(b_id).principal();
+        let toml = format!("[services.notes]\nrun = [\"true\"]\nallow = [\"{b_principal}\"]\n");
+        // Clones kept so the raw-dial helper can reach each prober's endpoint after the mesh
+        // takes ownership.
+        let (b_dial, d_dial) = (b_ep.clone(), d_ep.clone());
+        let a_mesh = assemble_mesh(a_ep, a_store, config.clone());
+        let b_mesh = assemble_mesh(b_ep, b_store, config.clone());
+        let d_mesh = assemble_mesh(d_ep, d_store, config.clone());
+        let accept = spawn_accept_loop(
+            a_mesh.clone(),
+            Arc::new(build_services(&Config::from_toml_str(&toml).unwrap())),
+        );
+
+        // The reference refusal: an unpaired stranger, closed by the trust gate.
+        let stranger_refusal = ping_refusal_reason(&c_ep, a_id)
+            .await
+            .expect("an unpaired stranger must never get a pong");
+
+        // 1. `paired` (the default) pongs a paired caller EVEN WITH NO GRANT — today's behaviour.
+        assert_eq!(a_mesh.presence_mode(), PresenceMode::Paired, "the default");
+        assert!(
+            probe_peer(&d_mesh, a_id).await.reachable,
+            "presence_mode = paired must pong a paired peer holding no grant (today's behaviour)"
+        );
+
+        // 2. `granted` pongs the caller WITH a grant, and refuses the one without.
+        a_mesh.set_presence_mode(PresenceMode::Granted);
+        assert!(
+            probe_peer(&b_mesh, a_id).await.reachable,
+            "presence_mode = granted must still pong a caller holding a service grant"
+        );
+        let revoked_refusal = ping_refusal_reason(&d_dial, a_id)
+            .await
+            .expect("granted must refuse a paired caller holding NO grant — this is the whole ask");
+
+        // 3. `off` refuses even the caller holding a grant — the mode overrides everything.
+        a_mesh.set_presence_mode(PresenceMode::Off);
+        let off_refusal = ping_refusal_reason(&b_dial, a_id)
+            .await
+            .expect("presence_mode = off must refuse even a granted caller");
+
+        // 4. THE ANTI-ORACLE PROPERTY. All three refusals are byte-identical, so a prober cannot
+        //    tell "not paired" from "hidden" from "no grants" — every one reads as offline.
+        assert_eq!(
+            revoked_refusal, stranger_refusal,
+            "a granted-mode refusal must be byte-identical to the trust gate's, or the prober \
+             learns the peer is online and merely ungranted"
+        );
+        assert_eq!(
+            off_refusal, stranger_refusal,
+            "an off-mode refusal must be byte-identical to the trust gate's, or 'appear offline' \
+             announces itself"
+        );
+        // 5. And in particular it is never the THROTTLE close, which is distinguishable ON PURPOSE
+        //    (#142) — so the policy must be consulted BEFORE the limiter.
+        assert_ne!(
+            off_refusal.as_slice(),
+            b"ping rate limited".as_slice(),
+            "a hidden node must not leak presence through the throttle close"
+        );
+
+        accept.abort();
+        std::mem::forget(dir);
+    })
+    .await
+    .expect("presence_mode test timed out");
 }
 
 #[tokio::test(flavor = "multi_thread")]

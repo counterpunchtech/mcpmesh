@@ -110,7 +110,7 @@ pub use roster_install::{
     install_roster_view_and_sever, should_staleness_sever, staleness_sweep_once,
 };
 
-pub use boot::{NetPlan, net_plan, validate_transport_config};
+pub use boot::{NetPlan, PresenceMode, net_plan, presence_mode, validate_transport_config};
 /// The mint-path relay-readiness cap. `pub` so the #125 suite can pin it against a MEASURED
 /// `online()` rather than a hardcoded number — the ordering is the contract, not the value.
 pub use handlers::RELAY_READY_TIMEOUT;
@@ -207,6 +207,13 @@ pub struct MeshState {
     /// registration and a pairing-grant each read the same base config and the second write
     /// clobbers the first's change (lost update). The redb `peer_add` path is already serialized
     /// by redb's write lock; this gives the config path an equivalent.
+    /// `[network].presence_mode` (#89), resolved at boot. Who gets a reachability pong.
+    ///
+    /// Not live-editable: changing the MODE needs a restart. The per-peer effect under
+    /// `Granted` is live anyway, because service grants are — revoking the last service takes
+    /// presence with it in the same action, which is the property an embedder's per-peer sharing
+    /// switch needs.
+    pub(crate) presence_mode: std::sync::RwLock<crate::daemon::PresenceMode>,
     pub(crate) reload_lock: tokio::sync::Mutex<()>,
     pub(crate) config_path: PathBuf,
     /// The relay posture (mode + custom URL set) currently APPLIED to the live endpoint — the
@@ -419,6 +426,11 @@ impl MeshState {
             accept_task: tokio::sync::Mutex::new(None),
             poll_loop: tokio::sync::Mutex::new(None),
             reload_lock: tokio::sync::Mutex::new(()),
+            // Defaults to today's behaviour; `boot` overrides it from `[network].presence_mode`
+            // (#89). Set post-construction rather than as a 13th parameter — `new` is pinned by 40+
+            // hermetic-mesh call sites across the integration tests, and every one of them wants
+            // the default.
+            presence_mode: std::sync::RwLock::new(crate::daemon::PresenceMode::default()),
             config_path,
             applied_relays: std::sync::Mutex::new(RelayPosture::default()),
             roster,
@@ -649,6 +661,31 @@ impl MeshState {
             .read()
             .expect("app_metadata lock not poisoned")
             .clone()
+    }
+
+    /// Who currently gets a reachability pong (#89). Read on every `mcpmesh/ping/1` accept.
+    pub fn presence_mode(&self) -> crate::daemon::PresenceMode {
+        *self
+            .presence_mode
+            .read()
+            .expect("presence_mode lock not poisoned")
+    }
+
+    /// Install the boot-resolved `[network].presence_mode` (#89).
+    ///
+    /// The supported way to set this is `[network].presence_mode` in config, which `boot` reads
+    /// once. This setter exists because `boot` installs it post-construction (`MeshState::new` is
+    /// pinned by 40+ hermetic-mesh call sites) and because the accept-arm tests drive it directly.
+    ///
+    /// Note for embedders: reaching this requires a `MeshState`, and `Node::mesh()` is private —
+    /// which is #89's own observation about there being no embedder interception point. A runtime
+    /// "appear offline" toggle therefore needs that seam opened first; it is not part of this
+    /// change.
+    pub fn set_presence_mode(&self, mode: crate::daemon::PresenceMode) {
+        *self
+            .presence_mode
+            .write()
+            .expect("presence_mode lock not poisoned") = mode;
     }
 
     /// Set this node's app metadata (#39); future heartbeats carry it. `""` clears it.

@@ -200,6 +200,10 @@ async fn boot_node(paths: NodePaths, config: Option<Config>) -> Result<BootedNod
     //    a pure-pairing daemon advertises exactly mcp/1 + pair/1 (no roster ALPNs to probe).
     let secret = iroh::SecretKey::from_bytes(&key.secret_bytes());
     let roster_mode = cfg.identity.org_root_pk.is_some();
+    // #89: resolve the presence policy BEFORE binding a socket, so `presence_mode = "of"` is a
+    // startup error rather than a node that silently pongs to everyone while its operator believes
+    // they are hidden. A privacy knob that fails open is worse than no knob.
+    let presence = presence_mode(&cfg.network)?;
     let endpoint = build_endpoint(secret, &cfg.network, roster_mode).await?;
     let our_id = endpoint.id();
 
@@ -349,6 +353,10 @@ async fn boot_node(paths: NodePaths, config: Option<Config>) -> Result<BootedNod
     // against runtime truth, not the on-disk config (the `.config()` embedder front door may
     // never persist the boot config to disk).
     mesh.set_applied_relays(&cfg.network.relay_mode, &cfg.network.relay_urls);
+    // #89: who gets a reachability pong. Parsed BEFORE this point (see the `presence_mode` call in
+    // the config-validation block) so an unknown value is a startup error, never a silent fall back
+    // to the permissive default — a privacy knob that fails open is worse than no knob.
+    mesh.set_presence_mode(presence);
     // Self-sovereign pairing identity: load
     // (or mint) this person's UserKey and precompute this daemon's binding over `our_id`, so the
     // pairing handlers PRESENT it and paired peers store a VERIFIED `user_id`. The key path mirrors
@@ -531,6 +539,38 @@ pub enum NetPlan {
 /// `doctor` share it. Unknown modes and a `"custom"` without URLs are ERRORS, never a silent
 /// fallback to public infrastructure — a metadata-privacy knob that quietly reverts to n0
 /// defaults would be worse than none.
+/// Who gets a reachability pong on `mcpmesh/ping/1` (#89).
+///
+/// The ping arm is gated by PAIRING alone, so `service_allow_revoke` never reached it: a peer whose
+/// every service was revoked still learned you were online, on demand and forever. The only lever
+/// was a full unpair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PresenceMode {
+    /// Any paired peer. Today's behaviour, and the default.
+    #[default]
+    Paired,
+    /// Only a caller currently holding at least one service grant — so an embedder's existing
+    /// per-peer sharing switch controls presence too, live, with no new verb.
+    Granted,
+    /// Never pong.
+    Off,
+}
+
+/// Parse `[network].presence_mode`. An unknown value is a STARTUP ERROR, matching
+/// `relay_mode`/`discovery_mode`: a privacy knob must never silently fall back to the permissive
+/// value. `presence_mode = "of"` failing loudly is the difference between a user who is hidden and
+/// a user who believes they are.
+pub fn presence_mode(net: &crate::config::NetworkCfg) -> Result<PresenceMode> {
+    match net.presence_mode.as_str() {
+        "paired" => Ok(PresenceMode::Paired),
+        "granted" => Ok(PresenceMode::Granted),
+        "off" => Ok(PresenceMode::Off),
+        other => anyhow::bail!(
+            "[network] unknown presence_mode {other:?} (expected \"paired\" | \"granted\" | \"off\")"
+        ),
+    }
+}
+
 pub fn net_plan(net: &crate::config::NetworkCfg) -> Result<NetPlan> {
     let relay = match net.relay_mode.as_str() {
         // Hermetic: no relay, no discovery (discovery_mode is ignored — doctor warns if set).
@@ -750,6 +790,10 @@ fn build_transport_config(
 /// read-only and binding a socket is not. This is the same validation with the endpoint left out,
 /// so the two cannot drift: both go through `build_transport_config`.
 pub fn validate_transport_config(net: &crate::config::NetworkCfg) -> Result<()> {
+    // #89: presence_mode rides the same pre-flight — doctor must not bless a config whose privacy
+    // knob the daemon will reject, and a typo there is exactly the case where the operator most
+    // needs to hear about it before the restart rather than after.
+    presence_mode(net)?;
     build_transport_config(net).map(|_| ())
 }
 
@@ -1370,6 +1414,38 @@ mod tests {
              Raising keep_alive_secs may now genuinely reduce ping traffic — revisit the refusal \
              in build_transport_config and the metered-link note in docs/config.md. Got: {over}"
         );
+    }
+
+    /// #89: an unknown `presence_mode` must be a STARTUP ERROR, never a silent fall back to the
+    /// permissive default. `presence_mode = "of"` quietly meaning "paired" is the difference
+    /// between a user who is hidden and a user who believes they are.
+    #[test]
+    fn an_unknown_presence_mode_is_a_startup_error() {
+        let with = |m: &str| crate::config::NetworkCfg {
+            presence_mode: m.into(),
+            ..Default::default()
+        };
+        for good in ["paired", "granted", "off"] {
+            presence_mode(&with(good)).unwrap_or_else(|e| panic!("{good:?} must parse: {e:#}"));
+        }
+        assert_eq!(
+            presence_mode(&crate::config::NetworkCfg::default()).unwrap(),
+            PresenceMode::Paired,
+            "the DEFAULT must stay today's behaviour — this knob must not change anyone silently"
+        );
+
+        // A typo, and the near-miss that matters most: a value that looks like it disables.
+        for bad in ["of", "OFF", "none", "disabled", "true", ""] {
+            let e = presence_mode(&with(bad)).unwrap_err().to_string();
+            assert!(
+                e.contains(bad) && e.contains("presence_mode"),
+                "the error must name the key AND the bad value: {e}"
+            );
+            assert!(
+                e.contains("paired") && e.contains("granted") && e.contains("off"),
+                "and list every legal value, or the operator guesses again: {e}"
+            );
+        }
     }
 
     /// #56: the ordering check. A keepalive at or above the idle timeout means the peer's timer

@@ -98,6 +98,13 @@ believes they are.
 6. The policy is consulted **before** the limiter: a hidden node's refusal is never
    `PING_THROTTLE_CLOSE`.
 
-Mutation: defaulting an unknown mode to `paired` fails 5; moving the policy check after the limiter
-fails 6; making `off` close with its own reason fails 4; making `granted` read the full registry
-rather than the caller's admitted services fails 2.
+Mutation, five run and five caught: defaulting an unknown mode to `paired` fails 5; moving the
+policy check after the limiter fails 6; making `off` close with its own reason fails 4; making
+`granted` admit everyone fails 2; making `off` pong fails 3.
+
+**Test 6 was vacuous in its first form** and is worth naming, because the trap is generic: it
+asserted `off_refusal != PING_THROTTLE_CLOSE` against a mesh with an unlimited limiter, where the
+throttle branch is unreachable and the assertion can never fail. It now installs a real limiter,
+**drains the bucket while still in `paired`** (under `off` the policy refuses first and spends no
+token — which is the property), then hides and asserts the refusal is still the gate's. Reordering
+the two checks now fails it with the throttle string in the message.
