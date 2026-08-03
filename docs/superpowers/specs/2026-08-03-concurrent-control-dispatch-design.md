@@ -31,16 +31,21 @@ The resolution is **`Arc<tokio::sync::Mutex<W>>` plus a quiesce**, not a respons
 
 - Ordinary responses take the mutex for **one whole frame** and release it. Frame atomicity is the
   property that matters — a `std::sync::Mutex` taken per `poll_write` would let two tasks interleave
-  fragments of two frames, which is worse than the bug being fixed.
+  fragments of two frames, which is worse than the bug being fixed. (Nothing in the suite asserts
+  atomicity directly; it is a reasoned choice, not a tested one.)
 - An upgrade verb **drains the `JoinSet` first** (every in-flight response lands, in whatever order
-  it finished), then takes an `OwnedMutexGuard` and holds it for the connection's remaining life.
-  A thin `OwnedWriter<W>` wrapper implements `AsyncWrite` by delegating to the guard, so
-  `open_session` and `run_subscription` keep their existing `impl AsyncWrite + Unpin + Send`
-  signatures.
+  it finished), then `Arc::try_unwrap`s the writer back **by value**, so `open_session` and
+  `run_subscription` keep their existing by-value `impl AsyncWrite + Unpin + Send` signatures
+  unchanged.
 
-Draining before the upgrade is what makes the guard exclusive. Taking the guard *without* draining
-would also be safe on the wire, but leaves in-flight tasks blocked forever on a mutex nobody
-releases — a leak until abort, and a response the client is still waiting for.
+A held `OwnedMutexGuard` was the first design and does not work: `tokio`'s guard is `Send` only when
+`T: Send + Sync`, and a write half is not `Sync`. Unwrapping is also strictly better — after the
+drain there is provably one reference, so a failure to unwrap is a loud error rather than a silent
+share.
+
+Draining is what makes that reference count reach one. Skipping it and taking the writer anyway
+would leave in-flight tasks blocked forever on a mutex nobody releases — a leak until abort, and a
+response the client is still waiting for.
 
 ### Ordering is now unspecified — this is the behaviour change
 
@@ -71,8 +76,28 @@ retried or spread over a second connection.
 
 - **`shutdown`** — it must always stop, ordering-independent, and it aborts every other connection.
 - **The upgrade verbs**, which by definition end the loop.
-- **The `register_service` ephemeral peek (#36)** moves *into* the spawned task, recorded before the
-  response is written, so a connection that closes immediately after still tears the name down.
+- **The `register_service` ephemeral teardown entry (#36)**, recorded in the read loop *before* the
+  handler is spawned. This one is not a stylistic choice — see below.
+
+### The abort window that recording-afterwards opens (found in review)
+
+`register_service` inserts into `mesh.ephemeral_services` and then **awaits** a config reload. While
+the handler was awaited inline that window could not be interrupted; in an abortable task it can.
+Recording the teardown entry after `handle_request` returned meant a client closing the socket
+mid-register left the registration **live with an empty teardown list** — an orphan service pointing
+at a dead backend, and a name `register_service` then refused forever.
+
+So the entry is recorded up front, and the task **removes it again if the register was refused** —
+otherwise a connection whose register failed would tear down the name on its way out, and that name
+belongs to whoever actually holds it.
+
+### A panic must answer, not vanish (found in review)
+
+A handler panic used to unwind the connection task, and the client saw EOF immediately. Inside a
+`JoinSet` it is swallowed — and for the ordinary one-request-at-a-time client, "reaped at the next
+inbound frame" means *never*: it waits forever on a response that cannot arrive, connection still
+open. The handler is therefore wrapped in `catch_unwind` and answers `-32603`. Strictly better than
+the EOF it used to get, and the requests behind it are not collateral.
 
 ### Connection close now aborts in-flight work
 
@@ -99,8 +124,9 @@ So cancel is addressable from **any** control connection, including a fresh one.
 ### Mechanism
 
 `blob_fetch` parses the ticket for its hash *before* dialing, registers a `CancelToken` in
-`MeshState.fetches: Mutex<HashMap<String, CancelToken>>`, and runs fetch-then-export under a
-`select!` against it. `blob_fetch_cancel` looks the hash up and trips the token.
+`MeshState.fetches: Mutex<HashMap<String, FetchSlot>>` (token + live-registration count), and runs
+fetch-then-export under a `select!` against it. `blob_fetch_cancel` looks the hash up and trips the
+token.
 
 Cancellation is **cooperative**, not `abort()`. An aborted task would deliver no response at all
 and the caller would wait forever on a request that has already stopped; the select arm returns
@@ -112,6 +138,18 @@ and avoids taking a `tokio-util` dependency for one type.
 Concurrent fetches of the **same** hash share one token: cancelling a hash cancels every fetch of
 it. That is the semantic a UI wants, and the registry entry is refcounted so the last fetch to
 finish removes it.
+
+Two refinements review forced:
+
+- **A tripped token is never inherited.** Cancel-then-Retry is the ordinary case, and the cancelled
+  fetch's guard does not deregister until its future is actually polled and dropped. Registering
+  against the dead token in that window made the retry answer "cancelled" instantly, for no reason
+  the user could see. `register` replaces a cancelled token with a fresh one.
+- **A stopped fetch emits a terminal `Aborted` frame.** `fetch` emits every transfer frame from
+  inside its progress loop, and cancellation works by *dropping* that loop — so the progress bar a
+  Cancel button lives next to would freeze at its last `Progress` forever. Emitted from the guard's
+  `Drop`, which also covers a connection-close abort, since an aborted future still runs its
+  destructors.
 
 ### What cancellation does NOT do
 
@@ -151,6 +189,14 @@ half-solved.
 9. The ephemeral `register_service` teardown (#36) still fires when the register ran in a spawned
    task.
 
-Mutation: `acquire().await` in place of `try_acquire_owned` fails 1 and 3; taking the guard without
-draining fails 4; a `std::sync::Mutex` per `poll_write` fails 4's interleaving assertion; `abort()`
-in place of the cooperative token fails 7 (no response); not removing the registry entry fails 8.
+Review added four more, each for a defect it found: an ephemeral registration must survive a
+connection that closes MID-register (and a refused register must not tear down a name another
+connection holds); a panicking handler must answer `-32603` rather than hang; `respond` must map
+`Cancelled` to `ERR_CANCELLED`; a cancel must touch only the hash it names; a retry must not inherit
+a tripped token; and a stopped fetch must emit `Aborted`.
+
+Mutation: `acquire().await` in place of `try_acquire_owned` fails 3; awaiting the handler inline
+fails 1; aborting instead of draining fails 4; a detached `tokio::spawn` fails 6; `abort()` in place
+of the cooperative token fails 7; not removing the registry entry fails 8; recording the ephemeral
+entry after the handler fails the mid-register-close test; removing the `catch_unwind` hangs the
+panic test.

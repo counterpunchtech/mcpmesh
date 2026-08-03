@@ -711,6 +711,26 @@ impl AppBlobs {
         Ok(ticket.hash())
     }
 
+    /// Broadcast a terminal `Aborted` for a fetch that was STOPPED rather than finished (#172).
+    ///
+    /// [`fetch`](Self::fetch) emits every transfer frame from inside its progress loop, and
+    /// cancellation works by dropping that future — so the loop simply stops, and a subscriber's
+    /// progress bar would sit at its last `Progress` value forever with no terminal frame. The
+    /// cancel path emits one from outside instead. `bytes_done` is not carried: the count lives in
+    /// the dropped future, and reporting a stale one would be worse than reporting none.
+    pub fn emit_fetch_aborted(&self, hash_hex: &str) {
+        if let Some(b) = &self.transfers {
+            let _ = b.send(crate::daemon::BlobTransfer {
+                direction: mcpmesh_local_api::BlobDirection::Fetch,
+                hash: hash_hex.to_string(),
+                bytes_done: 0,
+                bytes_total: None,
+                state: mcpmesh_local_api::BlobTransferState::Aborted,
+                peer: None,
+            });
+        }
+    }
+
     /// The hash a `mcpmesh/blob/1` ticket names, read WITHOUT dialing anything (#172).
     ///
     /// `blob_fetch` needs the hash before it starts, not after: the hash is the cancellation key,

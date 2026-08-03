@@ -240,7 +240,14 @@ Methods split into two groups by audience:
 >   also the honest answer when a cancel races a fetch to completion.
 >
 > Closing the control connection also aborts its in-flight work now, so "cancel by dropping the
-> socket" is a real mechanism rather than a transfer that runs on unread.
+> socket" is a real mechanism rather than a transfer that runs on unread. **That applies to every
+> verb, not just `blob_fetch`** — a request whose connection closes before it answers is stopped
+> wherever it happens to be. Its effects up to that point stand; nothing is rolled back.
+>
+> A stopped fetch — cancelled *or* aborted by a closing connection — broadcasts a terminal
+> `BlobTransfer` frame with `state: "aborted"`, so a subscriber's progress bar resolves instead of
+> freezing at its last `Progress`. `bytes_done` on that frame is `0`: the real count died with the
+> transfer, and a stale one would be worse than none.
 >
 > **What cancellation does NOT clean up.** A partially fetched blob's chunks stay in the store.
 > They are not listed by `blob_list` (which lists published scopes, not raw store contents) and
