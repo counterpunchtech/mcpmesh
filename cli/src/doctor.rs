@@ -828,6 +828,7 @@ mod tests {
             discovery_mode: disc.into(),
             discovery_urls: disc_urls.iter().map(|s| s.to_string()).collect(),
             relay_only: false,
+            ..Default::default()
         }
     }
 
@@ -1137,6 +1138,7 @@ mod tests {
             discovery_mode: "default".into(),
             discovery_urls: vec![],
             relay_only,
+            ..Default::default()
         }
     }
 

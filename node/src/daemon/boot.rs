@@ -16,6 +16,8 @@ use crate::config::Config;
 use crate::control::{DaemonState, serve_control};
 use crate::ipc;
 use crate::node::StartError;
+use std::time::Duration;
+
 use crate::pairing::LiveInvites;
 use crate::paths::NodePaths;
 use crate::roster::RosterStore;
@@ -624,12 +626,85 @@ pub(crate) async fn build_endpoint(
     };
     let alpns = alpns_for(roster_mode);
     let builder = apply_relay_only(builder, net);
+    let builder = apply_transport_config(builder, net)?;
     builder
         .secret_key(secret)
         .alpns(alpns)
         .bind()
         .await
         .context("bind iroh endpoint")
+}
+
+/// Apply `[network].idle_timeout_secs` / `keep_alive_secs` (#56), if set.
+///
+/// Untouched when both are absent — the endpoint gets iroh's defaults verbatim, so a config that
+/// says nothing about this behaves exactly as it did before the knobs existed.
+///
+/// **The ordering check is the load-bearing part.** A keepalive interval at or above the idle
+/// timeout means the peer's timer fires before the next PING arrives: every session dies on a
+/// clock, and the config that caused it looks reasonable. Rejecting it at boot, naming both values,
+/// is the difference between a startup error and a fleet that mysteriously severs.
+/// What `[network]`'s transport knobs resolve to (#56): `(max_idle_timeout, keep_alive_interval)`,
+/// each `None` for "leave iroh's default alone". `None` overall = touch nothing at all.
+///
+/// Separated from the builder call so the DECISION is inspectable. Applying it is two mechanical
+/// lines; choosing the values — including the ordering rule and `0` meaning no-timeout — is where a
+/// mistake hides, and a test that only checks "does boot succeed" cannot see a swapped argument
+/// (#56 gate: it did not).
+type TransportSettings = Option<(Option<Duration>, Option<Duration>)>;
+
+fn transport_settings(net: &crate::config::NetworkCfg) -> Result<TransportSettings> {
+    let (idle, keep) = (net.idle_timeout_secs, net.keep_alive_secs);
+    if idle.is_none() && keep.is_none() {
+        return Ok(None);
+    }
+    if let (Some(i), Some(k)) = (idle, keep) {
+        anyhow::ensure!(
+            k < i,
+            "[network] keep_alive_secs ({k}) must be less than idle_timeout_secs ({i}): a \
+             keepalive arriving after the peer's idle timer has fired severs every session on a \
+             clock rather than keeping it open"
+        );
+    }
+    Ok(Some((
+        // `0` is QUIC's "no idle timeout at all" — a real, sharp choice, kept rather than rejected.
+        // It maps to `None`, which is also what "not configured" maps to; the difference is that
+        // here we go on to SET it, overriding iroh's 30s.
+        idle.map(Duration::from_secs).filter(|d| !d.is_zero()),
+        keep.map(Duration::from_secs),
+    )))
+}
+
+/// Apply `[network].idle_timeout_secs` / `keep_alive_secs` (#56), if set.
+///
+/// Untouched when both are absent — the endpoint gets iroh's defaults verbatim, so a config that
+/// says nothing about this behaves exactly as it did before the knobs existed. Note the builder
+/// starts from `QuicTransportConfig::builder()`, which is iroh's OVERRIDDEN default (5s keepalive,
+/// 15s path idle), not the raw QUIC one — so setting one knob does not silently reset the others.
+fn apply_transport_config(
+    builder: iroh::endpoint::Builder,
+    net: &crate::config::NetworkCfg,
+) -> Result<iroh::endpoint::Builder> {
+    let Some((idle, keep)) = transport_settings(net)? else {
+        return Ok(builder);
+    };
+    let mut cfg = iroh::endpoint::QuicTransportConfig::builder();
+    if net.idle_timeout_secs.is_some() {
+        let timeout = idle
+            .map(|d| {
+                iroh::endpoint::IdleTimeout::try_from(d).map_err(|e| {
+                    anyhow::anyhow!(
+                        "[network] idle_timeout_secs is out of the range QUIC can encode: {e}"
+                    )
+                })
+            })
+            .transpose()?;
+        cfg = cfg.max_idle_timeout(timeout);
+    }
+    if let Some(k) = keep {
+        cfg = cfg.keep_alive_interval(k);
+    }
+    Ok(builder.transport_config(cfg.build()))
 }
 
 /// TEST-ONLY (#116): an iroh `PathSelector` that carries application data over the RELAY whenever a
@@ -1057,6 +1132,7 @@ mod tests {
             discovery_mode: disc.into(),
             discovery_urls: disc_urls.iter().map(|s| s.to_string()).collect(),
             relay_only: false,
+            ..Default::default()
         };
 
         // Defaults → the n0 mesh.
@@ -1122,6 +1198,113 @@ mod tests {
         );
     }
 
+    /// #56 gate: the values are applied to the RIGHT knobs.
+    ///
+    /// The first version only asserted that boot succeeded or failed, which cannot see a swapped
+    /// argument — mutating the keepalive to use the idle value passed every test. This inspects
+    /// the decision itself.
+    #[test]
+    fn transport_settings_map_each_knob_to_its_own_field() {
+        let net = |idle: Option<u64>, keep: Option<u64>| crate::config::NetworkCfg {
+            idle_timeout_secs: idle,
+            keep_alive_secs: keep,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            transport_settings(&net(None, None)).unwrap(),
+            None,
+            "an unconfigured node must touch NOTHING — iroh's defaults verbatim"
+        );
+        assert_eq!(
+            transport_settings(&net(Some(30), Some(5))).unwrap(),
+            Some((Some(Duration::from_secs(30)), Some(Duration::from_secs(5)))),
+            "idle -> idle, keepalive -> keepalive; swapping them is the mistake this catches"
+        );
+        assert_eq!(
+            transport_settings(&net(None, Some(5))).unwrap(),
+            Some((None, Some(Duration::from_secs(5)))),
+            "a keepalive alone must not invent an idle timeout the operator did not ask for"
+        );
+        assert_eq!(
+            transport_settings(&net(Some(60), None)).unwrap(),
+            Some((Some(Duration::from_secs(60)), None)),
+            "and an idle timeout alone must not invent a keepalive"
+        );
+        assert_eq!(
+            transport_settings(&net(Some(0), None)).unwrap(),
+            Some((None, None)),
+            "0 = QUIC's no-timeout: it maps to None, and (unlike unconfigured) it is still SET"
+        );
+        assert!(
+            transport_settings(&net(Some(30), Some(30))).is_err(),
+            "equal is not less-than — the keepalive would arrive exactly as the timer fires"
+        );
+    }
+
+    /// #56: the ordering check. A keepalive at or above the idle timeout means the peer's timer
+    /// fires before the next PING arrives — every session dies on a clock, from a config that
+    /// reads as reasonable. Boot must refuse it and name both values.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_keepalive_at_or_above_the_idle_timeout_is_refused() {
+        let net = |idle: u64, keep: u64| crate::config::NetworkCfg {
+            relay_mode: "disabled".into(),
+            idle_timeout_secs: Some(idle),
+            keep_alive_secs: Some(keep),
+            ..Default::default()
+        };
+        let key = || iroh::SecretKey::from_bytes(&[19u8; 32]);
+
+        for (idle, keep) in [(30, 30), (30, 60)] {
+            let e = build_endpoint(key(), &net(idle, keep), false)
+                .await
+                .expect_err("a keepalive that cannot arrive in time must be refused at boot");
+            let msg = format!("{e:#}");
+            assert!(
+                msg.contains(&keep.to_string()) && msg.contains(&idle.to_string()),
+                "the error must name BOTH values — an operator cannot fix what it does not \
+                 identify: {msg}"
+            );
+        }
+
+        // The valid ordering binds.
+        let ep = build_endpoint(key(), &net(30, 5), false)
+            .await
+            .expect("keepalive below the timeout is the working configuration");
+        ep.close().await;
+    }
+
+    /// #56: an absent config changes NOTHING — the endpoint gets iroh's defaults verbatim, so a
+    /// config that says nothing about this behaves exactly as it did before the knobs existed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn absent_transport_config_leaves_iroh_defaults_alone() {
+        let net = crate::config::NetworkCfg {
+            relay_mode: "disabled".into(),
+            ..Default::default()
+        };
+        assert_eq!(net.idle_timeout_secs, None);
+        assert_eq!(net.keep_alive_secs, None);
+        let ep = build_endpoint(iroh::SecretKey::from_bytes(&[20u8; 32]), &net, false)
+            .await
+            .expect("an unconfigured node still binds");
+        ep.close().await;
+    }
+
+    /// #56: `idle_timeout_secs = 0` is QUIC's "no timeout", and is ACCEPTED rather than rejected —
+    /// it is a real (if sharp) choice. Pinned so it is not turned into an error by accident.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_zero_idle_timeout_means_no_timeout_and_is_allowed() {
+        let net = crate::config::NetworkCfg {
+            relay_mode: "disabled".into(),
+            idle_timeout_secs: Some(0),
+            ..Default::default()
+        };
+        let ep = build_endpoint(iroh::SecretKey::from_bytes(&[21u8; 32]), &net, false)
+            .await
+            .expect("0 = no idle timeout is a valid QUIC configuration");
+        ep.close().await;
+    }
+
     /// A custom-relay endpoint BINDS without any live relay (the RelayMap is config, not a
     /// connection) — proving the builder wiring end to end with no network dependency.
     #[tokio::test(flavor = "multi_thread")]
@@ -1132,6 +1315,7 @@ mod tests {
             discovery_mode: "custom".into(),
             discovery_urls: vec!["https://dns.acme.com/pkarr".into()],
             relay_only: false,
+            ..Default::default()
         };
         let ep = build_endpoint(iroh::SecretKey::from_bytes(&[9u8; 32]), &net, false)
             .await

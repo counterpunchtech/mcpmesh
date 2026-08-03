@@ -86,6 +86,37 @@ nothing is detectably wrong at config time.
 #116 was filed to escape. The issue remains open.
 
 
+
+### Idle timeout and keepalive (#56)
+
+| Key | Default | Meaning |
+|---|---|---|
+| `idle_timeout_secs` | iroh's (**30 s** on iroh 1.0.3) | How long a connection survives with no traffic **and no keepalive** before QUIC closes it. `0` = no timeout at all. |
+| `keep_alive_secs` | iroh's (**5 s** on iroh 1.0.3) | How often the transport PINGs an otherwise idle connection. Must be **less than** `idle_timeout_secs`, or boot fails. |
+
+**A held session does not die when idle.** iroh already keepalives every 5 s, so `open_session` and
+`subscribe` survive indefinitely while the process runs and the network is up. The idle timeout is
+what detects a peer that *vanished* — not one that is merely quiet. **You do not need an
+application-level heartbeat for liveness**, and one costs you `[limits].rate_limit_per_min` budget
+that a transport keepalive does not: the limiter only counts method-bearing JSON-RPC frames, and a
+QUIC PING never becomes one.
+
+**These defaults are iroh's, not ours.** As measured on the pinned iroh 1.0.3:
+
+| setting | value | source |
+|---|---|---|
+| `keep_alive_interval` | 5 s | iroh overrides the QUIC default |
+| `max_idle_timeout` | 30 s | QUIC default, not overridden |
+| `default_path_max_idle_timeout` | 15 s | iroh override |
+| relay path max idle | 30 s | iroh override |
+
+An iroh bump can move them. Treat a change here as release-note-worthy; that is why they are written
+down rather than left to be measured on real hardware.
+
+Setting either key starts from iroh's *overridden* defaults, so changing one does not silently reset
+the others. The per-path knobs are deliberately **not** exposed: their interaction with hole-punching
+is uncharacterised, and a knob we cannot explain is worse than no knob.
+
 ## `[limits]`
 
 | Key | Default | Meaning |

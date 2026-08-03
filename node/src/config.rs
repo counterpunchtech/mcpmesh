@@ -122,6 +122,28 @@ pub struct NetworkCfg {
     /// `PathSelector` cannot reach). A direct path may still form — it simply never carries data,
     /// and `status` reports `relay` because #64 derives the path from `is_selected()`.
     pub relay_only: bool,
+    /// QUIC idle timeout in seconds (#56) — how long a connection survives with NO traffic and no
+    /// keepalive before the transport closes it. `None` = iroh's default, **30s** on iroh 1.0.3.
+    ///
+    /// This is not "how long an idle session lives". iroh keepalives every 5s by default, so a held
+    /// session survives indefinitely while the process runs; this is what detects a peer that
+    /// VANISHED. Raise it for a flaky link, lower it to notice a dead peer sooner.
+    ///
+    /// `0` means no timeout at all in QUIC — accepted, but then a vanished peer is never detected
+    /// at the transport layer and a session hangs until something above notices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_secs: Option<u64>,
+    /// QUIC keepalive interval in seconds (#56) — how often the transport sends a PING on an
+    /// otherwise idle connection. `None` = iroh's default, **5s** on iroh 1.0.3.
+    ///
+    /// A transport keepalive carries no method-bearing frame, so it does NOT consume a
+    /// `[limits].rate_limit_per_min` token — unlike an application-level heartbeat, which does.
+    ///
+    /// MUST be less than `idle_timeout_secs`: a keepalive that arrives after the peer's timeout has
+    /// already fired severs every session on a timer, so boot rejects that combination rather than
+    /// accepting a config that quietly cannot work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_alive_secs: Option<u64>,
 }
 impl Default for NetworkCfg {
     fn default() -> Self {
@@ -131,6 +153,8 @@ impl Default for NetworkCfg {
             discovery_mode: "default".into(),
             discovery_urls: Vec::new(),
             relay_only: false,
+            idle_timeout_secs: None,
+            keep_alive_secs: None,
         }
     }
 }
