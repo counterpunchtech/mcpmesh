@@ -108,7 +108,7 @@ downstreams break. `api_minor` **40 → 41**: a consumer must guard on `>= 41` b
    weaken authorization.
 6. An aborted transfer emits `Aborted`, not a silent stop.
 
-Mutation, five run and five caught: dropping the coalescing gate fails 2; downgrading
+Mutation, ten run and ten caught: dropping the coalescing gate fails 2; downgrading
 `InterceptLog` to `NotifyLog` fails 5; dropping the `Aborted` emit fails 6; dropping the
 final-count clamp fails 3.
 
@@ -117,6 +117,42 @@ final-count clamp fails 3.
 deliberately LAGGING last progress (400 of 1000), which is the case the clamp exists for: the stride
 skips the tail, so a consumer rendering the last `Progress` as the total stops at 40% on a fully
 successful transfer.
+
+## The gate round: the bound was false in the direction that matters, and the wiring was untested
+
+**The fetch side never learns `total`** — `GetProgressItem` carries no size — so `stride()` fell to
+the fixed 1 MiB floor forever. A 4 GiB fetch emitted **~4098 frames into a 256-deep ring**, and three
+places (this spec, the rustdoc, `docs/local-protocol.md`) stated "~102 whatever its size"
+unconditionally. The serve side was correctly bounded; the FETCH direction — the one #82 is about —
+was the one still flooding. The stride now doubles every 16 frames when the total is unknown, so the
+count grows with the log of the size (~128 frames for 4 GiB).
+
+**Five mutations escaped the whole workspace**, because every new test drove `apply_transfer_update`
+as a pure function and nothing drove the wiring:
+
+| mutation | now caught by |
+|---|---|
+| `emit_fetch`'s body deleted — all fetch-side frames gone | `a_real_transfer_emits_progress_on_both_sides` |
+| the serve side reports `direction: Fetch` | same |
+| the drain task never calls `apply_transfer_update` | same |
+| `blob_frame` drops every value — frames produced, never delivered | `blob_transfer_frames_reach_a_subscriber` |
+| the synthesized end-of-stream `Aborted` deleted | covered by the unit case |
+
+The spec's own **test 4** ("a fetch emits `direction: "fetch"` frames") was listed as required and
+never written — and the mutation that would have exposed it was deleted from the mutation list
+rather than run. Both tests now exist, and one drives a real publish → grant → fetch.
+
+Also corrected from the gate: `internal watch` — the documented reference consumer — rendered every
+frame as `[unknown frame]`; the two new enums were spliced into the middle of `StreamFrame`'s doc
+comment; `docs/local-protocol.md` had no entry for the frame, still said "four shapes", and
+mis-attached #63's `deny_unknown_fields` caveat to a server-pushed frame; the fetch rewrite defaulted
+`outcome` to `Ok`, a fail-OPEN where `complete()` failed closed; and the claim that `StreamFrame` is
+not `#[non_exhaustive]` was simply wrong (it is — the real break is `AppBlobs::load`'s signature).
+
+**Two semantics documented rather than papered over:** on the serve side `bytes_done` is an absolute
+offset and `bytes_total` the whole blob, so a legitimate sub-range GET still completes at the full
+size; on the fetch side it counts bytes downloaded *by this call*, so a re-fetch of a blob you
+already hold completes with `bytes_done: 0`.
 
 ## A regression the existing AC tests caught
 

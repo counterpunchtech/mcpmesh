@@ -531,6 +531,13 @@ impl MeshState {
     /// opens the session, or the transition it exists to observe can land in the gap between open
     /// and subscribe and the test passes or fails on timing rather than on behaviour.
     #[doc(hidden)]
+    /// The app-blob transfer ring (#82), so an integration test can assert that frames produced by
+    /// the provider actually REACH a subscriber. Without it nothing pins the wiring: deleting the
+    /// `blob_frame` mapping passed the whole workspace.
+    pub fn blob_bcast_for_test(&self) -> &tokio::sync::broadcast::Sender<BlobTransfer> {
+        &self.blob_bcast
+    }
+
     pub fn reach_bcast_for_test(&self) -> &tokio::sync::broadcast::Sender<ReachTransition> {
         &self.reach_bcast
     }

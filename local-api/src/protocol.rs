@@ -1534,14 +1534,6 @@ pub struct ActiveSession {
     pub principal: Option<String>,
 }
 
-/// One frame of the [`Request::Subscribe`] stream (pairing liveness & health telemetry). Tagged on
-/// `type` (snake_case), so a frame is `{"type":"snapshot",...}` / `{"type":"event",...}` /
-/// `{"type":"lagged",...}`. `Event.record` is the [`AuditRecord`] verbatim, so the stream and the
-/// on-disk log carry ONE schema. The daemon serializes these; an embedding consumer deserializes
-/// them (see `docs/local-protocol.md` "Live event stream").
-/// **`#[non_exhaustive]`**: a future frame kind must not break a downstream `match`. Adding
-/// `Reachability` in 0.13.0 DID break exhaustive matches — which is why that release is a MINOR,
-/// per `RELEASING.md`'s pre-1.0 rule that breaking changes bump the minor. Consumers now write a
 /// Which side of an app-blob transfer a [`StreamFrame::BlobTransfer`] describes (#82).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1566,6 +1558,15 @@ pub enum BlobTransferState {
     Aborted,
 }
 
+/// One frame of the [`Request::Subscribe`] stream (pairing liveness & health telemetry). Tagged on
+/// `type` (snake_case), so a frame is `{"type":"snapshot",...}` / `{"type":"event",...}` /
+/// `{"type":"lagged",...}`. `Event.record` is the [`AuditRecord`] verbatim, so the stream and the
+/// on-disk log carry ONE schema. The daemon serializes these; an embedding consumer deserializes
+/// them (see `docs/local-protocol.md` "Live event stream").
+///
+/// **`#[non_exhaustive]`**: a future frame kind must not break a downstream `match`. Adding
+/// `Reachability` in 0.13.0 DID break exhaustive matches — which is why that release is a MINOR,
+/// per `RELEASING.md`'s pre-1.0 rule that breaking changes bump the minor. Consumers now write a
 /// `_ =>` arm and later additions are additive for Rust as well as for JSON.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -1663,8 +1664,9 @@ pub enum StreamFrame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bytes_total: Option<u64>,
         state: BlobTransferState,
-        /// SERVING side only: the STABLE principal we are serving (`eid:`/`b64u:`/roster name,
-        /// #38 — never a display nickname). Absent when fetching, where the counterparty is named
+        /// SERVING side only: the STABLE `eid:` device principal we are serving (#38 — never a
+        /// display nickname). Always `eid:<hex>`: this comes from the authenticated endpoint, so it
+        /// is NOT the same namespace as a grant written as a user_id or roster name. Absent when fetching, where the counterparty is named
         /// by the ticket rather than by a resolved identity.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         peer: Option<String>,

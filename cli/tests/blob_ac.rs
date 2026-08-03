@@ -125,7 +125,9 @@ pub(crate) async fn serving_provider(
         provider_ep,
         mcpmesh::audit::AuditSink::disabled(),
         mcpmesh::limits::MeshLimiters::unlimited(),
-        None,
+        // #82: the mesh's transfer ring, exactly as `boot` wires it — so a test can observe the
+        // frames a real served transfer produces.
+        Some(mesh.blob_bcast_for_test().clone()),
     )
     .await
     .unwrap();
@@ -189,6 +191,113 @@ async fn ac1_granted_caller_fetches_large_blob_and_blake3_verifies() {
     })
     .await
     .expect("AC1 timed out");
+}
+
+/// #82 gate: the transfer frames must actually be PRODUCED by a real transfer, on BOTH sides.
+///
+/// The unit tests exercise `apply_transfer_update` as a pure function, which proves the coalescing
+/// arithmetic and nothing about the wiring. Five mutations escaped the whole workspace: deleting
+/// `emit_fetch`'s body, making the serve side report `direction: Fetch`, and severing the drain
+/// task's call to `apply_transfer_update` all passed. This drives a real
+/// publish → grant → fetch and asserts on what came out of both rings.
+#[tokio::test]
+async fn a_real_transfer_emits_progress_on_both_sides() {
+    timeout(Duration::from_secs(120), async {
+        let root = SigningKey::from_bytes(&[13u8; 32]);
+        let provider_ep = provider_endpoint().await;
+        let caller_ep = caller_endpoint().await;
+        let caller_id = *caller_ep.id().as_bytes();
+
+        let roster = Arc::new(RosterGate::empty());
+        let view = mint_view(&root, 1, &[(caller_id, "alice")], &[]);
+        let (mesh, dir) = serving_provider(provider_ep.clone(), roster, view).await;
+        seed_addr(&caller_ep, &provider_ep);
+
+        // Subscribe to the SERVE ring before anything moves.
+        let mut serve_rx = mesh.blob_bcast_for_test().subscribe();
+
+        let size = ac_blob_bytes();
+        let src = dir.path().join("progress.bin");
+        std::fs::write(&src, vec![7u8; size]).unwrap();
+        let provider = mesh.app_blobs().await.unwrap();
+        let (ticket, _hash) = provider.publish_scope("docs", &src).await.unwrap();
+        provider.grant("docs", "alice").unwrap();
+
+        // The FETCH side gets its own ring.
+        let (fetch_tx, mut fetch_rx) = tokio::sync::broadcast::channel(1024);
+        let cdir = tempfile::tempdir().unwrap();
+        let caller = AppBlobs::open_fetcher_with_progress(
+            cdir.path().join("b"),
+            caller_ep.clone(),
+            Some(fetch_tx),
+        )
+        .await
+        .unwrap();
+        caller.fetch(&ticket).await.expect("granted caller fetches");
+
+        let drain = |rx: &mut tokio::sync::broadcast::Receiver<mcpmesh::daemon::BlobTransfer>| {
+            let mut v = Vec::new();
+            while let Ok(f) = rx.try_recv() {
+                v.push(f);
+            }
+            v
+        };
+        let fetch_frames = drain(&mut fetch_rx);
+        let serve_frames = drain(&mut serve_rx);
+
+        // --- FETCH side ---
+        assert!(
+            !fetch_frames.is_empty(),
+            "the fetching node must emit progress — `emit_fetch`'s body could be deleted and the \
+             whole workspace stayed green"
+        );
+        assert!(
+            fetch_frames
+                .iter()
+                .all(|f| f.direction == mcpmesh_local_api::BlobDirection::Fetch),
+            "every fetch-side frame must be direction=Fetch: {fetch_frames:?}"
+        );
+        assert!(
+            fetch_frames.iter().all(|f| f.bytes_total.is_none()),
+            "the fetch side does not learn the size, so bytes_total must be None rather than a \
+             guess: {fetch_frames:?}"
+        );
+        assert_eq!(
+            fetch_frames.last().unwrap().state,
+            mcpmesh_local_api::BlobTransferState::Completed,
+            "a successful fetch ends Completed: {fetch_frames:?}"
+        );
+
+        // --- SERVE side ---
+        assert!(
+            !serve_frames.is_empty(),
+            "the serving node must emit progress too — severing the drain task's call to \
+             apply_transfer_update passed the whole workspace"
+        );
+        assert!(
+            serve_frames
+                .iter()
+                .all(|f| f.direction == mcpmesh_local_api::BlobDirection::Serve),
+            "every serve-side frame must be direction=Serve: {serve_frames:?}"
+        );
+        assert_eq!(
+            serve_frames.first().unwrap().state,
+            mcpmesh_local_api::BlobTransferState::Started
+        );
+        assert_eq!(
+            serve_frames.first().unwrap().bytes_total,
+            Some(size as u64),
+            "the serving side KNOWS the size from Started"
+        );
+        assert!(
+            serve_frames
+                .iter()
+                .any(|f| f.peer.as_deref().is_some_and(|p| p.starts_with("eid:"))),
+            "the serving side attributes the STABLE principal (#38): {serve_frames:?}"
+        );
+    })
+    .await
+    .expect("progress test timed out");
 }
 
 #[tokio::test]

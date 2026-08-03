@@ -673,6 +673,44 @@ pub fn render_frame(frame: &StreamFrame) -> String {
         StreamFrame::Lagged { dropped } => {
             format!("(lagged {dropped} events — reconnect for a fresh snapshot)")
         }
+        // #82: `internal watch` is the documented reference consumer of this stream, so a frame it
+        // renders as `[unknown frame]` is a frame no embedder has an example for. A 4 GiB fetch
+        // would have printed a screen of them.
+        StreamFrame::BlobTransfer {
+            direction,
+            hash,
+            bytes_done,
+            bytes_total,
+            state,
+            peer,
+        } => {
+            let dir = match direction {
+                mcpmesh_local_api::BlobDirection::Serve => "serving",
+                mcpmesh_local_api::BlobDirection::Fetch => "fetching",
+            };
+            let st = match state {
+                mcpmesh_local_api::BlobTransferState::Started => "started",
+                mcpmesh_local_api::BlobTransferState::Progress => "progress",
+                mcpmesh_local_api::BlobTransferState::Completed => "completed",
+                mcpmesh_local_api::BlobTransferState::Aborted => "aborted",
+            };
+            // Short hash only — the full one is 64 hex chars and this is a glanceable line.
+            let short: String = hash.chars().take(12).collect();
+            // A percentage needs the total, which the FETCH side never has: show bytes instead of
+            // inventing a denominator.
+            let amount = match bytes_total {
+                Some(total) if *total > 0 => format!(
+                    "{bytes_done}/{total} ({}%)",
+                    bytes_done.saturating_mul(100) / total
+                ),
+                _ => format!("{bytes_done} bytes"),
+            };
+            let who = peer
+                .as_deref()
+                .map(|p| format!(" to {p}"))
+                .unwrap_or_default();
+            format!("blob {dir} {short} {st} — {amount}{who}")
+        }
         // `#[non_exhaustive]`: render an unknown frame kind rather than refusing to compile
         // against a newer local-api. The daemon and CLI ship in lockstep, so this is defensive.
         _ => "[unknown frame]".to_string(),

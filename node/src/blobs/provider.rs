@@ -23,7 +23,7 @@ use crate::daemon::RELAY_READY_TIMEOUT;
 ///
 /// SECURITY — deny-by-default on every non-GET request type, made EXPLICIT (not left to a vestigial
 /// routing quirk). In the pinned iroh-blobs 0.103.0 the generic `EventSender::request()` reads ONLY
-/// `mask.get` for EVERY request type (get/get_many/push/observe), so `get: Intercept` currently
+/// `mask.get` for EVERY request type (get/get_many/push/observe), so `get: InterceptLog` currently
 /// routes all four to the drain loop, which denies the non-GET kinds explicitly.
 /// To keep the deny-by-default INDEPENDENT of that single-field
 /// routing, each non-GET request type is ALSO pinned to its most-refusing mask mode, so a FUTURE
@@ -40,7 +40,7 @@ use crate::daemon::RELAY_READY_TIMEOUT;
 ///    `ObserveMode::None` (the default) would mean "no event, request served normally" → a silent
 ///    bypass, so it is explicitly the WRONG choice here.
 ///
-/// `connected: Intercept` records the authenticated endpoint id; `get: Intercept` scope-checks every
+/// `connected: Intercept` records the authenticated endpoint id; `get: InterceptLog` scope-checks every
 /// single-blob GET (the AC fetch path — unchanged). `throttle` stays at its default
 /// (`ThrottleMode::None`) — it is a transfer-throttling knob, not a request-serving gate.
 const APP_BLOB_EVENT_MASK: EventMask = EventMask {
@@ -91,6 +91,8 @@ fn apply_transfer_update(
                 total: Some(started.size),
                 done: 0,
                 last_emitted: 0,
+                epochs: 0,
+                in_epoch: 0,
             };
             emit_transfer(bcast, &cur, S::Started);
             *st = Some(cur);
@@ -102,7 +104,7 @@ fn apply_transfer_update(
                 // THE coalescing gate. Without it a 4 GiB transfer emits ~262k frames and every
                 // subscriber lags out, losing the audit records that share their stream.
                 if cur.done.saturating_sub(cur.last_emitted) >= cur.stride() {
-                    cur.last_emitted = cur.done;
+                    cur.note_emitted();
                     emit_transfer(bcast, cur, S::Progress);
                 }
             }
@@ -147,16 +149,46 @@ struct TransferProgressState {
     done: u64,
     /// `done` as of the last frame emitted — the coalescing anchor.
     last_emitted: u64,
+    /// How many times the stride has doubled (unknown-total transfers only).
+    epochs: u32,
+    /// Frames emitted within the current epoch.
+    in_epoch: u32,
 }
+
+/// Frames allowed per stride "epoch" before the stride DOUBLES (#82 gate).
+///
+/// Only reachable when the total is unknown — which is every FETCH, since `GetProgressItem` carries
+/// no size. Without it the stride stayed at the 1 MiB floor forever, so a 4 GiB fetch emitted ~4098
+/// frames into a 256-deep ring: the direction #82 is actually about was the one still flooding.
+/// Doubling per epoch bounds it logarithmically — ~128 frames for 4 GiB, ~256 for 1 TiB.
+const FRAMES_PER_EPOCH: u32 = 16;
 
 impl TransferProgressState {
     /// The byte advance required before another `Progress` frame is worth sending.
+    ///
+    /// With a known total (the SERVE side) this is 1% of it, so the frame count is ~100 flat. With
+    /// an unknown total (every FETCH) it starts at the floor and doubles every
+    /// [`FRAMES_PER_EPOCH`] frames, so the count grows with the LOG of the size rather than
+    /// linearly.
     fn stride(&self) -> u64 {
-        self.total
-            .map_or(PROGRESS_STRIDE_BYTES, |t| {
-                (t / 100).max(PROGRESS_STRIDE_BYTES)
-            })
-            .max(1)
+        match self.total {
+            Some(t) => (t / 100).max(PROGRESS_STRIDE_BYTES),
+            None => PROGRESS_STRIDE_BYTES
+                .saturating_mul(1u64 << self.epochs.min(40))
+                .max(PROGRESS_STRIDE_BYTES),
+        }
+    }
+
+    /// Record that a `Progress` frame went out, widening the stride when an epoch fills.
+    fn note_emitted(&mut self) {
+        self.last_emitted = self.done;
+        if self.total.is_none() {
+            self.in_epoch += 1;
+            if self.in_epoch >= FRAMES_PER_EPOCH {
+                self.in_epoch = 0;
+                self.epochs = self.epochs.saturating_add(1);
+            }
+        }
     }
 }
 
@@ -273,9 +305,20 @@ impl AppBlobs {
 }
 
 impl AppBlobs {
+    /// [`open_fetcher_with_progress`](Self::open_fetcher_with_progress) with no progress ring.
+    pub async fn open_fetcher(blobs_dir: PathBuf, endpoint: Endpoint) -> Result<Arc<Self>> {
+        Self::open_fetcher_with_progress(blobs_dir, endpoint, None).await
+    }
+
     /// A caller-only fetcher: an `FsStore` + endpoint, NO scope gate (`events: None`), an empty
     /// scopes table it never persists. Used caller-side (the fetch path) and by the ungated tests.
-    pub async fn open_fetcher(blobs_dir: PathBuf, endpoint: Endpoint) -> Result<Arc<Self>> {
+    ///
+    /// `transfers` is where fetch-side progress goes (#82); `None` does no progress work at all.
+    pub async fn open_fetcher_with_progress(
+        blobs_dir: PathBuf,
+        endpoint: Endpoint,
+        transfers: Option<tokio::sync::broadcast::Sender<crate::daemon::BlobTransfer>>,
+    ) -> Result<Arc<Self>> {
         tokio::fs::create_dir_all(&blobs_dir)
             .await
             .with_context(|| format!("create blobs dir {}", blobs_dir.display()))?;
@@ -285,8 +328,7 @@ impl AppBlobs {
         Ok(Arc::new(Self {
             store,
             endpoint,
-            // A fetcher-only provider (open_fetcher) has no mesh to broadcast into.
-            transfers: None,
+            transfers,
             events: None,
             relay_wait: std::sync::atomic::AtomicBool::new(false),
             hash_membership: tokio::sync::Mutex::new(()),
@@ -322,7 +364,7 @@ impl AppBlobs {
             .with_context(|| format!("load blob store {}", blobs_dir.display()))?;
         // The request-time scope gate: `APP_BLOB_EVENT_MASK` intercepts connect + single-blob GET,
         // and pins every non-GET request type to deny-by-default (Disabled/Intercept — see the
-        // const's SECURITY note). Since `get: Intercept` also routes
+        // const's SECURITY note). Since `get: InterceptLog` also routes
         // get_many/observe/push to the drain loop today; the pinned fields keep them refused even if
         // a future iroh-blobs honors the per-type fields directly.
         // Only pay the per-chunk intercept when a budget is actually configured (#84a).
@@ -627,11 +669,17 @@ impl AppBlobs {
             total: None,
             done: 0,
             last_emitted: 0,
+            epochs: 0,
+            in_epoch: 0,
         };
         if let Some(b) = &self.transfers {
             emit_fetch(b, &st, mcpmesh_local_api::BlobTransferState::Started);
         }
-        let mut outcome: Result<()> = Ok(());
+        // Starts as an ERROR, not Ok: the old `.complete()` returned `LocalFailure("stream closed
+        // without result")` when the stream ended with neither Done nor Error. Defaulting to Ok
+        // turned that into a silent success — a fail-OPEN where the previous code failed closed
+        // (#82 gate). Practically unreachable; the direction of the default is the point.
+        let mut outcome: Result<()> = Err(anyhow::anyhow!("fetch stream closed without a result"));
         while let Some(item) = stream.next().await {
             match item {
                 iroh_blobs::api::remote::GetProgressItem::Progress(done) => {
@@ -639,7 +687,7 @@ impl AppBlobs {
                     if let Some(b) = &self.transfers
                         && st.done.saturating_sub(st.last_emitted) >= st.stride()
                     {
-                        st.last_emitted = st.done;
+                        st.note_emitted();
                         emit_fetch(b, &st, mcpmesh_local_api::BlobTransferState::Progress);
                     }
                 }
@@ -647,12 +695,15 @@ impl AppBlobs {
                     if let Some(b) = &self.transfers {
                         emit_fetch(b, &st, mcpmesh_local_api::BlobTransferState::Completed);
                     }
+                    outcome = Ok(());
                 }
                 iroh_blobs::api::remote::GetProgressItem::Error(e) => {
                     if let Some(b) = &self.transfers {
                         emit_fetch(b, &st, mcpmesh_local_api::BlobTransferState::Aborted);
                     }
-                    outcome = Err(anyhow::anyhow!("{e}"));
+                    // `{e:#}` keeps the GetError source chain that `.context(..)` used to
+                    // preserve; `{e}` alone flattened it to the outermost message.
+                    outcome = Err(anyhow::anyhow!("{e:#}"));
                 }
             }
         }
@@ -938,6 +989,13 @@ fn spawn_gate_loop(
                         // Drained in its OWN task: doing it inline would block the gate loop —
                         // which authorizes every OTHER request — for the whole transfer. The
                         // receiver's type is irpc-internal, so it is captured rather than named.
+                        //
+                        // DETACHED, and `shutdown()` does not join it (#82 gate). It holds only a
+                        // broadcast sender clone and this request's receiver, so it ends when the
+                        // transfer does or when the provider drops its side — it holds no store or
+                        // redb handle, which is what `shutdown`'s determinism guarantee is about.
+                        // An in-flight one can still outlive `Node::shutdown` by the length of a
+                        // transfer; tracking them belongs with the cancellation work in #172.
                         let mut updates = msg.rx;
                         tokio::spawn(async move {
                             let mut st = None;
@@ -1142,6 +1200,8 @@ mod tests {
             total: Some(1024),
             done: 0,
             last_emitted: 0,
+            epochs: 0,
+            in_epoch: 0,
         };
         assert_eq!(
             small.stride(),
@@ -1156,6 +1216,47 @@ mod tests {
             big.stride(),
             4 * 1024 * 1024 * 1024 / 100,
             "a big one uses 1% so the frame COUNT stays bounded instead of the byte gap"
+        );
+    }
+
+    /// #82 gate: the FETCH side never learns the total, so the stride must widen on its own.
+    ///
+    /// It did not: `stride()` fell to the fixed 1 MiB floor forever, so a 4 GiB fetch emitted ~4098
+    /// frames into a 256-deep ring — the direction #82 is actually about was the one still
+    /// flooding, while three doc sites claimed "~102 whatever its size".
+    #[test]
+    fn an_unknown_total_still_bounds_the_frame_count() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let mut st = TransferProgressState {
+            hash: "h".into(),
+            peer: None,
+            total: None, // every fetch
+            done: 0,
+            last_emitted: 0,
+            epochs: 0,
+            in_epoch: 0,
+        };
+        let mut frames = 0u32;
+        let mut at = 0u64;
+        let chunk = 16 * 1024;
+        while at < 4 * GIB {
+            at += chunk;
+            st.done = at;
+            if st.done.saturating_sub(st.last_emitted) >= st.stride() {
+                st.note_emitted();
+                frames += 1;
+            }
+        }
+        assert!(
+            frames <= 200,
+            "a 4 GiB FETCH emitted {frames} progress frames into a {}-deep ring — the stride must \
+             widen when the total is unknown, or a subscriber lags out on the very transfer this \
+             feature exists to show",
+            256
+        );
+        assert!(
+            frames >= 20,
+            "…but it must still report meaningfully often: {frames}"
         );
     }
 
@@ -2017,14 +2118,7 @@ mod tests {
         // authorizes every single-blob GET still runs. Anything that merely NOTIFIES
         // (`Notify`/`NotifyLog`) would give up the veto and serve bytes to an ungranted caller.
         assert_eq!(APP_BLOB_EVENT_MASK.get, RequestMode::InterceptLog);
-        assert!(
-            !matches!(
-                APP_BLOB_EVENT_MASK.get,
-                RequestMode::Notify | RequestMode::NotifyLog | RequestMode::None
-            ),
-            "the GET mode must retain its VETO — a notify-only mode serves the bytes and tells us \
-             afterwards"
-        );
+
         // get_many/push refuse at the protocol level with Permission (events.rs:504-506), no event.
         assert_eq!(APP_BLOB_EVENT_MASK.get_many, RequestMode::Disabled);
         assert_eq!(APP_BLOB_EVENT_MASK.push, RequestMode::Disabled);

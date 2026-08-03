@@ -482,7 +482,7 @@ async fn run_subscription(
     let (mut closed_audit, mut closed_reach, mut closed_self) = (false, false, false);
     let mut closed_blob = false;
     loop {
-        // Three independent rings — audit records, peer-reachability transitions (#58), and
+        // Four independent rings — audit records, peer-reachability transitions (#58), and
         // self-network transitions (#90) — merged here rather than at the source, so the audit
         // broadcast (which is the same call that appends to the on-disk log) keeps its schema
         // untouched. Lag on ANY ring reports the same `Lagged` frame and never drops the
