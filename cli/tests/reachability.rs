@@ -162,11 +162,19 @@ async fn ping_refusal_reason(dialer: &iroh::Endpoint, target: [u8; 32]) -> Optio
     }
 }
 
+/// The close CODE as well as the reason. Reading only the reason let a mutation that changed the
+/// policy close from 401 to 0 pass the whole suite — the code is on the wire and is just as
+/// distinguishable to a prober (#89 gate).
 fn close_reason_bytes(conn: &iroh::endpoint::Connection) -> Option<Vec<u8>> {
     match conn.close_reason() {
-        Some(iroh::endpoint::ConnectionError::ApplicationClosed(ac)) => {
-            Some(ac.reason.as_ref().to_vec())
-        }
+        Some(iroh::endpoint::ConnectionError::ApplicationClosed(ac)) => Some(
+            format!(
+                "code={} reason={}",
+                ac.error_code,
+                String::from_utf8_lossy(&ac.reason)
+            )
+            .into_bytes(),
+        ),
         other => Some(format!("{other:?}").into_bytes()),
     }
 }
@@ -198,9 +206,9 @@ async fn a_hidden_node_never_leaks_presence_through_the_throttle_close() {
         let a_mesh = assemble_mesh(a_ep, a_store, config.clone());
         // A REAL limiter — `unlimited()` would make the throttle branch unreachable and the whole
         // test vacuous, which is the trap the sibling throttle test documents.
-        a_mesh.set_limits(mcpmesh::limits::MeshLimiters::from_config(
-            &mcpmesh::config::LimitsCfg::default(),
-        ));
+        let a_limits =
+            mcpmesh::limits::MeshLimiters::from_config(&mcpmesh::config::LimitsCfg::default());
+        a_mesh.set_limits(a_limits.clone());
         let accept = spawn_accept_loop(
             a_mesh.clone(),
             Arc::new(build_services(&Config::from_toml_str("").unwrap())),
@@ -211,7 +219,7 @@ async fn a_hidden_node_never_leaks_presence_through_the_throttle_close() {
         let mut throttled = None;
         for _ in 0..120 {
             if let Some(reason) = ping_refusal_reason(&b_ep, a_id).await
-                && reason == b"ping rate limited".to_vec()
+                && String::from_utf8_lossy(&reason).contains("ping rate limited")
             {
                 throttled = Some(reason);
                 break;
@@ -228,12 +236,32 @@ async fn a_hidden_node_never_leaks_presence_through_the_throttle_close() {
             .await
             .expect("an off node must refuse");
         assert_eq!(
-            hidden,
-            b"unauthorized".to_vec(),
+            String::from_utf8_lossy(&hidden),
+            "code=401 reason=unauthorized",
             "a hidden node with an EXHAUSTED bucket must still answer like the trust gate. Got \
              {:?} — if this is the throttle close, the policy is being consulted after the limiter \
              and 'appear offline' announces itself to anyone who floods first.",
             String::from_utf8_lossy(&hidden)
+        );
+
+        // A REFUSED probe must still SPEND a token. Returning early without metering left the arm
+        // completely unmetered for exactly the peers a hidden node most wants bounded — undoing
+        // #89 ask 1 for this mode (#89 gate).
+        //
+        // Observed on the limiter's own counter, NOT on "is a later probe throttled": the bucket
+        // is already drained here, so on loopback 80 dials finish faster than one token refills
+        // and a later probe is throttled either way. That assertion passed with the metering
+        // deleted — insensitive, which is indistinguishable from correct until you mutate it.
+        let refused_before = a_limits.pings_refused();
+        for _ in 0..20 {
+            let _ = ping_refusal_reason(&b_ep, a_id).await;
+        }
+        assert!(
+            a_limits.pings_refused() > refused_before,
+            "a hidden node must still consult the limiter for refused probes — the counter did \
+             not move across 20 of them ({refused_before} → {}), so a revoked peer can flood a \
+             hidden node for free",
+            a_limits.pings_refused()
         );
 
         accept.abort();
@@ -302,6 +330,13 @@ async fn presence_mode_controls_who_gets_a_pong_and_never_says_why() {
         let stranger_refusal = ping_refusal_reason(&c_ep, a_id)
             .await
             .expect("an unpaired stranger must never get a pong");
+        // Pin the LITERAL, not just mutual equality: three identical dial FAILURES would satisfy
+        // "all refusals match" while proving nothing about the anti-oracle property (#89 gate).
+        assert_eq!(
+            String::from_utf8_lossy(&stranger_refusal),
+            "code=401 reason=unauthorized",
+            "the reference refusal must be the trust gate's application close, not a dial failure"
+        );
 
         // 1. `paired` (the default) pongs a paired caller EVEN WITH NO GRANT — today's behaviour.
         assert_eq!(a_mesh.presence_mode(), PresenceMode::Paired, "the default");
@@ -340,9 +375,8 @@ async fn presence_mode_controls_who_gets_a_pong_and_never_says_why() {
         );
         // 5. And in particular it is never the THROTTLE close, which is distinguishable ON PURPOSE
         //    (#142) — so the policy must be consulted BEFORE the limiter.
-        assert_ne!(
-            off_refusal.as_slice(),
-            b"ping rate limited".as_slice(),
+        assert!(
+            !String::from_utf8_lossy(&off_refusal).contains("ping rate limited"),
             "a hidden node must not leak presence through the throttle close"
         );
 

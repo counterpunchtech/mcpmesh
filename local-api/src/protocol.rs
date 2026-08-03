@@ -423,6 +423,19 @@ pub struct SelfNetwork {
     /// after boot, and from a point-in-time computation with no watcher running.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_change_epoch: Option<i64>,
+    /// This node's `[network].presence_mode` (#89): `"paired"` | `"granted"` | `"off"` — who
+    /// currently gets an answer to the `mcpmesh/ping/1` reachability probe.
+    ///
+    /// Reported because the setting was otherwise **unobservable**: an operator who set it had no
+    /// way to confirm it took effect, and a product backing a privacy switch with it could not show
+    /// the user its real state. Always present from `api_minor >= 38`.
+    ///
+    /// **It is not "appear offline".** It withholds the pong payload and makes our own probe report
+    /// this node unreachable; it does not hide that the node is running (a QUIC application close
+    /// implies a completed handshake, and `mcpmesh/pair/1` answers any stranger by design). Do not
+    /// render it to users as invisibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_mode: Option<String>,
     /// When the relay last reported that ANOTHER endpoint is presenting this node's identity
     /// (#134, epoch seconds), or absent if never — the overwhelmingly common case.
     ///
@@ -1677,7 +1690,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   thirty have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.37";
+pub const API_VERSION: &str = "1.38";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -1763,7 +1776,12 @@ pub const API_VERSION: &str = "1.37";
 /// refusals — expired line, no live invite, inviter unreachable, id mismatch, name conflict, and
 /// the deliberately-opaque refusal. `ERR_NICKNAME_TAKEN` had been the only coded pairing failure,
 /// so every other one arrived as `-32000` and an embedder could either forward our prose to end
-/// users or substring-match it (#159); to 37 when the reserved `mcpmesh/*` `_meta` namespace began
+/// users or substring-match it (#159); to 38 with `[network].presence_mode` + `SelfNetwork.
+/// presence_mode` — `reachable: false` gained a new meaning ("up, paired, and deliberately not
+/// answering"), and `peer_services` flips from "reachable, empty list" to "unreachable" for a
+/// caller holding no grant. A consumer must guard on `api_minor >= 38` before telling a user their
+/// peer is offline, since below it that verdict could not mean this (#89); to 37 when the reserved
+/// `mcpmesh/*` `_meta` namespace began
 /// being enforced on EVERY proxied frame rather than the session's first. `run_session` treats
 /// frame 1 as the `initialize` whatever its method is, so a caller could send any other method
 /// first and put its real `initialize` — with a forged `mcpmesh/peer` naming another principal,
@@ -1778,10 +1796,12 @@ pub const API_VERSION: &str = "1.37";
 /// several minors at once, read this block end to end AND the release notes, not the diff.
 ///
 /// That class is bigger than it looks: **10, 17, 21, 22, 23, 24 and 37 all shipped with no change
-/// to any type in this file** — they moved meaning, not shape. Seven of the thirty-seven, and 37 is
-/// a SECURITY fix, which is the case where a consumer most needs the guard. A downstream
+/// to any type in this file** — they moved meaning, not shape. Seven of the thirty-eight, and 37 is
+/// a SECURITY fix, which is the case where a consumer most needs the guard. 38 adds a field, but
+/// its REAL content is a meaning change to `reachable` — the field exists so the new meaning is
+/// observable at all. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 37;
+pub const API_MINOR: u32 = 38;
 
 #[cfg(test)]
 mod tests {
@@ -2100,6 +2120,9 @@ mod tests {
                 direct_addrs: vec!["192.168.1.2:4444".into()],
                 last_change_epoch: Some(1_753_842_000),
                 identity_conflict_epoch: None,
+                // #89: seeded NON-default so the round-trip actually carries it — an empty value
+                // here would round-trip through a `skip_serializing_if` and prove nothing.
+                presence_mode: Some("granted".into()),
             },
         };
         let v = serde_json::to_value(&frame).unwrap();
@@ -2107,6 +2130,12 @@ mod tests {
         assert_eq!(v["self_network"]["online"], true);
         assert_eq!(v["self_network"]["home_relay"], "https://relay.example:443");
         assert_eq!(v["self_network"]["relays"][0]["connected"], true);
+        assert_eq!(
+            v["self_network"]["presence_mode"], "granted",
+            "#89: the live presence mode must reach the wire — it is the only way an operator can \
+             confirm the knob took effect, and a product's privacy switch has nothing to render \
+             without it"
+        );
         let back: StreamFrame = serde_json::from_value(v).unwrap();
         assert_eq!(back, frame);
     }

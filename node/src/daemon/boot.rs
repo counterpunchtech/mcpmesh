@@ -556,6 +556,18 @@ pub enum PresenceMode {
     Off,
 }
 
+impl PresenceMode {
+    /// The config/wire spelling. One function, so `SelfNetwork.presence_mode` can never disagree
+    /// with the value an operator wrote in `config.toml`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Paired => "paired",
+            Self::Granted => "granted",
+            Self::Off => "off",
+        }
+    }
+}
+
 /// Parse `[network].presence_mode`. An unknown value is a STARTUP ERROR, matching
 /// `relay_mode`/`discovery_mode`: a privacy knob must never silently fall back to the permissive
 /// value. `presence_mode = "of"` failing loudly is the difference between a user who is hidden and
@@ -1187,6 +1199,82 @@ mod tests {
         // NOTHING: the accept loop, the app-blob gate loop (holding the redb data-dir lock) and
         // the endpoint would all outlive this test for the life of the binary.
         super::shutdown_booted(booted).await;
+    }
+
+    /// #89 gate: pin the two BOOT lines, not just the parser.
+    ///
+    /// `boot_node` is the only production caller of `set_presence_mode`, and the only place the
+    /// parse is reached on the daemon path. Both survived the whole suite when deleted: with the
+    /// install gone, `presence_mode = "off"` parses, doctor says OK, the daemon boots — and pongs
+    /// everybody. Nothing reports the live mode, so the operator cannot notice. That is the
+    /// "pin the call site, not the helper" failure exactly.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_booted_daemon_installs_the_configured_presence_mode() {
+        let boot_with = async |cfg: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = crate::paths::NodePaths::under_root(dir.path());
+            std::fs::create_dir_all(paths.config_path.parent().unwrap()).unwrap();
+            std::fs::write(&paths.config_path, cfg).unwrap();
+            let out = super::boot_node(paths, None).await;
+            (dir, out)
+        };
+
+        // The configured mode must reach the LIVE mesh, not just parse.
+        let (_d, booted) =
+            boot_with("[network]\nrelay_mode = \"disabled\"\npresence_mode = \"off\"\n").await;
+        let booted = booted.expect("the node boots with presence_mode = off");
+        assert_eq!(
+            booted
+                .state
+                .mesh_required()
+                .expect("mesh is up")
+                .presence_mode(),
+            PresenceMode::Off,
+            "boot must INSTALL the configured presence_mode — parsing it and dropping it on the \
+             floor leaves an operator who asked to be hidden pongging everyone, with nothing to see"
+        );
+        // …and the READ-BACK must report the live mesh, through the real projection. Asserting on
+        // `project(.., Some("off"))` directly proves only that a parameter survives a struct
+        // literal; the call site is what decides whether an operator can confirm their setting
+        // (#89 gate — the helper-vs-call-site trap again).
+        let reported = crate::daemon::self_net::read_current(
+            booted.state.mesh_required().expect("mesh is up"),
+            None,
+        );
+        assert_eq!(
+            reported.presence_mode.as_deref(),
+            Some("off"),
+            "status must report the LIVE presence mode, not a constant and not the on-disk config"
+        );
+        super::shutdown_booted(booted).await;
+
+        // The default is still today's behaviour.
+        let (_d2, booted2) = boot_with("[network]\nrelay_mode = \"disabled\"\n").await;
+        let booted2 = booted2.expect("the node boots with no presence_mode set");
+        assert_eq!(
+            booted2
+                .state
+                .mesh_required()
+                .expect("mesh is up")
+                .presence_mode(),
+            PresenceMode::Paired,
+            "an unset presence_mode must leave today's behaviour untouched"
+        );
+        super::shutdown_booted(booted2).await;
+
+        // And an unknown mode must REFUSE TO BOOT — not fall back to the permissive default.
+        let (_d3, refused) =
+            boot_with("[network]\nrelay_mode = \"disabled\"\npresence_mode = \"of\"\n").await;
+        let e = format!(
+            "{:#}",
+            refused
+                .err()
+                .expect("an unknown presence_mode must refuse to boot, never fall open")
+        );
+        assert!(
+            e.contains("presence_mode") && e.contains("of"),
+            "and the startup error must name the key and the typo: {e}"
+        );
     }
 
     /// #61: a PAIRING-mode daemon must advertise the app-blob ALPN. This is the load-bearing half

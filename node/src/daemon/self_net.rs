@@ -28,6 +28,8 @@ pub(crate) fn project(
     direct_addrs: Vec<String>,
     last_change_epoch: Option<i64>,
     identity_conflict_epoch: Option<i64>,
+    // #89: `"paired"` | `"granted"` | `"off"`. `None` only from a projection with no mesh.
+    presence_mode: Option<String>,
 ) -> SelfNetwork {
     let relays: Vec<RelayInfo> = relays
         .into_iter()
@@ -42,6 +44,7 @@ pub(crate) fn project(
         direct_addrs,
         last_change_epoch,
         identity_conflict_epoch,
+        presence_mode,
     }
 }
 
@@ -72,6 +75,9 @@ pub(crate) fn read_current(mesh: &MeshState, last_change_epoch: Option<i64>) -> 
         direct_addrs,
         last_change_epoch,
         mesh.identity_conflict_epoch(),
+        // #89: report the LIVE mode, not the on-disk config — an operator must be able to confirm
+        // the knob took effect, and boot is the only thing that installs it.
+        Some(mesh.presence_mode().as_str().to_string()),
     )
 }
 
@@ -93,7 +99,7 @@ pub fn spawn_self_net_watch(mesh: Arc<MeshState>) -> tokio::task::JoinHandle<()>
         let mut watcher = mesh.endpoint.home_relay_status();
         // The offline-empty baseline (see above). Compared WITHOUT `direct_addrs` or the
         // stamp — see `signature`.
-        let mut previous = project(std::iter::empty(), Vec::new(), None, None);
+        let mut previous = project(std::iter::empty(), Vec::new(), None, None, None);
         loop {
             let current = read_current(&mesh, None);
             if signature(&current) != signature(&previous) {
@@ -162,6 +168,7 @@ mod tests {
             vec!["192.168.1.2:4444".into()],
             None,
             None,
+            None,
         );
         assert!(net.online);
         assert_eq!(net.home_relay.as_deref(), Some("https://b.example:443"));
@@ -172,11 +179,18 @@ mod tests {
             Vec::new(),
             None,
             None,
+            None,
         );
         assert!(!net.online, "a known-but-disconnected relay is not online");
         assert_eq!(net.home_relay, None);
 
-        let net = project(std::iter::empty::<(String, bool)>(), Vec::new(), None, None);
+        let net = project(
+            std::iter::empty::<(String, bool)>(),
+            Vec::new(),
+            None,
+            None,
+            None,
+        );
         assert!(!net.online, "no relays configured (relay_mode=disabled)");
         assert!(net.relays.is_empty());
     }
@@ -228,6 +242,46 @@ mod tests {
     /// experience — and learning the cause at the moment the relay reports it. A sticky stamp that
     /// was excluded from the signature would still show up in `status`, but only if someone
     /// thought to look, which is exactly what nobody knew to do.
+    /// #89 gate: the reported mode must come from the LIVE mesh, not the on-disk config.
+    ///
+    /// The setting was otherwise unobservable — `set_presence_mode` had exactly one production
+    /// caller and deleting it passed the entire suite, leaving an operator who asked to be hidden
+    /// pongging everyone with nothing to see. This is the read-back that makes that visible.
+    #[test]
+    fn the_reported_presence_mode_is_the_live_one() {
+        let net = project(
+            std::iter::empty::<(String, bool)>(),
+            Vec::new(),
+            None,
+            None,
+            Some(crate::daemon::PresenceMode::Off.as_str().to_string()),
+        );
+        assert_eq!(
+            net.presence_mode.as_deref(),
+            Some("off"),
+            "the live mode must reach SelfNetwork"
+        );
+        // The spelling must match what an operator writes in config.toml, or the read-back is
+        // useless for confirming the value took.
+        for (mode, spelled) in [
+            (crate::daemon::PresenceMode::Paired, "paired"),
+            (crate::daemon::PresenceMode::Granted, "granted"),
+            (crate::daemon::PresenceMode::Off, "off"),
+        ] {
+            assert_eq!(mode.as_str(), spelled);
+            assert_eq!(
+                crate::daemon::presence_mode(&crate::config::NetworkCfg {
+                    presence_mode: spelled.into(),
+                    ..Default::default()
+                })
+                .unwrap(),
+                mode,
+                "the reported spelling must parse back to the same mode — one vocabulary for the \
+                 config and the API, or an operator cannot check their own setting"
+            );
+        }
+    }
+
     #[test]
     fn a_duplicate_identity_observation_is_a_transition() {
         let with = |conflict| {
@@ -236,6 +290,7 @@ mod tests {
                 vec!["10.0.0.1:1".into()],
                 None,
                 conflict,
+                None,
             )
         };
         let clean = with(None);
@@ -271,10 +326,12 @@ mod tests {
             vec!["10.0.0.1:1".into()],
             None,
             None,
+            None,
         );
         let addr_churn = project(
             [("https://a.example:443".to_string(), true)],
             vec!["10.0.0.2:2".into()],
+            None,
             None,
             None,
         );
@@ -286,6 +343,7 @@ mod tests {
         let relay_down = project(
             [("https://a.example:443".to_string(), false)],
             vec!["10.0.0.1:1".into()],
+            None,
             None,
             None,
         );
@@ -307,6 +365,7 @@ mod tests {
             vec!["10.0.0.1:1".into()],
             None,
             None,
+            None,
         );
         let secondary_down = project(
             [
@@ -314,6 +373,7 @@ mod tests {
                 ("https://b.example:443".to_string(), false),
             ],
             vec!["10.0.0.1:1".into()],
+            None,
             None,
             None,
         );

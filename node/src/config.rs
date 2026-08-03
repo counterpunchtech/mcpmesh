@@ -133,8 +133,14 @@ pub struct NetworkCfg {
     /// `stack_version` and your app metadata, on demand and forever. The only lever was a full
     /// unpair — a relationship-destroying action to express a privacy preference (#89).
     ///
-    /// A refusal under `"off"`/`"granted"` is BYTE-IDENTICAL to the trust gate's, so a prober
-    /// cannot tell "not paired" from "hidden" from "no grants". All three read as offline.
+    /// A refusal under `"off"`/`"granted"` matches the trust gate's, so this arm does not
+    /// distinguish "not paired" from "hidden" from "no grants".
+    ///
+    /// **This is NOT "appear offline".** It withholds the pong payload (`stack_version`, app
+    /// metadata, the caller's services) and makes our own probe report you unreachable. It does not
+    /// hide that the node is running: a QUIC application close implies a completed handshake,
+    /// `mcpmesh/pair/1` answers any stranger by design, and a paired peer still gets a served
+    /// `mcpmesh/mcp/1` session. Do not describe it to users as invisibility (#89 gate).
     ///
     /// Read at BOOT — changing the mode needs a restart. The per-peer effect under `"granted"` is
     /// live, because grants are.

@@ -207,6 +207,7 @@ pub struct MeshState {
     /// registration and a pairing-grant each read the same base config and the second write
     /// clobbers the first's change (lost update). The redb `peer_add` path is already serialized
     /// by redb's write lock; this gives the config path an equivalent.
+    pub(crate) reload_lock: tokio::sync::Mutex<()>,
     /// `[network].presence_mode` (#89), resolved at boot. Who gets a reachability pong.
     ///
     /// Not live-editable: changing the MODE needs a restart. The per-peer effect under
@@ -214,7 +215,6 @@ pub struct MeshState {
     /// presence with it in the same action, which is the property an embedder's per-peer sharing
     /// switch needs.
     pub(crate) presence_mode: std::sync::RwLock<crate::daemon::PresenceMode>,
-    pub(crate) reload_lock: tokio::sync::Mutex<()>,
     pub(crate) config_path: PathBuf,
     /// The relay posture (mode + custom URL set) currently APPLIED to the live endpoint — the
     /// runtime truth the `set_relays` verb (#53) diffs against. Seeded at boot from `[network]`

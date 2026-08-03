@@ -48,6 +48,27 @@ restart. Grants are already live (`service_allow_revoke` reloads under `reload_l
 the last service takes presence away in the same action. That is the thing the reporter cannot
 express today.
 
+### What this is NOT: the gate's most important finding
+
+The first draft called this "appear offline", in the commit, in `docs/config.md`, and in the config
+rustdoc. **That claim is false**, and shipping it would have been worse than shipping nothing —
+the reporter's whole problem is that they cannot describe their privacy switch honestly.
+
+A prober still learns the node is up, three ways:
+
+- A QUIC **application** close happens only after the handshake completes, so
+  `connect(you, "mcpmesh/ping/1")` returning `Ok` is itself proof of life, plus an RTT.
+- **`ALPN_PAIR` is advertised unconditionally and is gate-exempt by design** — it must be, to
+  receive an invite redemption. A total stranger with only an endpoint id gets a distinguishable
+  close from it.
+- A **paired** peer, even with every service revoked, still gets a served `ALPN_MCP` session and an
+  application-layer refusal frame back.
+
+So what this actually delivers is: **the pong payload is withheld** (`stack_version`, app metadata,
+the caller's admitted services, and the RTT the probe would have measured) **and mcpmesh's own
+presence feature stops reporting you** — you disappear from that peer's `status`. That is real and
+worth shipping. It is not invisibility, and every doc now says so in those words.
+
 ### A refusal must not distinguish why
 
 `off`, and `granted`-without-a-grant, close **exactly like the trust gate's refusal** —
@@ -67,11 +88,20 @@ metering a hidden node first would leak presence through the throttle close. Cos
 a hidden node still pays one `gate.resolve` per dial — identical to the unpaired-scanner path that
 already exists and is accepted under "strangers stay cheap".
 
-### Not exposed on the control API
+### Reported on `SelfNetwork`, and `api_minor` 37 → 38
 
-No verb reports the mode, so `api_minor` does not move. An embedder sets it through
-`NodeBuilder::config` and already knows its own value; a human sets it in `config.toml`. Adding a
-read-back verb is a separate, additive change if anyone asks.
+The first draft exposed nothing and left `api_minor` alone, reasoning that an embedder sets the
+value so it already knows it. Two things were wrong with that:
+
+- **The setting was unobservable, and that hid a real defect.** `set_presence_mode` had exactly one
+  production caller and deleting it passed the entire suite: `presence_mode = "off"` would parse,
+  `doctor` would say OK, the daemon would boot — and pong everyone, with nothing anywhere to show
+  the operator. `SelfNetwork.presence_mode` is the read-back that makes it checkable.
+- **`reachable: false` changed meaning** — it can now mean "up, paired, and deliberately not
+  answering". `peer_services` likewise flips from "reachable, empty list" to "unreachable" for an
+  ungranted caller. Minors 10, 17, 24 and 26 all bumped for exactly this class, and 24 is
+  specifically about what `reachable` means. A consumer must guard on `api_minor >= 38` before
+  telling a user their peer is offline.
 
 **It is read at boot**, not live-editable. The per-peer effect that a product needs *is* live, via
 grants under `granted`. Changing the mode itself needs a restart, and the docs say so rather than
@@ -98,9 +128,33 @@ believes they are.
 6. The policy is consulted **before** the limiter: a hidden node's refusal is never
    `PING_THROTTLE_CLOSE`.
 
-Mutation, five run and five caught: defaulting an unknown mode to `paired` fails 5; moving the
+### Known limitation: blob scope grants are not service grants
+
+Under `granted`, `caller_admitted_services` reads the live **services** registry only. App-blob
+scope grants (#62) live in the provider's own store, so a peer you are actively sharing files with
+is hidden from the probe *while still able to fetch those blobs* — which proves you are online. For
+an embedder whose per-peer switch is about file sharing rather than services, `granted` will not
+track it. Documented in `docs/config.md` rather than left to be discovered.
+
+Mutation, seven run and seven caught: defaulting an unknown mode to `paired` fails 5; moving the
 policy check after the limiter fails 6; making `off` close with its own reason fails 4; making
 `granted` admit everyone fails 2; making `off` pong fails 3.
+
+Two more the gate proved were escaping, both the call-site-vs-helper trap:
+
+- **Deleting `mesh.set_presence_mode(presence)` in `boot` survived the whole suite**, as did making
+  the parse fail open there. The three tests drove `MeshState` directly, so nothing pinned the two
+  lines that make the feature exist on the daemon path. A boot test now covers install, default,
+  and the startup error.
+- **The read-back test asserted on `project(.., Some("off"))`**, which proves only that a parameter
+  survives a struct literal. Replacing `mesh.presence_mode()` with a constant passed. It is now
+  asserted through `read_current` on a really-booted node.
+
+Also caught by the gate and fixed: the close-reason helper compared only the reason bytes, so
+changing the policy close's error **code** from 401 to 0 passed — the code is on the wire and just
+as distinguishable. And the refusal path skipped the limiter entirely, leaving the arm unmetered
+for exactly the peers a hidden node most wants bounded; it now spends a token and discards the
+verdict, which keeps the close identical while restoring the bound.
 
 **Test 6 was vacuous in its first form** and is worth naming, because the trap is generic: it
 asserted `off_refusal != PING_THROTTLE_CLOSE` against a mesh with an unlimited limiter, where the

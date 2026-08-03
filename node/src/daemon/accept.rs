@@ -209,26 +209,44 @@ pub fn spawn_accept_loop(mesh: Arc<MeshState>, services: Arc<Services>) -> JoinH
                         // computes for the pong, so an embedder's existing per-peer sharing switch
                         // now controls presence too — LIVE, since grants are, with no restart.
                         //
-                        // The refusal is BYTE-IDENTICAL to the trust gate's above. A prober must
-                        // not be able to tell "not paired" from "hidden" from "no grants": all
-                        // three read as offline (`probe_peer` records a gate refusal as a clean
-                        // `reachable:false`). A distinguishable close would tell the prober "this
-                        // peer is online and deliberately hiding" — precisely the fact the mode
-                        // exists to withhold. Same discipline as the pairing redemption oracle.
+                        // The refusal matches the trust gate's above (same code, same bytes) so
+                        // this arm does not itself distinguish "not paired" from "hidden" from "no
+                        // grants". Same discipline as the pairing redemption oracle.
                         //
-                        // BEFORE the limiter deliberately: `PING_THROTTLE_CLOSE` is distinguishable
-                        // on purpose (#142 — a throttled probe must not be written down as
-                        // "offline"), so metering a hidden node first would leak its presence
-                        // through the throttle close. The cost is that a hidden node still pays one
-                        // `gate.resolve` per dial — identical to the unpaired-scanner path that
-                        // already exists and is accepted under "strangers stay cheap".
-                        let admitted = crate::daemon::caller_admitted_services(&mesh, &identity);
-                        let pong_allowed = match mesh.presence_mode() {
+                        // THIS IS NOT INVISIBILITY, and the docs must not claim it is (#89 gate).
+                        // A QUIC application close happens only AFTER the handshake completes, so
+                        // `connect()` returning Ok already proves this node is up. `ALPN_PAIR` is
+                        // advertised unconditionally and answers ANY stranger; a paired peer still
+                        // gets a served `ALPN_MCP` session and an application-layer refusal frame.
+                        // What this mode actually withholds is the pong PAYLOAD — `stack_version`,
+                        // `meta` (#40), and the caller's admitted `services` (#52) — and it makes
+                        // mcpmesh's own probe report the peer unreachable.
+                        //
+                        // BEFORE the limiter's VERDICT deliberately: `PING_THROTTLE_CLOSE` is
+                        // distinguishable on purpose (#142 — a throttled probe must not be written
+                        // down as "offline"), so answering the throttle close here would tell a
+                        // prober that it is paired and the node is up. The token is still SPENT
+                        // (below) so a refused peer stays metered.
+                        let mode = mesh.presence_mode();
+                        // Skipped entirely under `Off`: the value is unused there, and it is a live
+                        // registry scan per dial on a path an unmetered peer can drive.
+                        let admitted = if mode == crate::daemon::PresenceMode::Off {
+                            Vec::new()
+                        } else {
+                            crate::daemon::caller_admitted_services(&mesh, &identity)
+                        };
+                        let pong_allowed = match mode {
                             crate::daemon::PresenceMode::Paired => true,
                             crate::daemon::PresenceMode::Granted => !admitted.is_empty(),
                             crate::daemon::PresenceMode::Off => false,
                         };
                         if !pong_allowed {
+                            // SPEND a token, then discard the verdict. Returning early without
+                            // metering left the arm completely unmetered for exactly the peers a
+                            // hidden node most wants bounded — undoing #89 ask 1 for this mode
+                            // (#89 gate). Discarding the verdict is what keeps the close identical
+                            // whether or not the bucket is empty.
+                            let _ = mesh.limits().admit_ping(&remote);
                             conn.close(mcpmesh_net::CLOSE_UNAUTHORIZED.into(), b"unauthorized");
                             return;
                         }
