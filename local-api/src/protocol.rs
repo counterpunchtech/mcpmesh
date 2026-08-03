@@ -1446,6 +1446,11 @@ pub struct AuditRecord {
     /// its allow entry therefore goes through the `status` peers list (which carries BOTH the
     /// device principal and the `user_id`), not string equality on this field alone.
     ///
+    /// **`peer_introduce` (#65) is the one exception, deliberately:** it carries the ENDORSER, not
+    /// the subject. An introduction's whole security question is *who vouched for this peer*, and
+    /// the subject is already in `target`. So `audit_list --peer <endorser>` finds the
+    /// introductions that endorser caused, which is the query an operator actually runs.
+    ///
     /// Deliberately absent on: `unpair` (may tear down several devices — no single subject),
     /// `roster_install` (purely local), and the failed-outbound-dial session record (our own
     /// dial, not a gate-resolved caller). Absent on every record written before 0.24.0.

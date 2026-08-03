@@ -695,7 +695,13 @@ when it applies:
   `status` (`"ok"` \| `"error"`), and `latency_ms`.
 - On a `blob_fetch` or `trust`: `target` — the blob's `"blake3:…"` hash, or the trust operation's
   target (a nickname or `org/serial`) — and, on a `trust`, `event` (the trust verb: `pair`, `unpair`,
-  `roster_install`, `revoke`).
+  `roster_install`, `revoke`, `peer_introduce`).
+
+  **`peer_introduce` (#65) puts the ENDORSER in `principal`, not the subject** — the one deliberate
+  exception. An introduction's security question is *who vouched for this peer*, and the subject is
+  already in `target`. So `audit_list --peer <endorser>` finds every introduction that endorser
+  caused, which is the query worth running; filtering by the subject's own principal will not find
+  it.
 
 A **failed dial** surfaces as a `session_open` with `status: "error"` — it reached no backend, so it
 is otherwise never session-audited; this frame records the attempted-and-failed reach.

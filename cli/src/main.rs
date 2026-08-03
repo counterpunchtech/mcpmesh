@@ -909,6 +909,7 @@ fn run_peer_introduce(
     })
 }
 
+/// `mcpmesh internal peer state <peer>` — dump the durable state for one peer (#140).
 fn run_peer_state(peer: String, json: bool) -> anyhow::Result<()> {
     with_daemon(async move |mut client| {
         let v = client
