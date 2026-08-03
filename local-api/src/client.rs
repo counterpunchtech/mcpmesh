@@ -230,12 +230,27 @@ impl ControlClient {
         app_label: Option<String>,
         max_uses: Option<u32>,
     ) -> Result<InviteResult, ClientError> {
+        self.invite_named(services, app_label, max_uses, None).await
+    }
+
+    /// Mint an invite, optionally under YOUR OWN local name for whoever redeems it (#87).
+    ///
+    /// `peer_nickname` overrides the name they claim for themselves — the fix for two same-model
+    /// machines that does not require the other person to rename theirs. Never sent to them, and
+    /// rejected alongside `max_uses > 1` (one name for every redeemer collides on the second).
+    pub async fn invite_named(
+        &mut self,
+        services: Vec<String>,
+        app_label: Option<String>,
+        max_uses: Option<u32>,
+        peer_nickname: Option<String>,
+    ) -> Result<InviteResult, ClientError> {
         self.request_typed(
             Request::Invite(InviteParams {
                 services,
                 app_label,
                 max_uses,
-                peer_nickname: None,
+                peer_nickname,
             }),
             "invite result",
         )

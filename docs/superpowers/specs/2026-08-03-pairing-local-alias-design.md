@@ -87,16 +87,61 @@ offering an alias in its UI, since below it the field is rejected outright by
 5. `peer_nickname` on a `max_uses > 1` invite is refused **at mint**, naming both.
 6. An empty or invalid alias is a `-32602`, not a silent fallback.
 
-Mutation, seven run and seven caught: the redeemer ignoring `as_nickname` fails 1 and 2; the squat
+Mutation, eleven run and eleven caught: the redeemer ignoring `as_nickname` fails 1 and 2; the squat
 check reading `invite.nickname` instead of the chosen name fails 4; `encode()` not stripping
 `peer_nickname` fails the line test; accepting `peer_nickname` with `max_uses > 1` fails 5; treating
 a blank alias as absent fails 6; `effective_redeemer_nickname` returning the self-claim fails 3; and
 the inviter applying its alias to the STORE but checking the self-claim also fails 3.
 
+Four more from the gate round: leaking the alias into the refusal, and checking the self-claim
+while storing the alias — the latter **survived the entire workspace** before, because no test drove
+an inviter-side collision with an alias present; removing `as_nickname`'s validation from `redeem`
+(its branch had no test at all, only `peer_nickname`'s); and dropping the trim.
+
 **Tests 1 and 3 are deliberately end-to-end**, through the real two-sided ceremony, asserting on both
 peer stores. A unit test of `effective_redeemer_nickname` proves nothing about which name the inviter
 writes, and one of the redeemer's `local_name` nothing about what it stores — the call sites are the
 entire claim. That is the failure mode this repo keeps hitting.
+
+## What the gate found: "never sent" was false
+
+The commit, the rustdoc and `docs/local-protocol.md` all said neither alias is ever sent. **The
+inviter's was.** `encode()` strips it from the invite line, but the collision refusal interpolates
+the colliding name into `PairReply::Refused.reason`, and this change had pointed that at the
+*chosen* name — which is the alias. Reproduced: the redeemer received
+
+```
+nickname 'MY-PRIVATE-NAME-FOR-BOB' is already taken by another paired peer; …
+```
+
+Two harms, not one. It disclosed the inviter's private name for that peer, and when the clash was
+with a **third party** it disclosed that peer's nickname too. It also carried `ERR_NICKNAME_TAKEN`
+— the documented rename-and-retry code — over a name the redeemer cannot influence, so an embedder
+following the contract would rename and retry forever.
+
+An aliased collision now answers the **generic** refusal, byte-identical to every other opaque one,
+so it discloses not even that a collision occurred. The operator gets the detail server-side. And
+`mint_invite` now checks the alias against the peer store at MINT, where the error reaches the
+person who chose the name and can still act on it.
+
+**A guessed-at scope error, corrected:** the gate also reported that a same-id re-pair checks a name
+it will never store. It does not — `resolve_and_check_collision` computes
+`existing.is_none() && nickname_collision(...)`, so an existing entry short-circuits the check
+entirely. Verified before acting.
+
+## Aliases were unvalidated where `set_nickname` is strict
+
+They took anything. `"alice/notes"` made the peer permanently unmountable (`split_target` cuts at
+the first `/`), and `" alice "` slipped past a collision check that compares exact bytes while
+rendering identically to `alice`. Both aliases now go through one `validated_alias` applying the
+same rules as `set_nickname`: trim, reject `/`, reject control characters, cap at 64 characters.
+
+## The CLI could not reach any of it
+
+`mcpmesh invite` had no `--peer-name` and `mcpmesh pair` no `--as`, so a fix for "two same-model
+laptops" was reachable only from a hand-rolled JSON-RPC client — while the CLI kept printing the
+refusal that says to go ask the other person. Both flags now exist, plus `ControlClient::invite_named`
+and `pair_as`. `--as` with `--remove` is refused rather than silently ignored.
 
 ## Also fixed while here
 

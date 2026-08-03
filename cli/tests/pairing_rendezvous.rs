@@ -1131,6 +1131,113 @@ async fn a_dead_invite_dial_reports_the_cause_not_a_bare_connection_failure() {
 /// This is the whole point of T6 — PeerEntry (identity) + config `allow` (authorization) together
 /// admit the peer, and the inviter-side grant appends the redeemer to `[services.notes].allow` +
 /// reloads so `select_service` says yes.
+/// #87 gate: an inviter-side collision on OUR OWN alias must not tell the redeemer anything.
+///
+/// The first draft interpolated the alias into the refusal reason, so the inviter's private name
+/// for that peer went over the wire — and when the clash was with a THIRD party, that name's
+/// existence too. It also carried `ERR_NICKNAME_TAKEN`, the documented rename-and-retry code, over
+/// a name the redeemer cannot change: an embedder following the contract would loop forever.
+///
+/// This also pins the inviter-side collision path WITH an alias, which no test covered — reverting
+/// the check to the redeemer's self-claim passed the entire workspace.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_inviter_side_alias_collision_says_nothing_to_the_redeemer() {
+    timeout(Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("alice.redb");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!("[services.notes]\nrun = ['{STUB}']\nallow = []\n"),
+        )
+        .unwrap();
+
+        let store = Arc::new(PeerStore::open(&db_path).unwrap());
+        // A THIRD party already holds the name Alice is about to alias Bob to.
+        store
+            .add(PeerEntry {
+                endpoint_id: [0xCC; 32],
+                nickname: "SECRET-NAME-FOR-BOB".into(),
+                services: vec![],
+                paired_at: None,
+                user_id: None,
+                last_addr: None,
+            })
+            .unwrap();
+
+        let gate: Arc<dyn TrustGate> = Arc::new(AllowlistGate::new(store.clone()));
+        let invites = Arc::new(LiveInvites::new());
+        let alice = inviter_endpoint().await;
+        let alice_id = *alice.id().as_bytes();
+        let alice_addr = alice.addr();
+        let cfg = Config::load(&config_path).unwrap();
+        let mesh = MeshState::new(
+            alice,
+            gate,
+            store.clone(),
+            invites.clone(),
+            "alice".into(),
+            config_path.clone(),
+            Arc::new(RosterGate::empty()),
+            Arc::new(ConnRegistry::new()),
+            None,
+            None,
+            None,
+            None,
+        );
+        let task = spawn_accept_loop(mesh.clone(), Arc::new(build_services(&cfg)));
+        mesh.set_accept_task(task).await;
+
+        // Minted DIRECTLY (bypassing `mint_invite`'s mint-time guard) to exercise the redemption
+        // path — the collision is also reachable when a peer is added AFTER minting.
+        let invite = Invite {
+            secret: [31u8; 32],
+            inviter_id: alice_id,
+            inviter_addr_json: serde_json::to_string(&alice_addr).unwrap(),
+            nickname: "alice".into(),
+            services: vec!["notes".into()],
+            expires_at_epoch: FUTURE,
+            app_label: None,
+            uses_remaining: 1,
+            peer_nickname: Some("SECRET-NAME-FOR-BOB".into()),
+        };
+        invites.mint(invite.clone()).await.unwrap();
+
+        let bob = redeemer_endpoint().await;
+        let bob_dir = tempfile::tempdir().unwrap();
+        let bob_store = Arc::new(PeerStore::open(&bob_dir.path().join("b.redb")).unwrap());
+        let err = redeem_invite(
+            bob.clone(),
+            "bob".into(),
+            invite.encode(),
+            None,
+            bob_store.clone(),
+            None,
+            None,
+        )
+        .await
+        .expect_err("the inviter's alias collides with a third party, so this must be refused");
+
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("SECRET-NAME-FOR-BOB"),
+            "the inviter's PRIVATE alias must never reach the redeemer — it is what WE call THEM, \
+             and here it also discloses a third party's nickname: {msg}"
+        );
+        assert!(
+            !msg.contains("rename this node"),
+            "and it must not advise a rename that cannot possibly work: the colliding name is the \
+             inviter's, over a name the redeemer cannot influence — following that advice loops \
+             forever: {msg}"
+        );
+
+        drop(bob_dir);
+        std::mem::forget(dir);
+    })
+    .await
+    .expect("alias collision test timed out");
+}
+
 /// #87: BOTH local aliases, driven through the real two-sided ceremony.
 ///
 /// A unit test of `effective_redeemer_nickname` would prove nothing about which name the inviter

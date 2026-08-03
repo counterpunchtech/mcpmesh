@@ -112,6 +112,15 @@ enum Cmd {
         /// the value actually applied is printed back.
         #[arg(long, value_name = "n")]
         uses: Option<u32>,
+        /// YOUR name for whoever redeems this invite, instead of the name their machine claims
+        /// (#87).
+        ///
+        /// Two same-model laptops both call themselves the same thing, and the second pairing is
+        /// refused. This is the fix that does not need them to rename their machine. It is local:
+        /// they never see it, and it does not change what they call themselves. Cannot be combined
+        /// with `--uses` above 1 — one name for every redeemer collides on the second.
+        #[arg(long, value_name = "name")]
+        peer_name: Option<String>,
     },
     /// Redeem an invite to access a peer's services, or unpair a peer.
     ///
@@ -124,6 +133,13 @@ enum Cmd {
         /// Unpair a peer by nickname instead of redeeming an invite.
         #[arg(long, value_name = "nickname")]
         remove: Option<String>,
+        /// YOUR name for the inviter, instead of the one their invite suggests (#87).
+        ///
+        /// Use it when you already call a different peer by that name — otherwise the pairing is
+        /// refused and the only other fixes are asking them to send a new invite, or unpairing
+        /// whoever holds the name. It is local: they never see it.
+        #[arg(long = "as", value_name = "name")]
+        as_nickname: Option<String>,
     },
     /// Print the steps to use a peer's service from your AI client.
     ///
@@ -469,8 +485,13 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             services,
             label,
             uses,
-        }) => run_invite(services, label, uses, cli.json),
-        Some(Cmd::Pair { invite, remove }) => run_pair(invite, remove, cli.json),
+            peer_name,
+        }) => run_invite(services, label, uses, peer_name, cli.json),
+        Some(Cmd::Pair {
+            invite,
+            remove,
+            as_nickname,
+        }) => run_pair(invite, remove, as_nickname, cli.json),
         Some(Cmd::Use { target }) => run_use(target, cli.json),
         Some(Cmd::Join {
             org_invite,
@@ -640,13 +661,16 @@ fn run_invite(
     services: Vec<String>,
     label: Option<String>,
     uses: Option<u32>,
+    peer_name: Option<String>,
     json: bool,
 ) -> anyhow::Result<()> {
     if services.is_empty() {
         anyhow::bail!("specify at least one service to grant (e.g. `mcpmesh invite notes`)");
     }
     with_daemon(async move |mut client| {
-        let invite = client.invite_multi(services.clone(), label, uses).await?;
+        let invite = client
+            .invite_named(services.clone(), label, uses, peer_name)
+            .await?;
         if json {
             println!("{}", mcpmesh::json::invite_json(&invite, &services));
             return Ok(());
@@ -664,7 +688,12 @@ fn run_invite(
 ///
 /// A control-API error (a pair refused/expired/id-mismatch, or a peer_remove failure) propagates
 /// out of `main` → the process prints the message to stderr and exits non-zero.
-fn run_pair(invite: Option<String>, remove: Option<String>, json: bool) -> anyhow::Result<()> {
+fn run_pair(
+    invite: Option<String>,
+    remove: Option<String>,
+    as_nickname: Option<String>,
+    json: bool,
+) -> anyhow::Result<()> {
     match (invite, remove) {
         (Some(_), Some(_)) => {
             anyhow::bail!("provide an invite to redeem OR --remove <nickname>, not both")
@@ -672,8 +701,16 @@ fn run_pair(invite: Option<String>, remove: Option<String>, json: bool) -> anyho
         (None, None) => {
             anyhow::bail!("provide an invite to redeem, or --remove <nickname> to unpair")
         }
+        // `--as` names the inviter you are about to pair with; with `--remove` there is nobody to
+        // name. Refused rather than ignored — silently dropping a flag is how someone believes
+        // they renamed a peer.
+        (None, Some(_)) if as_nickname.is_some() => {
+            anyhow::bail!(
+                "--as names the inviter you are redeeming from; it has no meaning with --remove"
+            )
+        }
         (Some(invite_line), None) => with_daemon(async move |mut client| {
-            let paired = client.pair(&invite_line).await?;
+            let paired = client.pair_as(&invite_line, as_nickname.clone()).await?;
             if json {
                 println!("{}", mcpmesh::json::pair_json(&paired));
                 return Ok(());

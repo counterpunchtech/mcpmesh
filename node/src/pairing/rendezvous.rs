@@ -303,6 +303,31 @@ async fn resolve_and_check_collision(
     .context("join nickname collision check")?
 }
 
+/// Choose the collision refusal, given whether OUR OWN alias is what collided (#87 gate).
+///
+/// Two different failures wear the same shape and must not wear the same reply:
+///
+/// - **No alias.** The colliding name is the one the redeemer claimed for itself. It can rename and
+///   retry, so name it and answer [`RefusalCode::NicknameTaken`] — the documented
+///   rename-and-retry code.
+/// - **Alias set.** The colliding name is OURS, chosen on OUR machine, over a name the redeemer
+///   cannot see or influence. The first draft interpolated it into the reply, which sent the
+///   inviter's private name for that peer — and when the clash was with a third party, disclosed
+///   that name too. Worse, it carried `NicknameTaken`, so an embedder following the documented
+///   contract would rename and retry forever: every attempt collides identically, because the name
+///   is not theirs to change. It answers with the GENERIC refusal instead — byte-identical to every
+///   other opaque one, so it discloses nothing, not even that a collision is what happened. The
+///   operator gets the detail in the server-side log line.
+fn collision_reply(alias: Option<&str>, hello: &RedeemerHello, invite_survived: bool) -> PairReply {
+    match alias {
+        None => collision_refusal(&hello.redeemer_nickname, invite_survived),
+        Some(_) => PairReply::Refused {
+            reason: REASON_REFUSED.into(),
+            code: None,
+        },
+    }
+}
+
 /// The name the inviter will actually store for a redeemer (#87).
 ///
 /// The inviter's own `peer_nickname` alias when the invite carries one, else the redeemer's
@@ -513,9 +538,10 @@ pub async fn handle_inviter_side(
             // NO endpoint id, NO secret.
             tracing::warn!(
                 nickname = %claimed,
+                aliased = alias.is_some(),
                 "pairing refused: nickname collision (invite preserved)"
             );
-            let _ = send_reply(&mut send, &collision_refusal(claimed, true)).await;
+            let _ = send_reply(&mut send, &collision_reply(alias.as_deref(), &hello, true)).await;
             return Ok(());
         }
     }
@@ -562,10 +588,15 @@ pub async fn handle_inviter_side(
                 let survived = invite.uses_remaining > 0;
                 tracing::warn!(
                     nickname = %claimed,
+                    aliased = invite.peer_nickname.is_some(),
                     uses_remaining = invite.uses_remaining,
                     "pairing refused: nickname collision (post-redeem race guard)"
                 );
-                let _ = send_reply(&mut send, &collision_refusal(&claimed, survived)).await;
+                let _ = send_reply(
+                    &mut send,
+                    &collision_reply(invite.peer_nickname.as_deref(), &hello, survived),
+                )
+                .await;
                 return Ok(());
             }
 
@@ -786,6 +817,7 @@ pub async fn redeem_invite(
     // ONE binding for the name we will use everywhere below — the squat check, the stored entry,
     // the grant-back display name, and the result. Computing it per-site is how a check ends up
     // running against a different name than the one written.
+    let as_nickname_used = as_nickname.is_some();
     let local_name = as_nickname.unwrap_or_else(|| invite.nickname.clone());
 
     // Client-side pre-check: a friendly early error for an expired invite (the inviter also
@@ -807,12 +839,27 @@ pub async fn redeem_invite(
     // principal-keyed (#38), so no access can follow the name; refusing here keeps the
     // invariant that redeeming an invite grants the other side nothing.
     if let Some(conflict) = nickname_squat(&store, &local_name, &invite.inviter_id)? {
-        bail!(PairRefusal::new(
-            mcpmesh_local_api::ERR_INVITE_NAME_CONFLICT,
+        // The wording has to follow WHOSE name collided (#87 gate). With `as_nickname` set, the
+        // invite asked for nothing of the sort — the local user picked it — and "ask them for a
+        // different name" is advice for a problem they do not have.
+        let reason = if as_nickname_used {
+            format!(
+                "you asked to call this peer '{local_name}', but {conflict} \
+                 Redeem the same invite again with a different name."
+            )
+        } else {
+            // BYTE-IDENTICAL to before this change. A downstream forwards this prose to end
+            // users, and #159 shipped `-32048` precisely so the code — not a reword — is how a
+            // consumer offers the better remedy. Only the NEW aliased case above gets new wording,
+            // because it has no existing consumer.
             format!(
                 "this invite asks to be called '{local_name}', but {conflict} \
-                 Ask them for an invite suggesting a different name.",
-            ),
+                 Ask them for an invite suggesting a different name."
+            )
+        };
+        bail!(PairRefusal::new(
+            mcpmesh_local_api::ERR_INVITE_NAME_CONFLICT,
+            reason,
         ));
     }
 
@@ -975,6 +1022,7 @@ pub async fn redeem_invite(
         let inviter_principal = peer_user_id
             .clone()
             .unwrap_or_else(|| mcpmesh_net::EndpointId::from_bytes(invite.inviter_id).principal());
+        // `local_name`, not `invite.nickname`: the grant-back display name is OURS.
         grant_back(inviter_principal, local_name.clone()).await?;
     }
 

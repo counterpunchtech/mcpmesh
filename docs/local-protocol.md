@@ -1062,12 +1062,14 @@ more usefully the refusal carries `-32043`, so branch on the code and write the 
 *your* rename affordance.
 
 **The surviving invite is part of what `-32043` means**, not a detail of the prose. Two other
-`pair` failures are also nickname collisions and are deliberately NOT coded, because the remedy the
-code implies would be wrong for them:
+`pair` failures are also nickname collisions, and the remedy `-32043` implies would be wrong for
+both:
 
 - the inviter's post-redeem **race guard** — two redeemers claiming the same new name, where the
   loser's invite was already burned winning the race. Its reason says "ask the inviter for a fresh
-  invite", which is the correct advice; retrying the same invite would fail.
+  invite", which is the correct advice; retrying the same invite would fail. On a **multi-use**
+  invite the loser's invite survives, so that one *does* carry `-32043` and the rename-and-retry
+  advice is right. The uncoded burned case surfaces as `-32049` `ERR_INVITE_REFUSED`.
 - the **redeemer-side** squat check, which refuses adopting an invite's suggested nickname when you
   already use that name for a different peer. That is a condition on *your* node, not the
   inviter's. It carries **`-32048` `ERR_INVITE_NAME_CONFLICT`** (#159) — the paragraph above said
@@ -1077,8 +1079,15 @@ code implies would be wrong for them:
   `as_nickname` set (#87). Its message still says "ask them for an invite suggesting a different
   name", which was the only remedy before; branch on `-32048` and offer the rename instead.
 
-The race guard answers `-32000` with a specific, actionable reason. So: branch on `-32043` for the
-rename-and-retry case, `-32048` to offer `as_nickname`, and render the message for everything else.
+So: branch on `-32043` for the rename-and-retry case, `-32048` to offer `as_nickname`, and render
+the message for everything else.
+
+> **A collision on the inviter's own `peer_nickname` (#87) is deliberately opaque.** When the
+> inviter aliased you and *its* alias collides, the refusal is the generic `pairing refused` with no
+> code — byte-identical to every other opaque refusal. Naming it would send you the inviter's
+> private name for you (and, when the clash is with a third party, disclose that name's existence),
+> and coding it `-32043` would have you rename and retry forever over a name you cannot influence.
+> The inviter's operator gets the detail in their own log.
 
 Every remaining `pair` refusal stays `-32000`. The one guarding the invite secret is also
 deliberately **opaque** — it does not distinguish unknown-vs-expired-vs-wrong-secret, because a
