@@ -4441,12 +4441,18 @@ allow = []
         // A well-formed ticket for a node that is not there.
         let nowhere = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
         let hash = iroh_blobs::Hash::new(b"never-fetched");
-        let ticket = iroh_blobs::ticket::BlobTicket::new(
-            iroh::EndpointAddr::from(nowhere),
-            hash,
-            iroh_blobs::BlobFormat::Raw,
-        )
-        .to_string();
+        // A BLACKHOLE direct address (TEST-NET-3, RFC 5737), so the dial hangs in its QUIC
+        // handshake instead of failing instantly. Without it the fetch can be over before a cancel
+        // could possibly arrive, and the test would be racing rather than asserting.
+        let addr = iroh::EndpointAddr::from_parts(
+            nowhere,
+            [iroh::TransportAddr::Ip(std::net::SocketAddr::from((
+                [203, 0, 113, 1],
+                44444,
+            )))],
+        );
+        let ticket = iroh_blobs::ticket::BlobTicket::new(addr, hash, iroh_blobs::BlobFormat::Raw)
+            .to_string();
         let hash_hex = hash.to_hex().to_string();
 
         let dest = dir.path().join("out.bin");
@@ -4456,6 +4462,7 @@ allow = []
         });
 
         // Wait until the fetch has registered itself, so the cancel cannot arrive before it starts.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
         loop {
             if mesh
                 .fetches
@@ -4465,7 +4472,13 @@ allow = []
             {
                 break;
             }
-            tokio::task::yield_now().await;
+            // Sleep, never `yield_now`: a spin busy-waits a worker thread, and on a small CI box
+            // running the suite in parallel that starves the very fetch task it waits for.
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the fetch never registered itself"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
         let r = blob_fetch_cancel(&state, &hash_hex).expect("cancel answers");
         assert!(r.cancelled, "the in-flight fetch was found and tripped");

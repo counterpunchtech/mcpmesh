@@ -1660,6 +1660,23 @@ mod tests {
         c.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Wait for a condition, BOUNDED, sleeping rather than spinning.
+    ///
+    /// Both properties are load-bearing under a loaded CI box. A `yield_now` spin busy-waits a
+    /// whole worker thread, which on a small runner running the suite in parallel starves the very
+    /// task it is waiting for; and an unbounded wait turns a broken assumption into a job that
+    /// hangs until the runner's own timeout kills it with no failing test named. One did.
+    async fn until(what: &str, mut cond: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while !cond() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for: {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
     type ClientReader =
         FrameReader<tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>;
     type ClientWriter = tokio::io::WriteHalf<tokio::io::DuplexStream>;
@@ -1911,15 +1928,16 @@ mod tests {
     /// `handle_request`) instead of before the spawn fails this.
     #[tokio::test(flavor = "multi_thread")]
     async fn an_ephemeral_registration_is_torn_down_even_if_the_connection_closes_mid_register() {
-        let (_dir, mesh, state) = mesh_state(2000).await;
+        let (_dir, mesh, state) = mesh_state(300).await;
         let (r, mut w, server) = raw_conn(state).await;
         send(&mut w, &ephemeral_register(1, "leaky")).await;
         // Close once the registration EXISTS but before the reload behind it has finished — the
         // window itself, not merely "soon after sending". Closing earlier would abort the handler
         // before it registered anything, which leaks nothing and proves nothing.
-        while ephemeral_names(&mesh).is_empty() {
-            tokio::task::yield_now().await;
-        }
+        until("the ephemeral registration to appear", || {
+            !ephemeral_names(&mesh).is_empty()
+        })
+        .await;
         // Close WITHOUT reading the ack — the whole point.
         drop(w);
         drop(r);
@@ -2036,9 +2054,7 @@ mod tests {
         send(&mut w, &blocking_req(1, gate_id)).await;
         // Wait for the handler to actually be running before closing — otherwise this could pass
         // by aborting something that had not started.
-        while load(&gate.entered) == 0 {
-            tokio::task::yield_now().await;
-        }
+        until("the handler to start", || load(&gate.entered) > 0).await;
 
         drop(w);
         drop(r);
