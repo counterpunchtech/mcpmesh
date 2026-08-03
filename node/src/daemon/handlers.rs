@@ -345,7 +345,16 @@ pub(crate) async fn register_service(
         backend,
         allow,
         ephemeral,
+        rate_limit_per_min,
     } = params;
+    // #63: `0` would silently block every request to this service. Refused, the same call
+    // `max_uses` makes — a caller asking for zero has a bug, and honouring it hides one.
+    if rate_limit_per_min == Some(0) {
+        anyhow::bail!(crate::control::InvalidParams(
+            "rate_limit_per_min must be at least 1 (omit it to use [limits].rate_limit_per_min)"
+                .into()
+        ));
+    }
     // `allow` entries are stored VERBATIM (#38): a `b64u:`/`eid:` principal or a roster
     // group/user_id name admits; a bare display nickname does NOT (nicknames never authorize
     // — the daemon deliberately does no nickname→principal resolution here, since a
@@ -374,6 +383,10 @@ pub(crate) async fn register_service(
                 crate::daemon::EphemeralService {
                     backend,
                     allow: allow.clone(),
+                    // Stored as REQUESTED; the clamp against `[limits].rate_limit_per_min` happens
+                    // in `MeshLimiters::for_service`, so there is ONE place the ceiling is applied
+                    // and the config and control paths cannot enforce it differently.
+                    rate_limit_per_min,
                 },
             );
         reload_services_from_disk(mesh, "register-ephemeral").await?;
@@ -401,9 +414,14 @@ pub(crate) async fn register_service(
 
     // Persistent: atomic config write on a blocking thread, then hot-reload.
     let config_path = mesh.config_path.clone();
-    let (name_w, backend_w, allow_w) = (name.clone(), backend.clone(), allow.clone());
+    let (name_w, backend_w, allow_w, rate_w) = (
+        name.clone(),
+        backend.clone(),
+        allow.clone(),
+        rate_limit_per_min,
+    );
     blocking("join config write", move || {
-        write_service_to_config(&config_path, &name_w, &backend_w, &allow_w)
+        write_service_to_config(&config_path, &name_w, &backend_w, &allow_w, rate_w)
     })
     .await??;
 
@@ -2042,6 +2060,72 @@ mod tests {
     /// be told 500, and discover the truth when the 65th colleague fails. Rejecting `0` rather
     /// than treating it as "unusable" surfaces a caller bug instead of minting a credential
     /// nobody can redeem.
+    /// #63: the control path must go through the SAME clamp as config, and `0` must be refused.
+    ///
+    /// An unclamped `rate_limit_per_min` on `register_service` is what got the first attempt at
+    /// this parked: one control call uncapped a service, where `[limits].rate_limit_per_min` had
+    /// previously been a hard ceiling no control call could raise.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn register_service_cannot_uncap_a_service() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "[limits]\nrate_limit_per_min = 5\n").unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        // MUST be installed explicitly: `MeshState::limits()` FAILS OPEN — a OnceCell miss returns
+        // `unlimited()`, so a test mesh silently has no rate limits at all and every assertion
+        // about clamping would be vacuously about an unlimited bundle.
+        mesh.set_limits(crate::limits::MeshLimiters::from_config(
+            &crate::config::LimitsCfg {
+                rate_limit_per_min: 5,
+                ..Default::default()
+            },
+        ));
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+
+        let params = |rate: Option<u32>| RegisterServiceParams {
+            name: "svc".into(),
+            backend: mcpmesh_local_api::BackendSpec::Socket {
+                path: "/run/svc.sock".into(),
+            },
+            allow: vec![],
+            ephemeral: true,
+            rate_limit_per_min: rate,
+        };
+
+        // `0` is refused rather than silently blocking every request.
+        let e = register_service(&state, params(Some(0)))
+            .await
+            .expect_err("rate_limit_per_min = 0 must be refused");
+        assert!(
+            format!("{e:#}").contains("at least 1"),
+            "and say what a valid value is: {e:#}"
+        );
+
+        // A BELOW-ceiling rate must actually reach the ephemeral backend's bucket. Asserting on
+        // `effective_rpm` alone would be arithmetic, not wiring — and the ephemeral path silently
+        // dropping a per-service feature is exactly the shape #55 was filed about.
+        register_service(&state, params(Some(2)))
+            .await
+            .expect("a below-ceiling rate registers");
+        assert_eq!(
+            mesh.limits().tracked_rpm("svc"),
+            Some(Some(2)),
+            "an EPHEMERAL registration's rate must reach its backend's bucket — dropping it here \
+             is the #55 shape: a per-service feature that silently does nothing for ephemerals"
+        );
+
+        // A wildly-over-ceiling request is ACCEPTED but CLAMPED — again through the real bucket.
+        register_service(&state, params(Some(1_000_000)))
+            .await
+            .expect("an over-ceiling rate is clamped, not rejected");
+        assert_eq!(
+            mesh.limits().tracked_rpm("svc"),
+            Some(Some(5)),
+            "the control path must clamp to [limits].rate_limit_per_min exactly as config does — \
+             one call must never be able to uncap a service"
+        );
+    }
+
     /// #87 gate: pin the CALL SITE, not just the validator.
     ///
     /// A helper test proves nothing about whether `redeem` calls it — deleting the call passed the
@@ -2472,6 +2556,7 @@ allow = []
                     path: "/run/tmp.sock".into(),
                 },
                 allow: vec!["legacy-nickname".to_string(), "eid:beef".to_string()],
+                rate_limit_per_min: None,
             },
         );
         service_allow_revoke(&state, "tmp".into(), "legacy-nickname".into())
@@ -2668,6 +2753,7 @@ allow = []
                     path: "/run/room.sock".into(),
                 },
                 allow: vec!["eid:beef".to_string()],
+                rate_limit_per_min: None,
             },
         );
 
@@ -2719,6 +2805,7 @@ allow = []
                     path: "/run/room.sock".into(),
                 },
                 allow: vec![],
+                rate_limit_per_min: None,
             },
         );
 
@@ -2764,6 +2851,7 @@ allow = []
                     path: "/run/room.sock".into(),
                 },
                 allow: vec![],
+                rate_limit_per_min: None,
             },
         );
         let allow = || {

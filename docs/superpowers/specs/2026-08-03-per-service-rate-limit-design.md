@@ -96,6 +96,18 @@ one is now backing off further than it needs to.
 7. `MeshLimiters::unlimited()` stays unlimited per-service.
 8. `0` is refused.
 
-Mutation: dropping the clamp fails 2 and 5; re-creating the limiter on every reload fails 3;
-sharing one limiter across services fails 1; the config-writer dropping the field fails 6;
-`unlimited()` returning a 120/min limiter fails 7.
+Mutation, seven run and seven caught: dropping the clamp fails 2 and 5; re-creating the limiter on
+every reload fails 3; the config-writer dropping the field fails 6; `unlimited()` carrying a real
+rate fails 7; the map falling back to the global past the cap fails the bounded-ness test.
+
+**Two escaped on the first pass, both the call-site-vs-helper trap:**
+
+- **Sharing one limiter across services.** The starvation test called `for_service` directly, so
+  reverting `build_services` to the shared `requests` limiter — the entire bug — passed it.
+  `MeshLimiters::tracked_rpm` now lets a test assert that `build_services` actually routed each
+  backend through it.
+- **The ephemeral path ignoring its rate.** The register test asserted `effective_rpm`, which is
+  arithmetic, not wiring — so dropping `eph.rate_limit_per_min` at the call site passed. That is
+  precisely the #55 shape this design set out not to repeat, and it took a call-site assertion to
+  catch. It now asserts through the real bucket, with a below-ceiling rate so a dropped value is
+  distinguishable from a clamped one.

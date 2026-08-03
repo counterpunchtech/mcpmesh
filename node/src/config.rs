@@ -41,6 +41,16 @@ pub struct ServiceCfg {
     pub env: BTreeMap<String, String>,
     /// Working directory for a `run` backend (#51). Default: inherit the daemon's cwd.
     pub cwd: Option<String>,
+    /// Per-service proxied-request rate (#63), falling back to `[limits].rate_limit_per_min`.
+    ///
+    /// Before #63 every service a peer could reach drew from ONE shared bucket, so an agent
+    /// hammering a browser or filesystem service starved the embedder's own low-rate control
+    /// traffic to a different service on the same node. Buckets are now per `(service, endpoint)`.
+    ///
+    /// **This can only LOWER the rate.** `[limits].rate_limit_per_min` is a hard ceiling; a larger
+    /// value here is clamped, not honoured. That is what keeps the limit from being raised by a
+    /// config edit or a `register_service` call.
+    pub rate_limit_per_min: Option<u32>,
 }
 
 /// The resolved backend kind of a [`ServiceCfg`], borrowing the config as slices (no
