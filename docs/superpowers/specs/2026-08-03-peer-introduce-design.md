@@ -108,5 +108,17 @@ guard on `>= 42`.
 7. Introducing our own endpoint id is refused.
 8. A colliding nickname is refused, exactly as pairing refuses it.
 
-Mutation: skipping the paired-endorser check fails 3 and 4; dropping the domain prefix fails 6;
-verifying against the subject's key rather than the endorser's fails 5; granting on install fails 2.
+Mutation, four run and four caught: skipping the paired-endorser check fails 3 and 4; granting on
+install fails 2; swapping the domain and dropping `endorser_pk` from the preimage both fail the
+golden-vector test.
+
+**A claim in the first draft was wrong, and the mutation is what exposed it.** The preimage doc said
+including the endorser's key "stops a signature being lifted onto a different endorser's identity".
+It does not: `verify_strict` already binds the statement to that key, because the key *is* the
+verifier. Removing the field symmetrically from sign and verify escaped the entire suite — which is
+the correct outcome for a defence-in-depth field, and the wrong outcome for the claim I had written.
+
+**Round-trip tests cannot pin a wire format**, because sign and verify share one function: change it
+symmetrically and they keep agreeing with each other while disagreeing with every other build. The
+domain string and the field layout are now pinned by a **golden vector**, which is what catches both
+mutations. Corrected in the code comment too.

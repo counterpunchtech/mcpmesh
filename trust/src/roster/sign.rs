@@ -53,6 +53,66 @@ pub fn mint_signed(root: &SigningKey, mut body: Roster) -> Roster {
 /// `sig` and the SAS/fingerprint domains, so a signature can never be replayed across purposes.
 const DEVICE_BINDING_DOMAIN: &[u8] = b"mcpmesh/join/device-binding/1";
 
+/// Domain for a peer INTRODUCTION (#65): C vouching for B's endpoint to A.
+///
+/// Separate from [`DEVICE_BINDING_DOMAIN`] so an endorsement can never be replayed as a binding or
+/// the reverse — a device binding says "this endpoint is MINE", an introduction says "this endpoint
+/// is SOMEONE ELSE'S and I vouch for it". Signed by the same `UserKey`, so without separation a
+/// binding C made for its own device would verify as C endorsing that device to anyone.
+const INTRODUCE_DOMAIN: &[u8] = b"mcpmesh/introduce/1";
+
+/// The bytes an endorser's user key signs to introduce a subject:
+/// domain ∥ endorser_pk ∥ subject_endpoint_id ∥ subject_user_pk (32 zero bytes when absent).
+///
+/// The endorser's own key is in the preimage as **defence in depth**, not as the primary binding —
+/// `verify_strict` already binds the statement to that key, because the key IS the verifier. (An
+/// earlier draft of the spec claimed the preimage was what stopped a signature being lifted onto
+/// another identity; that was overstated, and removing the field symmetrically from sign+verify
+/// escaped the whole suite. The golden vector below is what actually pins this layout.)
+fn introduce_preimage(
+    endorser_pk: &[u8; 32],
+    subject_endpoint_id: &[u8; 32],
+    subject_user_pk: Option<&[u8; 32]>,
+) -> Vec<u8> {
+    let mut m = Vec::with_capacity(INTRODUCE_DOMAIN.len() + 96);
+    m.extend_from_slice(INTRODUCE_DOMAIN);
+    m.extend_from_slice(endorser_pk);
+    m.extend_from_slice(subject_endpoint_id);
+    // A FIXED-WIDTH slot rather than an omitted field: a variable-length preimage would let
+    // "subject_user_pk absent" and some other framing collide.
+    m.extend_from_slice(subject_user_pk.unwrap_or(&[0u8; 32]));
+    m
+}
+
+/// Sign an introduction (#65) with the endorser's user key.
+pub fn sign_introduction(
+    endorser_key: &SigningKey,
+    subject_endpoint_id: &[u8; 32],
+    subject_user_pk: Option<&[u8; 32]>,
+) -> [u8; 64] {
+    use ed25519_dalek::Signer;
+    let endorser_pk = endorser_key.verifying_key().to_bytes();
+    let msg = introduce_preimage(&endorser_pk, subject_endpoint_id, subject_user_pk);
+    endorser_key.sign(&msg).to_bytes()
+}
+
+/// Verify an introduction (#65). `verify_strict`, matching the roster path. Never panics on a
+/// malformed key or signature.
+pub fn verify_introduction(
+    endorser_pk: &[u8; 32],
+    subject_endpoint_id: &[u8; 32],
+    subject_user_pk: Option<&[u8; 32]>,
+    sig: &[u8],
+) -> Result<(), RosterError> {
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(endorser_pk)
+        .map_err(|_| RosterError::BadSignature)?;
+    let sig: [u8; 64] = sig.try_into().map_err(|_| RosterError::BadSignature)?;
+    let sig = ed25519_dalek::Signature::from_bytes(&sig);
+    let msg = introduce_preimage(endorser_pk, subject_endpoint_id, subject_user_pk);
+    vk.verify_strict(&msg, &sig)
+        .map_err(|_| RosterError::BadSignature)
+}
+
 /// The bytes a user key signs to bind a device endpoint to itself: domain ∥ user_pk ∥ endpoint_id.
 fn device_binding_preimage(user_pk: &[u8; 32], device_endpoint_id: &[u8; 32]) -> Vec<u8> {
     let mut m = Vec::with_capacity(DEVICE_BINDING_DOMAIN.len() + 64);
@@ -116,6 +176,57 @@ fn sample_body() -> crate::roster::Roster {
 
 #[cfg(test)]
 mod tests {
+    /// #65: a GOLDEN VECTOR for the introduction preimage.
+    ///
+    /// The domain string and the field layout are wire format: a peer signing with one layout and a
+    /// peer verifying with another simply cannot interoperate, and a domain change silently makes
+    /// every existing endorsement unverifiable. Round-trip tests cannot catch either, because
+    /// sign and verify share the same function — changing it symmetrically keeps them agreeing
+    /// with each other and disagreeing with every other build. Two such mutations escaped the
+    /// whole suite before this test existed.
+    #[test]
+    fn the_introduction_preimage_layout_is_pinned() {
+        let endorser = [1u8; 32];
+        let subject = [2u8; 32];
+        let subject_user = [3u8; 32];
+
+        let without = super::introduce_preimage(&endorser, &subject, None);
+        assert_eq!(
+            &without[..super::INTRODUCE_DOMAIN.len()],
+            b"mcpmesh/introduce/1",
+            "the DOMAIN is wire format — changing it invalidates every endorsement in existence"
+        );
+        assert_eq!(
+            without.len(),
+            super::INTRODUCE_DOMAIN.len() + 96,
+            "domain ∥ endorser_pk ∥ subject ∥ subject_user_pk(32 zero bytes) — a FIXED width, so \
+             'absent' cannot collide with some other framing"
+        );
+        assert_eq!(&without[super::INTRODUCE_DOMAIN.len()..][..32], &endorser);
+        assert_eq!(
+            &without[super::INTRODUCE_DOMAIN.len() + 32..][..32],
+            &subject
+        );
+        assert_eq!(
+            &without[super::INTRODUCE_DOMAIN.len() + 64..][..32],
+            &[0u8; 32],
+            "the absent subject user key is 32 ZERO bytes, not an omission"
+        );
+
+        let with = super::introduce_preimage(&endorser, &subject, Some(&subject_user));
+        assert_eq!(
+            &with[super::INTRODUCE_DOMAIN.len() + 64..][..32],
+            &subject_user
+        );
+        assert_ne!(
+            without, with,
+            "present and absent must not produce one preimage"
+        );
+
+        // And the two domains are distinct — the separation the device-binding test relies on.
+        assert_ne!(super::INTRODUCE_DOMAIN, super::DEVICE_BINDING_DOMAIN);
+    }
+
     use super::*;
     use ed25519_dalek::SigningKey;
 

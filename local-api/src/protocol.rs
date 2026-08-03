@@ -620,6 +620,32 @@ pub struct PeerAddParams {
     pub allow: Vec<String>,
 }
 
+/// Params of [`Request::PeerIntroduce`] (#65): install a peer vouched for by someone you are
+/// already paired with.
+///
+/// The endorsement replaces pairing's SAS with the endorser's signature, so you are trusting that
+/// endorser's judgment and key hygiene as well as their identity. It buys identity resolution only
+/// — see [`Request::PeerIntroduce`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerIntroduceParams {
+    /// The subject's endpoint id, `eid:<hex>` — who is being introduced.
+    pub subject: String,
+    /// The endorser's user public key, `b64u:`. MUST be the `user_id` of a CURRENTLY paired peer:
+    /// the chain has to terminate at someone you paired with yourself, so an endorsement from a
+    /// stranger — or from someone you have since unpaired — is refused.
+    pub endorsed_by: String,
+    /// The endorser's signature over the domain-separated preimage, `b64u:`.
+    pub evidence: String,
+    /// The subject's OWN user key, `b64u:`, when the endorser vouches for that too — so several of
+    /// the subject's devices resolve to one person. Part of the signed statement, so it cannot be
+    /// added or removed after the fact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_user_id: Option<String>,
+    /// YOUR local name for the subject. Same rules and the same collision guard as pairing (#87).
+    pub nickname: String,
+}
+
 /// Params of [`Request::OpenSession`]: the `peer/service` target to dial. Both fields are
 /// defaultable — an empty target simply fails the dial (a clean `-32055` error).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -936,6 +962,18 @@ pub enum Request {
     /// (raw endpoint identifiers otherwise never cross this socket); NOT part of the stable
     /// vocabulary — do not build on it. Tag `"peer_add"`.
     PeerAdd(PeerAddParams),
+    /// Install a peer from a SIGNED endorsement by someone you are already paired with (#65) —
+    /// O(N) onboarding for a small group, without a fresh two-human SAS ceremony per pair.
+    ///
+    /// **It installs IDENTITY, never AUTHORIZATION.** The subject becomes resolvable; it is granted
+    /// nothing. Service access stays principal-keyed in config (#38) and an explicit, separate act.
+    /// That is what bounds the feature: a compromised endorser can make you KNOW about an attacker,
+    /// it cannot make you SERVE one.
+    ///
+    /// Unlike [`PeerAdd`](Self::PeerAdd) — which is reserved precisely because the caller merely
+    /// ASSERTS an id — this is verifiable: the endorsement is checked against a user key you
+    /// already hold from pairing with the endorser. Tag `"peer_introduce"`.
+    PeerIntroduce(PeerIntroduceParams),
     /// Open a mesh session to `peer/service`; the daemon dials and pipes.
     /// Distinct from the proxy's job: this returns a session the client streams.
     /// Named `open_session` rather than `connect` to avoid colliding
@@ -1783,7 +1821,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   thirty have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.41";
+pub const API_VERSION: &str = "1.42";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -1869,7 +1907,10 @@ pub const API_VERSION: &str = "1.41";
 /// refusals — expired line, no live invite, inviter unreachable, id mismatch, name conflict, and
 /// the deliberately-opaque refusal. `ERR_NICKNAME_TAKEN` had been the only coded pairing failure,
 /// so every other one arrived as `-32000` and an embedder could either forward our prose to end
-/// users or substring-match it (#159); to 41 with `StreamFrame::BlobTransfer` — live app-blob
+/// users or substring-match it (#159); to 42 with the `peer_introduce` verb — install a peer from a
+/// SIGNED endorsement by someone you are already paired with, so a small group onboards in O(N)
+/// instead of O(N²) two-human ceremonies (#65). It installs IDENTITY only and grants nothing, which
+/// is what bounds it. Guard on `>= 42`; to 41 with `StreamFrame::BlobTransfer` — live app-blob
 /// transfer progress on both the serving and fetching side (#82 ask 2), so an embedder can draw a
 /// real progress bar instead of an indeterminate spinner. Guard on `>= 41` before expecting the
 /// frame. NOTE what it does NOT bring: `blob_fetch` still blocks its whole control connection for
@@ -1909,7 +1950,7 @@ pub const API_VERSION: &str = "1.41";
 /// its REAL content is a meaning change to `reachable` — the field exists so the new meaning is
 /// observable at all. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 41;
+pub const API_MINOR: u32 = 42;
 
 #[cfg(test)]
 mod tests {

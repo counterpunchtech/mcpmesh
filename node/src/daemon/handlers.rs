@@ -497,6 +497,125 @@ pub(crate) async fn add_peer(state: &DaemonState, params: PeerAddParams) -> Resu
     Ok(())
 }
 
+/// Handle a `peer_introduce` control request (#65): install a peer vouched for by someone we are
+/// ALREADY paired with, without a fresh two-human SAS ceremony.
+///
+/// **Installs IDENTITY, never AUTHORIZATION.** The written [`PeerEntry`] carries `services: vec![]`
+/// — the subject becomes resolvable and is granted nothing. Service access is principal-keyed in
+/// config (#38) and stays an explicit, separate act. That is what bounds the whole feature: a
+/// compromised endorser can make us KNOW about an attacker, it cannot make us SERVE one.
+///
+/// Unlike `peer_add` — reserved precisely because the caller merely ASSERTS an id — this is
+/// verifiable: the endorsement is checked against a user key we already hold from pairing.
+pub async fn introduce_peer(
+    state: &DaemonState,
+    params: mcpmesh_local_api::PeerIntroduceParams,
+) -> Result<()> {
+    let mesh = state.mesh_required()?;
+    let mcpmesh_local_api::PeerIntroduceParams {
+        subject,
+        endorsed_by,
+        evidence,
+        subject_user_id,
+        nickname,
+    } = params;
+
+    let nickname = validated_alias("nickname", Some(nickname))?
+        .expect("Some in, Some out — the None arm is unreachable here");
+
+    // Same encoding as `peer_add`/status: iroh's native base32.
+    let subject_id = subject
+        .strip_prefix("eid:")
+        .unwrap_or(&subject)
+        .parse::<iroh::EndpointId>()
+        .map_err(|e| {
+            crate::control::InvalidParams(format!(
+                "peer_introduce: subject is not a valid endpoint id: {e}"
+            ))
+        })?;
+    let subject_bytes = *subject_id.as_bytes();
+
+    // Introducing OURSELVES is meaningless and would write a self-row the gate would then resolve.
+    anyhow::ensure!(
+        subject_bytes != *mesh.endpoint.id().as_bytes(),
+        crate::control::InvalidParams("peer_introduce: that is this node's own endpoint id".into())
+    );
+
+    // THE TRUST-CHAIN CHECK. The endorser must be a peer we are CURRENTLY paired with, identified
+    // by the `user_id` we stored when we paired (with a SAS). An endorsement from a stranger — or
+    // from someone we have since unpaired — is refused, so the chain always terminates at a
+    // ceremony the operator performed themselves.
+    let store = mesh.store.clone();
+    let endorser = endorsed_by.clone();
+    let known = blocking("join endorser lookup", move || {
+        anyhow::Ok(
+            store
+                .list()?
+                .into_iter()
+                .any(|e| e.user_id.as_deref() == Some(endorser.as_str())),
+        )
+    })
+    .await??;
+    anyhow::ensure!(
+        known,
+        crate::control::InvalidParams(
+            "peer_introduce: endorsed_by is not the user_id of a peer you are currently paired \
+             with — an introduction's trust chain must end at someone you paired with yourself"
+                .into()
+        )
+    );
+
+    mcpmesh_trust::binding::verify_endorsement(
+        &endorsed_by,
+        &evidence,
+        &subject_bytes,
+        subject_user_id.as_deref(),
+    )
+    .map_err(|e| {
+        crate::control::InvalidParams(format!(
+            "peer_introduce: the endorsement does not verify: {e}"
+        ))
+    })?;
+
+    // The same display-uniqueness guard pairing runs, for the same reason: a duplicate nickname
+    // makes our own `<peer>/<service>` routing ambiguous (#87).
+    let store = mesh.store.clone();
+    let (nick, subj) = (nickname.clone(), subject_bytes);
+    let collides = blocking("join introduce collision check", move || {
+        anyhow::Ok(
+            store
+                .list()?
+                .into_iter()
+                .any(|e| e.nickname == nick && e.endpoint_id != subj),
+        )
+    })
+    .await??;
+    anyhow::ensure!(
+        !collides,
+        crate::control::InvalidParams(format!(
+            "peer_introduce: you already use the name '{nickname}' for a different peer"
+        ))
+    );
+
+    let entry = PeerEntry {
+        endpoint_id: subject_bytes,
+        nickname: nickname.clone(),
+        // EMPTY, and this is the security property, not an omission: an introduction grants
+        // nothing. Authorization stays a separate, explicit act.
+        services: vec![],
+        // Not a pairing write — no SAS happened, so no `paired_at` stamp and no pairing-proven
+        // dial hint. Discovery resolves this peer.
+        paired_at: None,
+        user_id: subject_user_id,
+        last_addr: None,
+    };
+    let store = mesh.store.clone();
+    blocking("join peer introduce", move || store.add(entry)).await??;
+
+    tracing::info!(peer = %nickname, "installed peer from an endorsement (#65)");
+    Ok(())
+}
+
 /// Handle a `peer_remove` control request: drop a paired
 /// peer's authorization AND identity — the strict INVERSE of the pairing grant.
 ///
@@ -2060,6 +2179,194 @@ mod tests {
     /// be told 500, and discover the truth when the 65th colleague fails. Rejecting `0` rather
     /// than treating it as "unusable" surfaces a caller bug instead of minting a credential
     /// nobody can redeem.
+    /// #65: the endorsement path, end to end through the handler.
+    ///
+    /// Property 2 — **an introduction grants nothing** — is what bounds the whole feature, so it is
+    /// asserted on the stored row rather than inferred from the absence of a grant call.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_introduction_installs_identity_and_grants_nothing() {
+        use mcpmesh_local_api::PeerIntroduceParams;
+        use mcpmesh_trust::keys::UserKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+
+        // Carol: someone we ALREADY paired with, so her user_id is stored.
+        let (carol, _) = UserKey::load_or_generate(&dir.path().join("carol.key")).unwrap();
+        let carol_uid = mcpmesh_trust::binding::user_id(&carol);
+        mesh.store
+            .add(crate::allowlist::PeerEntry {
+                endpoint_id: [0xC0; 32],
+                nickname: "carol".into(),
+                services: vec!["notes".into()],
+                paired_at: Some("1".into()),
+                user_id: Some(carol_uid.clone()),
+                last_addr: None,
+            })
+            .unwrap();
+
+        // Endpoint ids must be VALID ed25519 points — an arbitrary [0xAA; 32] is not one, and
+        // `EndpointId::from_bytes` rightly refuses it.
+        let eid_from = |seed: u8| -> ([u8; 32], String) {
+            let pk = iroh::SecretKey::from_bytes(&[seed; 32]).public();
+            (*pk.as_bytes(), pk.to_string())
+        };
+        let (bob_eid, bob_str) = eid_from(0xBB);
+        let evidence = mcpmesh_trust::binding::endorse(&carol, &bob_eid, None).unwrap();
+        let params = |endorsed_by: &str, evidence: &str, nickname: &str| PeerIntroduceParams {
+            subject: bob_str.clone(),
+            endorsed_by: endorsed_by.to_string(),
+            evidence: evidence.to_string(),
+            subject_user_id: None,
+            nickname: nickname.to_string(),
+        };
+
+        introduce_peer(&state, params(&carol_uid, &evidence, "bob"))
+            .await
+            .expect("a valid endorsement from a paired peer installs the subject");
+
+        let bob = mesh
+            .store
+            .resolve(&bob_eid)
+            .unwrap()
+            .expect("the subject is now resolvable");
+        assert_eq!(bob.nickname, "bob");
+        assert!(
+            bob.services.is_empty(),
+            "AN INTRODUCTION MUST GRANT NOTHING — this is the property that bounds the whole \
+             feature: a compromised endorser can make us KNOW about a peer, never SERVE it. Got: \
+             {:?}",
+            bob.services
+        );
+        assert_eq!(
+            bob.paired_at, None,
+            "no SAS happened, so nothing may claim a pairing stamp"
+        );
+
+        // A stranger's endorsement — valid signature, unknown endorser — is refused.
+        let (mallory, _) = UserKey::load_or_generate(&dir.path().join("m.key")).unwrap();
+        let m_uid = mcpmesh_trust::binding::user_id(&mallory);
+        let m_ev = mcpmesh_trust::binding::endorse(&mallory, &eid_from(0xEE).0, None).unwrap();
+        let e = introduce_peer(
+            &state,
+            PeerIntroduceParams {
+                subject: eid_from(0xEE).1,
+                endorsed_by: m_uid,
+                evidence: m_ev,
+                subject_user_id: None,
+                nickname: "eve".into(),
+            },
+        )
+        .await
+        .expect_err("an endorsement from a peer we never paired with must be refused");
+        assert!(
+            format!("{e:#}").contains("currently paired"),
+            "and say why: {e:#}"
+        );
+
+        // A signature for a DIFFERENT subject does not transplant.
+        let e = introduce_peer(
+            &state,
+            PeerIntroduceParams {
+                subject: eid_from(0xAA).1,
+                endorsed_by: carol_uid.clone(),
+                evidence: evidence.clone(),
+                subject_user_id: None,
+                nickname: "someone".into(),
+            },
+        )
+        .await
+        .expect_err("an endorsement naming bob must not install someone else");
+        assert!(format!("{e:#}").contains("does not verify"), "{e:#}");
+
+        // Our OWN endpoint id is refused.
+        let ours = mesh.endpoint.id().to_string();
+        let self_ev =
+            mcpmesh_trust::binding::endorse(&carol, mesh.endpoint.id().as_bytes(), None).unwrap();
+        let e = introduce_peer(
+            &state,
+            PeerIntroduceParams {
+                subject: ours,
+                endorsed_by: carol_uid.clone(),
+                evidence: self_ev,
+                subject_user_id: None,
+                nickname: "me".into(),
+            },
+        )
+        .await
+        .expect_err("introducing ourselves must be refused");
+        assert!(format!("{e:#}").contains("own endpoint id"), "{e:#}");
+
+        // A colliding nickname is refused, exactly as pairing refuses it.
+        let ev2 = mcpmesh_trust::binding::endorse(&carol, &eid_from(0xDD).0, None).unwrap();
+        let e = introduce_peer(
+            &state,
+            PeerIntroduceParams {
+                subject: eid_from(0xDD).1,
+                endorsed_by: carol_uid.clone(),
+                evidence: ev2,
+                subject_user_id: None,
+                nickname: "carol".into(),
+            },
+        )
+        .await
+        .expect_err("a nickname already used for a different peer must be refused");
+        assert!(format!("{e:#}").contains("already use the name"), "{e:#}");
+    }
+
+    /// #65: the chain must be LIVE — unpairing the endorser revokes their power to introduce.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unpairing_the_endorser_revokes_their_introductions() {
+        use mcpmesh_local_api::PeerIntroduceParams;
+        use mcpmesh_trust::keys::UserKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+
+        let (carol, _) = UserKey::load_or_generate(&dir.path().join("carol.key")).unwrap();
+        let carol_uid = mcpmesh_trust::binding::user_id(&carol);
+        mesh.store
+            .add(crate::allowlist::PeerEntry {
+                endpoint_id: [0xC0; 32],
+                nickname: "carol".into(),
+                services: vec![],
+                paired_at: Some("1".into()),
+                user_id: Some(carol_uid.clone()),
+                last_addr: None,
+            })
+            .unwrap();
+
+        let bob_pk = iroh::SecretKey::from_bytes(&[0xBB; 32]).public();
+        let ev = mcpmesh_trust::binding::endorse(&carol, bob_pk.as_bytes(), None).unwrap();
+        let p = |n: &str| PeerIntroduceParams {
+            subject: bob_pk.to_string(),
+            endorsed_by: carol_uid.clone(),
+            evidence: ev.clone(),
+            subject_user_id: None,
+            nickname: n.to_string(),
+        };
+        introduce_peer(&state, p("bob"))
+            .await
+            .expect("works while paired");
+
+        // Unpair Carol. Her old, still-valid signature must stop working.
+        mesh.store.remove("carol").unwrap();
+        let e = introduce_peer(&state, p("bob2"))
+            .await
+            .expect_err("an endorsement from an UNPAIRED peer must be refused");
+        assert!(
+            format!("{e:#}").contains("currently paired"),
+            "the check must be on the CURRENT store, not on whether the signature is valid — a \
+             signature stays valid forever, which is exactly why the chain has to be live: {e:#}"
+        );
+    }
+
     /// #63: the control path must go through the SAME clamp as config, and `0` must be refused.
     ///
     /// An unclamped `rate_limit_per_min` on `register_service` is what got the first attempt at

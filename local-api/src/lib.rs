@@ -65,12 +65,12 @@ pub use protocol::{
     ERR_INVITER_UNREACHABLE, ERR_NICKNAME_TAKEN, ERR_NO_SUCH_BLOB, ERR_NO_SUCH_SERVICE, Hello,
     InviteParams, InviteResult, MAX_INVITE_USES, OpenSessionParams, OrgJoinParams, OrgJoinResult,
     PairParams, PairResult, PeerAddParams, PeerDiagnosticsParams, PeerDiagnosticsResult, PeerInfo,
-    PeerPath, PeerReachability, PeerRemoveParams, PeerRenameParams, PeerServicesParams,
-    PeerServicesResult, PresencePeer, ReachabilitySource, RecentPairing, RegisterServiceParams,
-    RelayInfo, Request, RosterInstallParams, RosterInstallResult, RosterStatus, ScopeInfo,
-    SelfNetwork, ServiceAllowParams, ServiceInfo, SetAppMetadataParams, SetNicknameParams,
-    SetRelaysParams, SetRelaysResult, SetRosterUrlParams, StatusResult, StorageInfo, StreamFrame,
-    UnregisterServiceParams, method_of, one_use,
+    PeerIntroduceParams, PeerPath, PeerReachability, PeerRemoveParams, PeerRenameParams,
+    PeerServicesParams, PeerServicesResult, PresencePeer, ReachabilitySource, RecentPairing,
+    RegisterServiceParams, RelayInfo, Request, RosterInstallParams, RosterInstallResult,
+    RosterStatus, ScopeInfo, SelfNetwork, ServiceAllowParams, ServiceInfo, SetAppMetadataParams,
+    SetNicknameParams, SetRelaysParams, SetRelaysResult, SetRosterUrlParams, StatusResult,
+    StorageInfo, StreamFrame, UnregisterServiceParams, method_of, one_use,
 };
 
 #[cfg(feature = "client")]
