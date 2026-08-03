@@ -20,9 +20,12 @@
 //! which is the whole argument of #38/#41. It arrives PER-CALLER through `run`
 //! (`Option<PeerIdentity>`), not as a construction field: `serve` builds each
 //! backend once per service and reuses it across all callers, so the injected
-//! identity cannot be baked in. `select_service` already stripped the
-//! caller's reserved `mcpmesh/*` `_meta` keys upstream, so the forwarded
-//! `initialize` is clean before it reaches the child.
+//! identity cannot be baked in. `select_service` strips the caller's reserved
+//! `mcpmesh/*` `_meta` keys from the first frame and the pump's sanitizer strips them
+//! from every later one (#164), so no frame reaching the child carries a forged one.
+//! This backend is given NO `_meta` identity to inject: it carries identity in env
+//! vars, and inventing an `_meta` seam would make a `run` server see a key that
+//! appears on no other release.
 use std::collections::BTreeMap;
 use std::process::Stdio;
 

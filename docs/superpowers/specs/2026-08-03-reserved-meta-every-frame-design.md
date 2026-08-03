@@ -56,8 +56,39 @@ coverage from the word "never".
 ## Versioning
 
 **MINOR → 0.29.0.** Behavior change: frames a backend previously received verbatim are now modified.
-`pump` is `pub(crate)`; `strip_reserved_meta` is additive `pub` in `mcpmesh-net`. No wire or
-Control-API change, so `api_minor` is unchanged.
+`pump` is `pub(crate)`; `strip_reserved_meta` is additive `pub` in `mcpmesh-net`.
+
+**`api_minor` 36 → 37.** The first draft said "no wire change, so `api_minor` is unchanged" — wrong
+by this file's own precedent. Minor 10, 17, 21, 22, 23 and 24 all shipped with no type change; they
+moved *meaning*, and 10's entry says exactly why: "A consumer can guard on `api_minor >= 10`." Here
+what changed is whether `_meta["mcpmesh/peer"]` can be trusted, which is the entire reason a backend
+reads it. Leaving it at 36 would give bolo no programmatic feature-detect for a **security** fix and
+force them to parse `stack_version`.
+
+## The batch bypass the gate found
+
+The first implementation was still evadable. `strip_reserved_meta` resolves `params/_meta` through a
+JSON pointer and the injection reads `frame.get("method")` — **both return `None` on an array
+root**. So wrapping the forged frame in `[ ... ]` carried it through untouched, reproduced end to end
+against the real socket backend.
+
+Whether it reaches a handler depends on the server: rmcp 3.1.0 does not unwrap batches (MCP removed
+them in 2025-06-18), but an older SDK or a custom NDJSON server does. **The invariant cannot depend
+on which server is behind it** — this daemon pumps rather than interprets, and the reporter is
+explicit that enforcing the reserved namespace is ours. Both halves now descend a batch, depth-bounded
+at 8 (a valid batch is one level; `serde_json` already caps parse depth).
+
+Worse, the first draft's own test *asserted the bypass was fine*: `odd_shapes_survive_sanitize_without_panicking`
+checked that `json!([1,2,3])` passed through unchanged. A test can encode the defect as intended
+behavior.
+
+## The trait contract, and what an embedder must do
+
+`SessionBackend` is `pub` in `mcpmesh-net`, and its doc said the transport "carries the rest of the
+session verbatim" — describing the defect as the contract. Enforcement lives in `mcpmesh-node`'s
+private `pump`, so an embedder implementing the trait itself gets raw frames 2+. The doc now says so
+and points at `strip_reserved_meta`. Moving enforcement into `mcpmesh-net` would mean wrapping the
+transport the backend consumes; not done here, and named rather than left implied.
 
 ## Testing
 
@@ -74,10 +105,18 @@ Control-API change, so `api_minor` is unchanged.
    panicking — `Value`'s `IndexMut` panics on a non-object base, and `select_service` already
    documents this shape as reachable.
 
-Mutation, four run and four caught: reverting the strip to first-frame-only (deleting the call site,
+Mutation, eight run and eight caught: reverting the strip to first-frame-only (deleting the call site,
 not the helper) fails 1, 2 and 5; dropping the later-`initialize` injection fails 1; stripping all of
 `_meta` rather than the reserved prefix fails 3; making `spawn.rs` pass a peer instead of `None`
 fails 4.
+
+Four more from the gate round: strip skipping a batch fails 6; injection skipping a batch fails 6;
+widening the injection gate to every frame fails 2 (it previously escaped every integration test and
+was caught only by a helper unit test — the same call-site blindness as case 4); removing the
+`params` object guard fails 5.
+
+6. A JSON-RPC **batch** cannot smuggle a forged key past either half, and a non-`initialize` element
+   inside one is stripped without being attributed.
 
 **Case 4 needed a call-site test, and the first attempt was a helper test that proved nothing.**
 `sanitize_caller_frame(&mut f, None)` is not evidence that `spawn.rs` passes `None` — the argument is

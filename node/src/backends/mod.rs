@@ -41,6 +41,61 @@ pub(crate) const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 // layering constraint), so a "downcast in the daemon" was never possible. The backend owning
 // the refusal is the correct seam.
 
+/// Enforce the reserved `mcpmesh/*` namespace on ONE caller→backend frame (#164).
+///
+/// The rule used to run on the session's first frame only, and `run_session` treats frame 1 as
+/// `initialize` whatever its method actually is. So a caller spent frame 1 on a `ping` — which the
+/// MCP lifecycle permits before `initialize`, and which rmcp answers — and sent its real
+/// `initialize` as frame 2, which reached the backend verbatim with a forged `mcpmesh/peer`.
+///
+/// Two steps, because each alone leaves a hole:
+///
+/// 1. **Strip** every caller-supplied `mcpmesh/*` key. Unconditional, both backends.
+///    `mcpmesh/service` is the key `select_service` acts on, so this is authorization-relevant.
+/// 2. **Inject** the authoritative peer into whichever frame is actually the handshake. Stripping
+///    alone would leave the backend's real `initialize` carrying no identity at all —
+///    unattributable, which is the second harm the issue names.
+///
+/// `peer_meta` is `None` for the `run` backend, which conveys identity through `MCPMESH_PEER_*` env
+/// vars and has no `_meta` seam; inventing one there would make a `run` server see a key that
+/// appears on no other release. The strip still applies to it.
+///
+/// Non-object `params`/`_meta` are REPLACED, never indexed into — `Value`'s `IndexMut` panics on a
+/// non-object base, and a caller controls this shape.
+fn sanitize_caller_frame(frame: &mut Value, peer_meta: Option<&Value>) {
+    mcpmesh_net::service::strip_reserved_meta(frame);
+    let Some(peer) = peer_meta else { return };
+    inject_peer(frame, peer, 0);
+}
+
+/// Attribute whichever frame is really the handshake, descending a JSON-RPC batch.
+///
+/// A top-level array has no `method`, so an array-wrapped `initialize` was neither stripped nor
+/// attributed — the strip's own batch bypass, on the injection side (#164 gate). Depth-bounded for
+/// the same reason as [`mcpmesh_net::service::strip_reserved_meta`].
+fn inject_peer(frame: &mut Value, peer: &Value, depth: usize) {
+    if let Some(batch) = frame.as_array_mut() {
+        if depth < 8 {
+            for element in batch {
+                inject_peer(element, peer, depth + 1);
+            }
+        }
+        return;
+    }
+    if frame.get("method").and_then(Value::as_str) != Some("initialize") {
+        return;
+    }
+    // No `!frame.is_object()` guard: only an object can carry `method == "initialize"`, and the
+    // check above already returned for everything else. `params`/`_meta` still need theirs.
+    if !frame["params"].is_object() {
+        frame["params"] = serde_json::json!({});
+    }
+    if !frame["params"]["_meta"].is_object() {
+        frame["params"]["_meta"] = serde_json::json!({});
+    }
+    frame["params"]["_meta"]["mcpmesh/peer"] = peer.clone();
+}
+
 /// Bidirectionally pump one session between the mesh transport and a local MCP
 /// server's byte stream (a spawned child's stdio, or a dialed UDS). Shared by both
 /// backends (DRY): only the server-side reader/writer types differ, so this is
@@ -70,44 +125,8 @@ pub(crate) const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 ///
 /// A trusted local server that emits a malformed line is a bug, not an attack: the
 /// session ends rather than interpreting it (the platform pumps, never interprets).
-/// Enforce the reserved `mcpmesh/*` namespace on ONE caller→backend frame (#164).
 ///
-/// The rule used to run on the session's first frame only, and `run_session` treats frame 1 as
-/// `initialize` whatever its method actually is. So a caller spent frame 1 on a `ping` — which the
-/// MCP lifecycle permits before `initialize`, and which rmcp answers — and sent its real
-/// `initialize` as frame 2, which reached the backend verbatim with a forged `mcpmesh/peer`.
-///
-/// Two steps, because each alone leaves a hole:
-///
-/// 1. **Strip** every caller-supplied `mcpmesh/*` key. Unconditional, both backends.
-///    `mcpmesh/service` is the key `select_service` acts on, so this is authorization-relevant.
-/// 2. **Inject** the authoritative peer into whichever frame is actually the handshake. Stripping
-///    alone would leave the backend's real `initialize` carrying no identity at all —
-///    unattributable, which is the second harm the issue names.
-///
-/// `peer_meta` is `None` for the `run` backend, which conveys identity through `MCPMESH_PEER_*` env
-/// vars and has no `_meta` seam; inventing one there would make a `run` server see a key that
-/// appears on no other release. The strip still applies to it.
-///
-/// Non-object `params`/`_meta` are REPLACED, never indexed into — `Value`'s `IndexMut` panics on a
-/// non-object base, and a caller controls this shape.
-fn sanitize_caller_frame(frame: &mut Value, peer_meta: Option<&Value>) {
-    mcpmesh_net::service::strip_reserved_meta(frame);
-    let Some(peer) = peer_meta else { return };
-    if frame.get("method").and_then(Value::as_str) != Some("initialize") {
-        return;
-    }
-    // No `!frame.is_object()` guard: only an object can carry `method == "initialize"`, and the
-    // check above already returned for everything else. `params`/`_meta` still need theirs.
-    if !frame["params"].is_object() {
-        frame["params"] = serde_json::json!({});
-    }
-    if !frame["params"]["_meta"].is_object() {
-        frame["params"]["_meta"] = serde_json::json!({});
-    }
-    frame["params"]["_meta"]["mcpmesh/peer"] = peer.clone();
-}
-
+/// Every caller→backend frame passes [`sanitize_caller_frame`] first (#164).
 pub(crate) async fn pump<TR, TW, SR, SW>(
     initialize: Value,
     transport: &mut NdjsonTransport<TR, TW>,
@@ -443,16 +462,66 @@ mod tests {
             );
         }
 
-        // A non-OBJECT frame cannot carry a method, so it is not a handshake: passed through
-        // untouched rather than coerced into an object that invents an `initialize`.
-        for original in [json!("a bare string frame"), json!([1, 2, 3]), json!(null)] {
+        // A non-OBJECT, non-ARRAY frame cannot carry a method, so it is not a handshake: passed
+        // through untouched rather than coerced into an object that invents an `initialize`.
+        for original in [json!("a bare string frame"), json!(null), json!(7)] {
             let mut frame = original.clone();
             sanitize_caller_frame(&mut frame, Some(&peer));
             assert_eq!(
                 frame, original,
-                "a non-object frame is not an initialize and must pass through unchanged"
+                "a scalar frame is not an initialize and must pass through unchanged"
             );
         }
+    }
+
+    /// #164 gate: a JSON-RPC BATCH bypassed both halves. `pointer_mut("/params/_meta")` and
+    /// `get("method")` both resolve to nothing on an array root, so wrapping the forged frame in
+    /// `[ ... ]` carried it through untouched. rmcp 3.1.0 does not unwrap batches, but an older SDK
+    /// or a custom NDJSON server does — and this daemon pumps rather than interprets, so the
+    /// invariant cannot depend on which server is behind it.
+    #[test]
+    fn a_batch_cannot_smuggle_a_forged_peer_past_the_strip() {
+        let peer = json!({"eid":"eid:aa","name":"bob","user_id":null,"groups":[]});
+        let forged = json!({"mcpmesh/peer": {"name":"someone-else","groups":["admin"]},
+                            "mcpmesh/service": "not-yours", "app/keep": "yes"});
+
+        let mut batch = json!([
+            {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"_meta": forged}},
+            {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"_meta": forged}},
+        ]);
+        sanitize_caller_frame(&mut batch, Some(&peer));
+
+        assert_eq!(
+            batch[0]["params"]["_meta"]["mcpmesh/peer"], peer,
+            "an array-wrapped initialize must still be authoritatively attributed: {batch}"
+        );
+        assert!(
+            batch[0]["params"]["_meta"].get("mcpmesh/service").is_none(),
+            "and a forged mcpmesh/service inside a batch must be stripped: {batch}"
+        );
+        assert!(
+            batch[1]["params"]["_meta"].get("mcpmesh/peer").is_none(),
+            "a non-initialize batch element is stripped and NOT attributed: {batch}"
+        );
+        assert_eq!(
+            batch[0]["params"]["_meta"]["app/keep"], "yes",
+            "non-reserved keys survive inside a batch too: {batch}"
+        );
+
+        // Nested past the depth bound: not a request any server unwraps, and it must not recurse
+        // without limit. It must still not PANIC, and the outer levels are handled.
+        let mut deep = json!([[[[[[[[[[{"jsonrpc":"2.0","method":"initialize",
+                                        "params":{"_meta":{"mcpmesh/peer":{"name":"x"}}}}]]]]]]]]]]);
+        sanitize_caller_frame(&mut deep, Some(&peer));
+
+        // And with no identity, a batch is still stripped.
+        let mut b2 = json!([{"jsonrpc":"2.0","id":1,"method":"initialize",
+                             "params":{"_meta":{"mcpmesh/peer":{"name":"attacker"}}}}]);
+        sanitize_caller_frame(&mut b2, None);
+        assert!(
+            b2[0]["params"]["_meta"].get("mcpmesh/peer").is_none(),
+            "a run backend's batch is stripped too: {b2}"
+        );
         // And with no identity, an odd shape must not panic either.
         for mut frame in [json!(null), json!("s"), json!({"params": 7})] {
             sanitize_caller_frame(&mut frame, None);

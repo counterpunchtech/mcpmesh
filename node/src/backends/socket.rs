@@ -5,10 +5,12 @@
 //!
 //! The injection is AUTHORITATIVE — it REPLACES, never merges. The value the
 //! backend writes is the daemon-authored one; a caller-forged `_meta["mcpmesh/peer"]`
-//! must never survive. In the real flow `select_service` has already STRIPPED every
-//! caller `mcpmesh/*` key upstream, so the forged key is already gone — this REPLACE is
-//! both defense-in-depth AND the single authoritative source of the value the warm
-//! server trusts.
+//! must never survive. `select_service` strips the caller's `mcpmesh/*` keys from the
+//! session's first frame, and the pump's sanitizer strips them from EVERY later frame
+//! and re-attributes a later `initialize` (#164) — so this REPLACE is both
+//! defense-in-depth AND the single authoritative source of the value the warm server
+//! trusts. Before #164 the strip ran on frame 1 alone, and `run_session` treats frame 1
+//! as the handshake whatever its method is, so a forged identity rode in on frame 2.
 //!
 //! Unlike the `run` backend, the server is a warm, shared process (e.g. a
 //! plugin daemon), so identity cannot travel as per-process env vars; it rides in
@@ -440,6 +442,14 @@ mod tests {
                 meta["_private"]["nested"],
                 json!(true),
                 "and so must a nested non-reserved value: {meta}"
+            );
+            // The gate is `method == "initialize"`, and this frame is a `tools/call`. Without this
+            // assertion, widening the gate to inject on EVERY frame was caught only by a helper
+            // unit test — the call site stayed green (#164 gate). Attributing a `tools/call` as
+            // though it were a handshake would tell a server the session re-identified mid-stream.
+            assert!(
+                meta.get("mcpmesh/peer").is_none(),
+                "a non-initialize frame must be stripped and NOT attributed: {meta}"
             );
 
             drop(client);
