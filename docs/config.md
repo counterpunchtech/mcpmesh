@@ -61,7 +61,7 @@ are in the [operator runbook §5](operator.md#5-self-hosting-relay--discovery-10
 | `discovery_mode` | `"default"` | `"default"` \| `"custom"` (your own discovery service — requires `discovery_urls`). Ignored when `relay_mode = "disabled"`. |
 | `discovery_urls` | `[]` | Your self-hosted discovery URLs, used for both publishing and resolving peer addresses. Required when `discovery_mode = "custom"`. |
 | `idle_timeout_secs` | iroh's (**30 s**) | QUIC idle timeout. **Negotiated** — the connection uses the minimum of both peers' values, so raising it needs every node configured. See [Idle timeout and keepalive](#idle-timeout-and-keepalive-56). |
-| `keep_alive_secs` | iroh's (**5 s**) | QUIC keepalive interval. Must be less than the effective idle timeout, or boot fails. See [Idle timeout and keepalive](#idle-timeout-and-keepalive-56). |
+| `keep_alive_secs` | iroh's (**5 s**) | QUIC keepalive interval. **Legal range is `1`–`5`** — iroh caps the per-path keepalive at 5 s, so a larger value is a **startup error**, not a slower ping. `0` is refused too (a PING storm, not "disabled"). Must additionally be less than the effective idle timeout. See [Idle timeout and keepalive](#idle-timeout-and-keepalive-56). |
 | `relay_only` | `false` | **TESTING ONLY (#116).** Force application data over the **relay** even when a direct path exists. Requires building with the `unstable-relay-only` cargo feature — without it the field still parses (configs stay portable) but is **ignored with a warning**, never a startup error. See the caveats below. |
 
 An unknown mode, or a `"custom"` mode without its URL list, is a **startup error** — the daemon
@@ -94,7 +94,7 @@ nothing is detectably wrong at config time.
 | Key | Default | Meaning |
 |---|---|---|
 | `idle_timeout_secs` | iroh's (**30 s** on iroh 1.0.3) | How long a connection survives with no traffic **and no keepalive** before QUIC closes it. `0` = no timeout at all. |
-| `keep_alive_secs` | iroh's (**5 s** on iroh 1.0.3) | How often the transport PINGs an otherwise idle connection. **Can only be LOWERED** — see the ceiling note below. Must be **less than** the effective idle timeout (`idle_timeout_secs` if set, else iroh's 30 s), or boot fails. |
+| `keep_alive_secs` | iroh's (**5 s** on iroh 1.0.3) | How often the transport PINGs an otherwise idle connection. **Can only be LOWERED — legal range `1`–`5`**; see the ceiling note below. Must be **less than** the effective idle timeout (`idle_timeout_secs` if set, else iroh's 30 s), or boot fails. |
 
 **A held session does not die when idle.** iroh already keepalives every 5 s, so `open_session` and
 `subscribe` survive indefinitely while the process runs and the network is up. The idle timeout is
@@ -103,14 +103,21 @@ application-level heartbeat for liveness**, and one costs you `[limits].rate_lim
 that a transport keepalive does not: the limiter only counts method-bearing JSON-RPC frames, and a
 QUIC PING never becomes one.
 
-> **`keep_alive_secs` cannot make pings LESS frequent, and values above 5 s are refused.** iroh
+> **`keep_alive_secs` cannot make pings LESS frequent; values above 5 s — and `0` — are refused.** iroh
 > keepalives per *path* as well as per connection, and it **caps the per-path interval at 5 s** —
 > `default_path_keep_alive_interval` discards anything larger with only a log warning. So a node set
 > to `keep_alive_secs = 60` would still ping every 5 s on every path. Rather than accept a setting
 > that silently does nothing, **the daemon refuses to start** and says so. Lower it (e.g. `3`) to ping
 > more often on a lossy link; there is **no supported way to reduce keepalive traffic on a metered
-> connection** with iroh 1.0.3. If a future iroh lifts the cap,
-> `iroh_transport_defaults_are_what_the_docs_claim` fails and this note gets revisited.
+> connection** with iroh 1.0.3. `keep_alive_secs = 0` does **not** disable keepalives either — it
+> arms a zero-length timer, so every packet emits a PING; no value disables them, and the daemon
+> refuses `0` rather than let it saturate the link it was meant to quiet. If a future iroh lifts the
+> cap, `iroh_transport_defaults_are_what_the_docs_claim` fails and this note gets revisited.
+
+The first three rows of the table above are pinned by that test and cannot drift silently. The
+**relay-path idle timeout is not** — it comes from `RELAY_PATH_MAX_IDLE_TIMEOUT` and is applied
+per-path at runtime, never through `QuicTransportConfig`, so no test can observe it. Re-measure that
+one by hand on an iroh bump.
 
 > **The idle timeout is NEGOTIATED, not imposed.** QUIC uses the **minimum** of the two peers'
 > advertised values (RFC 9000 §10.1). Raising `idle_timeout_secs` on one node achieves nothing
@@ -140,7 +147,7 @@ is uncharacterised, and a knob we cannot explain is worse than no knob.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `rate_limit_per_min` | `120` | Per-peer request rate (token bucket; this value is also the burst allowance). An over-limit **request** is refused with a `-32053` retry hint — never served. An over-limit **notification** is dropped without a reply, since JSON-RPC gives it no reply channel — but **not silently**: it is recorded with `status: "rate_limited"` in the audit log and on the `subscribe` stream (#76), so the loss is visible to the node operator even though the *sender* cannot detect it. Notification delivery is not guaranteed under load (see `docs/local-protocol.md`). |
+| `rate_limit_per_min` | `120` | Per-peer request rate (token bucket; this value is also the burst allowance). An over-limit **request** is refused with a `-32053` retry hint — never served. An over-limit **notification** is dropped without a reply, since JSON-RPC gives it no reply channel — but **not silently**: it is recorded with `status: "rate_limited"` in the audit log and on the `subscribe` stream (#76), so the loss is visible to the node operator even though the *sender* cannot detect it. That record is **latched** — one per throttle episode, not one per dropped notification (deliberately, so a flood cannot turn the audit log into a DoS): you learn that throttling happened, not how many notifications it ate. Notification delivery is not guaranteed under load (see `docs/local-protocol.md`). |
 | `blob_bytes_per_min` | `0` | Per-peer **app-blob byte budget**, bytes per minute. `0` = unlimited (the default), so upgrading changes nothing. The other blob limiter counts *connections*, which cannot see one granted peer re-pulling a 4 GB blob on each of 60 connections a minute; this bounds the bytes. A peer that exceeds it has its transfer **aborted** (retryable — `RateLimited`, not a permission failure), not paced: pacing holds the request open and turns a bandwidth problem into an unbounded-concurrency one. **The consequence is a partial transfer**, so size the budget above the largest blob you expect a peer to fetch in a minute. Setting it non-zero also arms a per-chunk intercept (~16 KiB granularity), which costs an in-process round trip per chunk — that cost is not paid at the default. **Requires a daemon restart** (the mask and the limiter are built once at boot), and **use 0 or at least 32768** (two chunks) — a value in `1..32768` is **floored to 32768**. Admission reserves one chunk before any bytes, so a sub-floor budget would not fail closed: it would silently cap every servable blob at about `budget - 16384` bytes and truncate anything larger (measured: 20480 serves a 4 KiB blob and nothing bigger). Note the budget also caps GETs at roughly `blob_bytes_per_min / 16384` per minute regardless of blob size. |
 | `audit_retain_months` | `0` | Audit-log retention window in calendar months (#88). **`0` = keep forever (the default)** — upgrading changes nothing. `N > 0` deletes monthly audit files older than the last `N` months **at daemon boot** (the current month counts as month 1); a long-running daemon prunes on its next start, and the `audit_prune` control verb covers live needs. The audit log grows with **inbound peer traffic** and shares a filesystem with `state.redb` and the device key — watch it via `status.storage.audit_bytes`. |
 | `max_sessions` | `4` | Per-service cap on concurrently spawned sessions for a `run` service (a `socket` service is one warm process that manages its own concurrency). `0` is floored to `1`. |

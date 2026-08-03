@@ -89,6 +89,26 @@ Three claims in the first draft were wrong, and two of them were in user-facing 
   This one survived a round of review because the test asserted `Some(5s)` while iroh's own default
   is 5s — deleting the per-path assignment left the assertion true. The fixture value collided with
   the default it existed to distinguish from. Values are now 3s, below both the default and the cap.
+
+- **`keep_alive_secs = 0` was a PING storm, not "disable keepalives".** It passed both checks
+  (`0 <= 5`, `0 < 30`) and reached `Duration::from_secs(0)`. noq-proto arms a zero-length keepalive
+  timer already-expired, so every authed packet emits a PING whose ACK re-arms it expired — a
+  self-sustaining loop at RTT cadence on every path. An operator reading `0` the way
+  `idle_timeout_secs = 0` reads three lines up in the same table would have saturated the link they
+  meant to quiet. Refused, with an error that corrects the reading: there is **no** value that
+  disables the transport keepalive.
+
+- **The same fixture-collision bug reappeared in the fix for it.** The over-cap test used
+  `idle_timeout_secs = 3600, keep_alive_secs = 60` and asserted `msg.contains("60")` — but `"3600"`
+  contains `"60"`, so an error naming only the idle timeout satisfied it. Now `1200`/`64`, where
+  neither number is a substring of the other, and the cap assertion is `"cap of 5s"` rather than a
+  bare `'5'`.
+
+- **`doctor` blessed a config the daemon refuses to boot on.** The knobs are validated inside
+  `build_endpoint`, which doctor must never call (it is read-only; binding a socket is not). So
+  `keep_alive_secs = 60` got a clean `[network]` verdict and then failed the restart — doctor
+  endorsing an unbootable config is worse than no check. `validate_transport_config` is the same
+  validation with the endpoint left out, so the two cannot drift.
 - **A bare `keep_alive_secs` skipped validation entirely.** `keep_alive_secs = 3600` with no
   `idle_timeout_secs` was accepted, producing exactly the keepalive-outlives-timeout pairing the
   check exists to reject, because iroh's 30s still applied. It now validates against the effective
@@ -104,9 +124,14 @@ Three claims in the first draft were wrong, and two of them were in user-facing 
    sets no-timeout rather than leaving iroh's 30s. Fixtures use 3s, which differs from every iroh
    default in the struct.
 3. `keep_alive_secs` above iroh's **per-path cap** → boot **fails**, naming their value, the cap,
-   and the fact that raising it cannot reduce traffic.
-4. `keep_alive_secs >= effective idle timeout` → boot **fails**, naming both values.
-5. **iroh's documented defaults are pinned, and so is the cap** — the cap is probed
+   and the fact that raising it cannot reduce traffic. **Both sides of the boundary** are pinned:
+   `6` (the smallest value iroh discards) must fail, `5` (the largest it keeps) must not.
+4. `keep_alive_secs >= effective idle timeout` → boot **fails**, naming both values. `0` is refused
+   separately, with an error that says what it really does. `idle_timeout_secs = 0` with a keepalive
+   is **allowed** — the `effective == 0` escape hatch, which had no test at all.
+5. `doctor` reports the same configs as ERROR and a valid one as OK, so an operator learns before
+   the restart rather than after.
+6. **iroh's documented defaults are pinned, and so is the cap** — the cap is probed
    *behaviourally* (build with cap+1, assert it came back clamped), not asserted against our own
    constant, so a bump that lifts it fails the test and tells us the metered-link case just became
    possible. This is ask 1's "treat a change as release-note-worthy" made mechanical.
@@ -117,6 +142,16 @@ the property it would demonstrate is iroh's, not ours — pinning iroh's keepali
 proxy. The rate-limit claim is confirmed structurally (the limiter's single call site is gated on
 `frame.get("method").is_some()`), not by a test.
 
-Mutation, all five run and all five caught: dropping the per-path keepalive fails 2; dropping the
-`0`-means-no-timeout branch fails 2; dropping the cap refusal fails 3; dropping the ordering
-refusal fails 4; changing the cap constant to a value iroh does not enforce fails 5.
+**Not pinned, stated rather than implied:** the relay-path idle timeout (30 s) in the docs table.
+It comes from `RELAY_PATH_MAX_IDLE_TIMEOUT` and is applied per-path at runtime, never through
+`QuicTransportConfig`, so no test can observe it. The test's own failure message says so, and the
+docs tell the next person to re-measure it by hand. The first draft's "four documented numbers"
+claimed coverage that did not exist.
+
+Mutation, nine run and nine caught. Five from the first round: dropping the per-path keepalive
+fails 2; dropping the `0`-means-no-timeout branch fails 2; dropping the cap refusal fails 3;
+dropping the ordering refusal fails 4; changing the cap constant to a value iroh does not enforce
+fails 6. Four the second round added, each of which escaped the entire suite before: loosening the
+cap by one (`k <= CAP + 1`) fails 3; making the over-cap error name the idle timeout instead of
+their value fails 3; dropping the `effective == 0` hatch fails 4; accepting `keep_alive_secs = 0`
+fails 4. Deleting doctor's pre-flight call site — not the helper — fails 5.

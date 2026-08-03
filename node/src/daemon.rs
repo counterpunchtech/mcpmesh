@@ -110,7 +110,7 @@ pub use roster_install::{
     install_roster_view_and_sever, should_staleness_sever, staleness_sweep_once,
 };
 
-pub use boot::{NetPlan, net_plan};
+pub use boot::{NetPlan, net_plan, validate_transport_config};
 /// The mint-path relay-readiness cap. `pub` so the #125 suite can pin it against a MEASURED
 /// `online()` rather than a hardcoded number — the ordering is the contract, not the value.
 pub use handlers::RELAY_READY_TIMEOUT;

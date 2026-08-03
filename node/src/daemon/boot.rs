@@ -635,21 +635,12 @@ pub(crate) async fn build_endpoint(
         .context("bind iroh endpoint")
 }
 
-/// Apply `[network].idle_timeout_secs` / `keep_alive_secs` (#56), if set.
-///
-/// Untouched when both are absent — the endpoint gets iroh's defaults verbatim, so a config that
-/// says nothing about this behaves exactly as it did before the knobs existed.
-///
-/// **The ordering check is the load-bearing part.** A keepalive interval at or above the idle
-/// timeout means the peer's timer fires before the next PING arrives: every session dies on a
-/// clock, and the config that caused it looks reasonable. Rejecting it at boot, naming both values,
-/// is the difference between a startup error and a fleet that mysteriously severs.
 /// iroh 1.0.3's effective QUIC idle timeout, in seconds — the value we validate a bare
 /// `keep_alive_secs` against when no `idle_timeout_secs` is set (#56).
 ///
 /// Pinned by `iroh_transport_defaults_are_what_the_docs_claim`, which is the drift detection the
-/// issue actually asked for: an iroh bump that moves this fails a test instead of quietly making
-/// four documented numbers wrong.
+/// issue actually asked for: an iroh bump that moves this fails a test instead of quietly making a
+/// documented number wrong.
 pub(crate) const IROH_DEFAULT_IDLE_SECS: u64 = 30;
 
 /// iroh's hard ceiling on the per-path keepalive (`HEARTBEAT_INTERVAL`), in seconds.
@@ -679,6 +670,19 @@ fn build_transport_config(
         // `endpoint/quic.rs`). So a keepalive above 5s cannot reduce ping frequency — every path
         // keeps pinging at 5s and the operator's metered-link saving never happens. Refuse it
         // rather than accept a knob that silently does the opposite of what it says (#56 gate).
+        // `0` is NOT "disable keepalives" — it is a zero-length timer. noq-proto arms it already
+        // expired, so every authed packet emits a PING whose ACK re-arms it expired: a self-
+        // sustaining PING/ACK loop at RTT cadence on every path. An operator reading `0` the way
+        // `idle_timeout_secs = 0` reads three lines up in the same table would saturate the link
+        // they meant to quiet. iroh's builder takes a `Duration`, so there is no value that
+        // disables keepalives at all — say that rather than accept the one that inverts it.
+        anyhow::ensure!(
+            k > 0,
+            "[network] keep_alive_secs = 0 is not \"disable keepalives\" — it is a zero-length \
+             timer that makes every packet emit a PING, saturating the link. There is no way to \
+             disable the transport keepalive; omit the key to get iroh's default of \
+             {IROH_MAX_PATH_KEEP_ALIVE_SECS}s"
+        );
         anyhow::ensure!(
             k <= IROH_MAX_PATH_KEEP_ALIVE_SECS,
             "[network] keep_alive_secs ({k}) is above iroh's per-path keepalive cap of \
@@ -697,6 +701,9 @@ fn build_transport_config(
             "[network] keep_alive_secs ({k}) must be less than the idle timeout ({effective}s{}): \
              a keepalive arriving after the peer's idle timer has fired severs sessions on a clock \
              rather than keeping them open",
+            // Always "" in practice: the cap above admits only <= 5s, which is under iroh's 30s
+            // default, so a BARE keepalive cannot reach this check. Kept with the `unwrap_or`
+            // because it is what bites if a bump moves either number.
             if idle.is_some() {
                 ""
             } else {
@@ -734,6 +741,16 @@ fn build_transport_config(
             .default_path_keep_alive_interval(d);
     }
     Ok(Some(cfg.build()))
+}
+
+/// Pre-flight the `[network]` transport knobs WITHOUT binding an endpoint (#56).
+///
+/// `doctor` exists so an operator learns about a fatal config error before a restart, not after.
+/// These knobs are validated inside `build_endpoint`, which doctor must never call — it is
+/// read-only and binding a socket is not. This is the same validation with the endpoint left out,
+/// so the two cannot drift: both go through `build_transport_config`.
+pub fn validate_transport_config(net: &crate::config::NetworkCfg) -> Result<()> {
+    build_transport_config(net).map(|_| ())
 }
 
 /// Apply `[network].idle_timeout_secs` / `keep_alive_secs` (#56), if set.
@@ -1322,7 +1339,9 @@ mod tests {
             assert!(
                 d.contains(needle),
                 "iroh's default changed: docs/config.md and node/src/config.rs claim {doc} for \
-                 iroh 1.0.3. Re-measure and update BOTH, and note it in the release. Got: {d}"
+                 iroh 1.0.3. Re-measure and update BOTH, and note it in the release. NOTE: the \
+                 relay-path idle timeout in that table is NOT pinned here — it never reaches \
+                 QuicTransportConfig — so check it by hand too. Got: {d}"
             );
         }
         assert_eq!(
@@ -1369,24 +1388,57 @@ mod tests {
         // Above iroh's per-path CAP the knob cannot do what its name promises: iroh discards the
         // per-path value with a `warn!`, every path keeps pinging at 5s, and the operator's metered
         // link saves nothing. Refuse it instead of accepting a lie (#56 gate).
-        let over_cap = crate::config::NetworkCfg {
+        let cfg = |idle: Option<u64>, keep: Option<u64>| crate::config::NetworkCfg {
             relay_mode: "disabled".into(),
-            idle_timeout_secs: Some(3600),
-            keep_alive_secs: Some(60),
+            idle_timeout_secs: idle,
+            keep_alive_secs: keep,
             ..Default::default()
         };
-        let e = build_transport_config(&over_cap)
+
+        // 64, and an idle timeout of 1200 rather than 3600: "3600" CONTAINS "60", so the previous
+        // fixture let an error that named only the idle timeout satisfy "must name their value".
+        // Neither number here is a substring of the other.
+        let e = build_transport_config(&cfg(Some(1200), Some(64)))
             .expect_err("a keepalive above iroh's per-path cap must be refused, not silently sunk");
         let msg = format!("{e:#}");
         assert!(
-            msg.contains("60") && msg.contains('5'),
-            "and must name both their value and the cap it exceeds: {msg}"
+            msg.contains("64"),
+            "the error must name THEIR value, not just the cap: {msg}"
+        );
+        assert!(
+            msg.contains("cap of 5s"),
+            "and the cap itself, as a number they can act on: {msg}"
         );
         assert!(
             msg.contains("cannot reduce"),
             "and say plainly that raising it does NOT reduce keepalive traffic — that is the whole \
              reason someone sets it: {msg}"
         );
+
+        // THE BOUNDARY. 6 is the smallest value iroh actually discards; 5 is the largest it keeps.
+        // Without both, an off-by-one in the predicate this whole change exists to add ships green.
+        build_transport_config(&cfg(Some(1200), Some(6)))
+            .expect_err("6s is above iroh's cap — iroh would drop it, so boot must refuse it");
+        build_transport_config(&cfg(Some(1200), Some(IROH_MAX_PATH_KEEP_ALIVE_SECS)))
+            .expect("5s is exactly the cap — iroh keeps it, so refusing it would be wrong");
+
+        // `0` is a PING storm, not "disabled" (#56 gate). The error must not merely refuse; it must
+        // correct the reading, or the operator retries with `1` and still has no way to turn it off.
+        let z = format!(
+            "{:#}",
+            build_transport_config(&cfg(Some(1200), Some(0)))
+                .expect_err("keep_alive_secs = 0 arms a zero-length timer and must be refused")
+        );
+        assert!(
+            z.contains("not \"disable keepalives\"") && z.contains("omit the key"),
+            "and must say what 0 really does AND how to actually get the default: {z}"
+        );
+
+        // `idle_timeout_secs = 0` (no timeout) with a keepalive: the `effective == 0` escape hatch.
+        // Untested before, and deleting it turned a valid config into a boot failure whose error
+        // said the keepalive must be less than `0s`.
+        build_transport_config(&cfg(Some(0), Some(3)))
+            .expect("no idle timeout means no keepalive can outlive it — this must be allowed");
 
         // The ordering check needs an idle timeout BELOW the cap; a bare keepalive can no longer
         // reach it, since anything the cap admits (<= 5s) is under iroh's 30s default. The check
