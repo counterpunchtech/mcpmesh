@@ -97,6 +97,14 @@ pub fn check_network(net: &crate::config::NetworkCfg) -> Verdict {
             );
         }
     }
+    // #56: these are validated inside `build_endpoint`, which doctor never calls. Without this,
+    // `keep_alive_secs = 60` gets a clean [network] verdict and then refuses to boot on restart —
+    // doctor blessing a config the daemon rejects is worse than no check at all.
+    if let Err(e) = crate::daemon::validate_transport_config(net) {
+        return Verdict::error(format!(
+            "[network] invalid — the daemon will refuse to start: {e:#}"
+        ));
+    }
     match crate::daemon::net_plan(net) {
         Err(e) => Verdict::error(format!(
             "[network] invalid — the daemon will refuse to start: {e}"
@@ -828,6 +836,7 @@ mod tests {
             discovery_mode: disc.into(),
             discovery_urls: disc_urls.iter().map(|s| s.to_string()).collect(),
             relay_only: false,
+            ..Default::default()
         }
     }
 
@@ -1137,7 +1146,47 @@ mod tests {
             discovery_mode: "default".into(),
             discovery_urls: vec![],
             relay_only,
+            ..Default::default()
         }
+    }
+
+    /// #56 gate: doctor must not bless a `[network]` the daemon will refuse to boot on. The
+    /// transport knobs are validated inside `build_endpoint`, which doctor never calls — so
+    /// without an explicit pre-flight, `keep_alive_secs = 60` passed doctor and then failed the
+    /// restart.
+    #[test]
+    fn network_check_catches_transport_knobs_the_daemon_will_reject() {
+        let with = |idle: Option<u64>, keep: Option<u64>| crate::config::NetworkCfg {
+            idle_timeout_secs: idle,
+            keep_alive_secs: keep,
+            ..net("default", &[], "default", &[])
+        };
+
+        // Above iroh's per-path cap: refused at boot, so refused here.
+        let over = check_network(&with(Some(1200), Some(60)));
+        assert_eq!(
+            over.level,
+            Level::Error,
+            "doctor must report an over-cap keepalive as an ERROR, not bless it: {}",
+            over.message
+        );
+        assert!(
+            over.message.contains("refuse to start") && over.message.contains("60"),
+            "and must say the daemon will refuse to start, naming their value: {}",
+            over.message
+        );
+
+        // Zero: the PING storm, not "disabled".
+        assert_eq!(
+            check_network(&with(Some(1200), Some(0))).level,
+            Level::Error
+        );
+        // Keepalive at/above the idle timeout.
+        assert_eq!(check_network(&with(Some(3), Some(5))).level, Level::Error);
+        // A VALID pairing must stay OK — this check must not reject what boots fine.
+        assert_eq!(check_network(&with(Some(1200), Some(3))).level, Level::Ok);
+        // And an unconfigured node is untouched.
+        assert_eq!(check_network(&with(None, None)).level, Level::Ok);
     }
 
     #[test]

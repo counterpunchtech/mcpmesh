@@ -38,10 +38,8 @@ pub struct ServiceCfg {
     pub allow: Vec<String>,
     /// Per-service env vars for a `run` backend (#51). The `MCPMESH_PEER_*` identity vars win
     /// over these. Ignored for a `socket` backend. Default empty.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
     /// Working directory for a `run` backend (#51). Default: inherit the daemon's cwd.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
 }
 
@@ -122,6 +120,42 @@ pub struct NetworkCfg {
     /// `PathSelector` cannot reach). A direct path may still form — it simply never carries data,
     /// and `status` reports `relay` because #64 derives the path from `is_selected()`.
     pub relay_only: bool,
+    /// QUIC idle timeout in seconds (#56) — how long a connection survives with NO traffic and no
+    /// keepalive before the transport closes it. `None` = iroh's default, **30s** on iroh 1.0.3.
+    ///
+    /// This is not "how long an idle session lives". iroh keepalives every 5s by default, so a held
+    /// session survives indefinitely while the process runs; this is what detects a peer that
+    /// VANISHED.
+    ///
+    /// **It is NEGOTIATED, not imposed.** QUIC takes the MINIMUM of the two peers' advertised
+    /// values (RFC 9000 §10.1), so raising this on one node achieves nothing against a peer still
+    /// on the default — the connection still times out at 30s. Raising it is only meaningful when
+    /// every node is configured together; lowering it works one-sidedly.
+    ///
+    /// `0` means "no timeout" from THIS side, which likewise yields the peer's value; against a
+    /// default peer that is still 30s. Only if both sides say `0` does a vanished peer go
+    /// undetected at the transport layer.
+    #[serde(default)]
+    pub idle_timeout_secs: Option<u64>,
+    /// QUIC keepalive interval in seconds (#56) — how often the transport PINGs an otherwise idle
+    /// connection. `None` = iroh's default, **5s** on iroh 1.0.3.
+    ///
+    /// Sets BOTH the connection-level and the per-path keepalive — setting only the former would
+    /// leave every path pinging at iroh's 5s regardless.
+    ///
+    /// A transport keepalive carries no method-bearing frame, so it does NOT consume a
+    /// `[limits].rate_limit_per_min` token — unlike an application-level heartbeat, which does.
+    ///
+    /// Must be less than the EFFECTIVE idle timeout — `idle_timeout_secs` if set, otherwise iroh's
+    /// 30s — or boot fails. Note that effective timeout is the negotiated minimum, so a value that
+    /// passes this check locally can still be too slow for a peer with a shorter one.
+    ///
+    /// **This can only LOWER the ping rate.** iroh caps the per-path keepalive at 5s and silently
+    /// discards anything larger, so a value above 5 would leave every path pinging at 5s anyway —
+    /// boot refuses it rather than pretend it took effect. There is no supported way to reduce
+    /// keepalive traffic on a metered link with iroh 1.0.3.
+    #[serde(default)]
+    pub keep_alive_secs: Option<u64>,
 }
 impl Default for NetworkCfg {
     fn default() -> Self {
@@ -131,6 +165,8 @@ impl Default for NetworkCfg {
             discovery_mode: "default".into(),
             discovery_urls: Vec::new(),
             relay_only: false,
+            idle_timeout_secs: None,
+            keep_alive_secs: None,
         }
     }
 }
