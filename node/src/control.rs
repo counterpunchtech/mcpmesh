@@ -546,7 +546,13 @@ pub(crate) async fn handle_request(req: &Value, state: &DaemonState) -> Value {
                 id,
                 "invite",
                 with_params(&params, |p: InviteParams| {
-                    crate::daemon::mint_invite(p.services, p.app_label, p.max_uses, mesh)
+                    crate::daemon::mint_invite(
+                        p.services,
+                        p.app_label,
+                        p.max_uses,
+                        p.peer_nickname,
+                        mesh,
+                    )
                 })
                 .await,
             )
@@ -558,7 +564,7 @@ pub(crate) async fn handle_request(req: &Value, state: &DaemonState) -> Value {
             id,
             "pair",
             with_params(&params, |p: PairParams| {
-                crate::daemon::redeem(state, p.invite_line)
+                crate::daemon::redeem(state, p.invite_line, p.as_nickname)
             })
             .await,
         ),

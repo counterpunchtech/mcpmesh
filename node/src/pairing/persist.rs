@@ -134,6 +134,10 @@ mod tests {
             expires_at_epoch,
             app_label: None,
             uses_remaining: 1,
+            // #87: seeded so the persistence round-trip actually carries it — the inviter's local
+            // alias must survive a restart with the invite, since it is stripped from the LINE and
+            // so cannot be recovered from anywhere else.
+            peer_nickname: Some("their-laptop".into()),
         }
     }
 

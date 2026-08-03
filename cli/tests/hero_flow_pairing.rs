@@ -217,6 +217,7 @@ async fn four_command_hero_flow() {
                 services: vec!["notes".into()],
                 app_label: None,
                 max_uses: None,
+                peer_nickname: None,
             }))
             .await
             .expect("invite over mcpmesh-local/1");
@@ -242,6 +243,7 @@ async fn four_command_hero_flow() {
         let pair_value = bob_client
             .request(Request::Pair(PairParams {
                 invite_line: invite.invite_line.clone(),
+                as_nickname: None,
             }))
             .await
             .expect("pair over mcpmesh-local/1");

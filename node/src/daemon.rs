@@ -82,7 +82,7 @@ pub async fn mint_invite_for_test(
     mesh: &std::sync::Arc<MeshState>,
     services: &[String],
 ) -> anyhow::Result<mcpmesh_local_api::InviteResult> {
-    mint_invite(services.to_vec(), None, None, mesh).await
+    mint_invite(services.to_vec(), None, None, None, mesh).await
 }
 
 #[doc(hidden)]

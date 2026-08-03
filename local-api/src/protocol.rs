@@ -533,6 +533,24 @@ pub struct InviteParams {
     /// behaviour; omit the field entirely when talking to one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_uses: Option<u32>,
+    /// YOUR local name for whoever redeems this invite (#87), overriding the nickname they claim
+    /// for themselves in the ceremony.
+    ///
+    /// The redeemer's self-claimed name is usually its hostname, so two same-model laptops collide
+    /// and the pairing is refused with [`ERR_NICKNAME_TAKEN`]. Before this field the only fixes
+    /// were to ask the other person to rename their machine, or to unpair whoever holds the name.
+    /// This lets you just call them something else.
+    ///
+    /// Local only: it is never sent to the peer and never affects what they call themselves or
+    /// you. It does **not** bypass the collision check — an alias that itself collides is refused
+    /// identically, because a duplicate display name makes your own `<peer>/<service>` routing
+    /// ambiguous whoever chose it.
+    ///
+    /// **Rejected with `max_uses > 1`:** one alias applied to every redeemer of a multi-use invite
+    /// would collide on the second redemption, so it is refused at MINT rather than producing an
+    /// invite that works exactly once. `api_minor >= 39`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_nickname: Option<String>,
 }
 
 /// The ceiling on [`InviteParams::max_uses`] (#87). Comfortably above "a team", far below "a
@@ -547,6 +565,19 @@ pub const MAX_INVITE_USES: u32 = 64;
 pub struct PairParams {
     #[serde(default)]
     pub invite_line: String,
+    /// YOUR local name for the inviter (#87), overriding the nickname their invite suggests.
+    ///
+    /// An invite carries the inviter's suggestion for what you should call them — usually their
+    /// hostname. If you already use that name for a different peer, the pairing is refused with
+    /// [`ERR_INVITE_NAME_CONFLICT`] and the message tells you to go ask them for a new invite.
+    /// This lets you resolve it yourself, without `set_nickname` (which rewrites your own GLOBAL
+    /// self-name — not what anyone wants in order to add one colleague).
+    ///
+    /// Local only: never sent to the inviter. It does **not** bypass the collision check — an alias
+    /// that itself collides is refused identically, because a duplicate display name makes your own
+    /// `<peer>/<service>` routing ambiguous whoever chose it. `api_minor >= 39`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub as_nickname: Option<String>,
 }
 
 /// Params of [`Request::PeerRemove`]: the nickname to unpair.
@@ -1690,7 +1721,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   thirty have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.38";
+pub const API_VERSION: &str = "1.39";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -1776,7 +1807,12 @@ pub const API_VERSION: &str = "1.38";
 /// refusals — expired line, no live invite, inviter unreachable, id mismatch, name conflict, and
 /// the deliberately-opaque refusal. `ERR_NICKNAME_TAKEN` had been the only coded pairing failure,
 /// so every other one arrived as `-32000` and an embedder could either forward our prose to end
-/// users or substring-match it (#159); to 38 with `[network].presence_mode` + `SelfNetwork.
+/// users or substring-match it (#159); to 39 with `PairParams::as_nickname` +
+/// `InviteParams::peer_nickname` — LOCAL aliases for the other party, so a nickname collision is
+/// resolvable by the person who hit it instead of requiring the other human to rename a machine or
+/// re-mint. #147 made the collision diagnosable; this makes it fixable. Guard on `>= 39` before
+/// offering an alias field in a UI: below it `deny_unknown_fields` rejects the whole request
+/// (#87); to 38 with `[network].presence_mode` + `SelfNetwork.
 /// presence_mode` — `reachable: false` gained a new meaning ("up, paired, and deliberately not
 /// answering"), and `peer_services` flips from "reachable, empty list" to "unreachable" for a
 /// caller holding no grant. A consumer must guard on `api_minor >= 38` before telling a user their
@@ -1801,7 +1837,7 @@ pub const API_VERSION: &str = "1.38";
 /// its REAL content is a meaning change to `reachable` — the field exists so the new meaning is
 /// observable at all. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 38;
+pub const API_MINOR: u32 = 39;
 
 #[cfg(test)]
 mod tests {
@@ -2481,9 +2517,16 @@ mod tests {
             services: vec!["notes".into(), "kb".into()],
             app_label: None,
             max_uses: None,
+            // #87: seeded NON-None so the round-trip actually carries it — `None` rides
+            // `skip_serializing_if` straight past the assertion and proves nothing.
+            peer_nickname: Some("laptop-of-alice".into()),
         });
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["method"], "invite");
+        assert_eq!(
+            v["params"]["peer_nickname"], "laptop-of-alice",
+            "#87: the inviter's local alias for the redeemer must reach the wire"
+        );
         assert_eq!(v["params"]["services"][0], "notes");
         assert_eq!(v["params"]["services"][1], "kb");
         assert_eq!(serde_json::from_value::<Request>(v).unwrap(), r);
@@ -2510,10 +2553,19 @@ mod tests {
         // Request::Pair → `{ "method": "pair", "params": { "invite_line": "..." } }`.
         let r = Request::Pair(PairParams {
             invite_line: "mcpmesh-invite:ABCDEF".into(),
+            as_nickname: Some("alice-mbp".into()),
         });
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["method"], "pair");
         assert_eq!(v["params"]["invite_line"], "mcpmesh-invite:ABCDEF");
+        assert_eq!(
+            v["params"]["as_nickname"], "alice-mbp",
+            "#87: the redeemer's local alias for the inviter must reach the wire"
+        );
+        // An OLD caller's payload — no alias — must still decode. The field is additive.
+        let legacy: PairParams =
+            serde_json::from_value(serde_json::json!({"invite_line": "x"})).unwrap();
+        assert_eq!(legacy.as_nickname, None);
         assert_eq!(serde_json::from_value::<Request>(v).unwrap(), r);
         // method_of resolves the tag generically (no per-variant arm).
         assert_eq!(

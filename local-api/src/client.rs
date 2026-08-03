@@ -235,6 +235,7 @@ impl ControlClient {
                 services,
                 app_label,
                 max_uses,
+                peer_nickname: None,
             }),
             "invite result",
         )
@@ -244,9 +245,24 @@ impl ControlClient {
     /// Redeem a pairing invite; return the inviter's suggested nickname, the display-only SAS
     /// code, and the granted services.
     pub async fn pair(&mut self, invite_line: &str) -> Result<PairResult, ClientError> {
+        self.pair_as(invite_line, None).await
+    }
+
+    /// Redeem an invite, optionally under YOUR OWN local name for the inviter (#87).
+    ///
+    /// `as_nickname` overrides the name the invite suggests. Use it when that name is already
+    /// taken locally — otherwise the pairing is refused and the only other fixes are asking the
+    /// inviter to re-mint or renaming your existing peer. It does not bypass the collision check:
+    /// an alias that itself collides is refused the same way.
+    pub async fn pair_as(
+        &mut self,
+        invite_line: &str,
+        as_nickname: Option<String>,
+    ) -> Result<PairResult, ClientError> {
         self.request_typed(
             Request::Pair(PairParams {
                 invite_line: invite_line.to_string(),
+                as_nickname,
             }),
             "pair result",
         )

@@ -87,6 +87,20 @@ offering an alias in its UI, since below it the field is rejected outright by
 5. `peer_nickname` on a `max_uses > 1` invite is refused **at mint**, naming both.
 6. An empty or invalid alias is a `-32602`, not a silent fallback.
 
-Mutation: applying the alias *after* the collision check fails 4; using the peer's suggestion when
-an alias is present fails 1 and 3; accepting `peer_nickname` with `max_uses > 1` fails 5; treating
-`Some("")` as absent fails 6.
+Mutation, seven run and seven caught: the redeemer ignoring `as_nickname` fails 1 and 2; the squat
+check reading `invite.nickname` instead of the chosen name fails 4; `encode()` not stripping
+`peer_nickname` fails the line test; accepting `peer_nickname` with `max_uses > 1` fails 5; treating
+a blank alias as absent fails 6; `effective_redeemer_nickname` returning the self-claim fails 3; and
+the inviter applying its alias to the STORE but checking the self-claim also fails 3.
+
+**Tests 1 and 3 are deliberately end-to-end**, through the real two-sided ceremony, asserting on both
+peer stores. A unit test of `effective_redeemer_nickname` proves nothing about which name the inviter
+writes, and one of the redeemer's `local_name` nothing about what it stores — the call sites are the
+entire claim. That is the failure mode this repo keeps hitting.
+
+## Also fixed while here
+
+`docs/local-protocol.md` claimed the redeemer-side squat check answers `-32000`. It has carried
+`-32048 ERR_INVITE_NAME_CONFLICT` since #159; the paragraph was never updated. It also named
+"unpair the existing peer first" as the remedy, which is now the *worse* of two — `as_nickname` is
+self-service.

@@ -50,6 +50,15 @@ pub struct Invite {
     /// `#[serde(default)]` so an old invite line decodes to `None` and an old daemon ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_label: Option<String>,
+    /// The INVITER's own local name for whoever redeems this invite (#87), overriding the nickname
+    /// the redeemer claims for itself.
+    ///
+    /// **Never rides the line.** [`encode`](Self::encode) strips it: this is what *we* call *them*,
+    /// the redeemer has no business knowing it, and an invite line is a copyable artifact that gets
+    /// pasted into chats. It is persisted (so it survives a restart alongside the invite) and read
+    /// at redemption time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_nickname: Option<String>,
     /// Redemptions still available on this invite (#87). `1` for an ordinary single-use invite,
     /// which is what an absent field means — so an invite line minted by an older daemon decodes
     /// as single-use rather than as unusable.
@@ -71,7 +80,14 @@ impl Invite {
     /// #2). Base32-nopad keeps the line to `[A-Z2-7]` — copy/paste-safe, case-forgiving,
     /// no `=` padding.
     pub fn encode(&self) -> String {
-        let json = serde_json::to_vec(self).expect("invite serializes");
+        // #87: `peer_nickname` is the inviter's PRIVATE local name for the redeemer. Stripped here
+        // rather than never stored, because it must survive a restart with the invite — but it must
+        // not travel. A `#[serde(skip)]` would have taken it out of persistence too.
+        let wire = Self {
+            peer_nickname: None,
+            ..self.clone()
+        };
+        let json = serde_json::to_vec(&wire).expect("invite serializes");
         format!(
             "{INVITE_SCHEME}{}",
             data_encoding::BASE32_NOPAD.encode(&json)
@@ -258,9 +274,20 @@ impl LiveInvites {
     /// the invite survives for a retry under a different name. Advisory only — `try_redeem`
     /// stays the authoritative (and racing-safe) redemption.
     pub fn peek_live(&self, secret: &[u8; 32], now_epoch: u64) -> bool {
+        self.peek_live_alias(secret, now_epoch).is_some()
+    }
+
+    /// As [`peek_live`](Self::peek_live), but also yields the invite's `peer_nickname` (#87) —
+    /// `Some(None)` for a live invite carrying no alias, `None` when not live.
+    ///
+    /// The collision PRE-CHECK needs the alias, because the name that will actually be stored is
+    /// the alias when one is set. Checking the redeemer's self-claim there instead would refuse a
+    /// pairing over a name we were never going to use, and let one through over the name we were.
+    pub fn peek_live_alias(&self, secret: &[u8; 32], now_epoch: u64) -> Option<Option<String>> {
         self.guard()
             .get(secret)
-            .is_some_and(|inv| inv.expires_at_epoch >= now_epoch)
+            .filter(|inv| inv.expires_at_epoch >= now_epoch)
+            .map(|inv| inv.peer_nickname.clone())
     }
 
     /// Redeem `secret` at `now_epoch`. Unknown secret → [`Redeem::Unknown`] (no state change).
@@ -670,6 +697,7 @@ mod tests {
             expires_at_epoch,
             app_label: None,
             uses_remaining: 1,
+            peer_nickname: None,
         }
     }
 
