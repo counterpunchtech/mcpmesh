@@ -927,9 +927,30 @@ impl MeshState {
             // #86: sign a binding for ANOTHER DEVICE of this person. Loads the key per call rather
             // than holding it, matching `peer_endorse`. `None` when this daemon has no user key —
             // there is then no identity to enroll into.
+            audit_trust: {
+                let mesh = self.clone();
+                Box::new(move |event: String, target: Option<String>| {
+                    mesh.audit().record(crate::audit::AuditRecord::trust(
+                        crate::audit::now_ts(),
+                        event,
+                        target,
+                        None,
+                    ));
+                })
+            },
             sign_binding: {
                 let path = self.user_key_path.get().cloned();
+                // An ENROLLED device must not enroll a third (#86 gate). Boot always mints a LOCAL
+                // user key, so without this check `sign_binding` would sign with the local key
+                // while we PRESENT the adopted one — issuing bindings for an identity no peer has
+                // ever seen, and silently. The documented limitation was false until this returned
+                // `None`; now the refusal is real and the enrolling device is the one that holds
+                // the key.
+                let adopted = self.adopted_binding.read().ok().and_then(|g| g.clone());
                 Box::new(move |endpoint_id: &[u8; 32]| {
+                    if adopted.is_some() {
+                        return None;
+                    }
                     let path = path.as_ref()?;
                     let (user_key, _) = mcpmesh_trust::UserKey::load_or_generate(path).ok()?;
                     Some(crate::pairing::binding_sig_for(&user_key, endpoint_id))

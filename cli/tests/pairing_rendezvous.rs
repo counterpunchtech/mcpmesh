@@ -1371,6 +1371,26 @@ async fn self_enrollment_shares_one_identity_and_writes_no_peer_rows() {
             "and must NOT be a binding for the enroller's endpoint"
         );
 
+        // The redeemer must REFUSE a binding it cannot use. Deleting that check survived the whole
+        // suite: the enrolled device would adopt a binding for someone else's endpoint and present
+        // an identity it can never prove.
+        let wrong = redeem_invite(
+            redeemer_endpoint().await,
+            "another-device".into(),
+            invite.encode(),
+            None,
+            None,
+            Arc::new(PeerStore::open(&bob_dir.path().join("c.redb")).unwrap()),
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            wrong.is_err(),
+            "the invite is burned, so a second redemption must fail — and if it ever succeeded, \
+             the binding it received would be for the FIRST device's endpoint"
+        );
+
         // 2. Neither side wrote a peer row.
         assert!(
             a_store.list().unwrap().is_empty(),

@@ -174,6 +174,29 @@ mod tests {
         }
     }
 
+    /// #86 gate: `write_private` must create at 0600. It exists so a second hand-rolled copy of
+    /// this pattern cannot end up 0644 — and nothing pinned the mode, so widening it passed.
+    #[test]
+    #[cfg(unix)]
+    fn write_private_creates_at_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("secret.json");
+        write_private(&path, b"{}").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "an adopted binding is identity material; 0600 AT CREATE, never a widen-after-write \
+             race. Got {mode:o}"
+        );
+        // Overwriting an existing file must keep it private too — `create_new` on a temp then
+        // rename, so the mode comes from the temp rather than the pre-existing file.
+        write_private(&path, b"{\"a\":1}").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "…including on rewrite. Got {mode:o}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"a\":1}");
+    }
+
     /// #87b: an invite written to disk is still there after the process that wrote it is gone —
     /// which is the entire point.
     #[test]

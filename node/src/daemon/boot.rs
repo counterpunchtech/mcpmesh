@@ -400,8 +400,28 @@ async fn boot_node(paths: NodePaths, config: Option<Config>) -> Result<BootedNod
                     .map_err(anyhow::Error::from)
             }) {
             Ok(b) => {
-                tracing::info!("presenting an adopted device identity (#86)");
-                mesh.set_self_binding_live(Some(b));
+                // VERIFY it against THIS endpoint before presenting it (#86 gate). An unverifiable
+                // binding — corrupt file, a rotated endpoint key, a planted file — would otherwise
+                // be presented forever: peers would warn and store `user_id: None` while `status`
+                // confidently reported the adopted id, making this node's self-reported identity
+                // locally unfalsifiable.
+                match mcpmesh_trust::binding::verify_presented(
+                    &b.user_pk,
+                    &b.sig,
+                    our_id.as_bytes(),
+                ) {
+                    Ok(_) => {
+                        tracing::info!("presenting an adopted device identity (#86)");
+                        mesh.set_self_binding_live(Some(b));
+                    }
+                    Err(e) => tracing::error!(
+                        %e,
+                        path = %adopted_path.display(),
+                        "the adopted device binding does not verify for THIS endpoint; presenting \
+                         this node's OWN identity instead. If the endpoint key was rotated, \
+                         re-enroll from the device that holds the user key"
+                    ),
+                }
             }
             Err(e) => tracing::error!(
                 %e,
@@ -1250,6 +1270,43 @@ mod tests {
         super::shutdown_booted(booted).await;
     }
 
+    /// #86 gate: an adopted binding that does NOT verify for this endpoint must be REFUSED, not
+    /// presented. Otherwise a corrupt file, a rotated endpoint key, or a planted one makes this
+    /// node's self-reported identity locally unfalsifiable: peers warn and store `user_id: None`
+    /// while `status` confidently reports the adopted id.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unverifiable_adopted_binding_is_refused_not_presented() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::paths::NodePaths::under_root(dir.path());
+        std::fs::create_dir_all(paths.config_path.parent().unwrap()).unwrap();
+        std::fs::write(&paths.config_path, "[network]\nrelay_mode = \"disabled\"\n").unwrap();
+
+        let adopted_path = paths
+            .user_key_path
+            .clone()
+            .with_extension("adopted-binding.json");
+        let (other, _) =
+            mcpmesh_trust::keys::UserKey::load_or_generate(&dir.path().join("other.key")).unwrap();
+        let other_pk = mcpmesh_trust::binding::user_id(&other);
+        // Signed for a DIFFERENT endpoint — the shape a rotated device key produces.
+        let wrong = crate::pairing::rendezvous::SelfBinding {
+            user_pk: other_pk.clone(),
+            sig: crate::pairing::binding_sig_for(&other, &[0x5A; 32]),
+        };
+        std::fs::create_dir_all(adopted_path.parent().unwrap()).unwrap();
+        std::fs::write(&adopted_path, serde_json::to_vec(&wrong).unwrap()).unwrap();
+
+        let booted = super::boot_node(paths, None).await.expect("boots");
+        let mesh = booted.state.mesh_required().expect("mesh");
+        let presented = mesh.self_binding().expect("a binding");
+        assert_ne!(
+            presented.user_pk, other_pk,
+            "an adopted binding that does not verify for THIS endpoint must not be presented — \
+             the node must fall back to its own identity rather than claim one it cannot prove"
+        );
+        super::shutdown_booted(booted).await;
+    }
+
     /// #89 gate: pin the two BOOT lines, not just the parser.
     ///
     /// `boot_node` is the only production caller of `set_presence_mode`, and the only place the
@@ -1577,9 +1634,17 @@ mod tests {
         let (other, _) =
             mcpmesh_trust::keys::UserKey::load_or_generate(&dir.path().join("other.key")).unwrap();
         let other_pk = mcpmesh_trust::binding::user_id(&other);
+
+        // The binding must be REAL and for THIS endpoint — boot verifies it now. Derive the
+        // endpoint id by minting the device key the way boot will, then sign for it. The first
+        // version of this test used `sig: "b64u:placeholder"` and passed, which is precisely how
+        // the missing verification went unnoticed.
+        let (device, _) =
+            mcpmesh_trust::DeviceKey::load_or_generate(&paths.device_key_path).unwrap();
+        let our_id = device.public_bytes();
         let adopted = crate::pairing::rendezvous::SelfBinding {
             user_pk: other_pk.clone(),
-            sig: "b64u:placeholder".into(),
+            sig: crate::pairing::binding_sig_for(&other, &our_id),
         };
         std::fs::create_dir_all(adopted_path.parent().unwrap()).unwrap();
         std::fs::write(&adopted_path, serde_json::to_vec(&adopted).unwrap()).unwrap();

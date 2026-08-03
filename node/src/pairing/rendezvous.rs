@@ -448,6 +448,8 @@ pub struct InviterCtx {
     pub grant: GrantFn,
     /// The ceremony-surface hook (see [`RecordPairingFn`]).
     pub record_pairing: RecordPairingFn,
+    /// #86: record a durable trust event. `(event, target)`.
+    pub audit_trust: AuditTrustFn,
     /// #86: sign a device→user binding for another device of THIS person, given that device's
     /// TLS-authenticated endpoint id. `None` when this daemon has no user key — there is then no
     /// identity to enroll into, and a self-enrollment is refused rather than silently completing.
@@ -461,6 +463,9 @@ pub struct InviterCtx {
 pub type AdoptBindingFn = Box<
     dyn Fn(SelfBinding) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> + Send + Sync,
 >;
+
+/// See [`InviterCtx::audit_trust`] (#86).
+pub type AuditTrustFn = Box<dyn Fn(String, Option<String>) + Send + Sync>;
 
 /// See [`InviterCtx::sign_binding`] (#86). `endpoint_id` → the `b64u:` signature, or `None`.
 pub type SignBindingFn = Box<dyn Fn(&[u8; 32]) -> Option<String> + Send + Sync>;
@@ -542,7 +547,11 @@ pub async fn handle_inviter_side(
     // of a live secret may be told the truth: the name is taken, the invite was NOT consumed,
     // rename and redeem it again — which turns two same-hostname machines' first pairing from
     // a burned invite plus a generic refusal into a self-service retry.
-    if let Some(alias) = ctx.invites.peek_live_alias(&hello.secret, now) {
+    // #86: skip for a self-enrollment — it stores no nickname on either side, so refusing over a
+    // name neither party will write is nonsense, and its remedy ("rename and redeem again") is
+    // advice for a problem the caller does not have.
+    let self_enrolling = ctx.invites.peek_is_self(&hello.secret, now);
+    if !self_enrolling && let Some(alias) = ctx.invites.peek_live_alias(&hello.secret, now) {
         // #87: check the name we will actually STORE. With a `peer_nickname` on the invite, the
         // redeemer's self-claim is never used, so checking it here would refuse over a name we
         // were never going to write — and admit over the one we were.
@@ -562,6 +571,24 @@ pub async fn handle_inviter_side(
     }
 
     match ctx.invites.try_redeem(&hello.secret, now).await {
+        // A self-invite must ALSO be single-use HERE, not only at mint. `Invite` is `pub` with `pub`
+        // fields and `LiveInvites::mint` is `pub`, so a hand-edited invite file or an embedder
+        // building one directly can present a multi-use identity invite — the standing offer to
+        // become this person that the mint guard exists to refuse. The repo's own `checked_sub`
+        // burn establishes the discipline: an invariant on a bearer credential fails closed
+        // WHEREVER it is violated (#86 gate).
+        Redeem::Ok(invite) if invite.as_self && invite.uses_remaining > 0 => {
+            tracing::warn!("refusing a MULTI-USE self-enrollment invite");
+            let _ = send_reply(
+                &mut send,
+                &PairReply::Refused {
+                    reason: REASON_REFUSED.into(),
+                    code: None,
+                },
+            )
+            .await;
+            Ok(())
+        }
         Redeem::Ok(invite) if invite.as_self => {
             // #86 SELF-ENROLLMENT. The redeemer is another DEVICE of this person, so the whole
             // peer-row/grant path below is skipped: writing a row would put this person in their
@@ -602,6 +629,14 @@ pub async fn handle_inviter_side(
                     return Ok(());
                 }
             };
+            // #86 gate: enrollment mints IDENTITY irrevocably, so it must leave a DURABLE record —
+            // `record_pairing` below is the display ring, documented as "lost on restart, NOT trust
+            // data". `pair`/`unpair`/`roster_install` all audit; this was the highest-value trust
+            // act in the system and the only one that did not. Exactly the #65 finding, recurring.
+            (ctx.audit_trust)(
+                "self_enroll".into(),
+                Some(mcpmesh_net::EndpointId::from_bytes(tls_id).principal()),
+            );
             let sas = short_auth_code(&invite.inviter_id, &tls_id, &hello.secret);
             tracing::info!(code = %sas, "enrolled another device of this person (#86)");
             // Recorded on the ceremony surface like any pairing, so the inviter's human can read
@@ -917,7 +952,9 @@ pub async fn redeem_invite(
     // our own outbound `<peer>/<service>` routing keys on — first-match by name). Grants are
     // principal-keyed (#38), so no access can follow the name; refusing here keeps the
     // invariant that redeeming an invite grants the other side nothing.
-    if let Some(conflict) = nickname_squat(&store, &local_name, &invite.inviter_id)? {
+    if !invite.as_self
+        && let Some(conflict) = nickname_squat(&store, &local_name, &invite.inviter_id)?
+    {
         // The wording has to follow WHOSE name collided (#87 gate). With `as_nickname` set, the
         // invite asked for nothing of the sort — the local user picked it — and "ask them for a
         // different name" is advice for a problem they do not have.
@@ -1068,8 +1105,14 @@ pub async fn redeem_invite(
                 "the inviter completed a self-enrollment without issuing a binding",
             ));
         };
-        mcpmesh_trust::binding::verify_presented(user_pk, sig, &self_id).map_err(|e| {
-            anyhow::anyhow!("the enrollment binding does not verify for THIS device: {e}")
+        mcpmesh_trust::binding::verify_presented(user_pk, sig, &self_id).map_err(|_| {
+            // Coded like every sibling refusal on this path (#159): a consumer branches on the
+            // code rather than matching prose. The inner error is a roster-layer string and says
+            // nothing useful to a redeemer, so it is not interpolated.
+            anyhow::Error::from(PairRefusal::new(
+                mcpmesh_local_api::ERR_INVITE_REFUSED,
+                "the enrollment binding does not verify for this device",
+            ))
         })?;
         if let Some(adopt) = adopt_binding {
             adopt(SelfBinding {

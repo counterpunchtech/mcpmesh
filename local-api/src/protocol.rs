@@ -2415,9 +2415,7 @@ mod tests {
     #[test]
     fn invite_params_reject_singular_service_typo() {
         // The reported bug: `{"service":"kb"}` (singular) used to deserialize to
-        // InviteParams { services: []
-        // InviteParams { services: []     as_self: false,
-        // InviteParams { services: [] } and mint a grants-nothing invite that looked
+        // `InviteParams { services: [] }` and mint a grants-nothing invite that looked
         // successful. With deny_unknown_fields the typo is a loud parse error instead.
         let err = serde_json::from_value::<InviteParams>(serde_json::json!({"service": "kb"}));
         assert!(

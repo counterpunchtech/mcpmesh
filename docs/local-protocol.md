@@ -387,7 +387,7 @@ than the connect-register-disconnect pattern (which would tear the registration 
 An ephemeral name that collides with an existing persistent (config) service is refused. Everything
 else — the `allow` list, dialing, invites granting it — works identically to a persistent service.
 
-#### Self-enrollment: one person, several devices (#86)
+### Self-enrollment: one person, several devices (#86)
 
 Each node root mints its own user key, so one person's laptop and phone are unrelated strangers to
 the mesh. `invite { as_self: true }` fixes that: the ceremony is ordinary pairing — same secret, same
@@ -405,6 +405,17 @@ endpoint and hands over only that signature. Two consequences worth designing ar
   place.
 - **There is no revocation.** A binding, once issued, verifies forever. A lost enrolled device means
   rotating the user key, which changes your `user_id` and means re-pairing with everyone.
+
+**What this asks of the people who trust you.** A peer who granted `b64u:alice` believed it meant
+"the machine holding Alice's key". After an enrollment it means "any endpoint Alice has ever
+blessed" — added without notification, and with no per-device revocation on *their* side. The
+irrevocability is not only your problem; it is theirs. Enroll deliberately, and prefer a fresh
+pairing when a device is meant to be separately revocable.
+
+**Your devices still have to pair with each other's peers.** Sharing a `user_id` means a peer who
+pairs with *both* devices resolves them to one person. It does not admit your phone to a peer that
+only ever paired with your laptop — there is no peer row, so that node closes the connection before
+identity is consulted. Each device pairs once with each peer.
 
 **Refreshing a binding a peer already stored: re-pair.** A peer records your `user_id` at pairing and
 re-pairing rewrites it. There is no push-refresh, deliberately — an unsolicited identity update
@@ -1253,7 +1264,7 @@ things:
   (#87) are `api_minor >= 39`; `RegisterServiceParams.rate_limit_per_min` and the per-service
   meaning of `-32053` (#63) are `api_minor >= 40` — below that `deny_unknown_fields` rejects the
   whole request, so guard before sending the field; `StreamFrame::BlobTransfer` (#82) is
-  `api_minor >= 41`; the `peer_introduce` + `peer_endorse` verbs (#65) are `api_minor >= 42`; `InviteParams.as_self` and `PairResult.enrolled_as_self` (#86) are `api_minor >= 43` — below that they answer `-32601 unknown method`. For REQUEST fields, `deny_unknown_fields` rejects the whole request, so
+  `api_minor >= 41`; the `peer_introduce` + `peer_endorse` verbs (#65) are `api_minor >= 42`; `InviteParams.as_self` and `PairResult.enrolled_as_self` (#86) are `api_minor >= 43` — an older daemon rejects the field with `-32602`, and a self-enrollment invite carries a distinct `mcpmesh-enroll:` scheme so an older REDEEMER refuses the line outright rather than pairing with it — below that they answer `-32601 unknown method`. For REQUEST fields, `deny_unknown_fields` rejects the whole request, so
   guard before offering an alias field in a UI.
   `api_minor` is itself additive: a pre-1.1 daemon omits it and it reads as `0`.
 

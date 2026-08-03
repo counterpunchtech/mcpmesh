@@ -514,7 +514,15 @@ fn adopt_hook(mesh: &Arc<MeshState>) -> crate::pairing::rendezvous::AdoptBinding
             })
             .await??;
             // Live, so this device presents the adopted identity without a restart.
-            mesh.set_self_binding_live(Some(binding));
+            mesh.set_self_binding_live(Some(binding.clone()));
+            // #86 gate: the REDEEMER side audits too. Adopting an identity is a durable trust
+            // change on this device — the one an operator asks about later.
+            mesh.audit().record(crate::audit::AuditRecord::trust(
+                now_ts(),
+                "self_enroll_adopt".into(),
+                Some(binding.user_pk.clone()),
+                None,
+            ));
             anyhow::Ok(())
         })
     })
@@ -545,6 +553,20 @@ pub async fn endorse_peer(
             ))
         })?;
 
+    // #86 gate: an ENROLLED device holds no authority over the identity it presents. Signing with
+    // its LOCAL key would return an `endorsed_by` no peer has ever paired with, so every
+    // endorsement it produced would be silently unredeemable.
+    anyhow::ensure!(
+        mesh.adopted_binding
+            .read()
+            .expect("adopted_binding lock not poisoned")
+            .is_none(),
+        crate::control::InvalidParams(
+            "peer_endorse: this device was enrolled into another device's identity (#86) and does \
+             not hold that user key. Endorse from the device that does."
+                .into()
+        )
+    );
     let path = mesh
         .user_key_path
         .get()
@@ -3213,6 +3235,97 @@ mod tests {
             validated_alias(field, Some("a".repeat(MAX_ALIAS_CHARS)))
                 .expect("exactly the cap is allowed — both sides of the boundary");
         }
+    }
+
+    /// #86 gate: an ENROLLED device must not be able to endorse (#65) or enroll a third device.
+    ///
+    /// The commit claimed "an enrolled device cannot enroll a third — it holds no private key".
+    /// That was FALSE: boot always mints a local user key, so the device signed with the LOCAL key
+    /// while PRESENTING the adopted one — producing endorsements under an id no peer has ever
+    /// paired with, silently unredeemable.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_enrolled_device_cannot_endorse_or_enroll() {
+        use mcpmesh_local_api::PeerEndorseParams;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        mesh.set_user_key_path(dir.path().join("user.key"));
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+        let subject = iroh::SecretKey::from_bytes(&[0x91; 32]).public();
+
+        // Before enrollment: endorsing works.
+        endorse_peer(
+            &state,
+            PeerEndorseParams {
+                subject: subject.to_string(),
+                subject_user_id: None,
+            },
+        )
+        .await
+        .expect("a device holding its own key can endorse");
+
+        // Enroll this device into someone else's identity.
+        mesh.set_self_binding_live(Some(crate::pairing::rendezvous::SelfBinding {
+            user_pk: "b64u:someone-elses".into(),
+            sig: "b64u:sig".into(),
+        }));
+
+        let e = endorse_peer(
+            &state,
+            PeerEndorseParams {
+                subject: subject.to_string(),
+                subject_user_id: None,
+            },
+        )
+        .await
+        .expect_err("an enrolled device must refuse to endorse");
+        assert!(
+            format!("{e:#}").contains("does not hold that user key"),
+            "and say WHY, since the caller's request looks reasonable: {e:#}"
+        );
+
+        // …and it must refuse to sign enrollment bindings for a third device.
+        assert!(
+            (mesh.inviter_ctx().sign_binding)(subject.as_bytes()).is_none(),
+            "an enrolled device must not sign a binding for a THIRD device — it would be for an \
+             identity no peer has seen"
+        );
+    }
+
+    /// #86 gate: the adopt hook must actually WRITE the file. It is "the only copy there will ever
+    /// be" — and no test connected the write path to the read path, so deleting the persist step
+    /// passed the whole workspace. The boot test writes the file itself, which proves the reader.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_adopt_hook_persists_the_binding_and_installs_it_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        mesh.set_user_key_path(dir.path().join("user.key"));
+
+        let binding = crate::pairing::rendezvous::SelfBinding {
+            user_pk: "b64u:someone-elses-identity".into(),
+            sig: "b64u:sig".into(),
+        };
+        adopt_hook(&mesh)(binding.clone())
+            .await
+            .expect("the hook persists and installs");
+
+        // On DISK — an enrolled device holds no user key and cannot re-derive this.
+        let path = mesh.adopted_binding_path();
+        let from_disk: crate::pairing::rendezvous::SelfBinding =
+            serde_json::from_slice(&std::fs::read(&path).expect("the binding was written"))
+                .expect("and is readable");
+        assert_eq!(from_disk, binding, "the file must round-trip the binding");
+
+        // …and LIVE, so the device presents it without a restart.
+        assert_eq!(
+            mesh.self_binding().expect("a binding").user_pk,
+            binding.user_pk,
+            "the adopted binding must take effect immediately, not only after a restart"
+        );
     }
 
     /// #86: a self-enrollment invite mints IDENTITY, so both guards are refusals, not warnings.
