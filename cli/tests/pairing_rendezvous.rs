@@ -14,6 +14,7 @@ use std::time::Duration;
 use mcpmesh::allowlist::{AllowlistGate, PeerEntry, PeerStore};
 use mcpmesh::config::Config;
 use mcpmesh::daemon::{MeshState, build_services, spawn_accept_loop};
+use mcpmesh::pairing::SelfEnroll;
 use mcpmesh::pairing::rendezvous::{GrantBackFn, SelfBinding, redeem_invite};
 use mcpmesh::pairing::sas::short_auth_code;
 use mcpmesh::pairing::{Invite, LiveInvites};
@@ -959,6 +960,7 @@ async fn repeat_grant_unions_the_redeemers_dial_directory_and_applies_the_new_ni
             "bob".into(),
             invite.encode(),
             None,
+            SelfEnroll::Refuse,
             None,
             bob_store.clone(),
             None,
@@ -1047,6 +1049,7 @@ async fn redeem_refuses_an_invite_squatting_an_existing_peers_nickname() {
             "bob".into(),
             invite.encode(),
             None,
+            SelfEnroll::Refuse,
             None,
             bob_store.clone(),
             None,
@@ -1107,6 +1110,7 @@ async fn a_dead_invite_dial_reports_the_cause_not_a_bare_connection_failure() {
             "bob".into(),
             invite.encode(),
             None,
+            SelfEnroll::Refuse,
             None,
             Arc::new(PeerStore::open(&tempfile::tempdir().unwrap().keep().join("b.redb")).unwrap()),
             None,
@@ -1219,6 +1223,7 @@ async fn an_inviter_side_alias_collision_says_nothing_to_the_redeemer() {
             "bob".into(),
             invite.encode(),
             None,
+            SelfEnroll::Refuse,
             None,
             bob_store.clone(),
             None,
@@ -1333,6 +1338,9 @@ async fn self_enrollment_shares_one_identity_and_writes_no_peer_rows() {
             "bobs-phone".into(),
             invite.encode(),
             None,
+            // #178: the ceremony this caller OFFERED. `Refuse` is the default everywhere else in
+            // this file, and it is what a UI that only meant to pair gets.
+            SelfEnroll::Allow,
             Some(adopt),
             b_store.clone(),
             None,
@@ -1379,6 +1387,10 @@ async fn self_enrollment_shares_one_identity_and_writes_no_peer_rows() {
             "another-device".into(),
             invite.encode(),
             None,
+            // MUST be `Allow`: this asserts the invite is BURNED. Under `Refuse` the #178 guard
+            // short-circuits before the dial, so the call would still be `is_err()` — for an
+            // entirely different reason — and this assertion would stop testing anything.
+            SelfEnroll::Allow,
             None,
             Arc::new(PeerStore::open(&bob_dir.path().join("c.redb")).unwrap()),
             None,
@@ -1476,6 +1488,7 @@ async fn both_sides_store_their_own_local_alias_after_a_real_pairing() {
             "bob".into(),
             invite.encode(),
             Some("alice-work".into()),
+            SelfEnroll::Refuse,
             None,
             bob_store.clone(),
             None,
@@ -1592,6 +1605,7 @@ async fn paired_and_granted_peer_is_admitted_to_the_service_end_to_end() {
             "bob".into(),
             invite.encode(),
             None,
+            SelfEnroll::Refuse,
             None,
             bob_store.clone(),
             None,
@@ -1763,6 +1777,7 @@ async fn rename_after_pairing_keeps_the_peer_admitted() {
             "bob".into(),
             invite.encode(),
             None,
+            SelfEnroll::Refuse,
             None,
             bob_store,
             None,
@@ -1928,6 +1943,7 @@ async fn pairing_exchanges_and_stores_each_sides_verified_user_id() {
             "bob".into(),
             invite.encode(),
             None,
+            SelfEnroll::Refuse,
             None,
             bob_store.clone(),
             Some(SelfBinding {
@@ -2024,6 +2040,7 @@ async fn redeem_refuses_an_address_swap_and_writes_no_entry_p3() {
             "bob".into(),
             invite.encode(),
             None,
+            SelfEnroll::Refuse,
             None,
             bob_store.clone(),
             None,

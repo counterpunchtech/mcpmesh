@@ -134,3 +134,104 @@ async fn two_embedded_nodes_pair_and_run_an_mcp_session() {
     b.shutdown().await;
     a.shutdown().await;
 }
+
+/// #59: the embedder signing seam, driven through two REAL nodes.
+///
+/// The unit tests in `mcpmesh-trust` prove the crypto. This proves the WIRING, which is the part
+/// they cannot see: that `Node::sign_app` signs with the key whose public half is the
+/// `endpoint_id()` this node reports, so a peer holding nothing but that id can attribute the
+/// payload.
+///
+/// The whole point of #59 is a payload that outlives its connection, so the flow here is
+/// deliberately NOT a session: A signs, the bytes travel by any means (a `let` here, a relay or a
+/// mailbox in a real embedder), and B verifies against A's id alone.
+///
+/// Signing against a separately-stored key copy — the shape this deliberately avoids — passes every
+/// unit test in `app.rs` and fails the first assertion here.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_embedder_can_attribute_a_payload_to_the_node_that_signed_it() {
+    let (a_root, b_root) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = NodeBuilder::new(a_root.path())
+        .config(hermetic())
+        .start()
+        .await
+        .expect("node a starts");
+    let b = NodeBuilder::new(b_root.path())
+        .config(hermetic())
+        .start()
+        .await
+        .expect("node b starts");
+
+    const DOMAIN: &[u8] = b"embedded-test/message/1";
+    let payload = b"a message that outlives its connection";
+    let sig = a.sign_app(DOMAIN, payload);
+
+    // B holds A's endpoint id and the bytes. Nothing else.
+    assert!(
+        mcpmesh_node::Node::verify_app(&a.endpoint_id(), DOMAIN, payload, &sig),
+        "a payload must verify against the SIGNER'S endpoint_id — if this fails, sign_app is not \
+         using the key that identifies this node and the attribution is worthless"
+    );
+
+    // Attribution is to a DEVICE: B's id must not verify A's signature. Without this, "signed by
+    // someone on the mesh" would read as "signed by A".
+    assert!(
+        !mcpmesh_node::Node::verify_app(&b.endpoint_id(), DOMAIN, payload, &sig),
+        "another node's id must not verify A's signature"
+    );
+    // …and B signing the same bytes produces a signature that is B's, not A's.
+    let b_sig = b.sign_app(DOMAIN, payload);
+    assert!(mcpmesh_node::Node::verify_app(
+        &b.endpoint_id(),
+        DOMAIN,
+        payload,
+        &b_sig
+    ));
+    assert!(
+        !mcpmesh_node::Node::verify_app(&a.endpoint_id(), DOMAIN, payload, &b_sig),
+        "two nodes must not be interchangeable signers"
+    );
+
+    // The domain and the message are covered end to end, not just in the preimage helper.
+    assert!(!mcpmesh_node::Node::verify_app(
+        &a.endpoint_id(),
+        b"other/domain/1",
+        payload,
+        &sig
+    ));
+    assert!(!mcpmesh_node::Node::verify_app(
+        &a.endpoint_id(),
+        DOMAIN,
+        b"tampered",
+        &sig
+    ));
+
+    // The identity SURVIVES a restart: the device key is on disk under the node's root, so a
+    // signature made before a restart still verifies after one. An embedder's mailbox is full of
+    // payloads signed by processes that have since exited — if this failed, every one of them
+    // would become unattributable on the next boot.
+    let a_id = a.endpoint_id();
+    a.shutdown().await;
+    let a2 = NodeBuilder::new(a_root.path())
+        .config(hermetic())
+        .start()
+        .await
+        .expect("node a restarts on the same root");
+    assert_eq!(
+        a2.endpoint_id(),
+        a_id,
+        "the same root must boot the same identity"
+    );
+    assert!(
+        mcpmesh_node::Node::verify_app(&a2.endpoint_id(), DOMAIN, payload, &sig),
+        "a signature must outlive the process that made it"
+    );
+    let sig_after = a2.sign_app(DOMAIN, payload);
+    assert_eq!(
+        sig, sig_after,
+        "and the restarted node must sign identically — same key, deterministic ed25519"
+    );
+
+    a2.shutdown().await;
+    b.shutdown().await;
+}

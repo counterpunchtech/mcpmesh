@@ -17,9 +17,11 @@
 //! different crate to the type system and breaks the build.
 pub use ed25519_dalek;
 
+pub mod app;
 pub mod binding;
 pub mod keys;
 pub mod roster;
+pub use app::{APP_SIG_DOMAIN, sign_app, verify_app};
 pub use keys::{DeviceKey, KeyError, OrgRootKey, UserKey};
 /// The family paths rule lives on `mcpmesh-local-api` (the featureless vocabulary crate —
 /// plugins are barred from depending on trust, and the endpoint formula must have ONE

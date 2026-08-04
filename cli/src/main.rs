@@ -153,6 +153,18 @@ enum Cmd {
         /// whoever holds the name. It is local: they never see it.
         #[arg(long = "as", value_name = "name")]
         as_nickname: Option<String>,
+        /// Redeem a `mcpmesh-enroll:` link, adding THIS device to the inviter's identity (#178).
+        ///
+        /// Required for an enrollment link, refused for anything else. Without it `pair` declines
+        /// the link and tells you what it was — because the two artifacts look alike and do very
+        /// different things. An ordinary invite makes you contacts; an enrollment link makes this
+        /// machine another device of that person, so everyone who trusts them starts admitting it,
+        /// and undoing that means rotating a key you do not hold.
+        ///
+        /// Use it on YOUR second machine, with a link YOUR other machine minted
+        /// (`mcpmesh invite --as-self`).
+        #[arg(long = "as-self")]
+        as_self: bool,
     },
     /// Print the steps to use a peer's service from your AI client.
     ///
@@ -548,7 +560,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             invite,
             remove,
             as_nickname,
-        }) => run_pair(invite, remove, as_nickname, cli.json),
+            as_self,
+        }) => run_pair(invite, remove, as_nickname, as_self, cli.json),
         Some(Cmd::Use { target }) => run_use(target, cli.json),
         Some(Cmd::Join {
             org_invite,
@@ -790,8 +803,16 @@ fn run_pair(
     invite: Option<String>,
     remove: Option<String>,
     as_nickname: Option<String>,
+    as_self: bool,
     json: bool,
 ) -> anyhow::Result<()> {
+    // `--as-self` names the ceremony you are redeeming; with `--remove` there is no redemption.
+    // Refused rather than ignored, for the same reason `--as` is below.
+    if remove.is_some() && as_self {
+        anyhow::bail!(
+            "--as-self names the enrollment you are redeeming; it has no meaning with --remove"
+        )
+    }
     match (invite, remove) {
         (Some(_), Some(_)) => {
             anyhow::bail!("provide an invite to redeem OR --remove <nickname>, not both")
@@ -808,7 +829,19 @@ fn run_pair(
             )
         }
         (Some(invite_line), None) => with_daemon(async move |mut client| {
-            let paired = client.pair_as(&invite_line, as_nickname.clone()).await?;
+            // #178: the CLI is an embedder too, and gets the same default. It was tempting to pass
+            // `true` unconditionally on the grounds that the person typing this is the one
+            // deciding — but they are deciding from a line someone else handed them, the two
+            // schemes look alike, and `render::pair_lines` only says which ceremony ran AFTER the
+            // binding is written. Requiring `--as-self` costs one flag in a flow that is already
+            // two commands, and is the difference between choosing this and being walked into it.
+            //
+            // It also keeps the field OFF the wire unless asked (`skip_serializing_if`), so a
+            // freshly-upgraded binary still pairs against a not-yet-restarted pre-45 daemon
+            // instead of failing `-32602 unknown field`.
+            let paired = client
+                .pair_opts(&invite_line, as_nickname.clone(), as_self)
+                .await?;
             if json {
                 println!("{}", mcpmesh::json::pair_json(&paired));
                 return Ok(());

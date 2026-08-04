@@ -543,3 +543,75 @@ async fn pair_remove_audits_a_real_unpair_but_not_a_no_op() {
     .await
     .expect("unpair audit test timed out");
 }
+
+/// #178: `mcpmesh pair <enroll-line>` without `--as-self` is REFUSED, through the real binary.
+///
+/// The whole point of #178 is that the two artifacts look alike and do very different things: an
+/// ordinary invite makes you contacts, an enrollment link makes this machine another device of that
+/// person's identity — irrevocable short of rotating a key you do not hold. The CLI shipped
+/// `allow_self_enroll: true` unconditionally at first, on the theory that its operator is the one
+/// deciding; they are, but they are deciding about a line someone else handed them, and the
+/// porcelain names the ceremony only after the binding is written.
+///
+/// This drives the whole stack — porcelain flag → wire field → daemon guard → coded refusal →
+/// porcelain rendering. Flipping the CLI back to an unconditional `true` fails it, as does
+/// dropping the `-32052` branch from `control_error_lines` (the remedy assertion).
+///
+/// The invite is REAL (minted by this same daemon with `--as-self`), so the refusal is decided on
+/// its actual scheme rather than on a hand-built string.
+#[tokio::test(flavor = "multi_thread")]
+async fn pairing_an_enrollment_link_without_as_self_is_refused() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let tmp = tempfile::tempdir().unwrap();
+        let (exe, socket, env) = launch_in(tmp.path());
+
+        // A real self-enrollment line from this daemon.
+        let minted = run_cmd(&exe, &env, &["invite", "--as-self"]);
+        assert!(
+            minted.status.success(),
+            "`mcpmesh invite --as-self` exit 0; stderr: {}",
+            String::from_utf8_lossy(&minted.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&minted.stdout).into_owned();
+        let line = stdout
+            .split_whitespace()
+            .find(|t| t.starts_with("mcpmesh-enroll:"))
+            .unwrap_or_else(|| panic!("an --as-self invite must carry an enroll line:\n{stdout}"))
+            .to_string();
+
+        let out = run_cmd(&exe, &env, &["pair", &line]);
+        assert!(
+            !out.status.success(),
+            "an enrollment link must be refused without --as-self"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(
+            stderr.contains("device-enrollment link"),
+            "the refusal must say what the line actually is: {stderr}"
+        );
+        assert!(
+            stderr.contains("--as-self"),
+            "…and name the flag the person can type: {stderr}"
+        );
+        assert!(
+            !stderr.contains("allow_self_enroll"),
+            "…without leaking the API field name: {stderr}"
+        );
+
+        // The refusal must leave the invite USABLE — nothing was dialled, nothing was burned. So
+        // the SAME line, offered, gets past the guard. (It then fails for an unrelated reason: you
+        // cannot redeem your own invite on the machine that minted it. What matters is that it is
+        // no longer the consent refusal.)
+        let retry = run_cmd(&exe, &env, &["pair", &line, "--as-self"]);
+        let retry_err = String::from_utf8_lossy(&retry.stderr).into_owned();
+        assert!(
+            !retry_err.contains("device-enrollment link"),
+            "with --as-self the consent guard must be OUT of the way — and the invite must have \
+             survived the refusal: {retry_err}"
+        );
+
+        shutdown_daemon(&socket).await;
+    })
+    .await
+    .expect("self-enroll refusal test timed out");
+}

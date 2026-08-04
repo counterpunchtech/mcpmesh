@@ -63,6 +63,24 @@ fn control_error_lines(error: &serde_json::Value) -> Vec<String> {
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
     let message = strip_wire_framing(message);
+    // #178: branch on the CODE, which is what #159 shipped codes for. The daemon's sentence names
+    // `allow_self_enroll` — the API field — and a person at a shell has no such thing. This is the
+    // one refusal whose remedy is a flag, so the porcelain owns the wording.
+    if error.get("code").and_then(serde_json::Value::as_i64)
+        == Some(mcpmesh_local_api::ERR_SELF_ENROLL_NOT_OFFERED)
+    {
+        return vec![
+            "Error: that is a device-enrollment link, not a pairing invite.".to_string(),
+            "Redeeming it makes THIS machine another device of that person's identity — \
+             everyone who trusts them starts admitting it, and it cannot be undone without \
+             rotating their key."
+                .to_string(),
+            "(If that is what you meant — it is your own second machine, and your other machine \
+             minted the link with `mcpmesh invite --as-self` — re-run with `--as-self`. \
+             Otherwise ask them for an ordinary invite.)"
+                .to_string(),
+        ];
+    }
     if message.contains("dial the inviter") {
         return vec![
             "Error: could not reach the inviter's machine — are they online?".to_string(),
@@ -1692,6 +1710,58 @@ mod tests {
     /// `ClientError::Api` converted into the verb's `anyhow::Result` by `?`.
     fn api_error(value: serde_json::Value) -> anyhow::Error {
         anyhow::Error::from(client::ClientError::Api(value))
+    }
+
+    /// #178: the self-enrollment refusal is rendered in CLI vocabulary, and it is chosen by CODE.
+    ///
+    /// The daemon's sentence tells the caller to "retry with allow_self_enroll" — the API field. A
+    /// person at a shell has no such thing; they have `--as-self`. This is exactly what #159
+    /// shipped codes for, so the branch reads `code` and not the prose: rewording the daemon's
+    /// message must not silently drop the remedy the human needs.
+    #[test]
+    fn the_self_enroll_refusal_names_the_flag_a_human_can_type() {
+        let err = api_error(json!({
+            "code": mcpmesh_local_api::ERR_SELF_ENROLL_NOT_OFFERED,
+            "message": "pair failed: this is a device-enrollment link, not a pairing invite: \
+                        redeeming it would make this device another device of that person's \
+                        identity, which this application did not offer — retry with \
+                        allow_self_enroll if that is what you meant",
+        }));
+        let rendered = error_lines(&err).join("\n");
+        assert!(
+            rendered.contains("--as-self"),
+            "the remedy must be the flag the user can actually type: {rendered}"
+        );
+        assert!(
+            !rendered.contains("allow_self_enroll"),
+            "…and must NOT leak the API field name, which is not a thing at a shell: {rendered}"
+        );
+        assert!(
+            rendered.contains("device-enrollment link"),
+            "and it must say what the line actually is: {rendered}"
+        );
+
+        // Chosen by CODE, not by matching the daemon's prose. With an empty message the branch
+        // must still fire — otherwise a daemon reword turns this into the generic fallback.
+        let bare = api_error(json!({
+            "code": mcpmesh_local_api::ERR_SELF_ENROLL_NOT_OFFERED,
+            "message": "",
+        }));
+        assert!(
+            error_lines(&bare).join("\n").contains("--as-self"),
+            "the branch must key on the code, so it survives any rewording of the message"
+        );
+
+        // …and it must not swallow OTHER refusals: a different code with similar prose renders
+        // normally.
+        let other = api_error(json!({
+            "code": mcpmesh_local_api::ERR_INVITE_EXPIRED,
+            "message": "invite expired",
+        }));
+        assert_eq!(
+            error_lines(&other),
+            vec!["Error: invite expired".to_string()]
+        );
     }
 
     #[test]

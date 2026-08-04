@@ -46,6 +46,50 @@ const INVITE_SCHEME: &str = "mcpmesh-invite:";
 /// invite", which is a clean refusal rather than a wrong ceremony.
 const ENROLL_SCHEME: &str = "mcpmesh-enroll:";
 
+/// Is this line a SELF-ENROLLMENT invite (#178)? The pre-screen an EMBEDDER needs.
+///
+/// [`Invite::decode`] accepts both schemes, so a `mcpmesh-enroll:` line pasted into a UI's ordinary
+/// "join" field is a well-formed invite that runs a materially different ceremony. An embedder can
+/// refuse it at `pair` — [`PairParams::allow_self_enroll`] defaults to `false` — but a refusal is a
+/// recovery, not a prompt. This lets a UI ask the right question in the first place ("this is a
+/// device-enrollment link — add this device to your account?") before it calls anything.
+///
+/// **The predicate is exported and the scheme constants are not**, deliberately. A `pub const`
+/// invites `line.starts_with(ENROLL_SCHEME)` at the call site, which is a second copy of the
+/// acceptance rule free to drift from this module's — the hand-copied-constant shape #147/#159
+/// exist to remove. This function IS the rule.
+///
+/// Sound as a pre-screen because [`Invite::decode`] refuses any line whose scheme and `as_self`
+/// disagree: for every line that decodes at all, this equals the decoded `as_self`. For a line that
+/// does NOT decode it is still the right answer to prompt on — a malformed enrollment line is not
+/// an ordinary invite.
+///
+/// [`PairParams::allow_self_enroll`]: mcpmesh_local_api::PairParams::allow_self_enroll
+pub fn is_enrollment_line(line: &str) -> bool {
+    line.starts_with(ENROLL_SCHEME)
+}
+
+/// Whether the CALLER offered a self-enrollment ceremony (#178).
+///
+/// Passed to [`rendezvous::redeem_invite`] as a REQUIRED argument rather than read off a config or
+/// defaulted, so the un-offered ceremony is unrepresentable: every caller — the control seam, an
+/// embedder driving the redeemer directly, a test — has to say which ceremony it is willing to
+/// complete. Enforcing it only in the `pair` handler would leave `redeem_invite`'s other callers
+/// exactly as exposed as #178 found them.
+///
+/// A named type rather than a bare `bool` because `redeem_invite` already takes eight arguments; a
+/// ninth positional boolean is unreadable at the call site, which is precisely where the security
+/// decision is being made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelfEnroll {
+    /// A `mcpmesh-enroll:` line is refused before any dial. The default everywhere the caller has
+    /// not explicitly offered the ceremony.
+    Refuse,
+    /// A `mcpmesh-enroll:` line completes the enrollment: this device adopts the inviter's binding
+    /// and becomes another device of that person.
+    Allow,
+}
+
 /// A pairing invite. Serialized to the `mcpmesh-invite:` line, carried out-of-band, and redeemed
 /// over `mcpmesh/pair/1` — once by default, up to `uses_remaining` times (#87).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -755,6 +799,43 @@ mod tests {
             peer_nickname: None,
             as_self: false,
         }
+    }
+
+    /// #178: the embedder's pre-screen must agree with what `decode` actually does.
+    ///
+    /// The predicate exists so a UI can PROMPT ("this is a device-enrollment link") instead of
+    /// recovering from a refusal. That is only safe if it never disagrees with the ceremony that
+    /// would actually run — a predicate that said "ordinary" for a line `decode` reads as an
+    /// enrollment would put the wrong question in front of the person, which is the exact failure
+    /// #178 is about, moved one layer up.
+    ///
+    /// So this asserts agreement rather than a string prefix: it compares the predicate against
+    /// the DECODED `as_self` for both schemes. Hardcoding `is_enrollment_line` to `false` (or to
+    /// `true`) fails one half; wiring it to `INVITE_SCHEME` fails both.
+    #[test]
+    fn the_enrollment_pre_screen_agrees_with_the_decoder() {
+        let plain = sample_invite(7, 1_800_000_000);
+        let mut enroll = sample_invite(8, 1_800_000_000);
+        enroll.as_self = true;
+
+        for inv in [&plain, &enroll] {
+            let line = inv.encode();
+            assert_eq!(
+                is_enrollment_line(&line),
+                Invite::decode(&line).unwrap().as_self,
+                "the pre-screen must answer what the ceremony will actually do: {line}"
+            );
+        }
+        // Stated explicitly so the loop above cannot pass by agreeing on one value twice.
+        assert!(!is_enrollment_line(&plain.encode()));
+        assert!(is_enrollment_line(&enroll.encode()));
+
+        // A line that does not decode at all is still screened as what it CLAIMS to be — a UI
+        // prompting on a malformed enrollment link must not be told it is an ordinary invite.
+        assert!(is_enrollment_line("mcpmesh-enroll:!!!not-base32"));
+        assert!(!is_enrollment_line("mcpmesh-invite:!!!not-base32"));
+        assert!(!is_enrollment_line("https://example.com/enroll"));
+        assert!(!is_enrollment_line(""));
     }
 
     #[test]

@@ -1411,10 +1411,14 @@ pub(crate) async fn mint_invite(
 /// [`crate::pairing::rendezvous::redeem_invite`], threading our own endpoint + self-nickname +
 /// store. The inviter-side authorization (adding US to its service `allow`) happens on ITS
 /// daemon inside its rendezvous handler — see [`grant_service_access`].
+///
+/// `self_enroll` carries the caller's #178 consent: a `mcpmesh-enroll:` line is refused before any
+/// dial unless the caller asked for that ceremony.
 pub(crate) async fn redeem(
     state: &DaemonState,
     invite_line: String,
     as_nickname: Option<String>,
+    self_enroll: crate::pairing::SelfEnroll,
 ) -> Result<PairResult> {
     let mesh = state.mesh_required()?;
     // #87: validated HERE, at the control seam, so a blank field is a clean -32602 rather than a
@@ -1459,6 +1463,7 @@ pub(crate) async fn redeem(
         mesh.self_nickname(),
         invite_line,
         as_nickname,
+        self_enroll,
         // #86: persist an adopted self-enrollment binding — the only copy there will ever be.
         Some(adopt_hook(mesh)),
         mesh.store.clone(),
@@ -3310,6 +3315,7 @@ mod tests {
             &state,
             "total-garbage-not-an-invite".into(),
             Some("  ".into()),
+            crate::pairing::SelfEnroll::Refuse,
         )
         .await
         .expect_err("a blank as_nickname must be refused");
@@ -3324,15 +3330,21 @@ mod tests {
             &state,
             "total-garbage-not-an-invite".into(),
             Some("a/b".into()),
+            crate::pairing::SelfEnroll::Refuse,
         )
         .await
         .expect_err("a '/' in as_nickname must be refused");
         assert!(format!("{e:#}").contains("as_nickname"), "{e:#}");
 
         // …and a VALID alias must fall through to the real work (which fails on the garbage line).
-        let e = redeem(&state, "total-garbage".into(), Some("fine".into()))
-            .await
-            .expect_err("the garbage line still fails");
+        let e = redeem(
+            &state,
+            "total-garbage".into(),
+            Some("fine".into()),
+            crate::pairing::SelfEnroll::Refuse,
+        )
+        .await
+        .expect_err("the garbage line still fails");
         assert!(
             !format!("{e:#}").contains("as_nickname"),
             "a valid alias must not be reported as an alias problem: {e:#}"
@@ -3786,6 +3798,7 @@ allow = []
                 meta: String::new(),
                 services: Vec::new(),
                 seq: 1,
+                observed: 1,
                 path: mcpmesh_local_api::PeerPath::Direct,
             },
         );
