@@ -169,9 +169,17 @@ pub(crate) fn commit_observation(
         }
         let cached = cache.get(&endpoint_id).map(|e| e.path.clone());
         let path = decide(observed, cached.as_ref())?;
-        // #176: this writer's COMMIT ticket. The watcher only fires for a LIVE session, so it is
-        // positive evidence exactly like a pong — and a probe that started before this must not be
-        // able to land a timeout over it. Stamping `observed` here is what `contradicted_by` reads.
+        // #176: this writer's COMMIT ticket. The watcher runs on a LIVE session, so what it writes
+        // is positive evidence exactly like a pong — and a probe that started before this must not
+        // be able to land a timeout over it. Stamping `observed` here is what `contradicted_by`
+        // reads.
+        //
+        // What it does NOT do: protect a stable session. `decide` returns `None` — and this line is
+        // never reached — whenever the path is UNCHANGED, which is the common case for a session
+        // that is simply up. So a live session refreshes `observed` only when its path moves, and
+        // an idle-but-connected peer is still protected by probes alone. That is the honest scope:
+        // this closes the cross-writer hole (a timeout landing over a path observation), not
+        // "a live session is always shielded from a timeout".
         let committed_at = mesh
             .probe_seq
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -439,7 +447,13 @@ mod tests {
             })
             .unwrap();
 
-        // A probe landed first: Direct, with a MEASURED round trip.
+        // A probe landed first: Direct, with a MEASURED round trip. Its `observed` is drawn from
+        // the REAL counter (#176) rather than written as a literal — the whole point of the field
+        // is that both writers order against one another through it, and a fixture that invents a
+        // number compares the watcher's stamp against nothing.
+        let probe_observed = mesh
+            .probe_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         mesh.reachability.lock().unwrap().insert(
             eid,
             crate::daemon::ReachEntry {
@@ -449,7 +463,7 @@ mod tests {
                 meta: String::new(),
                 services: Vec::new(),
                 seq: 1,
-                observed: 1,
+                observed: probe_observed,
                 path: PeerPath::Direct,
             },
         );
@@ -471,6 +485,29 @@ mod tests {
             Some(12),
             "the probe's measurement survives, so `rtt_ms: None` is NOT the session marker — this \
              frame is session-sourced AND carries an rtt"
+        );
+
+        // #176: the watcher is the SECOND writer to this cache, so its rows must carry a commit
+        // ticket a concurrent probe's timeout can be compared against. Without it the row keeps
+        // whatever `observed` the probe left (1 here), and an in-flight probe that started at 2
+        // would be free to overwrite this live-session observation with `reachable: false` — the
+        // cross-writer half of the bug.
+        //
+        // Asserted as "advanced past the ticket the row already had", not as a literal: the exact
+        // number depends on how many probes the hermetic mesh has taken, and pinning it would make
+        // this test a hostage to unrelated probe traffic.
+        let stamped = mesh
+            .reachability
+            .lock()
+            .unwrap()
+            .get(&eid)
+            .expect("row committed")
+            .observed;
+        assert!(
+            stamped > probe_observed,
+            "the watcher must stamp its OWN commit ticket (stamped {stamped}, the probe's was \
+             {probe_observed}) — leaving it stale lets a probe that started later land a timeout \
+             over this live-session observation"
         );
     }
 

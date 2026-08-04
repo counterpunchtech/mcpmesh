@@ -624,7 +624,7 @@ pub struct PairParams {
     /// person is then offered the real choice.
     ///
     /// To decide BEFORE calling — to show the right prompt rather than recover from a refusal — use
-    /// `mcpmesh::pairing::is_enrollment_line`. `api_minor >= 45`.
+    /// `mcpmesh_node::pairing::is_enrollment_line`. `api_minor >= 45`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub allow_self_enroll: bool,
 }

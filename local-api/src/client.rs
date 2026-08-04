@@ -335,7 +335,7 @@ impl ControlClient {
     /// devices": the ceremony writes a device→user binding that is irrevocable short of rotating
     /// the user key.
     ///
-    /// `mcpmesh::pairing::is_enrollment_line` answers which kind of line you are holding without
+    /// `mcpmesh_node::pairing::is_enrollment_line` answers which kind of line you are holding without
     /// dialling, for a UI that wants to PROMPT rather than recover from a refusal.
     pub async fn pair_opts(
         &mut self,

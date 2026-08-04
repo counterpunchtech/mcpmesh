@@ -205,6 +205,12 @@ impl Node {
         // whose public half IS `endpoint_id()`, by construction. A separately-stored copy could be
         // absent or stale, and a signing API that fails open or signs under the wrong identity is
         // worse than none.
+        //
+        // Hardening note, the same residual `DeviceKey::secret_bytes` documents: `to_bytes()` hands
+        // back a plain `[u8; 32]` that is not zeroized, and the `SigningKey` built from it is
+        // scrubbed on drop but the array is not. Per call rather than once — accepted, because the
+        // alternative is caching the key material for the node's whole life, which is a larger
+        // residual, not a smaller one.
         let signing = mcpmesh_trust::ed25519_dalek::SigningKey::from_bytes(
             &self.mesh().endpoint.secret_key().to_bytes(),
         );

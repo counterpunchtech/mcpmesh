@@ -1146,6 +1146,52 @@ mod tests {
         );
     }
 
+    /// #176 at the CALL SITE: `reachability_of` must HOLD the claim for the life of the probe, not
+    /// merely take one.
+    ///
+    /// Found by mutation review, and this is why the helper test above is not enough: inserting
+    /// `drop(guard);` before the `tokio::spawn` disables the dedup completely — one dial per poll,
+    /// exactly the behaviour #176 removes — and leaves every other test in this module green.
+    /// Nothing else in the tree names `probes_inflight`.
+    ///
+    /// Deterministic: the claim is taken synchronously inside `reachability_of`, before the spawn,
+    /// so the assertion reads state that exists the instant the call returns. No sleeping, and no
+    /// "did a probe start?" timing judgement.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reachability_of_holds_its_refresh_claim_across_the_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+        std::fs::write(&cfg, "").unwrap();
+        let mesh = crate::daemon::testutil::hermetic_mesh(cfg).await;
+        let eid = [0x7Eu8; 32];
+        mesh.store
+            .add(crate::allowlist::PeerEntry {
+                endpoint_id: eid,
+                nickname: "never-probed".into(),
+                services: vec![],
+                paired_at: None,
+                user_id: None,
+                last_addr: None,
+            })
+            .unwrap();
+
+        // Never probed → stale → a refresh is scheduled.
+        let rows = super::reachability_of(&mesh);
+        assert_eq!(rows.len(), 1, "the stored peer must be projected");
+        assert!(
+            mesh.probes_inflight.lock().unwrap().contains(&eid),
+            "the refresh claim must still be HELD when reachability_of returns — a claim taken and \
+             released before the spawn dedups nothing"
+        );
+
+        // …and while it is held, a second poll schedules nothing for that peer. This is the
+        // property, read through the real entry point rather than the helper.
+        assert!(
+            super::claim_refreshes(&mesh, vec![eid]).is_empty(),
+            "a second status poll inside the probe window must not spawn another dial"
+        );
+    }
+
     /// #58: the emit rule, exhaustively. A transition is a CHANGE in the `reachable` verdict (or
     /// first knowledge of the peer) — never a refresh that merely re-confirms it, which would emit
     /// a frame per TTL refresh for a peer that is simply staying up.

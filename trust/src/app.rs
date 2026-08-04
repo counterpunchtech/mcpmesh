@@ -20,17 +20,25 @@
 //! are properties of the API rather than of caller discipline:
 //!
 //! 1. **An app signature is never an mcpmesh signature.** [`APP_SIG_DOMAIN`] is a fixed prefix a
-//!    caller cannot escape, so no caller-chosen `domain` can produce a preimage under
-//!    `mcpmesh/join/device-binding/1`, `mcpmesh/introduce/1`, the roster `sig`, or any domain
-//!    mcpmesh adds later — and the reverse holds too. Without it, an embedder that let a peer
-//!    choose the bytes it signs would be an oracle for forging mcpmesh's own statements.
+//!    caller cannot escape, so no caller-chosen `domain` can produce a preimage mcpmesh itself
+//!    signs — nor any domain it adds later — and the reverse holds too. Without it, an embedder
+//!    that let a peer choose the bytes it signs would be an oracle for forging mcpmesh's own
+//!    statements.
 //!
-//!    Stated precisely, because it is easy to over-claim: **today the length field alone would
-//!    also separate them**, since every mcpmesh preimage opens with an ASCII domain string and an
-//!    app preimage would open with a small little-endian `u64`. That is an accident of the current
-//!    domains, not an invariant — a future mcpmesh preimage with a different shape would erase it
-//!    silently. The fixed prefix makes the separation explicit and structural, so it is pinned by
-//!    the LAYOUT test rather than left to hold by coincidence.
+//!    Two precisions, because this is easy to over-claim in both directions.
+//!
+//!    **Which statements are actually at risk.** Only ones signed by the SAME key. A device
+//!    binding (`mcpmesh/join/device-binding/1`), an introduction (`mcpmesh/introduce/1`) and a
+//!    roster `sig` are signed by a [`UserKey`](crate::UserKey) / [`OrgRootKey`](crate::OrgRootKey),
+//!    so they were never reachable from here whatever the domain. The statement this key does sign
+//!    is the roster-mode **presence heartbeat** (`mcpmesh/presence/1`) — that is the domain this
+//!    prefix has to stay clear of, and the one to check against if either string ever changes.
+//!
+//!    **Today the length field alone would also separate them**, since every mcpmesh preimage opens
+//!    with an ASCII domain string while an app preimage opens with a small little-endian `u64`.
+//!    That is an accident of the current domains, not an invariant — a future preimage with a
+//!    different shape would erase it silently. The fixed prefix makes the separation structural, so
+//!    it is pinned by the LAYOUT test rather than left to hold by coincidence.
 //! 2. **Two app domains cannot collide.** The length prefix means `(b"ab", b"c")` and
 //!    `(b"a", b"bc")` have different preimages. Plain concatenation would let a signature made for
 //!    one domain verify under another, which is the whole failure domain separation exists to
@@ -151,17 +159,43 @@ mod tests {
     /// live in disjoint spaces, whatever domain the embedder chooses.
     ///
     /// This is the same shape as `a_device_binding_is_not_an_endorsement_and_vice_versa`, one layer
-    /// out. The dangerous direction is an embedder that signs peer-chosen bytes: without the fixed
-    /// prefix, a peer picking `domain = "mcpmesh/join/device-binding/1"` and a crafted message
-    /// would get the device key to emit a valid DEVICE BINDING — a forged identity claim, from an
-    /// API whose whole purpose is to hand embedders a safe use of that key.
+    /// out. The dangerous direction is an embedder that signs peer-chosen bytes: a peer picking an
+    /// mcpmesh domain and a crafted message must not get the device key to emit a valid mcpmesh
+    /// statement — a forged claim, from an API whose whole purpose is to hand embedders a safe use
+    /// of that key.
+    ///
+    /// The FIRST case below is the one that matters, and it took a review to get right: the
+    /// statements this key actually signs are what is at risk, and the device key signs the
+    /// roster-mode PRESENCE heartbeat. Device bindings and introductions are signed by a `UserKey`,
+    /// so they are unreachable from here whatever the domain — kept anyway as a regression guard
+    /// in case a future statement moves onto the device key.
     #[test]
     fn an_app_signature_is_never_an_mcpmesh_signature() {
         let k = key(4);
         let device = [7u8; 32];
 
-        // The adversarial case: the caller names an mcpmesh domain verbatim and supplies the
-        // binding's own payload as the message.
+        // THE case: the presence heartbeat, which this same device key signs
+        // (`node/src/roster/presence.rs`, domain `mcpmesh/presence/1`). The two preimages must not
+        // meet, so an embedder signing peer-chosen bytes can never emit a presence claim.
+        const PRESENCE_DOMAIN: &[u8] = b"mcpmesh/presence/1";
+        assert_ne!(
+            APP_SIG_DOMAIN, PRESENCE_DOMAIN,
+            "the app domain must differ from the one statement the DEVICE key signs"
+        );
+        let presence_shaped = preimage(PRESENCE_DOMAIN, b"whatever a heartbeat body looks like");
+        assert!(
+            !presence_shaped.starts_with(PRESENCE_DOMAIN),
+            "an app preimage must never open with a presence preimage's bytes — a signature over \
+             it would be a valid heartbeat"
+        );
+        assert!(
+            presence_shaped.starts_with(APP_SIG_DOMAIN),
+            "…because the fixed app prefix always comes first"
+        );
+
+        // And the same argument against a UserKey statement, which is unreachable today but is the
+        // shape a future device-key statement would take. The caller names the domain verbatim and
+        // supplies the binding's own payload as the message.
         let mut forged_msg = k.verifying_key().to_bytes().to_vec();
         forged_msg.extend_from_slice(&device);
         let sig = sign_app(&k, b"mcpmesh/join/device-binding/1", &forged_msg);
