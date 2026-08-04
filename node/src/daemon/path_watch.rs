@@ -169,6 +169,12 @@ pub(crate) fn commit_observation(
         }
         let cached = cache.get(&endpoint_id).map(|e| e.path.clone());
         let path = decide(observed, cached.as_ref())?;
+        // #176: this writer's COMMIT ticket. The watcher only fires for a LIVE session, so it is
+        // positive evidence exactly like a pong — and a probe that started before this must not be
+        // able to land a timeout over it. Stamping `observed` here is what `contradicted_by` reads.
+        let committed_at = mesh
+            .probe_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         match cache.get_mut(&endpoint_id) {
             Some(entry) => {
                 // `probed_at` is the timestamp for the WHOLE row, and the row still carries the
@@ -179,6 +185,11 @@ pub(crate) fn commit_observation(
                 // measurement's FRESHNESS is the same lie with an extra step (#92 review).
                 entry.path = path.clone();
                 entry.seq = seq;
+                // The row's evidence is as of now, whatever `reachable` it already carried. (On a
+                // `reachable: false` row this is inert — `contradicted_by` only reads `observed`
+                // off a reachable entry — but leaving it stale would make the field mean two
+                // different things depending on which branch wrote it.)
+                entry.observed = committed_at;
                 entry.clone()
             }
             None => {
@@ -191,6 +202,7 @@ pub(crate) fn commit_observation(
                     meta: String::new(),
                     services: Vec::new(),
                     seq,
+                    observed: committed_at,
                     path,
                 };
                 cache.insert(endpoint_id, entry.clone());
@@ -437,6 +449,7 @@ mod tests {
                 meta: String::new(),
                 services: Vec::new(),
                 seq: 1,
+                observed: 1,
                 path: PeerPath::Direct,
             },
         );

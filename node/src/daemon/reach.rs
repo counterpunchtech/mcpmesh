@@ -33,6 +33,16 @@ pub struct ReachEntry {
     /// wins on arrival, poisoning the cache for a full TTL and, since #58, PUSHING a false "went
     /// offline" for a peer that is up.
     pub seq: u64,
+    /// Monotonic ticket taken when this probe's result was COMMITTED (#176) — drawn from the same
+    /// counter as [`seq`](Self::seq), so the two are directly comparable.
+    ///
+    /// `seq` orders probes by when they STARTED; this orders them by when their evidence actually
+    /// landed. Both are needed, because #58 and #176 are the same bug facing opposite ways: a
+    /// timeout must not overwrite a pong, whether that pong came from a probe that started earlier
+    /// or one that started later. The question that separates them is not "which is newer" but
+    /// "did the peer answer inside my window?" — and answering it needs the pong's arrival
+    /// compared against the timeout's start, which is exactly `observed` vs `seq`.
+    pub observed: u64,
     /// HOW the peer was reached on this probe (#64) — direct/hole-punched vs through a relay.
     /// Captured alongside `reachable`/`rtt_ms` so it shares ONE TTL and one `age_secs`, rather
     /// than inventing a second staleness rule; `Unknown` covers "never probed" for free.
@@ -148,6 +158,10 @@ pub async fn probe_peer(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> ReachEn
             meta: String::new(),
             services: Vec::new(),
             seq,
+            // Never cached (that is the point of this arm), so no other probe ever compares
+            // against it. It carries our own start ticket rather than a fresh one so the row is
+            // self-consistent if a caller inspects it.
+            observed: seq,
             path: mcpmesh_local_api::PeerPath::Unknown,
         });
     }
@@ -158,6 +172,11 @@ pub async fn probe_peer(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> ReachEn
     // away, because iroh leaves those entries Active for up to a minute after the connection dies.
     let (reachable, meta, services, path, rtt_ms) =
         classify(outcome, |conn| async move { settled_path(&conn).await }).await;
+    // The COMMIT ticket (#176). Taken before the lock so it is drawn exactly once per probe, and
+    // from the same counter as `seq` so `observed` and `seq` are comparable across probes.
+    let observed = mesh
+        .probe_seq
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let entry = ReachEntry {
         reachable,
         rtt_ms,
@@ -165,6 +184,7 @@ pub async fn probe_peer(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> ReachEn
         meta,
         services,
         seq,
+        observed,
         path,
     };
     // Commit under ONE lock acquisition, DISCARDING a result a newer probe has already superseded
@@ -178,6 +198,9 @@ pub async fn probe_peer(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> ReachEn
             // A newer probe already landed. Drop ours and report THEIRS, so a caller never acts on
             // a value the cache disagrees with.
             Some(newer) if !supersedes(seq, newer) => Outcome::Superseded(newer.clone()),
+            // #176: our probe started LATER, but it found nothing while a pong landed INSIDE our
+            // window. Drop ours — see `contradicted_by`.
+            Some(pong) if contradicted_by(&entry, seq, pong) => Outcome::Superseded(pong.clone()),
             other => {
                 let previous = other.cloned();
                 cache.insert(endpoint_id, entry.clone());
@@ -215,6 +238,33 @@ pub async fn probe_peer(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> ReachEn
 /// — and is treated as "write" so the guard can never wedge.
 pub(crate) fn supersedes(seq: u64, existing: &ReachEntry) -> bool {
     seq >= existing.seq
+}
+
+/// Is `ours` — a probe that started at `seq` — contradicted by the cached `existing` entry (#176)?
+///
+/// True when all three hold: our verdict is `reachable: false`, the cached verdict is
+/// `reachable: true`, and that pong was OBSERVED after we started (`existing.observed > seq`).
+///
+/// **Why a timeout is weaker evidence than a pong.** A pong is a fact about the peer at a known
+/// instant. A `PROBE_TIMEOUT` elapse is a fact about *our dial* over a window — "no pong reached
+/// me". When a pong demonstrably arrived inside that same window, on someone else's connection,
+/// our window contained a live peer and our "unreachable" is simply wrong about it. Committing it
+/// anyway is what pinned `reachable: false` for a full `REACH_TTL_SECS` on a peer that never went
+/// anywhere. Same reasoning as #89's throttle arm: not every failed probe is evidence of a down
+/// peer.
+///
+/// **Why [`supersedes`] alone could not fix it.** That rule orders by probe START, so among N
+/// overlapping probes the last-started always wins — and the last-started is the most contended,
+/// so it is the one most likely to time out. #58 stopped an OLD probe's timeout landing on a NEW
+/// probe's pong; this stops the mirror image. Neither ordering by start nor ordering by completion
+/// gets both, because the real relation is between one probe's window and another's arrival.
+///
+/// **It does not wedge a genuinely down peer as reachable.** This only ever refuses probes that
+/// were already in flight when the last pong landed. Any probe starting AFTER it has
+/// `seq > existing.observed`, so once the peer really stops answering the next probe commits
+/// `reachable: false` normally. The stale-positive window is one probe cycle, not the 20s TTL.
+fn contradicted_by(ours: &ReachEntry, seq: u64, existing: &ReachEntry) -> bool {
+    !ours.reachable && existing.reachable && existing.observed > seq
 }
 
 /// What [`probe_peer`]'s commit step decided.
@@ -674,26 +724,78 @@ pub fn reachability_of(mesh: &Arc<MeshState>) -> Vec<mcpmesh_local_api::PeerReac
             }
         }
     }
-    // KNOWN, BOUNDED v1 TRADEOFF: no in-flight dedup here. Rapid `status` polls against a DOWN
-    // peer can spawn a few OVERLAPPING probes in the ~`PROBE_TIMEOUT` window before the first
-    // result lands and writes `probed_at`. This is deliberately not guarded (no dedup set — YAGNI
-    // for v1): each probe is cheap, self-limits once its result is cached, and the overlap is
-    // bounded by `PROBE_TIMEOUT` (the probe's hard deadline) and `REACH_TTL_SECS` (which quiets
-    // refreshes once a fresh entry exists). Revisit only if probe cost or poll rate ever makes the
-    // transient overlap matter.
-    for eid in stale {
+    // #176: ONE background refresh per peer at a time. The v1 note here called the missing dedup a
+    // bounded tradeoff because the overlap self-limits once a result is cached — true of the probe
+    // COUNT, not of the damage. A caller polling `status` faster than `PROBE_TIMEOUT` spawned a
+    // fresh dial every poll, and that contention is what made the last-started probe (whose verdict
+    // the ordering rule used to prefer) the one most likely to time out. `contradicted_by` fixes
+    // the verdict; this removes the storm that produced it.
+    //
+    // Reads are unaffected: a peer already being refreshed still gets its cached row in `out`, just
+    // no second dial. `probe_peer` itself stays unconditional — `peer_services` and the tests call
+    // it directly and mean it.
+    for (eid, guard) in claim_refreshes(mesh, stale) {
         let mesh = mesh.clone();
         tokio::spawn(async move {
+            let _guard = guard; // released on completion, panic, or cancellation
             probe_peer(&mesh, eid).await;
         });
     }
     out
 }
 
+/// Which of `stale` this call may refresh (#176), each paired with the claim that reserves it.
+///
+/// Split from the spawn loop so the dedup decision is testable without a runtime and without a
+/// timing assertion: the second call over the same peer returns an empty list, deterministically,
+/// for as long as the first call's guards are alive. The loop above then holds nothing but a
+/// `spawn`.
+fn claim_refreshes(mesh: &Arc<MeshState>, stale: Vec<[u8; 32]>) -> Vec<([u8; 32], InFlight)> {
+    stale
+        .into_iter()
+        .filter_map(|eid| InFlight::claim(mesh, eid).map(|g| (eid, g)))
+        .collect()
+}
+
+/// A claim on "this peer is being refreshed" (#176), released on drop.
+///
+/// A drop guard rather than a `remove` at the end of the spawned task: a probe that panics, or a
+/// task dropped when the runtime shuts down, would otherwise leave the peer marked in-flight
+/// forever and never refresh it again. That failure is silent and permanent, which is a strictly
+/// worse bug than the duplicate dials this exists to prevent.
+struct InFlight {
+    mesh: Arc<MeshState>,
+    endpoint_id: [u8; 32],
+}
+
+impl InFlight {
+    /// `Some` if no refresh for `endpoint_id` was already running — the claim. `None` means one is.
+    fn claim(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> Option<Self> {
+        mesh.probes_inflight
+            .lock()
+            .expect("probes_inflight lock not poisoned")
+            .insert(endpoint_id)
+            .then(|| Self {
+                mesh: mesh.clone(),
+                endpoint_id,
+            })
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.mesh
+            .probes_inflight
+            .lock()
+            .expect("probes_inflight lock not poisoned")
+            .remove(&self.endpoint_id);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::pong_meta;
-    use super::{ReachEntry, is_transition, sanitize_relay_url, supersedes};
+    use super::{ReachEntry, contradicted_by, is_transition, sanitize_relay_url, supersedes};
     use crate::roster::presence::APP_METADATA_MAX_BYTES;
 
     fn entry(reachable: bool, rtt_ms: Option<u64>) -> ReachEntry {
@@ -704,6 +806,7 @@ mod tests {
             meta: String::new(),
             services: Vec::new(),
             seq: 0,
+            observed: 0,
             path: mcpmesh_local_api::PeerPath::Unknown,
         }
     }
@@ -879,6 +982,167 @@ mod tests {
         assert!(
             supersedes(7, &newer),
             "equal tickets cannot happen, but must not wedge the guard"
+        );
+    }
+
+    /// #176: the mirror of the case above, which `supersedes` alone cannot express.
+    ///
+    /// `supersedes` orders by probe START, so the LAST-started probe always wins. Among
+    /// overlapping probes that one is the most contended and therefore the likeliest to hit
+    /// `PROBE_TIMEOUT` — so its `reachable: false` overwrote a pong that had already arrived, and
+    /// the peer read offline for a full 20s TTL while demonstrably up.
+    ///
+    /// The rule is about EVIDENCE, not recency: a timeout says "no pong reached ME over my
+    /// window"; a pong inside that same window says the peer was up. Every assertion below pins one
+    /// conjunct, so dropping any of the three flips exactly one of them.
+    #[test]
+    fn a_timeout_never_overwrites_a_pong_that_landed_inside_its_window() {
+        // Our probe started at ticket 5 and timed out.
+        let ours = entry(false, None);
+
+        // THE CASE. A pong committed at ticket 9 — after we started, so it landed inside our
+        // window. Dropping `existing.observed > seq` (or comparing against `existing.seq`, which
+        // is 0 here) makes this false and reinstates #176.
+        let mut pong_inside = entry(true, Some(50));
+        pong_inside.observed = 9;
+        assert!(
+            contradicted_by(&ours, 5, &pong_inside),
+            "a pong observed at 9 is inside the window of a probe that started at 5 — our timeout \
+             says nothing about a peer that answered someone else meanwhile"
+        );
+
+        // …and the peer is NOT wedged reachable. A probe that starts AFTER that pong carries a
+        // higher ticket, so it commits normally — which is how a genuinely down peer is reported
+        // down, one probe cycle later rather than never.
+        assert!(
+            !contradicted_by(&ours, 11, &pong_inside),
+            "a probe that started after the last pong must be free to commit reachable: false"
+        );
+
+        // A REACHABLE result is never refused. Without the `!ours.reachable` conjunct this would
+        // block a fresh pong from landing over an older one.
+        let ours_ok = entry(true, Some(12));
+        assert!(
+            !contradicted_by(&ours_ok, 5, &pong_inside),
+            "the guard is about timeouts; a pong must always be free to commit"
+        );
+
+        // Nor does an UNREACHABLE cached entry protect anything — there is no positive evidence to
+        // contradict. Without the `existing.reachable` conjunct a down peer's row would freeze.
+        let mut cached_down = entry(false, None);
+        cached_down.observed = 9;
+        assert!(
+            !contradicted_by(&ours, 5, &cached_down),
+            "an unreachable cached row is not evidence the peer answered; ours must commit"
+        );
+    }
+
+    /// #176 at the CALL SITE, not the helper: `probe_peer` must actually consult `contradicted_by`
+    /// before it writes.
+    ///
+    /// Deterministic, with no timing assertion. The peer id is unroutable on a hermetic mesh, so
+    /// the probe is guaranteed to produce `reachable: false`; the cache is seeded with a reachable
+    /// row whose `observed` is above every ticket the probe can draw, which is exactly "a pong
+    /// landed after this probe started". `seq: 0` keeps the #58 rule satisfied, so this test can
+    /// only fail on the #176 arm.
+    ///
+    /// Deleting that match arm makes `probe_peer` return `reachable: false` here and overwrite the
+    /// cache — the reported bug, caught.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn probe_peer_does_not_commit_a_timeout_over_a_pong_from_its_own_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+        std::fs::write(&cfg, "").unwrap();
+        let mesh = crate::daemon::testutil::hermetic_mesh(cfg).await;
+        let eid = [0x5Au8; 32];
+
+        let mut pong = entry(true, Some(42));
+        pong.seq = 0;
+        pong.observed = u64::MAX; // observed after any ticket this probe can take
+        mesh.reachability.lock().unwrap().insert(eid, pong);
+
+        let got = super::probe_peer(&mesh, eid).await;
+        assert!(
+            got.reachable,
+            "the unreachable probe must be DISCARDED and the surviving pong reported"
+        );
+        assert_eq!(
+            got.rtt_ms,
+            Some(42),
+            "and it must be that pong's row, not a synthesised one"
+        );
+        assert!(
+            mesh.reachability
+                .lock()
+                .unwrap()
+                .get(&eid)
+                .expect("row still cached")
+                .reachable,
+            "the CACHE must be left holding the pong — this is what pinned reachable:false for a \
+             full TTL"
+        );
+
+        // The negative control, same call site: with the pong observed BEFORE this probe started,
+        // the timeout is honest evidence and must commit. Without it the assertions above are also
+        // satisfied by a `probe_peer` that never writes `reachable: false` at all.
+        let mut stale_pong = entry(true, Some(42));
+        stale_pong.seq = 0;
+        stale_pong.observed = 0;
+        mesh.reachability.lock().unwrap().insert(eid, stale_pong);
+        let got = super::probe_peer(&mesh, eid).await;
+        assert!(
+            !got.reachable,
+            "a peer that stopped answering must still be reported down — the guard only refuses \
+             probes that were already in flight when the last pong landed"
+        );
+    }
+
+    /// #176: `reachability_of` spawns ONE refresh per peer, not one per poll.
+    ///
+    /// The old v1 note called the missing dedup bounded because each probe self-limits once its
+    /// result is cached. That bounds the probe COUNT and not the damage: a caller polling `status`
+    /// faster than `PROBE_TIMEOUT` spawned a dial per poll, and the contention that produced is
+    /// what made the last-started probe — the one the ordering rule preferred — the likeliest to
+    /// time out.
+    ///
+    /// Asserted through `claim_refreshes`, the function the spawn loop calls, so this needs no
+    /// runtime and no "wait and see if a probe started" timing assertion.
+    #[tokio::test]
+    async fn a_peer_already_being_refreshed_is_not_probed_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+        std::fs::write(&cfg, "").unwrap();
+        let mesh = crate::daemon::testutil::hermetic_mesh(cfg).await;
+        let (a, b) = ([1u8; 32], [2u8; 32]);
+
+        let first = super::claim_refreshes(&mesh, vec![a, b]);
+        assert_eq!(
+            first.len(),
+            2,
+            "both peers are unclaimed, so both are refreshed"
+        );
+
+        // While those claims are alive, a second poll gets nothing.
+        assert!(
+            super::claim_refreshes(&mesh, vec![a, b]).is_empty(),
+            "a peer with a refresh already in flight must not be dialled again"
+        );
+        // …and a peer that is NOT in flight still is — the dedup must be per peer, not a global
+        // latch. Without this, dropping the whole claim set would also pass the assertion above.
+        assert_eq!(
+            super::claim_refreshes(&mesh, vec![[3u8; 32]]).len(),
+            1,
+            "an unclaimed peer must still be refreshed while others are in flight"
+        );
+
+        // Released on drop — including on a panicking or cancelled probe task, which is why the
+        // claim is a guard rather than a `remove` at the end of the spawned future. A leaked claim
+        // would silently stop refreshing that peer forever.
+        drop(first);
+        assert_eq!(
+            super::claim_refreshes(&mesh, vec![a, b]).len(),
+            2,
+            "claims must be released when the refresh ends"
         );
     }
 

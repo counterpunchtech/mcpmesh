@@ -382,6 +382,18 @@ pub struct MeshState {
     /// order; each takes a ticket at START so a slow earlier probe cannot overwrite a fast later
     /// one — see [`ReachEntry::seq`].
     pub(crate) probe_seq: std::sync::atomic::AtomicU64,
+    /// Peers with a background refresh already in flight (#176), so [`reach::reachability_of`]
+    /// spawns ONE probe per peer instead of one per poll.
+    ///
+    /// This replaces the "known, bounded v1 tradeoff" that used to live at the spawn site. It was
+    /// bounded in probe COUNT and not in damage: a caller polling `status` faster than
+    /// `PROBE_TIMEOUT` spawned a fresh dial every poll, and the resulting contention is what made
+    /// the last-started probe — the one whose verdict used to win — the one most likely to time
+    /// out. Entries are released by a drop guard, so a probe that panics or is cancelled cannot
+    /// wedge a peer into never being refreshed again.
+    ///
+    /// std `Mutex`, held only for the insert/remove and never across an await.
+    pub(crate) probes_inflight: std::sync::Mutex<std::collections::HashSet<[u8; 32]>>,
     /// EPHEMERAL service registrations (#36): in-memory only, never written to config, torn down
     /// when the registering control connection closes. Keyed by service name → its backend spec +
     /// allow list. Overlaid onto the config-built registry on every hot-reload
@@ -529,6 +541,7 @@ impl MeshState {
             self_net_bcast: tokio::sync::broadcast::channel(REACH_BROADCAST_DEPTH).0,
             self_net_change: std::sync::Mutex::new(None),
             probe_seq: std::sync::atomic::AtomicU64::new(0),
+            probes_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
             ephemeral_services: std::sync::Mutex::new(std::collections::HashMap::new()),
             fetches: std::sync::Mutex::new(std::collections::HashMap::new()),
         })

@@ -3798,6 +3798,7 @@ allow = []
                 meta: String::new(),
                 services: Vec::new(),
                 seq: 1,
+                observed: 1,
                 path: mcpmesh_local_api::PeerPath::Direct,
             },
         );
