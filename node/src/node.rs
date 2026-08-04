@@ -178,6 +178,59 @@ impl Node {
         self.mesh().endpoint.id()
     }
 
+    /// Sign an application payload with this node's DEVICE key, under the embedder's own
+    /// `domain` (#59).
+    ///
+    /// **What this is for.** mcpmesh authenticates the transport: inside a session,
+    /// `_meta["mcpmesh/peer"]` says who is calling. That answers nothing about a payload which
+    /// outlives its connection — anything store-and-forward (offline delivery, a relay, a mailbox,
+    /// an app-level overlay) handles bytes whose author is not the peer that delivered them, and
+    /// the transport authenticated the FORWARDER. This attributes the ORIGIN, against the same
+    /// identity the transport already proves, so an embedder needs no second key, no second
+    /// backup/revocation story, and no binding protocol tying the two together.
+    ///
+    /// **`domain` is yours; pick one per statement KIND** (`b"chat/message/1"`,
+    /// `b"mailbox/receipt/1"`). A signature is only as narrow as its domain, and sharing one across
+    /// two shapes lets a value from either be read as the other. mcpmesh's own domains are out of
+    /// reach whatever you choose — see [`mcpmesh_trust::app`] for why that is a property of the
+    /// preimage rather than of your discipline.
+    ///
+    /// Verify with [`verify_app`](Self::verify_app), which needs no node.
+    ///
+    /// **Not a control verb, deliberately.** Signing over the JSON-RPC socket would put the device
+    /// key's authority behind an IPC surface shared by every consumer of that socket. This is an
+    /// in-process seam for the embedder that owns the node.
+    pub fn sign_app(&self, domain: &[u8], msg: &[u8]) -> [u8; 64] {
+        // Derived from the endpoint rather than held as a field: the signing key is then the one
+        // whose public half IS `endpoint_id()`, by construction. A separately-stored copy could be
+        // absent or stale, and a signing API that fails open or signs under the wrong identity is
+        // worse than none.
+        let signing = mcpmesh_trust::ed25519_dalek::SigningKey::from_bytes(
+            &self.mesh().endpoint.secret_key().to_bytes(),
+        );
+        mcpmesh_trust::sign_app(&signing, domain, msg)
+    }
+
+    /// Verify an application payload signed by `endpoint_id` under `domain` (#59).
+    ///
+    /// An associated function: verification needs no node, which is the point — a consumer checking
+    /// a relayed payload has the peer's `EndpointId` and nothing else.
+    ///
+    /// Returns `false` for a bad signature, a mismatched domain/message, or malformed bytes. It
+    /// never panics: every input is attacker-supplied by construction.
+    ///
+    /// It answers "which device produced these bytes" and nothing else. Whether that device was
+    /// ENTITLED to make the statement is the embedder's authorization question, answered from the
+    /// embedder's own state.
+    pub fn verify_app(
+        endpoint_id: &iroh::EndpointId,
+        domain: &[u8],
+        msg: &[u8],
+        sig: &[u8; 64],
+    ) -> bool {
+        mcpmesh_trust::verify_app(endpoint_id.as_bytes(), domain, msg, sig)
+    }
+
     /// Resolves once shutdown has been requested — by [`shutdown`](Node::shutdown) from
     /// another handle, or by the control protocol's `shutdown` verb (e.g. an operator
     /// driving this node's control connection).

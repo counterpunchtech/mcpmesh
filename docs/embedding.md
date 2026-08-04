@@ -86,3 +86,49 @@ every outstanding invite and nothing else.
   host owns telemetry.
 - **Versioning:** `mcpmesh-node` rides the release train (all crates version-lockstep);
   `mcpmesh_node::VERSION` is the stack version peers see in `status`.
+
+## Attributing a payload that outlives its connection (`sign_app`, #59)
+
+mcpmesh authenticates the **transport**. Inside a session, `_meta["mcpmesh/peer"]` tells your
+service who is calling — exactly right for request/response, and no help at all for a payload that
+outlives the connection it arrived on.
+
+Anything store-and-forward hits this: offline delivery, an always-on relay, a mailbox, an app-level
+gossip overlay. The bytes reach you from someone other than their author, so the transport
+authenticated the **forwarder**, not the **origin**.
+
+`Node::sign_app` signs with the node's own device key — the same identity `endpoint_id()` reports
+and the transport already proves — so attribution needs no second keypair, no second
+backup/revocation story, and no binding protocol tying the two identities together.
+
+```rust
+const DOMAIN: &[u8] = b"myapp/chat-message/1";
+
+// Author's node, once, when the message is created:
+let sig = node.sign_app(DOMAIN, payload);
+
+// Any recipient, however the bytes got there — needs only the author's endpoint id:
+if mcpmesh_node::Node::verify_app(&author_eid, DOMAIN, payload, &sig) {
+    // these bytes were produced by that device
+}
+```
+
+Three things worth knowing:
+
+- **Pick one `domain` per statement KIND**, not per app. A signature is only as narrow as its
+  domain, so sharing one between "a message" and "a delivery receipt" lets either be read as the
+  other. The domain is covered by the signature, and the boundary between it and the message is
+  length-prefixed, so no choice of one can be made to look like a different split of the two.
+- **mcpmesh's own signing domains are out of reach**, whatever you pass. The preimage carries a
+  fixed `mcpmesh/app-sig/1` prefix your `domain` sits inside, so a caller — including a peer that
+  influences the bytes you sign — cannot steer `sign_app` into emitting a device binding or an
+  endorsement. This is a property of the preimage, not of your discipline.
+- **It answers "which device", not "was that device allowed to say this".** Authorization stays
+  yours, answered from your own state. `verify_app` returns `false` for anything malformed and
+  never panics — every input is attacker-supplied by construction.
+
+`verify_app` is an associated function: verification needs no running node, so a consumer can check
+a stored payload without one.
+
+Signatures survive restarts and process exits — the device key lives under the node's root
+directory, so a mailbox full of payloads signed by long-gone processes stays attributable.
