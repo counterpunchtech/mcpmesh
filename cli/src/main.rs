@@ -808,7 +808,16 @@ fn run_pair(
             )
         }
         (Some(invite_line), None) => with_daemon(async move |mut client| {
-            let paired = client.pair_as(&invite_line, as_nickname.clone()).await?;
+            // #178: the CLI OFFERS both ceremonies, so it opts in. `allow_self_enroll` exists to
+            // stop an application being walked into an enrollment it never presented; this command
+            // is #86's documented redeemer half (`mcpmesh invite --as-self` on the device that
+            // holds the key, `mcpmesh pair <line>` on the new one), and `render::pair_lines`
+            // already prints the enrollment outcome as its own thing. The person typing this IS
+            // the one deciding, so a flag here would add a step to a shipped flow and guard
+            // nobody. An embedded UI gets the default (refuse) and must ask for itself.
+            let paired = client
+                .pair_opts(&invite_line, as_nickname.clone(), true)
+                .await?;
             if json {
                 println!("{}", mcpmesh::json::pair_json(&paired));
                 return Ok(());

@@ -748,7 +748,15 @@ pub(crate) async fn handle_request(req: &Value, state: &DaemonState) -> Value {
             id,
             "pair",
             with_params(&params, |p: PairParams| {
-                crate::daemon::redeem(state, p.invite_line, p.as_nickname)
+                // #178: the flag is translated into the ceremony vocabulary HERE, once. The
+                // handler and the redeemer take `SelfEnroll`, not a bool, so no site downstream
+                // can pass the wrong polarity of a nameless `true`.
+                let self_enroll = if p.allow_self_enroll {
+                    crate::pairing::SelfEnroll::Allow
+                } else {
+                    crate::pairing::SelfEnroll::Refuse
+                };
+                crate::daemon::redeem(state, p.invite_line, p.as_nickname, self_enroll)
             })
             .await,
         ),

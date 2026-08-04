@@ -245,6 +245,10 @@ async fn four_command_hero_flow() {
             .request(Request::Pair(PairParams {
                 invite_line: invite.invite_line.clone(),
                 as_nickname: None,
+                // An ORDINARY invite, so the #178 consent is irrelevant here — and left at the
+                // safe default on purpose, since the hero flow is exactly the shape an embedder
+                // copies.
+                allow_self_enroll: false,
             }))
             .await
             .expect("pair over mcpmesh-local/1");

@@ -607,6 +607,26 @@ pub struct PairParams {
     /// `<peer>/<service>` routing ambiguous whoever chose it. `api_minor >= 39`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub as_nickname: Option<String>,
+    /// Consent to complete a SELF-ENROLLMENT (#178): a `mcpmesh-enroll:` line is refused with
+    /// [`ERR_SELF_ENROLL_NOT_OFFERED`] unless this is set.
+    ///
+    /// Defaults to `false`, which is the whole point. #86 gave self-enrollment its own scheme so a
+    /// version-skewed redeemer refuses rather than pairing wrongly — but a CURRENT caller that only
+    /// ever meant to pair still ran the ceremony to completion, and learned which one it had run
+    /// from [`PairResult::enrolled_as_self`] only AFTER the device→user binding was written. That
+    /// binding admits this device to everyone who trusts the inviter's `user_id`, and it is
+    /// irrevocable short of rotating that user key — so "observe it afterwards" is not a place a
+    /// caller can refuse from.
+    ///
+    /// Set it when the ceremony is one your UI actually OFFERED ("add another of my devices"). Leave
+    /// it unset on an ordinary "join / add a contact" field: the refusal costs nothing, the invite is
+    /// untouched (nothing is dialled and nothing is burned), and the same line still works if the
+    /// person is then offered the real choice.
+    ///
+    /// To decide BEFORE calling — to show the right prompt rather than recover from a refusal — use
+    /// `mcpmesh::pairing::is_enrollment_line`. `api_minor >= 45`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_self_enroll: bool,
 }
 
 /// Params of [`Request::PeerRemove`]: the nickname to unpair.
@@ -1937,6 +1957,20 @@ pub const ERR_CANCELLED: i64 = -32050;
 /// connection can have outstanding so a buggy client cannot spawn unboundedly.
 pub const ERR_TOO_MANY_INFLIGHT: i64 = -32051;
 
+/// The invite line is a SELF-ENROLLMENT (`mcpmesh-enroll:`) and the caller did not offer that
+/// ceremony — [`PairParams::allow_self_enroll`] was unset (#178).
+///
+/// Decided from the line in hand, BEFORE any dial: nothing was contacted, no secret was revealed,
+/// and the invite is untouched. Like [`ERR_INVITE_EXPIRED`] it therefore reveals nothing about the
+/// inviter and is safe to name precisely.
+///
+/// Distinct from [`ERR_INVITE_REFUSED`] in the direction it points: that one is the inviter turning
+/// US down, this one is US declining a ceremony we were never asked to run. Remedy: if the person
+/// meant to add another of their OWN devices, offer that explicitly and retry the SAME line with
+/// `allow_self_enroll`; otherwise they pasted the wrong link and want an ordinary
+/// `mcpmesh-invite:` one.
+pub const ERR_SELF_ENROLL_NOT_OFFERED: i64 = -32052;
+
 /// How many requests one control connection may have in flight at once (#172), after which it
 /// answers [`ERR_TOO_MANY_INFLIGHT`]. Per connection, not per daemon.
 pub const MAX_INFLIGHT: usize = 32;
@@ -1955,7 +1989,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   thirty have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.44";
+pub const API_VERSION: &str = "1.45";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -2041,7 +2075,17 @@ pub const API_VERSION: &str = "1.44";
 /// refusals — expired line, no live invite, inviter unreachable, id mismatch, name conflict, and
 /// the deliberately-opaque refusal. `ERR_NICKNAME_TAKEN` had been the only coded pairing failure,
 /// so every other one arrived as `-32000` and an embedder could either forward our prose to end
-/// users or substring-match it (#159); to 44 when control responses stopped arriving in REQUEST
+/// users or substring-match it (#159); to 45 with [`PairParams::allow_self_enroll`] +
+/// [`ERR_SELF_ENROLL_NOT_OFFERED`] — `pair` now REFUSES a `mcpmesh-enroll:` line unless the caller
+/// asked for that ceremony. A behaviour change for existing callers, deliberately: at 43-44 a caller
+/// whose UI only ever offered "add a contact" completed a self-enrollment and learned which
+/// ceremony it had run from `enrolled_as_self` afterwards — by which point the device→user binding
+/// was written and irrevocable short of rotating the user key (#178). The refusal is decided from
+/// the line before any dial, so the invite survives it and the same line works once the ceremony is
+/// actually offered. Guard on `>= 45` before sending the field — below it `deny_unknown_fields`
+/// rejects the whole request. Note what the guard means: a daemon BELOW 45 gives a caller no way to
+/// decline, so a UI that does not offer device enrollment should require `>= 45` rather than pair
+/// without it; to 44 when control responses stopped arriving in REQUEST
 /// order and the `blob_fetch_cancel` verb landed (#172). The daemon now dispatches each request
 /// CONCURRENTLY on its connection, so a `blob_fetch` no longer stalls every other verb behind it —
 /// and responses arrive in COMPLETION order. JSON-RPC ids make that legal and the in-tree
@@ -2053,7 +2097,10 @@ pub const API_VERSION: &str = "1.44";
 /// treating [`ERR_CANCELLED`] as unexpected; to 43 with `InviteParams::as_self` — SELF-ENROLLMENT, so one
 /// person's devices share a `user_id` instead of appearing as unrelated strangers (#86). The
 /// ceremony is ordinary pairing; the outcome is a device→user binding rather than a peer row, and
-/// the private key never moves. Guard on `>= 43`; to 42 with the `peer_introduce` + `peer_endorse`
+/// the private key never moves. Guard on `>= 43`. What this entry did NOT say, and 45 fixed: the
+/// distinct scheme closes the version-SKEW hazard (a pre-43 redeemer silently over-granting) and
+/// closes nothing for a CURRENT redeemer, which had no way to decline a ceremony it never offered
+/// (#178); to 42 with the `peer_introduce` + `peer_endorse`
 /// verbs — install a peer from a
 /// SIGNED endorsement by someone you are already paired with, so a small group onboards in O(N)
 /// instead of O(N²) two-human ceremonies (#65). It installs IDENTITY only and grants nothing, which
@@ -2097,7 +2144,7 @@ pub const API_VERSION: &str = "1.44";
 /// its REAL content is a meaning change to `reachable` — the field exists so the new meaning is
 /// observable at all. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 44;
+pub const API_MINOR: u32 = 45;
 
 #[cfg(test)]
 mod tests {
@@ -2816,6 +2863,7 @@ mod tests {
         let r = Request::Pair(PairParams {
             invite_line: "mcpmesh-invite:ABCDEF".into(),
             as_nickname: Some("alice-mbp".into()),
+            allow_self_enroll: true,
         });
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["method"], "pair");
@@ -2824,10 +2872,22 @@ mod tests {
             v["params"]["as_nickname"], "alice-mbp",
             "#87: the redeemer's local alias for the inviter must reach the wire"
         );
+        assert_eq!(
+            v["params"]["allow_self_enroll"], true,
+            "#178: the caller's consent to a self-enrollment must reach the wire — the daemon \
+             refuses the ceremony without it"
+        );
         // An OLD caller's payload — no alias — must still decode. The field is additive.
         let legacy: PairParams =
             serde_json::from_value(serde_json::json!({"invite_line": "x"})).unwrap();
         assert_eq!(legacy.as_nickname, None);
+        // #178: and the consent defaults to REFUSING. A caller that predates the field, or one that
+        // simply never set it, must not be read as having offered a device enrollment — that is the
+        // whole guard, and a `#[serde(default)]` flipping to `true` would silently remove it.
+        assert!(
+            !legacy.allow_self_enroll,
+            "an absent allow_self_enroll must default to false (refuse), never to true"
+        );
         assert_eq!(serde_json::from_value::<Request>(v).unwrap(), r);
         // method_of resolves the tag generically (no per-variant arm).
         assert_eq!(

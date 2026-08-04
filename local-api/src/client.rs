@@ -322,10 +322,32 @@ impl ControlClient {
         invite_line: &str,
         as_nickname: Option<String>,
     ) -> Result<PairResult, ClientError> {
+        self.pair_opts(invite_line, as_nickname, false).await
+    }
+
+    /// Redeem an invite, stating whether a SELF-ENROLLMENT is a ceremony you offered (#178).
+    ///
+    /// [`pair`](Self::pair) and [`pair_as`](Self::pair_as) pass `false`, so a `mcpmesh-enroll:` line
+    /// pasted into an ordinary "join" field is refused with
+    /// [`ERR_SELF_ENROLL_NOT_OFFERED`](crate::ERR_SELF_ENROLL_NOT_OFFERED) before anything is
+    /// dialled — the invite survives, so the same line still works once the person is offered the
+    /// real choice. Pass `true` only from a path that actually means "add another of my own
+    /// devices": the ceremony writes a device→user binding that is irrevocable short of rotating
+    /// the user key.
+    ///
+    /// `mcpmesh::pairing::is_enrollment_line` answers which kind of line you are holding without
+    /// dialling, for a UI that wants to PROMPT rather than recover from a refusal.
+    pub async fn pair_opts(
+        &mut self,
+        invite_line: &str,
+        as_nickname: Option<String>,
+        allow_self_enroll: bool,
+    ) -> Result<PairResult, ClientError> {
         self.request_typed(
             Request::Pair(PairParams {
                 invite_line: invite_line.to_string(),
                 as_nickname,
+                allow_self_enroll,
             }),
             "pair result",
         )

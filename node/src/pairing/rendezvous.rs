@@ -51,7 +51,7 @@ use mcpmesh_net::framing::{FrameReader, Inbound, write_frame};
 
 use crate::allowlist::{PeerEntry, PeerStore};
 use crate::pairing::sas::short_auth_code;
-use crate::pairing::{Invite, LiveInvites, Redeem};
+use crate::pairing::{Invite, LiveInvites, Redeem, SelfEnroll};
 use crate::util::epoch_now_u64 as epoch_now;
 
 /// Frame cap for the pair rendezvous. The redeemer's hello is a tiny JSON object (two 32-byte
@@ -909,8 +909,9 @@ async fn send_reply(
 /// that reaches a swapped address never reveals the bearer credential to the wrong peer.
 ///
 /// [`grant_service_access`]: crate::daemon::grant_service_access
-// Eight collaborators, each a distinct capability the redeemer needs (endpoint, our name, the line,
-// our alias for them, the adopt hook, the store, our binding, the grant-back hook). A params struct
+// Nine collaborators, each a distinct capability the redeemer needs (endpoint, our name, the line,
+// our alias for them, whether we offered self-enrollment, the adopt hook, the store, our binding,
+// the grant-back hook). A params struct
 // would rename them without reducing them, and the signature is pinned by the integration tests.
 #[allow(clippy::too_many_arguments)]
 pub async fn redeem_invite(
@@ -920,6 +921,9 @@ pub async fn redeem_invite(
     // #87: OUR local name for the inviter, overriding the one its invite suggests. Local only —
     // never sent, and it does not bypass the squat check below.
     as_nickname: Option<String>,
+    // #178: which ceremony this caller is willing to complete. REQUIRED — see [`SelfEnroll`] for
+    // why it is not defaulted.
+    self_enroll: SelfEnroll,
     // #86: install an adopted self-enrollment binding. `None` = a caller that cannot persist one
     // (a fixture), in which case a self-enrollment still verifies but is not retained.
     adopt_binding: Option<AdoptBindingFn>,
@@ -928,6 +932,23 @@ pub async fn redeem_invite(
     grant_back: Option<GrantBackFn>,
 ) -> anyhow::Result<PairResult> {
     let invite = Invite::decode(&invite_line)?;
+    // #178: refuse a ceremony the caller never offered, HERE — before the nickname check, before
+    // the dial, before the secret is on the wire. The outcome of a self-enrollment is a device→user
+    // binding admitting this device to everyone who trusts the inviter's `user_id`, and #86 gives
+    // no revocation short of rotating that user key. So it cannot be a thing a caller observes
+    // afterwards on `enrolled_as_self` and declines: by then it is done.
+    //
+    // Refusing before the dial is what keeps the invite USABLE. Nothing is contacted and nothing is
+    // burned, so the identical line still works the moment the person is offered the real choice —
+    // a refusal here costs a round trip, not the credential.
+    if invite.as_self && self_enroll == SelfEnroll::Refuse {
+        bail!(PairRefusal::new(
+            mcpmesh_local_api::ERR_SELF_ENROLL_NOT_OFFERED,
+            "this is a device-enrollment link, not a pairing invite: redeeming it would make this \
+             device another device of that person's identity, which this application did not offer \
+             — retry with allow_self_enroll if that is what you meant",
+        ));
+    }
     // ONE binding for the name we will use everywhere below — the squat check, the stored entry,
     // the grant-back display name, and the result. Computing it per-site is how a check ends up
     // running against a different name than the one written.
@@ -1471,6 +1492,7 @@ mod tests {
             "me".into(),
             expired.encode(),
             None,
+            SelfEnroll::Refuse,
             None,
             store(),
             None,
@@ -1502,6 +1524,7 @@ mod tests {
             "me".into(),
             named.encode(),
             None,
+            SelfEnroll::Refuse,
             None,
             s.clone(),
             None,
@@ -1524,6 +1547,7 @@ mod tests {
             "me".into(),
             named.encode(),
             Some("their-laptop".into()),
+            SelfEnroll::Refuse,
             None,
             s.clone(),
             None,
@@ -1546,6 +1570,7 @@ mod tests {
             "me".into(),
             fresh.encode(),
             Some("taken".into()),
+            SelfEnroll::Refuse,
             None,
             s,
             None,
@@ -1568,6 +1593,7 @@ mod tests {
             "me".into(),
             dead.encode(),
             None,
+            SelfEnroll::Refuse,
             None,
             store(),
             None,
@@ -1584,6 +1610,112 @@ mod tests {
             e.to_string().contains("dial the inviter"),
             "and its MESSAGE must stay the string the porcelain matches on to explain a \
              self-redeem — rewording it made that branch dead code (#159 gate): {e}"
+        );
+    }
+
+    /// #178: an enrollment line is refused when the caller did not offer that ceremony — and the
+    /// refusal happens BEFORE the dial.
+    ///
+    /// The two halves are one test on purpose, because each alone is satisfiable by a wrong
+    /// implementation:
+    ///
+    /// - Asserting only the refusal is satisfied by refusing enrollment lines outright, which
+    ///   breaks #86. So the SAME line under `Allow` must get past the guard.
+    /// - Asserting only "it errors" proves nothing about ORDER — every path through this function
+    ///   errors on an undialable inviter. `sample_invite_for` names an id-only address on the
+    ///   Minimal preset, so a line that reaches the dial fails with `ERR_INVITER_UNREACHABLE`.
+    ///   Getting `ERR_SELF_ENROLL_NOT_OFFERED` instead is what proves nothing was contacted.
+    ///
+    /// Order is the security property, not a nicety: past the dial the secret is on the wire and
+    /// the invite is burned, so a refusal there would cost the credential. Moving the guard below
+    /// the `connect` flips this test's first code to `ERR_INVITER_UNREACHABLE`.
+    #[tokio::test]
+    async fn an_unoffered_self_enrollment_is_refused_before_the_dial() {
+        use mcpmesh_local_api as api;
+        let code_of = |e: &anyhow::Error| e.downcast_ref::<PairRefusal>().map(|r| r.code());
+        let store = || {
+            std::sync::Arc::new(
+                crate::allowlist::PeerStore::open(
+                    &tempfile::tempdir().unwrap().keep().join("s.redb"),
+                )
+                .unwrap(),
+            )
+        };
+        let ep = || async {
+            iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .bind()
+                .await
+                .unwrap()
+        };
+        let inviter = iroh::SecretKey::from_bytes(&[43u8; 32]).public();
+
+        let mut enroll = sample_invite_for(inviter, 9_999_999_999);
+        enroll.as_self = true;
+        enroll.services = vec![]; // an enrollment grants nothing
+        let line = enroll.encode();
+
+        let e = redeem_invite(
+            ep().await,
+            "me".into(),
+            line.clone(),
+            None,
+            SelfEnroll::Refuse,
+            None,
+            store(),
+            None,
+            None,
+        )
+        .await
+        .expect_err("an enrollment line must be refused when the caller did not offer it");
+        assert_eq!(
+            code_of(&e),
+            Some(api::ERR_SELF_ENROLL_NOT_OFFERED),
+            "the guard must own its own code — and getting ERR_INVITER_UNREACHABLE here would \
+             mean we dialled first, revealing the secret before deciding: {e:#}"
+        );
+
+        // The SAME line, offered: past the guard, so it now fails on the undialable inviter like
+        // any other invite. Without this the guard could be a blanket refusal of every
+        // `mcpmesh-enroll:` line — which passes the assertion above and breaks #86 entirely.
+        let e = redeem_invite(
+            ep().await,
+            "me".into(),
+            line,
+            None,
+            SelfEnroll::Allow,
+            None,
+            store(),
+            None,
+            None,
+        )
+        .await
+        .expect_err("the sample inviter is undialable, so this still fails — just not on consent");
+        assert_eq!(
+            code_of(&e),
+            Some(api::ERR_INVITER_UNREACHABLE),
+            "with the ceremony offered, the guard must be OUT of the way: {e:#}"
+        );
+
+        // And the guard must not touch an ORDINARY invite: `Refuse` is the default every embedder
+        // gets, so if it refused plain pairing lines it would break every caller.
+        let plain = sample_invite_for(inviter, 9_999_999_999);
+        let e = redeem_invite(
+            ep().await,
+            "me".into(),
+            plain.encode(),
+            None,
+            SelfEnroll::Refuse,
+            None,
+            store(),
+            None,
+            None,
+        )
+        .await
+        .expect_err("still undialable");
+        assert_eq!(
+            code_of(&e),
+            Some(api::ERR_INVITER_UNREACHABLE),
+            "an ordinary invite must be unaffected by the self-enrollment guard: {e:#}"
         );
     }
 
