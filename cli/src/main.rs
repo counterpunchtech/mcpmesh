@@ -219,6 +219,15 @@ enum Cmd {
         #[command(subcommand)]
         command: IdentityCmd,
     },
+    /// Get a replacement machine admitted by the peers you already pair with (#85).
+    ///
+    /// After `mcpmesh identity import` restores your identity on new hardware, your peers still do
+    /// not know that machine — they authorize per device. This is how it gets in, without an
+    /// in-person ceremony with each of them.
+    Attest {
+        #[command(subcommand)]
+        command: AttestCmd,
+    },
     /// Mark a device DEAD — locally, or with a signed statement your peers can apply (#85).
     ///
     /// Not the same as `pair --remove`. Removal says "we are not working together"; a re-pair
@@ -329,6 +338,24 @@ enum IdentityCmd {
         /// machine currently presents — irreversibly, unless you have THAT key's phrase too.
         #[arg(long)]
         replace: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum AttestCmd {
+    /// Print a `mcpmesh-attest:` line for another of YOUR devices to dial.
+    ///
+    /// Run this on a node that already pairs with you. It carries nothing secret — just where to
+    /// reach this node — and only works if this node has `[identity].admit_attested_devices` on.
+    Offer,
+    /// Present this device's identity to a peer, using their `mcpmesh-attest:` line.
+    ///
+    /// They admit this machine only if they already pair with you, have opted in, and have not
+    /// revoked it. Nothing here can get a stranger in.
+    #[command(name = "to")]
+    To {
+        /// The `mcpmesh-attest:...` line. Omit to read from stdin.
+        offer: Option<String>,
     },
 }
 
@@ -670,6 +697,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Some(Cmd::Identity {
             command: IdentityCmd::Import { phrase, replace },
         }) => enrollcmd::run_identity_import(phrase, replace, cli.json),
+        Some(Cmd::Attest {
+            command: AttestCmd::Offer,
+        }) => enrollcmd::run_attest_offer(cli.json),
+        Some(Cmd::Attest {
+            command: AttestCmd::To { offer },
+        }) => enrollcmd::run_attest_to(offer, cli.json),
         Some(Cmd::Revoke {
             command: RevokeCmd::Peer { peer, reason },
         }) => enrollcmd::run_revoke_peer(peer, reason, cli.json),

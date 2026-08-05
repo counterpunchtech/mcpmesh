@@ -524,4 +524,28 @@ impl Node {
             .mesh()
             .expect("a started Node always owns a mesh")
     }
+
+    /// Present this device's binding to a peer that already pairs with this person (#85 ask 3).
+    ///
+    /// The recovery path's second half. `identity import` (0.42.0) restores the `b64u:` a person's
+    /// peers pinned; this is what gets the machine holding it ADMITTED, without the in-person SAS
+    /// ceremony with everyone they ever paired with that #85 filed against.
+    ///
+    /// `offer` is a `mcpmesh-attest:` line the ADMITTING node mints (`attest_offer`) — a restored
+    /// device holds no rows, so it has no other way to find anyone.
+    ///
+    /// The peer admits this device only if it already holds a row for this person's `user_id`, has
+    /// `[identity].admit_attested_devices` on, and does not have this endpoint revoked. It cannot
+    /// admit a stranger.
+    pub async fn attest_to(&self, offer: &str) -> anyhow::Result<mcpmesh_local_api::PairResult> {
+        let mesh = self.mesh();
+        crate::pairing::rendezvous::attest_to(
+            mesh.endpoint.clone(),
+            offer.to_string(),
+            mesh.store.clone(),
+            mesh.self_binding(),
+            None,
+        )
+        .await
+    }
 }

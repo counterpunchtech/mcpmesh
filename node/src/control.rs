@@ -712,6 +712,16 @@ pub(crate) async fn handle_request(req: &Value, state: &DaemonState) -> Value {
         // Rename a contact's nickname (Contacts rename): the person's `user_id` (or a
         // provisional `nickname`) + the new nickname `to`. `rename_peer` guards the collision
         // (no inheriting another identity's grants), rewrites allow lists, and reloads.
+        // #85 ask 3 — device attestation. `attest_offer` says where another of this person's
+        // devices should dial; `attest_to` runs the ceremony from the device being admitted.
+        Some("attest_offer") => {
+            respond(id, "attest_offer", crate::daemon::attest_offer(state).await)
+        }
+        Some("attest_to") => respond(
+            id,
+            "attest_to",
+            with_params(&params, |p| crate::daemon::attest_to(state, p)).await,
+        ),
         // #85 ask 4 — pairing-mode revocation. `peer_revoke` is an operator's LOCAL decision about
         // someone else's device; `device_revoke` signs a portable statement about one of THIS
         // person's own. Deliberately distinct from `peer_remove`: removal is routine and
@@ -1426,6 +1436,26 @@ pub(crate) fn status_result(state: &DaemonState) -> Result<StatusResult> {
                         .find(|e| e.endpoint_id == r.endpoint_id)
                         .map(|e| e.nickname.clone()),
                 })
+                // …plus revoked IDENTITIES (#85 ask 3 gate). These have no endpoint of their own —
+                // they refuse every device of a person, including ones this node has never seen —
+                // so they are rendered with the `b64u:` as the principal. Without them `status`
+                // would show an operator who revoked a PERSON nothing but the devices that
+                // happened to be known at the time, which is the misunderstanding that made
+                // endpoint-only revocation look sufficient.
+                .chain(
+                    mesh.store
+                        .list_revoked_users()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|(uid, r)| mcpmesh_local_api::RevokedEndpoint {
+                            principal: uid,
+                            revoked_at_epoch: r.revoked_at,
+                            source: r.source,
+                            signer_user_id: r.signer_user_id,
+                            reason: r.reason,
+                            nickname: None,
+                        }),
+                )
                 .collect()
         })
         .unwrap_or_default();

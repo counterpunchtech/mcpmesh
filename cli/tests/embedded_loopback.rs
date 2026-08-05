@@ -1330,3 +1330,543 @@ async fn the_revocation_verbs_round_trip_through_the_control_socket() {
     a.shutdown().await;
     b.shutdown().await;
 }
+
+/// #85 ask 3 END TO END: a machine restored from a recovery phrase is admitted by a peer that
+/// already pairs with that person, with no fresh SAS ceremony — and can then actually be reached.
+///
+/// This is the half #85 filed against. Ask 2 (0.42.0) restores the `b64u:` peers pinned; on its own
+/// that machine is still a complete stranger, because `PeerEntry.user_id` is written once at
+/// pairing and never refreshed. Recovery meant an in-person ceremony with everyone.
+///
+/// The final assertion is a real MCP session, not the presence of a row: "admitted" means the gate
+/// resolves it and a service serves it. A test that stopped at the row would pass on an
+/// implementation that wrote one the gate never honoured.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_device_restored_from_a_recovery_phrase_is_admitted_by_attestation() {
+    let admits = Config::from_toml_str(
+        "[network]\nrelay_mode = \"disabled\"\n[identity]\nadmit_attested_devices = true\n",
+    )
+    .expect("valid config");
+
+    let (a_root, b_root, c_root) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    // A admits attested devices; B is the person whose laptop dies; C is the replacement.
+    let a = NodeBuilder::new(a_root.path())
+        .config(admits)
+        .start()
+        .await
+        .expect("a starts");
+    let b = NodeBuilder::new(b_root.path())
+        .config(hermetic())
+        .start()
+        .await
+        .expect("b starts");
+    let mut a_ctl = a.control().await.expect("a control");
+    let mut b_ctl = b.control().await.expect("b control");
+    // DISTINCT nicknames. Every in-process node otherwise defaults to the same hostname-derived
+    // name, which made the reply-nickname assertion below unfalsifiable — the 0.46.0 gate found the
+    // reply carrying the admitter's name for the ATTESTER's person and the test unable to see it.
+    a_ctl.set_nickname("alice-node").await.expect("rename a");
+    b_ctl.set_nickname("bob-node").await.expect("rename b");
+
+    a_ctl
+        .register_service_with(
+            "notes",
+            mcpmesh_local_api::BackendSpec::Socket {
+                path: a_root.path().join("notes.sock").display().to_string(),
+            },
+            vec![],
+            true,
+        )
+        .await
+        .expect("register notes");
+    let invite = a_ctl.invite(vec!["notes".into()]).await.expect("invite");
+    let paired = timeout(Duration::from_secs(30), b_ctl.pair(&invite.invite_line))
+        .await
+        .expect("pair within 30s")
+        .expect("pair");
+    let b_user_id = a_ctl
+        .status()
+        .await
+        .expect("status")
+        .peers
+        .first()
+        .and_then(|p| p.user_id.clone())
+        .expect("a stored b's self-sovereign user_id at pairing");
+
+    // B's laptop dies. Its identity moves to C by recovery phrase — ask 2's whole purpose.
+    let phrase = b_ctl
+        .user_key_export()
+        .await
+        .expect("export")
+        .recovery_phrase;
+    let c = NodeBuilder::new(c_root.path())
+        .config(hermetic())
+        .start()
+        .await
+        .expect("c starts");
+    let mut c_ctl = c.control().await.expect("c control");
+    let imported = c_ctl
+        .user_key_import(&phrase, true)
+        .await
+        .expect("import the phrase on the replacement machine");
+    assert_eq!(
+        imported.user_id, b_user_id,
+        "precondition: c presents the SAME identity a pinned — without this the attestation below \
+         would be testing nothing"
+    );
+
+    // …and yet a does not know c at all. This is the gap #85 filed.
+    assert!(
+        !a_ctl
+            .status()
+            .await
+            .expect("status")
+            .peers
+            .iter()
+            .any(|p| p.principal.as_deref() == Some(&format!("eid:{}", c.endpoint_id()))),
+        "precondition: a has no row for c before the attestation"
+    );
+
+    // The ceremony. `attest_offer` is how c learns where to dial — it holds no rows.
+    let offer = a_ctl.attest_offer().await.expect("a mints an offer").offer;
+    assert!(offer.starts_with("mcpmesh-attest:"), "offer: {offer}");
+    // Driven through the CONTROL SOCKET, not `Node::attest_to` — 0.45.0's gate renamed four
+    // dispatch arms and left the whole suite green, because every test called the handlers
+    // directly. The CLI and every embedder reach this verb by its method string.
+    let result = timeout(Duration::from_secs(30), c_ctl.attest_to(&offer))
+        .await
+        .expect("attest within 30s")
+        .expect("a peer that already pairs with this person admits another of their devices");
+    assert!(
+        result.sas_code.is_empty(),
+        "no SAS is shown — a fabricated code would tell the operator a number that verified nothing"
+    );
+    assert_eq!(
+        result.peer_nickname, "alice-node",
+        "the reply must carry the ADMITTER's own name, not its name for the attester's person — \
+         otherwise `attest to` reports \"Admitted by bob\" on bob's own machine, and attesting to \
+         several peers files them all under one nickname"
+    );
+
+    // a now holds c, as the SAME person: same user_id, same nickname, and b's services.
+    let st = a_ctl.status().await.expect("status");
+    let c_principal = format!("eid:{}", c.endpoint_id());
+    let row = st
+        .peers
+        .iter()
+        .find(|p| p.principal.as_deref() == Some(&c_principal))
+        .expect("a admitted c");
+    assert_eq!(
+        row.user_id.as_deref(),
+        Some(b_user_id.as_str()),
+        "the new device must resolve to the SAME person — that is what makes grants follow"
+    );
+    assert_eq!(
+        row.name, "bob-node",
+        "…under the SAME nickname a already used for that person — nicknames here are per-person, \
+         and a distinct one per node is what makes this assertion able to fail"
+    );
+    // NOT asserted here: `PeerInfo.services`. It mirrors `PeerEntry.services`, which the pairing
+    // path only ever carries over from a pre-existing row — so it is empty for both b and c, and an
+    // assertion on it would be measuring bookkeeping. What actually authorizes is below.
+    assert_eq!(
+        row.services,
+        st.peers
+            .iter()
+            .find(|p| p.name == paired.peer_nickname && p.principal != row.principal)
+            .map(|p| p.services.clone())
+            .unwrap_or_default(),
+        "the new device is bookkept exactly like the existing one — same person, same row shape"
+    );
+
+    // The reason attestation works at all, and worth naming because it is not obvious: the pairing
+    // grant is appended keyed on the person's `b64u:` (#38 — stable principals, never nicknames),
+    // and the new device presents that SAME user_id. So it inherits exactly the person's access —
+    // no more — with nothing to copy across. Were grants keyed on the device `eid:`, an attested
+    // machine would be admitted and then forbidden, which is the failure the session below catches.
+
+    // THE assertion: a real session. A row the gate does not honour is not admission.
+    let opened = timeout(
+        Duration::from_secs(30),
+        c_ctl.open_session(paired.peer_nickname.clone(), "notes".to_string()),
+    )
+    .await
+    .expect("open_session within 30s")
+    .map(|_| ())
+    .map_err(|e| format!("{e}"));
+    assert!(
+        opened.is_ok(),
+        "the restored device must be able to REACH the peer that admitted it — a row the gate does \
+         not honour is not admission: {opened:?}"
+    );
+
+    a.shutdown().await;
+    b.shutdown().await;
+    c.shutdown().await;
+}
+
+/// #85 ask 3 — the four refusals. Each one is the whole authorization argument for this ceremony.
+///
+/// A ceremony that admits a device on the strength of a signature has exactly four things standing
+/// between it and "anyone can join": the opt-in, the binding verifying against the AUTHENTICATED
+/// endpoint, the revocation list, and the requirement that we already pair with that person. Each
+/// is tested here against a node that is otherwise willing.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_attestation_is_refused_unless_every_condition_holds() {
+    let admits = || {
+        Config::from_toml_str(
+            "[network]\nrelay_mode = \"disabled\"\n[identity]\nadmit_attested_devices = true\n",
+        )
+        .expect("valid config")
+    };
+
+    // ---- (1) OFF BY DEFAULT.
+    //
+    // The node here PAIRS with the person and holds a row for their user_id, so every OTHER check
+    // passes and the opt-in is the only thing refusing. An earlier version of this block used an
+    // unpaired node, which meant the `user_id`-must-exist check refused first — so deleting the
+    // opt-in left the test GREEN. Caught by running that mutation.
+    {
+        let (a_root, b_root, c_root) = (
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        );
+        let a = NodeBuilder::new(a_root.path())
+            .config(hermetic()) // knob OFF
+            .start()
+            .await
+            .expect("a starts");
+        let b = NodeBuilder::new(b_root.path())
+            .config(hermetic())
+            .start()
+            .await
+            .expect("b starts");
+        let mut a_ctl = a.control().await.expect("a control");
+        let mut b_ctl = b.control().await.expect("b control");
+        a_ctl
+            .register_service_with(
+                "notes",
+                mcpmesh_local_api::BackendSpec::Socket {
+                    path: a_root.path().join("notes.sock").display().to_string(),
+                },
+                vec![],
+                true,
+            )
+            .await
+            .expect("register");
+        let invite = a_ctl.invite(vec!["notes".into()]).await.expect("invite");
+        timeout(Duration::from_secs(30), b_ctl.pair(&invite.invite_line))
+            .await
+            .expect("pair within 30s")
+            .expect("pair");
+
+        let e = a_ctl
+            .attest_offer()
+            .await
+            .expect_err("a node that does not admit attested devices must not mint an offer");
+        assert!(
+            format!("{e}").contains("admit_attested_devices"),
+            "the refusal must name the knob: {e}"
+        );
+
+        // The person's replacement device, holding the RIGHT identity — so only the opt-in stands
+        // between it and admission.
+        let phrase = b_ctl
+            .user_key_export()
+            .await
+            .expect("export")
+            .recovery_phrase;
+        let c = NodeBuilder::new(c_root.path())
+            .config(hermetic())
+            .start()
+            .await
+            .expect("c starts");
+        let mut c_ctl = c.control().await.expect("c control");
+        c_ctl.user_key_import(&phrase, true).await.expect("import");
+
+        let offer = mcpmesh_node::pairing::rendezvous::AttestOffer {
+            node_id: *a.endpoint_id().as_bytes(),
+            node_addr_json: serde_json::to_string(&a.endpoint_addr()).unwrap(),
+        }
+        .encode()
+        .unwrap();
+        assert!(
+            timeout(Duration::from_secs(30), c.attest_to(&offer))
+                .await
+                .expect("the ceremony must not hang")
+                .is_err(),
+            "a node with the knob off must refuse a device it would otherwise admit — every other \
+             condition holds here, so the opt-in is the only thing saying no"
+        );
+        assert!(
+            !a_ctl
+                .status()
+                .await
+                .expect("status")
+                .peers
+                .iter()
+                .any(|p| p.principal.as_deref() == Some(&format!("eid:{}", c.endpoint_id()))),
+            "…and nothing may be written"
+        );
+        a.shutdown().await;
+        b.shutdown().await;
+        c.shutdown().await;
+    }
+
+    // ---- (2) A STRANGER's identity is refused, however valid its binding.
+    // ---- (3) A REVOKED endpoint is refused, even holding a binding to a person we DO pair with.
+    {
+        let (a_root, b_root, c_root, s_root) = (
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        );
+        let a = NodeBuilder::new(a_root.path())
+            .config(admits())
+            .start()
+            .await
+            .expect("a starts");
+        let b = NodeBuilder::new(b_root.path())
+            .config(hermetic())
+            .start()
+            .await
+            .expect("b starts");
+        let mut a_ctl = a.control().await.expect("a control");
+        let mut b_ctl = b.control().await.expect("b control");
+        a_ctl
+            .register_service_with(
+                "notes",
+                mcpmesh_local_api::BackendSpec::Socket {
+                    path: a_root.path().join("notes.sock").display().to_string(),
+                },
+                vec![],
+                true,
+            )
+            .await
+            .expect("register");
+        let invite = a_ctl.invite(vec!["notes".into()]).await.expect("invite");
+        timeout(Duration::from_secs(30), b_ctl.pair(&invite.invite_line))
+            .await
+            .expect("pair within 30s")
+            .expect("pair");
+        let offer = a_ctl.attest_offer().await.expect("offer").offer;
+
+        // (2) A stranger: a node with its OWN user key, which a has never seen.
+        let stranger = NodeBuilder::new(s_root.path())
+            .config(hermetic())
+            .start()
+            .await
+            .expect("stranger starts");
+        let mut s_ctl = stranger.control().await.expect("stranger control");
+        // Force a user key into existence so the stranger has a real binding to present — without
+        // one it would be refused for the WRONG reason and this test would prove nothing.
+        s_ctl
+            .user_key_export()
+            .await
+            .expect("stranger has a user key");
+        let e = timeout(Duration::from_secs(30), stranger.attest_to(&offer))
+            .await
+            .expect("no hang")
+            .expect_err("an identity this node has never paired with must be refused");
+        assert!(
+            format!("{e:#}").contains("refused"),
+            "generic refusal, so a caller cannot probe which check failed: {e:#}"
+        );
+        assert!(
+            !a_ctl
+                .status()
+                .await
+                .expect("status")
+                .peers
+                .iter()
+                .any(|p| p.principal.as_deref()
+                    == Some(&format!("eid:{}", stranger.endpoint_id()))),
+            "…and nothing may be written for a stranger — attestation is not a pairing mechanism"
+        );
+        stranger.shutdown().await;
+
+        // (3) A revoked device of a person we DO pair with.
+        let phrase = b_ctl
+            .user_key_export()
+            .await
+            .expect("export")
+            .recovery_phrase;
+        let c = NodeBuilder::new(c_root.path())
+            .config(hermetic())
+            .start()
+            .await
+            .expect("c starts");
+        let mut c_ctl = c.control().await.expect("c control");
+        c_ctl.user_key_import(&phrase, true).await.expect("import");
+        let c_principal = format!("eid:{}", c.endpoint_id());
+        a_ctl
+            .peer_revoke(&c_principal, Some("stolen before it ever attested".into()))
+            .await
+            .expect("a revokes c up front");
+
+        let e = timeout(Duration::from_secs(30), c.attest_to(&offer))
+            .await
+            .expect("no hang")
+            .expect_err("a REVOKED endpoint must be refused even with a valid binding");
+        // Cut at the ACCEPT layer (0.45.0), before the ceremony runs — so it surfaces as the same
+        // close a node with no live invite sends, not as a `Refused` frame. That is deliberate: a
+        // revoked device learning it was refused *for being revoked* is a disclosure with no
+        // upside, and the two cases being indistinguishable is the point.
+        let msg = format!("{e:#}");
+        assert!(
+            msg.contains("no pairing in progress") || msg.contains("refused"),
+            "a revoked endpoint must be cut, in a way it cannot distinguish from a closed door: \
+             {msg}"
+        );
+        assert!(
+            !a_ctl
+                .status()
+                .await
+                .expect("status")
+                .peers
+                .iter()
+                .any(|p| p.principal.as_deref() == Some(&c_principal)),
+            "a revoked device must not walk back in by attestation — this is the ask-4 interlock, \
+             and the reason revocation shipped first"
+        );
+
+        // …and once the revocation is lifted, the same ceremony succeeds. Without this the test
+        // above would pass on a node that refused every attestation for any reason.
+        a_ctl.peer_unrevoke(&c_principal).await.expect("unrevoke");
+        timeout(Duration::from_secs(30), c.attest_to(&offer))
+            .await
+            .expect("no hang")
+            .expect("the same device is admitted once the revocation is lifted");
+
+        a.shutdown().await;
+        b.shutdown().await;
+        c.shutdown().await;
+    }
+}
+
+/// #85 ask 3 — revoking the PERSON keeps their stolen laptop out, on any endpoint id.
+///
+/// **The 0.46.0 gate proved the first cut did not do this**, and it is the feature's whole safety
+/// story. Revocation was keyed on the endpoint id; attestation authorizes on the person. A thief
+/// holding the stolen machine holds the USER KEY — that is exactly what `identity export`/`import`
+/// moves — so they mint a brand-new endpoint id, sign a fresh binding over it, and the endpoint
+/// check never sees an id it knows. In the probe the admitted device opened a live MCP session.
+///
+/// The CLI has always said `revoke peer <b64u:>` revokes "EVERY device you know of that person's,
+/// which is what you want". The gap was "you know of": now it revokes the identity too, so devices
+/// this node has never seen are refused as well.
+#[tokio::test(flavor = "multi_thread")]
+async fn revoking_a_person_keeps_their_new_devices_out_too() {
+    let admits = Config::from_toml_str(
+        "[network]\nrelay_mode = \"disabled\"\n[identity]\nadmit_attested_devices = true\n",
+    )
+    .expect("valid config");
+    let (a_root, b_root, c_root) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    let a = NodeBuilder::new(a_root.path())
+        .config(admits)
+        .start()
+        .await
+        .expect("a starts");
+    let b = NodeBuilder::new(b_root.path())
+        .config(hermetic())
+        .start()
+        .await
+        .expect("b starts");
+    let mut a_ctl = a.control().await.expect("a control");
+    let mut b_ctl = b.control().await.expect("b control");
+    a_ctl
+        .register_service_with(
+            "notes",
+            mcpmesh_local_api::BackendSpec::Socket {
+                path: a_root.path().join("notes.sock").display().to_string(),
+            },
+            vec![],
+            true,
+        )
+        .await
+        .expect("register");
+    let invite = a_ctl.invite(vec!["notes".into()]).await.expect("invite");
+    timeout(Duration::from_secs(30), b_ctl.pair(&invite.invite_line))
+        .await
+        .expect("pair within 30s")
+        .expect("pair");
+    let b_user_id = a_ctl
+        .status()
+        .await
+        .expect("status")
+        .peers
+        .first()
+        .and_then(|p| p.user_id.clone())
+        .expect("a stored b's user_id");
+    let offer = a_ctl.attest_offer().await.expect("offer").offer;
+
+    // A revokes the PERSON — the documented remedy for "their laptop was stolen".
+    a_ctl
+        .peer_revoke(&b_user_id, Some("laptop stolen".into()))
+        .await
+        .expect("revoke the person");
+
+    // The thief has the disk, so they have the user key. They put it on a machine with a
+    // completely different endpoint id and attest. THIS is the scenario the endpoint-keyed check
+    // could not see.
+    let phrase = b_ctl
+        .user_key_export()
+        .await
+        .expect("export")
+        .recovery_phrase;
+    let thief = NodeBuilder::new(c_root.path())
+        .config(hermetic())
+        .start()
+        .await
+        .expect("thief starts");
+    let mut thief_ctl = thief.control().await.expect("thief control");
+    thief_ctl
+        .user_key_import(&phrase, true)
+        .await
+        .expect("the thief holds the user key");
+    let thief_principal = format!("eid:{}", thief.endpoint_id());
+
+    let err = timeout(Duration::from_secs(30), thief_ctl.attest_to(&offer))
+        .await
+        .expect("no hang")
+        .expect_err(
+            "a revoked PERSON must not get in on a fresh endpoint id — endpoint revocation alone \
+             is a list of the ids the attacker will not reuse",
+        );
+    let _ = err;
+    assert!(
+        !a_ctl
+            .status()
+            .await
+            .expect("status")
+            .peers
+            .iter()
+            .any(|p| p.principal.as_deref() == Some(&thief_principal)),
+        "nothing may be written for a revoked identity"
+    );
+
+    // The control: lifting the identity revocation lets the same device in. Without this the test
+    // would pass on a node that refused every attestation for any reason.
+    a_ctl
+        .peer_unrevoke(&b_user_id)
+        .await
+        .expect("lift the identity revocation");
+    timeout(Duration::from_secs(30), thief_ctl.attest_to(&offer))
+        .await
+        .expect("no hang")
+        .expect("once the person is trusted again, the same device is admitted");
+
+    a.shutdown().await;
+    b.shutdown().await;
+    thief.shutdown().await;
+}

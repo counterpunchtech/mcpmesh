@@ -171,6 +171,7 @@ Methods split into two groups by audience:
 | `peer_endorse` | `{subject, subject_user_id?}` — **produce** an endorsement of a peer for someone else to redeem (#65, `api_minor >= 42`). Signs with your user key; it changes nothing about your own trust in the subject. Hand both result fields to the recipient. | `{endorsed_by, evidence}` |
 | `peer_introduce` | `{subject, endorsed_by, evidence, subject_user_id?, subject_binding?, nickname}` — install a peer from a **signed endorsement** by someone you are already paired with (#65, `api_minor >= 42`). Onboards a small group in O(N) instead of O(N²) two-human ceremonies. **It installs IDENTITY, not authorization**: service access stays principal-keyed in config (#38) and an explicit, separate act. `endorsed_by` must be the `user_id` of a peer you are **currently paired** with, so the chain terminates at a ceremony you performed yourself — unpairing them revokes their power to introduce, even though the signature stays cryptographically valid, and an **introduced peer cannot introduce others**. `subject_user_id` requires `subject_binding` (the subject's OWN device→user binding): a `user_id` is authorization-bearing and public, so an endorser alone must not be able to attach one. Refused for: an unpaired endorser, a signature naming a different subject, your own endpoint id, a peer you are **already paired with** (it would replace a SAS-proven row with a weaker one), or a nickname you already use for a different peer. Recorded as a `trust` audit event naming the endorser. | `{}` |
 | `peer_remove` | `{nickname}` | `{}` (ack) |
+| `attest_offer` | `{}` — mint a `mcpmesh-attest:` line telling another **device of you** where to dial (#85 ask 3, `api_minor >= 52`). Carries nothing secret: the node's id and address, both of which an invite line already carries in the clear. It exists because a machine restored from a recovery phrase holds no rows and so cannot find anyone. Refused unless `[identity].admit_attested_devices` is on — an offer this node would not honour is worse than none. | `{offer}` |
 | `peer_revoke` | `{peer, reason?}` — a nickname, `eid:`, `b64u:`, or (in roster mode) a roster **group name**, which revokes every device in it — mark this device **dead on this node** (#85 ask 4, `api_minor >= 51`). Blocks the **outbound** direction too: this node will not dial a revoked endpoint, so `open_session`, `peer_services` and `peer_diagnostics` all refuse it. A revoked device is also refused on the otherwise gate-exempt pair ALPN, so it cannot burn an invite or re-append itself to an allow list. **Not `peer_remove`**: removal is routine and re-pairable, revocation is a compromise claim that **outlives the pair row**, so it cannot be undone by a fresh pairing. Live sessions are **severed immediately** (#54), not left to end on their own. A `b64u:` revokes every device you know of that person's. A name matching nothing is an **error**, never an empty success. | `{revoked: [eid], severed}` |
 | `peer_unrevoke` | `{peer}` — lift a local revocation. Idempotent. Restores the peer only because revocation never deleted its pair row. Accepts a bare `eid:` too, so a revoke-then-unpair cannot leave a revocation permanently unliftable. | `{unrevoked: [eid]}` |
 | `device_revoke` | `{endpoint, reason?}` — sign a **portable** revocation of one of **your own** devices with your user key. The direction local revocation cannot express: your peers cannot discover your laptop was stolen. Also applies it here. Requires a user key. | `{token, endpoint, user_id}` |
@@ -585,8 +586,62 @@ when this node applied it, the surviving local `nickname` if there is one, and a
 - `"signed"` — a statement the device's **owner** issued about their own, with the verified
   `signer_user_id`. Only this one is evidence that the person themselves declared the device dead.
 
+A row whose `principal` is a **`b64u:`** rather than an `eid:` is a revoked **identity** — every
+device of that person, including ones this node has never seen. `peer_revoke` on a `b64u:` records
+one, and it is what actually keeps a stolen laptop out: whoever holds the disk holds the user key
+and can sign a binding over a fresh endpoint id at will.
+
 Present because a revocation is otherwise invisible: a peer that has been cut off simply stops
 working, and neither side can distinguish that from a network fault.
+
+### Device attestation (#85 ask 3)
+
+A machine restored from a recovery phrase presents the same `b64u:` its owner's peers pinned — but
+`PeerEntry.user_id` is written once at pairing and never refreshed, so it was still a stranger to
+every one of them, and recovery meant an in-person SAS ceremony with all of them.
+
+With `[identity].admit_attested_devices = true`, a peer will admit **another device of a person it
+already pairs with**, on the strength of a user-key binding:
+
+```
+mcpmesh attest offer          # on the admitting peer → mcpmesh-attest:…
+mcpmesh attest to <line>      # on the restored machine
+```
+
+Four things stand between that ceremony and "anyone can join", and all four are enforced:
+
+1. **The opt-in**, off by default — at the accept layer *and* in the ceremony.
+2. **The binding verifies against the TLS-authenticated endpoint**, never the id the caller writes
+   in its own hello. A binding for a different device is refused however valid its signature.
+3. **Neither the endpoint nor the IDENTITY is revoked.** Both matter, and the second is the one
+   that protects a stolen machine: a thief holding the disk holds the user key, so they can mint a
+   fresh endpoint id and sign a new binding — a check keyed on the id would be a list of the ids
+   they will not reuse. `mcpmesh revoke peer <b64u:>` revokes the person, including devices you
+   have never seen.
+4. **We already hold a row for that `user_id`.** Attestation admits another device of someone you
+   paired with; it is not itself a pairing mechanism. A stranger is refused and nothing is written.
+
+Refusals are deliberately uninformative — the differences between them are the probe an unproven
+caller would use to enumerate who you pair with. **One is distinguishable**, and it is worth knowing
+rather than claiming otherwise: a REVOKED endpoint is cut at the accept layer with no reply frame,
+while the other refusals get a JSON error. So a revoked caller can tell that it specifically is
+revoked. That is a disclosure to the device that already knows its own id, not a way to enumerate
+anyone else, and closing it would mean either letting a revoked device into the ceremony or making
+every pairing refusal silent.
+
+**What actually authorizes the new device** is that it shares the person's `b64u:`, and grants are
+keyed on stable principals (#38). So it inherits exactly that person's access, with nothing copied
+across. The row's `services` field mirrors the person's existing rows (the **intersection** across
+their devices, never the union) and is bookkeeping, not the authorization.
+
+**It does not resurrect a device you removed.** `peer_remove` deletes the row; it does not stop the
+*person* from attesting a device afterwards, because you still pair with them. If you removed a
+device because it was compromised, **revoke the person** (`mcpmesh revoke peer <b64u:>`) — revoking
+the endpoint alone leaves the user key free to mint another.
+
+**It keeps the pair ALPN's front door open.** That ALPN normally fast-closes when no invite is live;
+an attestation needs no invite, so with this on the (rate-limited, binding-verified) ceremony is
+reachable continuously. That is the cost of the feature.
 
 **A revocation can only name a device you already know.** `device_revocation_import` refuses an
 endpoint this node has no row for, even with a perfect signature. That costs something real — a peer

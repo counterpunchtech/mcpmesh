@@ -475,6 +475,8 @@ async fn boot_node(
     // back in the same vocabulary as `config.toml`. Parsed and validated far above — a bad value
     // already failed the boot — so this cannot report a mode the node is not on.
     mesh.set_local_discovery(cfg.network.local_discovery.clone());
+    // #85 ask 3 — off unless asked for. Read at boot, like every other trust-shaping knob.
+    mesh.set_admit_attested_devices(cfg.identity.admit_attested_devices);
     // Self-sovereign pairing identity: load
     // (or mint) this person's UserKey and precompute this daemon's binding over `our_id`, so the
     // pairing handlers PRESENT it and paired peers store a VERIFIED `user_id`. The key path mirrors

@@ -312,6 +312,34 @@ serve. All four are safe to hand-edit; the durations use the format above.
 | `poll_interval` | `"1h"` | How often the daemon re-polls `url` to confirm the installed roster is current. |
 | `max_staleness` | `"24h"` | How long the node may go without confirming the roster current before it degrades (same warning-then-stop ladder as expiry). Under an adversary withholding updates, staleness is bounded by `max_staleness + grace_period`. |
 
+### `admit_attested_devices` — letting a replacement machine back in (#85 ask 3)
+
+```toml
+[identity]
+admit_attested_devices = true      # default false
+```
+
+Admits **another device of a person you already pair with** when it presents a binding signed by
+that person's user key — no fresh SAS ceremony. This is what makes `mcpmesh identity import` useful:
+without it, a machine restored from a recovery phrase presents the right `b64u:` and is still a
+stranger to everyone.
+
+**Off by default**, and #85 asked for it to be seamless. It changes what a pairing *means*: today it
+admits a device, and with this on it admits a person and their future devices. #38 arguably made
+that true of grants already — they are keyed on stable principals — but "arguably implied" is not a
+reason to widen admission on somebody's node during an upgrade.
+
+Two consequences worth knowing before you turn it on:
+
+- **It does not resurrect a device you removed.** `pair --remove` deletes the row; it does not stop
+  the *person* from attesting a device afterwards, because you still pair with them. If you removed
+  a device because it was compromised, use `mcpmesh revoke peer <b64u:>` — revoking the PERSON.
+  Revoking the endpoint id alone is not enough here: whoever holds that machine holds the user key,
+  and can sign a binding over a fresh endpoint id at will.
+- **The pair ALPN stays reachable.** It normally fast-closes when no invite is live; an attestation
+  carries no invite, so this keeps that door open to a rate-limited, binding-verified ceremony that
+  can only ever admit a device of someone you already pair with.
+
 ## `[blobs]`
 
 Reclaiming disk from the app-blob store (#80).

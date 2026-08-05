@@ -32,6 +32,19 @@ const PEERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("peers");
 /// can arrive before, or instead of, a pairing).
 const REVOKED: TableDefinition<&[u8], &[u8]> = TableDefinition::new("revoked");
 
+/// Revoked IDENTITIES — `b64u:` user ids, not endpoints (#85 ask 3 gate).
+///
+/// Endpoint revocation cannot express "I no longer trust this person". It was enough while
+/// admission was per-device, and attestation broke that: a thief holding a stolen laptop holds the
+/// USER KEY, so they mint a brand-new endpoint id, sign a fresh binding over it, and walk past a
+/// check keyed on the id they no longer need. The 0.46.0 gate proved it end to end — the admitted
+/// device opened a live session.
+///
+/// So `peer_revoke` on a `b64u:` now records the identity as well as its known endpoints, and
+/// attestation refuses it. Future devices of a revoked person are refused too, which is what an
+/// operator meant when they revoked the person.
+const REVOKED_USERS: TableDefinition<&str, &[u8]> = TableDefinition::new("revoked_users");
+
 /// One revocation: "this endpoint is dead" (#85 ask 4).
 ///
 /// Roster mode has had `revoked_endpoints` since the roster schema; pairing mode had nothing, so
@@ -121,6 +134,7 @@ impl PeerStore {
         // open_table creates the table if absent; commit persists the (empty) schema.
         txn.open_table(PEERS)?;
         txn.open_table(REVOKED)?;
+        txn.open_table(REVOKED_USERS)?;
         txn.commit()?;
         Ok(Self {
             db,
@@ -179,6 +193,74 @@ impl PeerStore {
                 issued_at: None,
             }
         })))
+    }
+
+    /// Is this `b64u:` IDENTITY revoked (#85 ask 3 gate)?
+    ///
+    /// Fails CLOSED as revoked, for the same reason [`is_revoked`](Self::is_revoked) does: this
+    /// table exists to refuse, so "I cannot read it" must mean "no".
+    pub fn is_user_revoked(&self, user_id: &str) -> bool {
+        let read = || -> Result<bool> {
+            let txn = self.db.begin_read()?;
+            let table = txn.open_table(REVOKED_USERS)?;
+            Ok(table.get(user_id)?.is_some())
+        };
+        match read() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    %e,
+                    "identity-revocation lookup failed; treating as REVOKED (fail-closed)"
+                );
+                true
+            }
+        }
+    }
+
+    /// Revoke a `b64u:` IDENTITY — every device of that person, including ones we have never seen.
+    pub fn revoke_user(&self, user_id: &str, e: &RevokedEntry) -> Result<()> {
+        let bytes = serde_json::to_vec(e)?;
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(REVOKED_USERS)?;
+            table.insert(user_id, bytes.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Lift an identity revocation. Returns whether one was present.
+    pub fn unrevoke_user(&self, user_id: &str) -> Result<bool> {
+        let txn = self.db.begin_write()?;
+        let removed = {
+            let mut table = txn.open_table(REVOKED_USERS)?;
+            table.remove(user_id)?.is_some()
+        };
+        txn.commit()?;
+        Ok(removed)
+    }
+
+    /// Every revoked identity, for `status`.
+    pub fn list_revoked_users(&self) -> Result<Vec<(String, RevokedEntry)>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(REVOKED_USERS)?;
+        let mut out = Vec::new();
+        for row in table.iter()? {
+            let (k, v) = row?;
+            let uid = k.value().to_string();
+            out.push((
+                uid.clone(),
+                serde_json::from_slice(v.value()).unwrap_or(RevokedEntry {
+                    endpoint_id: [0u8; 32],
+                    revoked_at: 0,
+                    reason: Some("unreadable revocation row".into()),
+                    source: "unknown".into(),
+                    signer_user_id: None,
+                    issued_at: None,
+                }),
+            ));
+        }
+        Ok(out)
     }
 
     /// Write a revocation (idempotent upsert). One atomic redb transaction.

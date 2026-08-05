@@ -356,6 +356,18 @@ struct RedeemerHello {
     user_pk: Option<String>,
     #[serde(default)]
     binding_sig: Option<String>,
+    /// DEVICE ATTESTATION (#85 ask 3): this is not an invite redemption. The caller is another
+    /// device of a person the receiver ALREADY pairs with, proving it by the binding above.
+    ///
+    /// `secret` is ignored on this path — there is no invite — so `user_pk`/`binding_sig` become
+    /// REQUIRED rather than optional, and the receiver verifies the binding against the
+    /// TLS-authenticated endpoint id exactly as it does on the pairing path.
+    ///
+    /// `#[serde(default)]` so an older redeemer's hello (which never sets it) is an ordinary
+    /// redemption, and an older RECEIVER simply ignores the field and refuses the zero secret —
+    /// which is the correct outcome for a node that cannot honour the ceremony.
+    #[serde(default)]
+    attest: bool,
 }
 
 /// The inviter's reply. On success it carries the inviter's identity so the redeemer can write
@@ -456,6 +468,20 @@ pub struct InviterCtx {
     ///
     /// A hook rather than the key itself, so this module never learns where the key lives.
     pub sign_binding: SignBindingFn,
+    /// #85 ask 3: does this node admit another DEVICE of a person it already pairs with, on the
+    /// strength of a user-key binding? `[identity].admit_attested_devices`, OFF by default.
+    ///
+    /// A field rather than a config read, so the un-offered ceremony is unrepresentable at this
+    /// seam — the same discipline #178 established for `SelfEnroll`, and for the same reason: every
+    /// caller has to say which ceremonies it is willing to complete.
+    pub admit_attested: bool,
+    /// This node's OWN endpoint id (#85 ask 3). The pairing path takes it from the invite
+    /// (`invite.inviter_id`); an attestation has no invite, and the attesting device — freshly
+    /// restored from a recovery phrase — holds no row for us, so the reply has to carry it.
+    pub self_endpoint_id: [u8; 32],
+    /// This node's OWN nickname (#85 ask 3). The pairing path takes it from the invite; an
+    /// attestation has none, and the reply has to tell the attesting device what to file us under.
+    pub self_nickname: String,
 }
 
 /// Persist an adopted self-enrollment binding (#86) — the ONLY copy, since the enrolled device
@@ -511,6 +537,180 @@ fn verified_user_id(
 /// Takes an [`InviterCtx`]: the redeem reads `ctx.invites` + `ctx.store`, and the authorization
 /// grant runs through the `ctx.grant` hook the daemon supplied (see the [`InviterCtx`] doc for
 /// the reload-reentrancy argument).
+/// What an accepted attestation will write. Separated from the I/O so the DECISION is testable.
+#[derive(Debug, PartialEq, Eq)]
+struct AdmitPlan {
+    user_id: String,
+    nickname: String,
+    services: Vec<String>,
+}
+
+/// The whole authorization decision for an attestation, as a pure-ish function over the store.
+///
+/// Extracted from [`handle_attestation`] because the property that matters most here — that the
+/// binding is verified against the **TLS-authenticated** endpoint and never the id the caller wrote
+/// in its own hello — cannot be reached end to end: `attest_to` always sends its real id, so no
+/// honest client can express the attack. Swapping `tls_id` for `hello.redeemer_id` went UNCAUGHT by
+/// every e2e test until this seam existed.
+///
+/// The `Err` is a reason for the LOG only. Every refusal goes back on the wire identically, because
+/// the differences between them are exactly the probe an unproven caller would use to enumerate who
+/// this node pairs with.
+fn attestation_decision(
+    hello: &RedeemerHello,
+    tls_id: [u8; 32],
+    ctx: &InviterCtx,
+) -> Result<AdmitPlan, &'static str> {
+    if !ctx.admit_attested {
+        return Err("not enabled on this node");
+    }
+    let (Some(user_pk), Some(sig)) = (hello.user_pk.as_deref(), hello.binding_sig.as_deref())
+    else {
+        return Err("no binding presented");
+    };
+    // `tls_id`, ALWAYS — never `hello.redeemer_id`, which the caller writes. `handle_inviter_side`
+    // also refuses a hello whose claimed id disagrees, so today the two are equal here; using the
+    // authenticated one anyway keeps that check from being load-bearing for a SECOND property, and
+    // means this function is correct in isolation.
+    let user_id = mcpmesh_trust::binding::verify_presented(user_pk, sig, &tls_id)
+        .map_err(|_| "binding does not verify against the authenticated endpoint")?;
+    if ctx.store.is_revoked(&tls_id) {
+        return Err("endpoint is revoked");
+    }
+    // …and the IDENTITY, which is the check that actually protects a stolen laptop.
+    //
+    // Endpoint revocation was the documented remedy until the 0.46.0 gate disproved it end to end:
+    // a thief holding the stolen machine holds the USER KEY — that is exactly what
+    // `identity export`/`import` moves — so they mint a brand-new endpoint id, sign a fresh binding
+    // over it, and the endpoint check never sees an id it knows. The admitted device opened a live
+    // session in the probe. Attestation authorizes on the PERSON, so the refusal has to be
+    // available at that granularity too.
+    if ctx.store.is_user_revoked(&user_id) {
+        return Err("identity is revoked");
+    }
+    let existing = ctx
+        .store
+        .entries_for_user(&user_id)
+        .map_err(|_| "peer store read failed")?;
+    if existing.is_empty() {
+        return Err("no existing row for that identity");
+    }
+    // INTERSECTION across the person's rows: a new device must never arrive holding the most
+    // privileged grant on the node.
+    let mut services: Vec<String> = existing[0].services.clone();
+    for e in &existing[1..] {
+        services.retain(|s| e.services.contains(s));
+    }
+    Ok(AdmitPlan {
+        user_id,
+        nickname: existing[0].nickname.clone(),
+        services,
+    })
+}
+
+/// #85 ask 3 — admit another DEVICE of a person we already pair with, on the strength of a
+/// user-key binding rather than a fresh SAS ceremony.
+///
+/// A `b64u:` user id is what peers pin, and `PeerEntry.user_id` is written once at pairing and never
+/// refreshed — so a replacement machine holding the right user key (restored from 0.42.0's recovery
+/// phrase) was a complete stranger to every peer, and recovery meant an in-person ceremony with
+/// everyone you had ever paired with.
+///
+/// The order of the checks below is the design. Each one refuses generically; a caller learns only
+/// that it was refused, never which check said so, because the differences are exactly the
+/// probe an unproven caller would use to enumerate who we pair with.
+///
+/// 1. **The receiver opted in.** Off by default — see `[identity].admit_attested_devices`.
+/// 2. **The binding verifies against the TLS-AUTHENTICATED endpoint** (`verify_presented`), never a
+///    self-asserted id. A binding transplanted from another device fails here.
+/// 3. **The endpoint is not REVOKED** (#85 ask 4). Checked before anything is written, and the
+///    reason ask 4 shipped first: without it a device someone had declared stolen could walk back
+///    in holding a binding it still had.
+/// 4. **We already hold a row for that `user_id`.** This is the authorization in full: attestation
+///    admits another device of someone we paired with, and is not itself a pairing mechanism. An
+///    unknown `user_id` is refused.
+///
+/// The new row carries the person's `user_id` and nickname — it is the same person, and nicknames
+/// here are per-person, not per-device — and the INTERSECTION of that person's existing service
+/// grants. Never the union: a new device must not arrive holding the most-privileged grant on the
+/// node, and the operator can widen it deliberately with `service_allow_grant`.
+async fn handle_attestation(
+    send: &mut iroh::endpoint::SendStream,
+    hello: &RedeemerHello,
+    tls_id: [u8; 32],
+    ctx: &InviterCtx,
+) -> anyhow::Result<()> {
+    let refuse_generic = async |send: &mut iroh::endpoint::SendStream| {
+        let _ = send_reply(
+            send,
+            &PairReply::Refused {
+                reason: REASON_REFUSED.into(),
+                code: None,
+            },
+        )
+        .await;
+        anyhow::Ok(())
+    };
+
+    let plan = match attestation_decision(hello, tls_id, ctx) {
+        Ok(plan) => plan,
+        Err(why) => {
+            tracing::debug!(%why, "refused a device attestation");
+            return refuse_generic(send).await;
+        }
+    };
+    let AdmitPlan {
+        user_id,
+        nickname,
+        services,
+    } = plan;
+
+    // Same merge discipline on this side (#85 ask 3 gate): a re-attestation by a device we already
+    // hold must not wipe its dial hint or its pairing stamp.
+    let prior = ctx.store.resolve(&tls_id)?;
+    ctx.store.add(PeerEntry {
+        endpoint_id: tls_id,
+        nickname: nickname.clone(),
+        services: services.clone(),
+        paired_at: prior
+            .as_ref()
+            .and_then(|e| e.paired_at.clone())
+            .or_else(|| Some(epoch_now().to_string())),
+        user_id: Some(user_id.clone()),
+        last_addr: prior.as_ref().and_then(|e| e.last_addr.clone()),
+    })?;
+
+    // A device joining under a known identity is NEVER silent: durable audit + the ceremony ring
+    // that feeds `status.recent_pairings` and the subscribe stream.
+    (ctx.audit_trust)(
+        "device_attest".into(),
+        Some(mcpmesh_net::EndpointId::from_bytes(tls_id).principal()),
+    );
+    tracing::warn!(
+        peer = %mcpmesh_net::EndpointId::from_bytes(tls_id).principal(),
+        %user_id,
+        nickname = %nickname,
+        services = ?services,
+        "admitted a new DEVICE of a person already paired with (attestation)"
+    );
+
+    let reply = PairReply::Ok {
+        inviter_id: ctx.self_endpoint_id,
+        // OUR name for ourselves — the same field the pairing path fills from `invite.nickname`.
+        //
+        // It carried `plan.nickname` (our name for THEIR person) until the 0.46.0 gate: the
+        // attesting device then filed us under its own owner's name, `mcpmesh attest to` printed
+        // "Admitted by bob." on bob's own machine, and attesting to several peers landed all of
+        // them under one nickname — a real collision, since `entry_for` is first-match and
+        // `remove` deletes every match.
+        inviter_nickname: ctx.self_nickname.clone(),
+        user_pk: ctx.self_binding.as_ref().map(|b| b.user_pk.clone()),
+        binding_sig: ctx.self_binding.as_ref().map(|b| b.sig.clone()),
+    };
+    send_reply(send, &reply).await?;
+    Ok(())
+}
+
 pub async fn handle_inviter_side(
     conn: iroh::endpoint::Connection,
     ctx: InviterCtx,
@@ -539,6 +739,13 @@ pub async fn handle_inviter_side(
     }
 
     let now = epoch_now();
+
+    // #85 ask 3 — DEVICE ATTESTATION. Handled before any invite lookup, because this path has no
+    // invite: the caller is another device of a person we ALREADY pair with, and the binding it
+    // presents is the whole credential.
+    if hello.attest {
+        return handle_attestation(&mut send, &hello, tls_id, &ctx).await;
+    }
 
     // #87: collision pre-check BEFORE the burn — but ONLY behind a live-secret peek. Order is
     // the whole design: checking the nickname first for every caller would let a stranger with
@@ -1059,6 +1266,7 @@ pub async fn redeem_invite(
         redeemer_nickname: self_nickname,
         user_pk: redeemer_pk,
         binding_sig: redeemer_sig,
+        attest: false,
     };
     let exchange = async {
         let (mut send, recv) = conn.open_bi().await.context("open the pairing bi-stream")?;
@@ -1826,4 +2034,449 @@ mod tests {
         assert_eq!(e.to_string(), format!("pairing refused: {wire}"));
         assert!(e.to_string().contains("rename this node"));
     }
+
+    /// #85 ask 3: the decision refuses a forged binding, a stranger, a revoked endpoint, and a
+    /// node that has not opted in — and admits the real thing.
+    ///
+    /// The FORGED case is why this function exists separately from its I/O. `attest_to` always
+    /// sends its own real endpoint id, so no honest client can present a binding for a *different*
+    /// device — which means swapping the ceremony's TLS-authenticated id for the caller-claimed one
+    /// went uncaught by every end-to-end test. Here the hello is built by hand.
+    #[test]
+    fn the_attestation_decision_refuses_everything_but_a_known_persons_real_device() {
+        use crate::allowlist::{PeerEntry, PeerStore};
+        use mcpmesh_trust::UserKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(PeerStore::open(&dir.path().join("p.redb")).unwrap());
+        let bob = UserKey::from_signing_key(mcpmesh_trust::ed25519_dalek::SigningKey::from_bytes(
+            &[41u8; 32],
+        ));
+        let bob_uid = mcpmesh_trust::binding::user_id(&bob);
+        let stranger = UserKey::from_signing_key(
+            mcpmesh_trust::ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]),
+        );
+
+        let (old_device, new_device) = ([1u8; 32], [2u8; 32]);
+        store
+            .add(PeerEntry {
+                endpoint_id: old_device,
+                nickname: "bob".into(),
+                services: vec!["notes".into(), "files".into()],
+                paired_at: None,
+                user_id: Some(bob_uid.clone()),
+                last_addr: None,
+            })
+            .unwrap();
+
+        let ctx = |admit: bool| InviterCtx {
+            store: store.clone(),
+            invites: Arc::new(crate::pairing::LiveInvites::new()),
+            config_path: dir.path().join("config.toml"),
+            self_binding: None,
+            grant: Box::new(|_, _, _| Box::pin(async { Ok(()) })),
+            record_pairing: Box::new(|_, _, _| {}),
+            audit_trust: Box::new(|_, _| {}),
+            sign_binding: Box::new(|_| None),
+            admit_attested: admit,
+            self_endpoint_id: [9u8; 32],
+            self_nickname: "us".into(),
+        };
+        let hello = |pk: String, sig: String, claimed: [u8; 32]| RedeemerHello {
+            secret: [0u8; 32],
+            redeemer_id: claimed,
+            redeemer_nickname: String::new(),
+            user_pk: Some(pk),
+            binding_sig: Some(sig),
+            attest: true,
+        };
+
+        // THE happy case: bob's real binding for the NEW device.
+        let (pk, sig) = mcpmesh_trust::binding::present(&bob, &new_device);
+        let plan = attestation_decision(
+            &hello(pk.clone(), sig.clone(), new_device),
+            new_device,
+            &ctx(true),
+        )
+        .expect("a known person's real device is admitted");
+        assert_eq!(plan.user_id, bob_uid);
+        assert_eq!(plan.nickname, "bob");
+        assert_eq!(
+            plan.services,
+            vec!["notes".to_string(), "files".to_string()]
+        );
+
+        // FORGED: bob's binding for his OLD device, presented by the new one. The signature is
+        // perfectly valid — it just does not bind THIS endpoint.
+        let (old_pk, old_sig) = mcpmesh_trust::binding::present(&bob, &old_device);
+        assert_eq!(
+            attestation_decision(
+                // …and the hello CLAIMS to be the old device, which is the lie the TLS id catches.
+                &hello(old_pk, old_sig, old_device),
+                new_device,
+                &ctx(true)
+            ),
+            Err("binding does not verify against the authenticated endpoint"),
+            "a binding for a DIFFERENT endpoint must not admit this one, however valid its \
+             signature — verifying against the claimed id instead of the authenticated one is the \
+             whole attack"
+        );
+
+        // STRANGER: a valid binding for this device, by an identity we have never seen.
+        let (spk, ssig) = mcpmesh_trust::binding::present(&stranger, &new_device);
+        assert_eq!(
+            attestation_decision(&hello(spk, ssig, new_device), new_device, &ctx(true)),
+            Err("no existing row for that identity"),
+            "attestation admits another device of someone we already pair with — it is not itself \
+             a pairing mechanism"
+        );
+
+        // NOT OPTED IN.
+        assert_eq!(
+            attestation_decision(
+                &hello(pk.clone(), sig.clone(), new_device),
+                new_device,
+                &ctx(false)
+            ),
+            Err("not enabled on this node")
+        );
+
+        // REVOKED — and checked BEFORE the identity lookup succeeds is not enough: it must refuse a
+        // device that would otherwise be admitted, which is exactly this one.
+        store
+            .revoke(crate::allowlist::RevokedEntry {
+                endpoint_id: new_device,
+                revoked_at: 1,
+                reason: None,
+                source: "signed".into(),
+                signer_user_id: Some(bob_uid.clone()),
+                issued_at: Some(1),
+            })
+            .unwrap();
+        assert_eq!(
+            attestation_decision(&hello(pk, sig, new_device), new_device, &ctx(true)),
+            Err("endpoint is revoked"),
+            "the ask-4 interlock: a device its owner declared stolen must not walk back in holding \
+             a binding it still has"
+        );
+    }
+
+    /// Services are the INTERSECTION across a person's devices, never the union.
+    ///
+    /// A new device must not arrive holding the most-privileged grant on the node. Pinned with
+    /// DIFFERING, non-empty sets — with equal or empty ones the two operations agree and the test
+    /// would measure nothing.
+    #[test]
+    fn attested_services_are_the_intersection_not_the_union() {
+        use crate::allowlist::{PeerEntry, PeerStore};
+        use mcpmesh_trust::UserKey;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(PeerStore::open(&dir.path().join("p.redb")).unwrap());
+        let bob = UserKey::from_signing_key(mcpmesh_trust::ed25519_dalek::SigningKey::from_bytes(
+            &[41u8; 32],
+        ));
+        let bob_uid = mcpmesh_trust::binding::user_id(&bob);
+        for (eid, services) in [
+            ([1u8; 32], vec!["notes", "files", "shared"]),
+            ([2u8; 32], vec!["notes", "shared", "phone-only"]),
+        ] {
+            store
+                .add(PeerEntry {
+                    endpoint_id: eid,
+                    nickname: "bob".into(),
+                    services: services.into_iter().map(String::from).collect(),
+                    paired_at: None,
+                    user_id: Some(bob_uid.clone()),
+                    last_addr: None,
+                })
+                .unwrap();
+        }
+        let new_device = [3u8; 32];
+        let (pk, sig) = mcpmesh_trust::binding::present(&bob, &new_device);
+        let ctx = InviterCtx {
+            store: store.clone(),
+            invites: Arc::new(crate::pairing::LiveInvites::new()),
+            config_path: dir.path().join("config.toml"),
+            self_binding: None,
+            grant: Box::new(|_, _, _| Box::pin(async { Ok(()) })),
+            record_pairing: Box::new(|_, _, _| {}),
+            audit_trust: Box::new(|_, _| {}),
+            sign_binding: Box::new(|_| None),
+            admit_attested: true,
+            self_endpoint_id: [9u8; 32],
+            self_nickname: "us".into(),
+        };
+        let plan = attestation_decision(
+            &RedeemerHello {
+                secret: [0u8; 32],
+                redeemer_id: new_device,
+                redeemer_nickname: String::new(),
+                user_pk: Some(pk),
+                binding_sig: Some(sig),
+                attest: true,
+            },
+            new_device,
+            &ctx,
+        )
+        .expect("admitted");
+        assert_eq!(
+            plan.services,
+            vec!["notes".to_string(), "shared".to_string()],
+            "only what EVERY existing device of that person has — the union would hand the new \
+             machine `files` and `phone-only`, which no single existing device holds together"
+        );
+    }
+
+    /// An attestation offer round-trips, and MALFORMED input is refused rather than guessed at.
+    ///
+    /// Untested until the 0.46.0 gate: `.strip_prefix(ATTEST_SCHEME).or(Some(line))` — accepting
+    /// any bare base64 line — went uncaught. The scheme prefix is what stops an invite line, an
+    /// enrollment line or a revocation token being fed to the wrong ceremony.
+    #[test]
+    fn an_attestation_offer_round_trips_and_refuses_anything_else() {
+        let offer = AttestOffer {
+            node_id: [7u8; 32],
+            node_addr_json: r#"{"id":"x","addrs":[]}"#.into(),
+        };
+        let line = offer.encode().unwrap();
+        assert!(line.starts_with(ATTEST_SCHEME));
+        assert_eq!(AttestOffer::decode(&line).unwrap(), offer);
+        // Whitespace is forgiven — it is a pasted line.
+        assert_eq!(AttestOffer::decode(&format!("  {line}\n")).unwrap(), offer);
+
+        for bad in [
+            "",
+            "hello",
+            // The right shape, the WRONG scheme: an invite, an enrollment link, a revocation
+            // token. Each is a real artifact a user could paste here by mistake.
+            &line.replace(ATTEST_SCHEME, "mcpmesh-invite:"),
+            &line.replace(ATTEST_SCHEME, "mcpmesh-enroll:"),
+            &line.replace(ATTEST_SCHEME, "mcpmesh-revoke:"),
+            // Right scheme, junk body.
+            &format!("{ATTEST_SCHEME}!!!not-base64!!!"),
+            ATTEST_SCHEME,
+        ] {
+            assert!(
+                AttestOffer::decode(bad).is_err(),
+                "{bad:?} must be refused, not guessed at"
+            );
+        }
+    }
+
+    /// A hello with NO binding is refused — the arm that has no other coverage.
+    #[test]
+    fn an_attestation_without_a_binding_is_refused() {
+        use crate::allowlist::PeerStore;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(PeerStore::open(&dir.path().join("p.redb")).unwrap());
+        let ctx = InviterCtx {
+            store,
+            invites: Arc::new(crate::pairing::LiveInvites::new()),
+            config_path: dir.path().join("config.toml"),
+            self_binding: None,
+            grant: Box::new(|_, _, _| Box::pin(async { Ok(()) })),
+            record_pairing: Box::new(|_, _, _| {}),
+            audit_trust: Box::new(|_, _| {}),
+            sign_binding: Box::new(|_| None),
+            admit_attested: true,
+            self_endpoint_id: [9u8; 32],
+            self_nickname: "us".into(),
+        };
+        for (pk, sig) in [
+            (None, None),
+            (Some("b64u:whatever".to_string()), None),
+            (None, Some("sig".to_string())),
+        ] {
+            assert_eq!(
+                attestation_decision(
+                    &RedeemerHello {
+                        secret: [0u8; 32],
+                        redeemer_id: [1u8; 32],
+                        redeemer_nickname: String::new(),
+                        user_pk: pk,
+                        binding_sig: sig,
+                        attest: true,
+                    },
+                    [1u8; 32],
+                    &ctx
+                ),
+                Err("no binding presented")
+            );
+        }
+    }
+}
+
+/// The `mcpmesh-attest:` scheme — where to dial for a device attestation (#85 ask 3).
+pub const ATTEST_SCHEME: &str = "mcpmesh-attest:";
+
+/// An attestation OFFER: where to dial, and whose node it is.
+///
+/// **Carries nothing secret.** No bearer credential, no expiry, no burn — an invite's `secret` is
+/// what admits a stranger, and an attestation admits nobody who cannot already produce a binding to
+/// a `user_id` the offering node pairs with. The line exists only because a device freshly restored
+/// from a recovery phrase holds no rows and therefore has no way to find anyone.
+///
+/// The same two fields ride an invite line in the clear today, so this discloses nothing new.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AttestOffer {
+    /// The offering node's endpoint id — the redeemer verifies the TLS peer id against it, the same
+    /// address-swap defense an invite has.
+    pub node_id: [u8; 32],
+    /// Its `EndpointAddr` as JSON, so the ceremony needs no discovery (works on a LAN, or
+    /// localhost).
+    pub node_addr_json: String,
+}
+
+impl AttestOffer {
+    pub fn encode(&self) -> anyhow::Result<String> {
+        Ok(format!(
+            "{ATTEST_SCHEME}{}",
+            data_encoding::BASE64URL_NOPAD.encode(&serde_json::to_vec(self)?)
+        ))
+    }
+
+    pub fn decode(line: &str) -> anyhow::Result<Self> {
+        let body = line
+            .trim()
+            .strip_prefix(ATTEST_SCHEME)
+            .context("not an attestation offer (expected a mcpmesh-attest: line)")?;
+        let raw = data_encoding::BASE64URL_NOPAD
+            .decode(body.as_bytes())
+            .context("attestation offer is not valid base64url")?;
+        serde_json::from_slice(&raw).context("attestation offer is malformed")
+    }
+}
+
+/// Present THIS device's binding to a peer that already pairs with this person (#85 ask 3).
+///
+/// The mirror of [`redeem_invite`]: same ALPN, same framing, same hello — with `attest: true` and no
+/// secret. The peer verifies our binding against our TLS-authenticated endpoint and, if it already
+/// holds a row for that `user_id`, admits us as another device of that person.
+///
+/// Requires a `self_binding`: with no user key there is nothing to attest, and sending a hello that
+/// could only ever be refused wastes a rate-limited connection on both nodes.
+///
+/// Writes the peer's row on success, so the ceremony leaves this device able to dial back — a
+/// restored machine holds no rows at all, which is the situation this exists for.
+pub async fn attest_to(
+    endpoint: iroh::Endpoint,
+    offer_line: String,
+    store: Arc<PeerStore>,
+    self_binding: Option<SelfBinding>,
+    nickname_for_peer: Option<String>,
+) -> anyhow::Result<PairResult> {
+    let offer = AttestOffer::decode(&offer_line)?;
+    let binding = self_binding.context(
+        "this device has no user key, so it has nothing to attest — import your recovery phrase \
+         first (`mcpmesh identity import`)",
+    )?;
+    let addr: iroh::EndpointAddr = serde_json::from_str(&offer.node_addr_json)
+        .context("attestation offer carries an unusable address")?;
+    let conn = endpoint
+        .connect(addr, mcpmesh_net::ALPN_PAIR)
+        .await
+        .context("dial the attesting peer")?;
+    // Address-swap defense, exactly as `redeem_invite` does it: the TLS peer id is authoritative,
+    // and an offer that routed us somewhere else is refused before we send anything.
+    anyhow::ensure!(
+        conn.remote_id().as_bytes() == &offer.node_id,
+        "peer id mismatch — refusing (address-swap defense)"
+    );
+
+    let hello = RedeemerHello {
+        // No invite. Zeroed rather than random: it is never read on this path, and a random value
+        // would look like a credential to anyone reading a capture.
+        secret: [0u8; 32],
+        redeemer_id: *endpoint.id().as_bytes(),
+        redeemer_nickname: String::new(),
+        user_pk: Some(binding.user_pk.clone()),
+        binding_sig: Some(binding.sig.clone()),
+        attest: true,
+    };
+    let (mut send, recv) = conn
+        .open_bi()
+        .await
+        .context("open the attestation stream")?;
+    write_frame(&mut send, &serde_json::to_value(&hello)?)
+        .await
+        .context("send the attestation hello")?;
+    let mut reader = FrameReader::new(BufReader::new(recv), MAX_PAIR_FRAME);
+    let reply: PairReply = match reader.next().await.context("read the attestation reply")? {
+        Some(Inbound::Frame(v)) => {
+            serde_json::from_value(v).context("peer reply is not a PairReply")?
+        }
+        _ => anyhow::bail!("no reply from the peer (connection closed before a reply)"),
+    };
+    let (peer_id, peer_nickname, peer_pk, peer_sig) = match reply {
+        PairReply::Ok {
+            inviter_id,
+            inviter_nickname,
+            user_pk,
+            binding_sig,
+        } => (inviter_id, inviter_nickname, user_pk, binding_sig),
+        PairReply::Refused { reason, .. } => anyhow::bail!(
+            "the peer refused this attestation ({reason}). It admits another of your devices only \
+             if it already pairs with you AND has `admit_attested_devices` enabled"
+        ),
+    };
+    anyhow::ensure!(
+        peer_id == offer.node_id,
+        "peer reported an id that disagrees with its own offer"
+    );
+
+    // Their binding is verified against THEIR endpoint — ours to check, exactly as the pairing path
+    // does. An unverifiable one stores no `user_id` rather than failing the ceremony: their identity
+    // is a bonus here, not the credential.
+    let peer_user_id = match (peer_pk.as_deref(), peer_sig.as_deref()) {
+        (Some(pk), Some(sig)) => mcpmesh_trust::binding::verify_presented(pk, sig, &peer_id).ok(),
+        _ => None,
+    };
+    // MERGE, never clobber (#85 ask 3 gate).
+    //
+    // `store.add` is an upsert keyed on endpoint id, and this device may already pair with this
+    // peer — re-attesting is ordinary. The first cut wrote a fresh row every time, which wiped the
+    // peer's `services`, renamed it, and could DOWNGRADE a proven `user_id` to `None`, the one
+    // thing `allowlist.rs` says the pairing path must never do. The pairing path merges for exactly
+    // these reasons; this now follows it.
+    let existing = store.resolve(&peer_id)?;
+    let nickname = nickname_for_peer
+        .or_else(|| existing.as_ref().map(|e| e.nickname.clone()))
+        .unwrap_or(peer_nickname);
+    let addr_json = serde_json::to_string(&endpoint_addr_of(&conn)).ok();
+    store.add(PeerEntry {
+        endpoint_id: peer_id,
+        nickname: nickname.clone(),
+        services: existing
+            .as_ref()
+            .map(|e| e.services.clone())
+            .unwrap_or_default(),
+        paired_at: existing
+            .as_ref()
+            .and_then(|e| e.paired_at.clone())
+            .or_else(|| Some(epoch_now().to_string())),
+        // Never downgrade a proven identity to `None`.
+        user_id: peer_user_id
+            .clone()
+            .or_else(|| existing.as_ref().and_then(|e| e.user_id.clone())),
+        // …nor a known dial hint. Under `relay_mode = "disabled"` losing it is unrecoverable
+        // without another ceremony.
+        last_addr: addr_json.or_else(|| existing.as_ref().and_then(|e| e.last_addr.clone())),
+    })?;
+    conn.close(0u32.into(), b"done");
+    Ok(PairResult {
+        peer_nickname: nickname,
+        // No SAS: the whole point is that a binding replaces the human ceremony. An empty string
+        // rather than a fabricated code — a caller rendering one would be showing the operator a
+        // number that verified nothing.
+        sas_code: String::new(),
+        app_label: None,
+        peer_user_id,
+        enrolled_as_self: false,
+        services: Vec::new(),
+    })
+}
+
+/// The peer's dialable address as observed on the live connection.
+fn endpoint_addr_of(conn: &iroh::endpoint::Connection) -> iroh::EndpointAddr {
+    iroh::EndpointAddr::from(conn.remote_id())
 }

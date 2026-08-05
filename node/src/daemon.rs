@@ -66,7 +66,7 @@ pub use handlers::{
     grant_service_access, grant_service_allow, introduce_peer, peer_revoke, peer_unrevoke,
     remove_peer, rename_peer, revoke_service_access, revoke_service_allow,
 };
-pub(crate) use handlers::{device_revocation_import, device_revoke};
+pub(crate) use handlers::{attest_offer, attest_to, device_revocation_import, device_revoke};
 pub(crate) use reach::caller_admitted_services;
 /// The services this identity is admitted to, as the accept path computes them (#100). Test seam:
 /// it lets a test assert that the reported set matches what a session would actually be granted.
@@ -229,6 +229,8 @@ pub struct MeshState {
     /// `status.self_network` reading it back to the operator — and a read-back in a different
     /// vocabulary from the one they wrote cannot confirm their setting took.
     pub(crate) local_discovery: std::sync::OnceLock<String>,
+    /// `[identity].admit_attested_devices` (#85 ask 3), resolved at boot.
+    pub(crate) admit_attested: std::sync::OnceLock<bool>,
     pub(crate) config_path: PathBuf,
     /// The relay posture (mode + custom URL set) currently APPLIED to the live endpoint — the
     /// runtime truth the `set_relays` verb (#53) diffs against. Seeded at boot from `[network]`
@@ -604,6 +606,7 @@ impl MeshState {
             // the default.
             presence_mode: std::sync::RwLock::new(crate::daemon::PresenceMode::default()),
             local_discovery: std::sync::OnceLock::new(),
+            admit_attested: std::sync::OnceLock::new(),
             config_path,
             applied_relays: std::sync::Mutex::new(RelayPosture::default()),
             roster,
@@ -1016,6 +1019,18 @@ impl MeshState {
         let _ = self.local_discovery.set(mode);
     }
 
+    /// #85 ask 3: does this node admit attested devices of people it already pairs with?
+    /// `[identity].admit_attested_devices`, resolved at boot. Defaults to FALSE — a node whose boot
+    /// never set it must not silently widen admission.
+    pub fn admit_attested_devices(&self) -> bool {
+        self.admit_attested.get().copied().unwrap_or(false)
+    }
+
+    /// Install the boot-resolved `[identity].admit_attested_devices` (#85 ask 3).
+    pub fn set_admit_attested_devices(&self, on: bool) {
+        let _ = self.admit_attested.set(on);
+    }
+
     /// Who currently gets a reachability pong (#89). Read on every `mcpmesh/ping/1` accept.
     pub fn presence_mode(&self) -> crate::daemon::PresenceMode {
         *self
@@ -1249,6 +1264,10 @@ impl MeshState {
         let grant_mesh = self.clone();
         let record_mesh = self.clone();
         crate::pairing::rendezvous::InviterCtx {
+            // #85 ask 3 — read once at boot, like `presence_mode`. Off unless asked for.
+            admit_attested: self.admit_attested_devices(),
+            self_endpoint_id: *self.endpoint.id().as_bytes(),
+            self_nickname: self.self_nickname(),
             store: self.store.clone(),
             invites: self.invites.clone(),
             config_path: self.config_path.clone(),

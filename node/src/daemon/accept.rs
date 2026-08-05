@@ -152,7 +152,17 @@ pub fn spawn_accept_loop(mesh: Arc<MeshState>, services: Arc<Services>) -> JoinH
                         // caller WITHOUT the secret; it is bounded by the same rate limiter and
                         // strike budget that already protect the by-design-open pair ALPN, and by
                         // the operator choosing to mint a multi-use invite at all.
-                        if mesh.invites.count() == 0 {
+                        // #85 ask 3: an ATTESTATION carries no invite, so the invite-window
+                        // fast-close would refuse it before the ceremony could run. With the knob
+                        // on, the pair ALPN is therefore reachable continuously — the cost of the
+                        // feature, stated in `[identity].admit_attested_devices` and the release
+                        // notes rather than discovered. With it off (the default) this is exactly
+                        // today's behaviour.
+                        //
+                        // What stays: the rate limiter below, the binding verification, and the
+                        // rule that an attestation can only ever admit a device of a person this
+                        // node already pairs with.
+                        if mesh.invites.count() == 0 && !mesh.admit_attested_devices() {
                             // The shared constant (#87b): the redeemer matches these bytes off
                             // `close_reason()` to say "expired / used / inviter restarted"
                             // instead of a bare connection failure.
