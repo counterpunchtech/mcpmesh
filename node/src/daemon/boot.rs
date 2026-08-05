@@ -53,7 +53,7 @@ pub async fn serve_forever(socket: &Path, paths: NodePaths) -> Result<()> {
         }
         Err(e) => return Err(e),
     };
-    let booted = start_node(paths, None).await?;
+    let booted = start_node(paths, None, BootOverrides::default()).await?;
     let state = booted.state;
     // #134: the duplicate-identity detector, installed ONLY here.
     //
@@ -126,20 +126,47 @@ pub(crate) async fn shutdown_booted(booted: BootedNode) {
 /// gates, limiters, service registry, the mesh accept loop, and roster mode's loops.
 /// `config` overrides the on-disk `paths.config_path` when `Some` (the embedder's
 /// programmatic config); config-persisting verbs still write that path.
+/// What an EMBEDDER may substitute at boot, beyond the config (#85).
+///
+/// One struct rather than a growing parameter list: `boot_node` backs both `serve_forever` and
+/// `NodeBuilder::start`, so every parameter added here is one the daemon shell must also thread
+/// through and keep meaningless.
+#[derive(Default)]
+pub(crate) struct BootOverrides {
+    /// The device key to run as, instead of reading (or minting) `<root>/config/device.key`
+    /// (#85 ask 1).
+    ///
+    /// The default posture is 32 raw secret bytes at 0600 in a directory the node owns — no
+    /// passphrase, no keychain, no hardware seam — and an embedder could not fix that from
+    /// outside, because the file is inside the mesh root it is told not to hand-write and there
+    /// was no API to hand over a decrypted key. This is that API: unwrap the key from wherever
+    /// your platform keeps secrets and pass it in.
+    ///
+    /// When set, the node reads and writes NO device key file at all. Losing the key material
+    /// therefore loses the identity — which is the trade an embedder makes deliberately by
+    /// taking custody.
+    pub(crate) device_key: Option<mcpmesh_trust::ed25519_dalek::SigningKey>,
+}
+
 pub(crate) async fn start_node(
     paths: NodePaths,
     config: Option<Config>,
+    overrides: BootOverrides,
 ) -> Result<BootedNode, StartError> {
     let config_path = paths.config_path.clone();
     let db_path = paths.state_db_path.clone();
-    boot_node(paths, config)
+    boot_node(paths, config, overrides)
         .await
         .map_err(|e| StartError::classify(e, &config_path, &db_path))
 }
 
 /// The anyhow-typed boot body — [`start_node`] classifies its error at the boundary
 /// (classification inspects the error CHAIN, so inner `?` sites stay untouched).
-async fn boot_node(paths: NodePaths, config: Option<Config>) -> Result<BootedNode> {
+async fn boot_node(
+    paths: NodePaths,
+    config: Option<Config>,
+    overrides: BootOverrides,
+) -> Result<BootedNode> {
     // 0. CRITICAL: install a process-default rustls `CryptoProvider` (ring) BEFORE any
     //    reqwest client is built. reqwest 0.13.4 (`rustls-no-provider`) resolves the provider via
     //    `CryptoProvider::get_default()` at CLIENT-BUILD time and PANICS ("No rustls crypto provider
@@ -192,8 +219,23 @@ async fn boot_node(paths: NodePaths, config: Option<Config>) -> Result<BootedNod
         Some(p) => p,
         None => paths.device_key_path.clone(),
     };
-    let (key, _created) = DeviceKey::load_or_generate(&key_path)
-        .map_err(|e| anyhow::anyhow!("device key error at {}: {e}", key_path.display()))?;
+    // #85: an embedder may supply the key instead, so it can live in the OS keychain (or anywhere
+    // else) rather than as raw secret bytes in a file this node owns. When it does, NOTHING here
+    // touches `key_path` — not a read, not a mint — so the on-disk key never exists to be stolen,
+    // and a node whose embedder holds the key cannot silently fall back to a file one.
+    let key = match overrides.device_key.as_ref() {
+        Some(sk) => {
+            tracing::debug!(
+                "using an embedder-supplied device key; no key file is read or written"
+            );
+            DeviceKey::from_signing_key(sk.clone())
+        }
+        None => {
+            DeviceKey::load_or_generate(&key_path)
+                .map_err(|e| anyhow::anyhow!("device key error at {}: {e}", key_path.display()))?
+                .0
+        }
+    };
 
     // 2. The single Iroh endpoint, seeded from the device key. Roster mode (an org root
     //    pinned in config) additionally advertises the gossip + blob ALPNs on this same endpoint;
@@ -350,6 +392,9 @@ async fn boot_node(paths: NodePaths, config: Option<Config>) -> Result<BootedNod
     );
     // Install the process audit sink on the mesh BEFORE serving, so the reload sites +
     // trust-event hooks can re-thread/read it.
+    // #67: record what the endpoint ACTUALLY bound, so registering a custom protocol re-advertises
+    // this exact set rather than a recomputation that can disagree with it.
+    mesh.set_bound_alpns(alpns_for(roster_mode));
     mesh.set_audit(audit.clone());
     mesh.set_limits(limiters.clone());
     // Seed the live relay posture from the boot `[network]` so the `set_relays` verb (#53) diffs
@@ -1246,7 +1291,7 @@ mod tests {
         // Relay-disabled so the test never reaches the network; the FLAG is what is under test.
         std::fs::write(&paths.config_path, "[network]\nrelay_mode = \"disabled\"\n").unwrap();
 
-        let booted = super::boot_node(paths, None)
+        let booted = super::boot_node(paths, None, BootOverrides::default())
             .await
             .expect("the node boots in pairing mode");
         let provider = booted
@@ -1296,7 +1341,9 @@ mod tests {
         std::fs::create_dir_all(adopted_path.parent().unwrap()).unwrap();
         std::fs::write(&adopted_path, serde_json::to_vec(&wrong).unwrap()).unwrap();
 
-        let booted = super::boot_node(paths, None).await.expect("boots");
+        let booted = super::boot_node(paths, None, BootOverrides::default())
+            .await
+            .expect("boots");
         let mesh = booted.state.mesh_required().expect("mesh");
         let presented = mesh.self_binding().expect("a binding");
         assert_ne!(
@@ -1321,7 +1368,7 @@ mod tests {
             let paths = crate::paths::NodePaths::under_root(dir.path());
             std::fs::create_dir_all(paths.config_path.parent().unwrap()).unwrap();
             std::fs::write(&paths.config_path, cfg).unwrap();
-            let out = super::boot_node(paths, None).await;
+            let out = super::boot_node(paths, None, BootOverrides::default()).await;
             (dir, out)
         };
 
@@ -1650,7 +1697,9 @@ mod tests {
         std::fs::write(&adopted_path, serde_json::to_vec(&adopted).unwrap()).unwrap();
 
         // Boot: the adopted binding must be what we present.
-        let booted = super::boot_node(paths, None).await.expect("boots");
+        let booted = super::boot_node(paths, None, BootOverrides::default())
+            .await
+            .expect("boots");
         let mesh = booted.state.mesh_required().expect("mesh");
         assert_eq!(
             mesh.self_binding().expect("a binding").user_pk,

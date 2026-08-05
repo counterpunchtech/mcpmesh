@@ -172,6 +172,61 @@ async fn dial_by_eid(mesh: &Arc<MeshState>, hex: &str, service: &str) -> Result<
 /// embedded id EQUALS the stored `endpoint_id` — a stored address claiming a DIFFERENT id is
 /// ignored (identity stays pinned to the allowlist row; TLS still authenticates whoever
 /// answers). An unparseable/absent hint degrades to the bare-id, discovery-only dial.
+/// Every endpoint worth trying for `peer`, best first (#67) — the candidate list a custom-protocol
+/// dial walks.
+///
+/// Resolution order mirrors what `dial_service` considers, so `connect_protocol` reaches the same
+/// peers `open_session` does rather than a narrower set:
+///
+/// 1. An `eid:` principal names one device directly.
+/// 2. ROSTER first for a bare name: `devices_for_user` already orders primary before mirror and is
+///    the only path that reaches a rostered person with no pairing entry. Omitting it — the first
+///    version of this function did — made `connect_protocol("alice")` fail on a roster-mode node
+///    where `open_session("alice")` works.
+/// 3. Then the pairing store: an exact nickname, else every device of that `user_id` (not just the
+///    first, which stranded a person whose first-stored device happened to be offline).
+///
+/// Deduplicated, preserving order. Empty means "nobody by that name", which the caller reports.
+pub(crate) async fn protocol_candidates(
+    mesh: &Arc<MeshState>,
+    peer: &str,
+) -> anyhow::Result<Vec<[u8; 32]>> {
+    if let Some(hex) = peer.strip_prefix("eid:") {
+        let bytes = data_encoding::HEXLOWER
+            .decode(hex.as_bytes())
+            .map_err(|_| anyhow::anyhow!("invalid eid principal: not lowercase hex"))?;
+        let id: [u8; 32] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid eid principal: expected 32 bytes"))?;
+        return Ok(vec![id]);
+    }
+    let mut out: Vec<[u8; 32]> = Vec::new();
+    if let Some(view) = mesh.roster.view() {
+        out.extend(view.devices_for_user(peer).into_iter().map(|(eid, _)| eid));
+    }
+    let store = mesh.store.clone();
+    let name = peer.to_string();
+    let from_store = crate::util::blocking("join connect_protocol resolve", move || {
+        let mut v: Vec<[u8; 32]> = Vec::new();
+        if let Some(e) = store.entry_for(&name)? {
+            v.push(e.endpoint_id);
+        }
+        v.extend(
+            store
+                .entries_for_user(&name)?
+                .into_iter()
+                .map(|e| e.endpoint_id),
+        );
+        Ok::<_, anyhow::Error>(v)
+    })
+    .await??;
+    out.extend(from_store);
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|e| seen.insert(*e));
+    Ok(out)
+}
+
 pub(crate) fn stored_dial_addr(
     last_addr: Option<&str>,
     endpoint_id: iroh::EndpointId,
@@ -192,7 +247,7 @@ const DIAL_STAGGER: Duration = Duration::from_millis(500);
 /// The explicit application-level dial timeout. Defense-in-depth over iroh's
 /// transport idle timeouts — SYMMETRIC across both dial paths (the person→device race AND the
 /// single-nickname fallback) so a dead/stalling peer fails a dial in a bounded, asserted window.
-const DIAL_TIMEOUT: Duration = Duration::from_secs(20);
+pub(crate) const DIAL_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// `connect` with an explicit timeout. On elapse → a typed Err (the caller surfaces
 /// `-32055 unreachable` upstream). Used by BOTH `dial_one` and the single-nickname `dial_service`.

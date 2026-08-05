@@ -40,6 +40,21 @@
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub use config::Config;
+/// The pinned iroh, re-exported (#67).
+///
+/// [`Node::accept_protocol`](node::Node::accept_protocol) and
+/// [`Node::connect_protocol`](node::Node::connect_protocol) name iroh types in their signatures,
+/// so an embedder needs them in scope. Use THIS path — never your own `iroh` dependency: a
+/// version mismatch is a different crate to the type system and breaks the build with an
+/// `expected Connection, found Connection`.
+pub use mcpmesh_net::iroh;
+/// The pinned `mcpmesh-trust`, re-exported (#85).
+///
+/// [`NodeBuilder::device_key`](node::NodeBuilder::device_key) takes a
+/// `mcpmesh_trust::ed25519_dalek::SigningKey`, so an embedder needs that type in scope. Use THIS
+/// path rather than adding your own `mcpmesh-trust` or `ed25519-dalek` dependency — the version
+/// hazard is identical to the iroh one above, and the compiler error is just as unhelpful.
+pub use mcpmesh_trust;
 pub use node::{Node, NodeBuilder, StartError};
 pub use paths::NodePaths;
 
