@@ -206,6 +206,96 @@ impl Node {
         self.mesh().endpoint.id()
     }
 
+    /// Add an address-lookup service — a peer RESOLVER — to this node's endpoint (#68).
+    ///
+    /// **What this is for.** Peer resolution otherwise depends on external infrastructure: the
+    /// pkarr publisher/resolver a relay provides, or a dialable address someone already handed you
+    /// in an invite. Two machines on the same LAN with no internet cannot find each other, even
+    /// though the network path between them is fine — and offline-capable operation is the claim
+    /// that most clearly separates a P2P library from a self-hosted server, which is still a star
+    /// topology with a single point of failure.
+    ///
+    /// iroh 1.0.3 ships **no** mDNS or local-swarm lookup (that existed in 0.x and is not present
+    /// here), so mcpmesh cannot simply switch one on. What it can do is stop the resolver set being
+    /// closed: `iroh::address_lookup::AddressLookup` is a public, pluggable trait, so an mDNS
+    /// implementation — or any other — can live outside this crate and be handed in here.
+    ///
+    /// ```no_run
+    /// use mcpmesh_node::iroh::address_lookup::{AddressLookup, EndpointData};
+    ///
+    /// #[derive(Debug)]
+    /// struct MyMdns;
+    ///
+    /// impl AddressLookup for MyMdns {
+    ///     fn publish(&self, _data: &EndpointData) {
+    ///         // announce this endpoint's addresses on the LAN
+    ///     }
+    ///     // `resolve` defaults to `None`; implement it to answer queries.
+    /// }
+    ///
+    /// # fn f(node: &mcpmesh_node::Node) -> anyhow::Result<()> {
+    /// node.add_address_lookup(MyMdns)?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// # It PUBLISHES too — read this before you add one
+    ///
+    /// `AddressLookup` is not only a resolver. iroh hands the service this node's own
+    /// [`EndpointData`] — **its direct IP addresses, LAN and public, v4 and v6** — synchronously
+    /// inside this call, and again on every address change afterwards. That happens whether or not
+    /// you implement `publish`, because the default is a no-op *you* control: a lookup that grows
+    /// a `publish` later, or a dependency's lookup you pass through, starts announcing them.
+    ///
+    /// This is outside `[network].discovery_urls`' scope. An operator who pinned that precisely so
+    /// publication never leaves their infrastructure gets no say over a lookup added here — you do.
+    /// Treat what you hand this seam as something you would let see the machine's addresses.
+    ///
+    /// The node's `[network]` address filter still applies: on a relay-only posture the service
+    /// receives relay-only data, because the filter runs centrally before any service sees it.
+    ///
+    /// # And its answers are attacker-controlled input
+    ///
+    /// A resolver on an untrusted LAN is fed by whoever is on that LAN. They cannot impersonate a
+    /// peer (see below), but they can steer a dial: make this node send QUIC handshakes to an
+    /// address of their choosing, revealing that it is looking for peer X, or hand back a relay URL
+    /// that routes metadata through them. Validate what your implementation accepts.
+    ///
+    /// # What it cannot do
+    ///
+    /// **Additive, never authoritative.** Lookups are consulted alongside whatever this node
+    /// already has — `add` appends, and every service is queried — so adding one cannot remove
+    /// relay-based resolution.
+    ///
+    /// **Resolution AUTHORIZES nothing.** A misdirected dial cannot complete against the wrong
+    /// peer: iroh's TLS verifier rejects any server whose key is not the `EndpointId` the dial
+    /// named, mcpmesh's pairing dial re-checks `conn.remote_id()` against the invite before
+    /// revealing the secret, and a stored dial hint whose embedded id disagrees is discarded. A
+    /// peer found this way then faces the trust gate exactly as one found any other way —
+    /// resolution answers "where", never "who may".
+    ///
+    /// **Takes effect for dials from now on.** A dial already in flight is not re-resolved (the
+    /// service list is snapshotted when resolution is triggered).
+    ///
+    /// # Errors and panics
+    ///
+    /// The `Result` is effectively infallible for an embedder: it errors only on a closed endpoint,
+    /// and `shutdown` consumes the `Node`, so you cannot hold one to call this on. It is kept as a
+    /// `Result` rather than swallowed because the underlying accessor can fail.
+    ///
+    /// **It can panic**, though: your `publish` is called synchronously inside this call, so a
+    /// panic in it propagates out of here.
+    pub fn add_address_lookup(
+        &self,
+        lookup: impl iroh::address_lookup::AddressLookup + 'static,
+    ) -> anyhow::Result<()> {
+        self.mesh()
+            .endpoint
+            .address_lookup()
+            .map_err(|e| anyhow::anyhow!("this node's endpoint is closed: {e}"))?
+            .add(lookup);
+        Ok(())
+    }
+
     /// Serve a custom protocol on `alpn`, through this node's existing trust gate (#67).
     ///
     /// **What this is for.** mcpmesh has already built the hard parts of a P2P application

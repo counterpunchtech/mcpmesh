@@ -611,3 +611,124 @@ async fn an_embedder_can_supply_the_device_key_and_no_key_file_is_written() {
     );
     filed.shutdown().await;
 }
+
+/// #68: an embedder supplies its OWN peer resolver, and two nodes that cannot otherwise find each
+/// other connect through it.
+///
+/// Peer resolution depends on external infrastructure — the pkarr publisher/resolver a relay
+/// provides, or an address someone already handed you in an invite. Two machines on one LAN with no
+/// internet cannot find each other, though the network path between them is fine. iroh 1.0.3 ships
+/// no mDNS lookup, so mcpmesh cannot switch one on; what it can do is stop the resolver set being
+/// closed, so an implementation can live outside this crate.
+///
+/// The test constructs exactly that situation. Both nodes run `relay_mode = "disabled"` — no relay,
+/// no discovery — and node b is given ONLY a nickname to dial, with no stored address for it. So:
+///
+/// 1. Before the lookup is added, the dial fails: nothing can turn that identity into an address.
+/// 2. After it, the same dial succeeds — through the embedder's resolver and nothing else.
+///
+/// Assertion 1 is what makes assertion 2 mean anything. Without it the test would pass on a node
+/// that had cached the address from an earlier dial.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_embedder_can_supply_its_own_peer_resolver() {
+    use std::sync::Arc;
+
+    const ALPN: &[u8] = b"app/resolved/1";
+
+    #[derive(Debug)]
+    struct Echo;
+    impl mcpmesh_node::iroh::protocol::ProtocolHandler for Echo {
+        async fn accept(
+            &self,
+            conn: mcpmesh_node::iroh::endpoint::Connection,
+        ) -> Result<(), mcpmesh_node::iroh::protocol::AcceptError> {
+            let (mut send, mut recv) = conn.accept_bi().await?;
+            let got = recv.read_to_end(64).await.map_err(|e| {
+                mcpmesh_node::iroh::protocol::AcceptError::from_err(std::io::Error::other(e))
+            })?;
+            send.write_all(&got).await.map_err(|e| {
+                mcpmesh_node::iroh::protocol::AcceptError::from_err(std::io::Error::other(e))
+            })?;
+            send.finish().ok();
+            conn.closed().await;
+            Ok(())
+        }
+    }
+
+    let (a_root, b_root) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = NodeBuilder::new(a_root.path())
+        .config(hermetic())
+        .start()
+        .await
+        .expect("node a starts");
+    let b = NodeBuilder::new(b_root.path())
+        .config(hermetic())
+        .start()
+        .await
+        .expect("node b starts");
+    a.accept_protocol(ALPN, Arc::new(Echo)).expect("register");
+
+    // b learns a's IDENTITY only — never its address. `eid:` is the one form that needs no
+    // pairing and no stored row, so the dial depends on resolution and nothing else.
+    let a_eid = format!("eid:{}", a.endpoint_id());
+
+    // (1) No resolver: the dial cannot succeed, because nothing can turn that id into an address.
+    assert!(
+        timeout(Duration::from_secs(30), b.connect_protocol(&a_eid, ALPN))
+            .await
+            .expect("the dial must give up, not hang past its own timeout")
+            .is_err(),
+        "with no address and no resolver the dial must fail — this is the air-gapped-LAN state \
+         #68 describes, and the control that makes the assertion below meaningful"
+    );
+
+    // (2) The embedder supplies a resolver. A `MemoryLookup` seeded with a's address stands in for
+    // the mDNS implementation an embedder would write: what is under test is the SEAM, not the
+    // protocol behind it.
+    let lookup = mcpmesh_node::iroh::address_lookup::MemoryLookup::new();
+    lookup.add_endpoint_info(a.endpoint_addr());
+    b.add_address_lookup(lookup)
+        .expect("an embedder's resolver is accepted");
+
+    let conn = timeout(Duration::from_secs(30), b.connect_protocol(&a_eid, ALPN))
+        .await
+        .expect("connect within 30s")
+        .expect("the same dial must now succeed, resolved by the embedder's own lookup");
+
+    // …and the gate STILL applies. b never paired with a, so a closes the connection 401 rather
+    // than serving it. Context rather than evidence for THIS seam — it exercises #67's gate, which
+    // no mutation of `add_address_lookup` can affect — but worth keeping, because it is the
+    // property that makes handing an embedder a resolver safe at all. That is the second half of the property and worth asserting rather than
+    // working around: resolution answers WHERE a peer is, never WHO MAY talk to it, so an embedder
+    // adding a resolver cannot widen who its node admits.
+    let (mut send, mut recv) = conn.open_bi().await.expect("open_bi");
+    let _ = send.write_all(b"found-you").await;
+    let _ = send.finish();
+    let refused = timeout(Duration::from_secs(30), recv.read_to_end(64))
+        .await
+        .expect("the gate answers promptly")
+        .expect_err("an UNPAIRED peer must be refused however it was resolved");
+    assert!(
+        format!("{refused:?}").contains("401") || format!("{refused:?}").contains("unauthorized"),
+        "the refusal must be the trust gate's 401, not a transport failure — a resolver that \
+         admitted strangers would be a second door into the node: {refused:?}"
+    );
+
+    // (3) ADDITIVE, not replacing. A SECOND lookup — one that knows nothing — is added on top, and
+    // resolution still works. Without this the claim was asserted nowhere: both nodes are hermetic
+    // and start with ZERO lookups, so nothing could have been shadowed and no assertion would have
+    // failed if `add` replaced the service list instead of appending to it.
+    b.add_address_lookup(mcpmesh_node::iroh::address_lookup::MemoryLookup::new())
+        .expect("a second resolver is accepted");
+    let again = timeout(Duration::from_secs(30), b.connect_protocol(&a_eid, ALPN))
+        .await
+        .expect("connect within 30s")
+        .expect(
+            "adding a second lookup must not displace the first — `add` appends, and every \
+             service is queried",
+        );
+    drop(again);
+
+    b.shutdown().await;
+    a.shutdown().await;
+}
