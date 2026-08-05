@@ -5788,13 +5788,27 @@ pub async fn peer_revoke(
     params: mcpmesh_local_api::PeerRevokeParams,
 ) -> Result<mcpmesh_local_api::PeerRevokeResult> {
     let mesh = state.mesh_required()?;
-    let targets = revocation_targets(mesh, &params.peer).await?;
-    // A name that resolves to nothing is an ERROR, never an empty success. This is a revocation
-    // surface: a typo reading as "done" would leave an operator believing they had cut off a device
-    // they had not touched — the same reasoning `peer_remove` uses for its all-no-op case.
+    let mut targets = revocation_targets(mesh, &params.peer).await?;
+    // A bare, well-formed `eid:` is accepted even with NO matching row.
+    //
+    // An operator told "this endpoint id is compromised" must be able to act before they have ever
+    // paired with it — otherwise the only way to pre-empt a bad device is to pair with it first,
+    // which is absurd. Unlike the SIGNED import, this carries no denial-of-service risk: it is
+    // local-only and the operator made the decision themselves.
+    if targets.is_empty()
+        && let Some(id) = principal_to_endpoint(&params.peer)
+    {
+        targets.push(id);
+    }
+    // Anything else that resolves to nothing is an ERROR, never an empty success. This is a
+    // revocation surface: a typo reading as "done" would leave an operator believing they had cut
+    // off a device they had not touched — the same reasoning `peer_remove` uses for its all-no-op
+    // case. An `eid:` is exempt above precisely because it is unambiguous; a mistyped nickname or
+    // `b64u:` is not.
     anyhow::ensure!(
         !targets.is_empty(),
-        "no paired device matches {:?} (expected a nickname, an eid: principal, or a b64u: user_id)",
+        "no paired device matches {:?} (expected a nickname, a b64u: user_id, or a well-formed \
+         eid: principal — an eid: may be revoked before you have paired with it)",
         params.peer
     );
 
@@ -5802,6 +5816,34 @@ pub async fn peer_revoke(
     let reason = params.reason.clone();
     let ids: Vec<[u8; 32]> = targets.iter().map(|e| *e.as_bytes()).collect();
     let now = crate::util::epoch_now_u64();
+    // A `b64u:` revokes the IDENTITY as well as its known endpoints (#85 ask 3 gate).
+    //
+    // Per-endpoint revocation cannot express "not on any of their machines" once attestation
+    // exists: a device holding that person's user key can mint a fresh endpoint id at will, so a
+    // list of the ids we happen to know is a list of the ones the attacker will not reuse. The CLI
+    // has always described this verb as revoking the person; now it does.
+    let revoked_user = params
+        .peer
+        .starts_with("b64u:")
+        .then(|| params.peer.clone());
+    if let Some(uid) = revoked_user.clone() {
+        let store = mesh.store.clone();
+        let reason = params.reason.clone();
+        blocking("join identity revoke write", move || {
+            store.revoke_user(
+                &uid,
+                &crate::allowlist::RevokedEntry {
+                    endpoint_id: [0u8; 32],
+                    revoked_at: now,
+                    reason,
+                    source: "local".into(),
+                    signer_user_id: None,
+                    issued_at: None,
+                },
+            )
+        })
+        .await??;
+    }
     blocking("join peer revoke write", move || {
         for id in ids {
             // Do NOT overwrite a SIGNED revocation with a local one (#85 ask 4, 0.45.0 gate).
@@ -5872,6 +5914,14 @@ pub async fn peer_unrevoke(
     }
     let store = mesh.store.clone();
     let ids: Vec<[u8; 32]> = targets.iter().map(|e| *e.as_bytes()).collect();
+    if params.peer.starts_with("b64u:") {
+        let store = mesh.store.clone();
+        let uid = params.peer.clone();
+        blocking("join identity unrevoke write", move || {
+            store.unrevoke_user(&uid)
+        })
+        .await??;
+    }
     let lifted = blocking("join peer unrevoke write", move || {
         let mut lifted = Vec::new();
         for id in ids {
@@ -6152,4 +6202,44 @@ pub(crate) async fn device_revocation_import(
         applied: true,
         severed,
     })
+}
+
+/// `attest_offer` (#85 ask 3): mint the `mcpmesh-attest:` line another device of this person dials.
+///
+/// Refused unless this node actually admits attested devices. An offer we would not honour is worse
+/// than no offer: the other device would run a ceremony, be refused generically, and have nothing
+/// to tell the operator about why.
+pub(crate) async fn attest_offer(
+    state: &DaemonState,
+) -> Result<mcpmesh_local_api::AttestOfferResult> {
+    let mesh = state.mesh_required()?;
+    anyhow::ensure!(
+        mesh.admit_attested_devices(),
+        "this node does not admit attested devices — set `[identity].admit_attested_devices = true` \
+         and restart, then offer again"
+    );
+    let offer = crate::pairing::rendezvous::AttestOffer {
+        node_id: *mesh.endpoint.id().as_bytes(),
+        node_addr_json: serde_json::to_string(&mesh.endpoint.addr())?,
+    };
+    Ok(mcpmesh_local_api::AttestOfferResult {
+        offer: offer.encode()?,
+    })
+}
+
+/// `attest_to` (#85 ask 3): present this device's identity to a peer that already pairs with this
+/// person, using their offer line.
+pub(crate) async fn attest_to(
+    state: &DaemonState,
+    params: mcpmesh_local_api::AttestToParams,
+) -> Result<mcpmesh_local_api::PairResult> {
+    let mesh = state.mesh_required()?;
+    crate::pairing::rendezvous::attest_to(
+        mesh.endpoint.clone(),
+        params.offer,
+        mesh.store.clone(),
+        mesh.self_binding(),
+        None,
+    )
+    .await
 }

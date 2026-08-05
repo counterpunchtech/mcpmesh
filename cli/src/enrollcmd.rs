@@ -651,6 +651,56 @@ pub fn run_revoke_import(token: Option<String>, json: bool) -> anyhow::Result<()
     Ok(())
 }
 
+/// `mcpmesh attest offer` (#85 ask 3).
+pub fn run_attest_offer(json: bool) -> anyhow::Result<()> {
+    let out = with_daemon(async move |mut client| Ok(client.attest_offer().await?))?;
+    if json {
+        println!("{}", serde_json::to_string(&out)?);
+        return Ok(());
+    }
+    println!("Hand this to another of your devices:");
+    println!();
+    println!("  {}", out.offer);
+    println!();
+    println!("  mcpmesh attest to <line>");
+    println!();
+    println!("  → It is not a secret: it says where to reach this node, nothing more. Only a");
+    println!(
+        "    device presenting a binding to someone this node already pairs with is admitted."
+    );
+    Ok(())
+}
+
+/// `mcpmesh attest to [line]` (#85 ask 3). Reads stdin when the line is omitted.
+pub fn run_attest_to(offer: Option<String>, json: bool) -> anyhow::Result<()> {
+    let offer = match offer {
+        Some(o) => o,
+        None => {
+            use std::io::Read;
+            let mut buf = String::new();
+            std::io::stdin().read_to_string(&mut buf)?;
+            buf
+        }
+    };
+    let offer = offer.trim().to_string();
+    anyhow::ensure!(
+        !offer.is_empty(),
+        "no attestation offer given (argument or stdin)"
+    );
+    let out = with_daemon(async move |mut client| Ok(client.attest_to(offer).await?))?;
+    if json {
+        println!("{}", serde_json::to_string(&out)?);
+        return Ok(());
+    }
+    println!("Admitted by {}.", out.peer_nickname);
+    println!();
+    println!("  → No confirmation code: the binding replaced the in-person ceremony, so there is");
+    println!("    nothing for the two of you to compare.");
+    println!("  → They admitted this machine as another device of you, with the access you");
+    println!("    already had. Repeat for each peer you want to reach.");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

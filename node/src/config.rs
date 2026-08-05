@@ -94,6 +94,25 @@ pub struct IdentityCfg {
     /// Roster mode: this node's stable user_id in the org. Pinned at `join` (proposed)
     /// and reconciled to the roster's authoritative value once installed.
     pub user_id: Option<String>,
+    /// #85 ask 3: admit another DEVICE of a person this node already pairs with, when it presents a
+    /// binding signed by that person's user key — no fresh SAS ceremony.
+    ///
+    /// **OFF by default**, and #85 asks for it to be seamless. It changes what a pairing MEANS:
+    /// today a pairing admits a device, and with this on it admits a person and their future
+    /// devices. #38 arguably made that true of grants already — they are keyed on stable
+    /// principals, so a person's devices share authorization — but "arguably implied" is not a
+    /// reason to widen admission on somebody's node during an upgrade.
+    ///
+    /// **It does not resurrect a device you removed.** `peer_remove` deletes the row; it does not
+    /// stop the PERSON from attesting a device afterwards, because you still pair with them. If you
+    /// removed a device because it was compromised, REVOKE it — attestation checks the revocation
+    /// list first, which is why #85 ask 4 shipped before this.
+    ///
+    /// **It also keeps the pair ALPN's front door open.** That ALPN fast-closes when no invite is
+    /// live; an attestation needs no invite, so with this on the (rate-limited, binding-verified)
+    /// ceremony is reachable continuously. That is the cost of the feature, not a side effect.
+    #[serde(default)]
+    pub admit_attested_devices: bool,
     /// Roster mode: path to this person's user key. Minted by `join`; binds this
     /// person's devices. `None` → paths::default_user_key_path() when needed.
     pub user_key: Option<PathBuf>,

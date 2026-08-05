@@ -466,6 +466,28 @@ impl ControlClient {
         .await
     }
 
+    /// Mint an attestation offer (#85 ask 3) — where another of this person's devices should dial.
+    pub async fn attest_offer(
+        &mut self,
+    ) -> Result<crate::protocol::AttestOfferResult, ClientError> {
+        self.request_typed(Request::AttestOffer, "attest_offer result")
+            .await
+    }
+
+    /// Present this device's identity to a peer, using their `mcpmesh-attest:` line (#85 ask 3).
+    pub async fn attest_to(
+        &mut self,
+        offer: impl Into<String>,
+    ) -> Result<crate::protocol::PairResult, ClientError> {
+        self.request_typed(
+            Request::AttestTo(crate::protocol::AttestToParams {
+                offer: offer.into(),
+            }),
+            "attest_to result",
+        )
+        .await
+    }
+
     /// Refuse a peer's device on this node (#85 ask 4). Immediate: live sessions are severed.
     pub async fn peer_revoke(
         &mut self,

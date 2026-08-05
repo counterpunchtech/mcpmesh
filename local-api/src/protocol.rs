@@ -734,6 +734,21 @@ pub struct PairParams {
     pub allow_self_enroll: bool,
 }
 
+/// Params of [`Request::AttestTo`] (#85 ask 3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttestToParams {
+    /// A `mcpmesh-attest:` line from the peer that will admit this device.
+    pub offer: String,
+}
+
+/// Result of [`Request::AttestOffer`] (#85 ask 3).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct AttestOfferResult {
+    /// The `mcpmesh-attest:` line. Hand it to your other device.
+    pub offer: String,
+}
+
 /// Params of [`Request::PeerRevoke`] (#85 ask 4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1285,6 +1300,26 @@ pub enum Request {
     /// pairing rendezvous uses, so a rename can't inherit another peer's access. Tag `"peer_rename"`;
     /// host-privileged like the other pair ops.
     PeerRename(PeerRenameParams),
+    /// Mint an attestation OFFER (#85 ask 3): a `mcpmesh-attest:` line telling another device of a
+    /// person you already pair with where to dial. Tag `"attest_offer"`.
+    ///
+    /// **Carries nothing secret** — the offering node's id and address, both of which an invite
+    /// line already carries in the clear. It exists because a device freshly restored from a
+    /// recovery phrase holds no rows and so has no way to find anyone.
+    ///
+    /// Refused unless this node has `[identity].admit_attested_devices` on: an offer it would not
+    /// honour is worse than no offer.
+    AttestOffer,
+    /// Present THIS device's identity to a peer, using their `mcpmesh-attest:` line (#85 ask 3).
+    /// Tag `"attest_to"`.
+    ///
+    /// The recovery path's second half: `user_key_import` restores the `b64u:` your peers pinned,
+    /// and this is what gets the machine holding it ADMITTED. Requires a user key — with none there
+    /// is nothing to attest.
+    ///
+    /// The peer admits this device only if it already holds a row for this person, has opted in,
+    /// and has revoked neither this endpoint nor the IDENTITY. It cannot admit a stranger.
+    AttestTo(AttestToParams),
     /// REVOKE an endpoint locally: "I no longer trust this device" (#85 ask 4). Tag
     /// `"peer_revoke"`.
     ///
@@ -2593,7 +2628,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   thirty have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.51";
+pub const API_VERSION: &str = "1.52";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -2679,7 +2714,19 @@ pub const API_VERSION: &str = "1.51";
 /// refusals — expired line, no live invite, inviter unreachable, id mismatch, name conflict, and
 /// the deliberately-opaque refusal. `ERR_NICKNAME_TAKEN` had been the only coded pairing failure,
 /// so every other one arrived as `-32000` and an embedder could either forward our prose to end
-/// users or substring-match it (#159); to 51 with the PAIRING-MODE REVOCATION verbs —
+/// users or substring-match it (#159); to 52 with `attest_offer` and the DEVICE ATTESTATION
+/// ceremony (#85 ask 3) — a peer that already holds your `b64u:` admits a replacement device on the
+/// strength of a user-key binding, with no fresh SAS ceremony with everyone you ever paired with.
+/// `PeerEntry.user_id` was written once at pairing and never refreshed, so a machine restored from
+/// a recovery phrase (ask 2) was still a complete stranger. **OFF by default**
+/// (`[identity].admit_attested_devices`): it changes what a pairing MEANS, from admitting a device
+/// to admitting a person and their future devices, and that should be chosen rather than inherited
+/// on upgrade. An attestation cannot admit a stranger — the receiver must already hold a row for
+/// that `user_id` — cannot resurrect a REVOKED endpoint OR a revoked IDENTITY (ask 4, which is why
+/// it shipped first; `peer_revoke` on a `b64u:` now revokes the person, because a thief holding the
+/// disk holds the user key and can mint a fresh endpoint id at will), and
+/// grants the INTERSECTION of that person's existing services, never the union. Guard on `>= 52`;
+/// to 51 with the PAIRING-MODE REVOCATION verbs —
 /// `peer_revoke` / `peer_unrevoke` / `device_revoke` / `device_revocation_import`, plus
 /// [`StatusResult::revoked`] (#85 ask 4). `revoked_endpoints` was roster-only, so in pairing mode
 /// the only remedy for a stolen device was every peer independently running `peer_remove`, with
@@ -2814,7 +2861,7 @@ pub const API_VERSION: &str = "1.51";
 /// its REAL content is a meaning change to `reachable` — the field exists so the new meaning is
 /// observable at all. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 51;
+pub const API_MINOR: u32 = 52;
 
 #[cfg(test)]
 mod tests {
