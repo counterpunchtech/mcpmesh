@@ -696,7 +696,9 @@ async fn an_embedder_can_supply_its_own_peer_resolver() {
         .expect("the same dial must now succeed, resolved by the embedder's own lookup");
 
     // …and the gate STILL applies. b never paired with a, so a closes the connection 401 rather
-    // than serving it. That is the second half of the property and worth asserting rather than
+    // than serving it. Context rather than evidence for THIS seam — it exercises #67's gate, which
+    // no mutation of `add_address_lookup` can affect — but worth keeping, because it is the
+    // property that makes handing an embedder a resolver safe at all. That is the second half of the property and worth asserting rather than
     // working around: resolution answers WHERE a peer is, never WHO MAY talk to it, so an embedder
     // adding a resolver cannot widen who its node admits.
     let (mut send, mut recv) = conn.open_bi().await.expect("open_bi");
@@ -711,6 +713,21 @@ async fn an_embedder_can_supply_its_own_peer_resolver() {
         "the refusal must be the trust gate's 401, not a transport failure — a resolver that \
          admitted strangers would be a second door into the node: {refused:?}"
     );
+
+    // (3) ADDITIVE, not replacing. A SECOND lookup — one that knows nothing — is added on top, and
+    // resolution still works. Without this the claim was asserted nowhere: both nodes are hermetic
+    // and start with ZERO lookups, so nothing could have been shadowed and no assertion would have
+    // failed if `add` replaced the service list instead of appending to it.
+    b.add_address_lookup(mcpmesh_node::iroh::address_lookup::MemoryLookup::new())
+        .expect("a second resolver is accepted");
+    let again = timeout(Duration::from_secs(30), b.connect_protocol(&a_eid, ALPN))
+        .await
+        .expect("connect within 30s")
+        .expect(
+            "adding a second lookup must not displace the first — `add` appends, and every \
+             service is queried",
+        );
+    drop(again);
 
     b.shutdown().await;
     a.shutdown().await;

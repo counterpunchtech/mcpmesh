@@ -221,8 +221,7 @@ impl Node {
     /// implementation — or any other — can live outside this crate and be handed in here.
     ///
     /// ```no_run
-    /// use mcpmesh_node::iroh::address_lookup::{AddressLookup, EndpointData, Item};
-    /// use mcpmesh_node::iroh::EndpointId;
+    /// use mcpmesh_node::iroh::address_lookup::{AddressLookup, EndpointData};
     ///
     /// #[derive(Debug)]
     /// struct MyMdns;
@@ -239,14 +238,52 @@ impl Node {
     /// # Ok(()) }
     /// ```
     ///
-    /// **Additive, and never authoritative.** Lookups are consulted alongside whatever this node
-    /// already has; adding one cannot remove the relay-based resolution, and resolving an address
-    /// AUTHORIZES nothing. A peer found this way still faces the trust gate exactly as one found
-    /// any other way — resolution answers "where", never "who may".
+    /// # It PUBLISHES too — read this before you add one
     ///
-    /// **Takes effect for dials from now on.** A dial already in flight is not re-resolved.
+    /// `AddressLookup` is not only a resolver. iroh hands the service this node's own
+    /// [`EndpointData`] — **its direct IP addresses, LAN and public, v4 and v6** — synchronously
+    /// inside this call, and again on every address change afterwards. That happens whether or not
+    /// you implement `publish`, because the default is a no-op *you* control: a lookup that grows
+    /// a `publish` later, or a dependency's lookup you pass through, starts announcing them.
     ///
-    /// Errors only if the endpoint is closed (a node that has been shut down).
+    /// This is outside `[network].discovery_urls`' scope. An operator who pinned that precisely so
+    /// publication never leaves their infrastructure gets no say over a lookup added here — you do.
+    /// Treat what you hand this seam as something you would let see the machine's addresses.
+    ///
+    /// The node's `[network]` address filter still applies: on a relay-only posture the service
+    /// receives relay-only data, because the filter runs centrally before any service sees it.
+    ///
+    /// # And its answers are attacker-controlled input
+    ///
+    /// A resolver on an untrusted LAN is fed by whoever is on that LAN. They cannot impersonate a
+    /// peer (see below), but they can steer a dial: make this node send QUIC handshakes to an
+    /// address of their choosing, revealing that it is looking for peer X, or hand back a relay URL
+    /// that routes metadata through them. Validate what your implementation accepts.
+    ///
+    /// # What it cannot do
+    ///
+    /// **Additive, never authoritative.** Lookups are consulted alongside whatever this node
+    /// already has — `add` appends, and every service is queried — so adding one cannot remove
+    /// relay-based resolution.
+    ///
+    /// **Resolution AUTHORIZES nothing.** A misdirected dial cannot complete against the wrong
+    /// peer: iroh's TLS verifier rejects any server whose key is not the `EndpointId` the dial
+    /// named, mcpmesh's pairing dial re-checks `conn.remote_id()` against the invite before
+    /// revealing the secret, and a stored dial hint whose embedded id disagrees is discarded. A
+    /// peer found this way then faces the trust gate exactly as one found any other way —
+    /// resolution answers "where", never "who may".
+    ///
+    /// **Takes effect for dials from now on.** A dial already in flight is not re-resolved (the
+    /// service list is snapshotted when resolution is triggered).
+    ///
+    /// # Errors and panics
+    ///
+    /// The `Result` is effectively infallible for an embedder: it errors only on a closed endpoint,
+    /// and `shutdown` consumes the `Node`, so you cannot hold one to call this on. It is kept as a
+    /// `Result` rather than swallowed because the underlying accessor can fail.
+    ///
+    /// **It can panic**, though: your `publish` is called synchronously inside this call, so a
+    /// panic in it propagates out of here.
     pub fn add_address_lookup(
         &self,
         lookup: impl iroh::address_lookup::AddressLookup + 'static,

@@ -311,12 +311,28 @@ impl AddressLookup for MyMdns {
 node.add_address_lookup(MyMdns)?;
 ```
 
+**It publishes, not only resolves.** iroh hands your service this node's own `EndpointData` — its
+direct IP addresses, LAN *and* public — synchronously inside `add_address_lookup`, and again on
+every address change. That happens whether or not you implement `publish`: the default is a no-op
+*you* own, so a lookup that grows one later, or a dependency's lookup you pass through, starts
+announcing them. This is outside `[network].discovery_urls`' scope — an operator who pinned that so
+publication never leaves their infrastructure has no say over what you add here. The node's address
+filter still applies, so a relay-only posture hands over relay-only data.
+
+**Its answers are attacker-controlled input.** A resolver on an untrusted LAN is fed by whoever is on
+that LAN. They cannot impersonate a peer, but they can steer a dial — make your node handshake at an
+address of their choosing, revealing that it is looking for peer X, or return a relay URL that routes
+metadata through them. Validate what your implementation accepts.
+
 - **Additive, never authoritative.** Your lookup is consulted alongside whatever the node already
-  has; adding one cannot remove relay-based resolution.
-- **Resolution authorizes nothing.** A peer found this way faces the trust gate exactly as one found
-  any other way — resolution answers *where*, never *who may*. A resolver cannot widen who your node
-  admits, which is why this is safe to hand to an embedder at all.
+  has; `add` appends and every service is queried, so adding one cannot remove relay-based
+  resolution.
+- **Resolution authorizes nothing.** A misdirected dial cannot complete against the wrong peer —
+  iroh's TLS verifier rejects any server whose key is not the `EndpointId` the dial named. A peer
+  found this way then faces the trust gate exactly as one found any other way: resolution answers
+  *where*, never *who may*.
 - **Takes effect for dials from now on.** A dial already in flight is not re-resolved.
+- **A panic in your `publish` propagates out of `add_address_lookup`** — it is called synchronously.
 
 **An in-tree mDNS implementation behind `[network].local_discovery` is still open** (#68). This is
 the seam that unblocks writing one outside; it is not the discovery itself.
