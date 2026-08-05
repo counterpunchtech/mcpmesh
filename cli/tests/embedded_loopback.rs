@@ -698,20 +698,27 @@ async fn an_embedder_can_supply_its_own_peer_resolver() {
     // …and the gate STILL applies. b never paired with a, so a closes the connection 401 rather
     // than serving it. Context rather than evidence for THIS seam — it exercises #67's gate, which
     // no mutation of `add_address_lookup` can affect — but worth keeping, because it is the
-    // property that makes handing an embedder a resolver safe at all. That is the second half of the property and worth asserting rather than
-    // working around: resolution answers WHERE a peer is, never WHO MAY talk to it, so an embedder
-    // adding a resolver cannot widen who its node admits.
-    let (mut send, mut recv) = conn.open_bi().await.expect("open_bi");
-    let _ = send.write_all(b"found-you").await;
-    let _ = send.finish();
-    let refused = timeout(Duration::from_secs(30), recv.read_to_end(64))
-        .await
-        .expect("the gate answers promptly")
-        .expect_err("an UNPAIRED peer must be refused however it was resolved");
+    // property that makes handing an embedder a resolver safe at all: resolution answers WHERE a
+    // peer is, never WHO MAY talk to it, so adding a resolver cannot widen who a node admits.
+    // The refusal can surface at EITHER call: the gate closes asynchronously, so `open_bi` may
+    // already see the close, or it may succeed and the read see it. Asserting on one of them
+    // specifically is a race — CI caught exactly that. What matters is that a 401 arrives.
+    let refused = match conn.open_bi().await {
+        Err(e) => format!("{e:?}"),
+        Ok((mut send, mut recv)) => {
+            let _ = send.write_all(b"found-you").await;
+            let _ = send.finish();
+            let e = timeout(Duration::from_secs(30), recv.read_to_end(64))
+                .await
+                .expect("the gate answers promptly")
+                .expect_err("an UNPAIRED peer must be refused however it was resolved");
+            format!("{e:?}")
+        }
+    };
     assert!(
-        format!("{refused:?}").contains("401") || format!("{refused:?}").contains("unauthorized"),
+        refused.contains("401") || refused.contains("unauthorized"),
         "the refusal must be the trust gate's 401, not a transport failure — a resolver that \
-         admitted strangers would be a second door into the node: {refused:?}"
+         admitted strangers would be a second door into the node: {refused}"
     );
 
     // (3) ADDITIVE, not replacing. A SECOND lookup — one that knows nothing — is added on top, and

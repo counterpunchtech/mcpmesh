@@ -62,6 +62,9 @@ pub async fn dial_service(
         let devices = view.devices_for_user(peer);
         if !devices.is_empty() {
             let candidates = order_dial_candidates(&devices, &mesh.presence_table, peer);
+            // #186: a rostered device often ALSO has a paired row, and its hint is the only address
+            // anyone has on a network with no discovery.
+            let candidates = hinted_addrs(mesh, candidates).await?;
             let (transport, conn) = race_dial(&mesh.endpoint, candidates, service)
                 .await
                 .with_context(|| format!("dial {peer}/{service}"))?;
@@ -96,6 +99,10 @@ pub async fn dial_service(
     // Several devices share the resolved user_id → race them (bare-id, discovery-resolved),
     // mirroring the roster person→device path.
     if !multi.is_empty() {
+        // #186: these came from `entries_for_user`, so the hints were literally in hand and the
+        // old code kept only the ids — making a two-device person unreachable offline while a
+        // one-device person was fine.
+        let multi = hinted_addrs(mesh, multi).await?;
         let (transport, conn) = race_dial(&mesh.endpoint, multi, service)
             .await
             .with_context(|| format!("dial {peer}/{service}"))?;
@@ -390,7 +397,7 @@ pub(crate) fn dial_role_rank(role: &str) -> u8 {
 /// [`JoinSet`]: tokio::task::JoinSet
 pub async fn race_dial(
     endpoint: &iroh::Endpoint,
-    candidates: Vec<[u8; 32]>,
+    candidates: Vec<iroh::EndpointAddr>,
     service: &str,
 ) -> Result<(SessionTransport, iroh::endpoint::Connection)> {
     anyhow::ensure!(!candidates.is_empty(), "no dial candidates to race");
@@ -401,14 +408,14 @@ pub async fn race_dial(
         tokio::task::JoinSet::new();
     let spawn_dial =
         |set: &mut tokio::task::JoinSet<Result<(SessionTransport, iroh::endpoint::Connection)>>,
-         eid: [u8; 32]| {
+         addr: iroh::EndpointAddr| {
             let ep = endpoint.clone();
             let svc = service.to_string();
-            set.spawn(async move { dial_one(&ep, eid, &svc).await });
+            set.spawn(async move { dial_one(&ep, addr, &svc).await });
         };
 
     let mut next = 0usize; // index of the next candidate to launch
-    spawn_dial(&mut set, candidates[next]); // candidate 0 immediately
+    spawn_dial(&mut set, candidates[next].clone()); // candidate 0 immediately
     next += 1;
     let mut last_err: Option<anyhow::Error> = None;
 
@@ -425,13 +432,13 @@ pub async fn race_dial(
                     Some(Err(e)) => last_err = Some(anyhow::anyhow!("dial task join error: {e}")),
                     None => {
                         // Every in-flight dial failed before the stagger: launch the next NOW.
-                        spawn_dial(&mut set, candidates[next]);
+                        spawn_dial(&mut set, candidates[next].clone());
                         next += 1;
                     }
                 },
                 () = tokio::time::sleep(DIAL_STAGGER) => {
                     // No winner within the stagger window → add the next candidate to the race.
-                    spawn_dial(&mut set, candidates[next]);
+                    spawn_dial(&mut set, candidates[next].clone());
                     next += 1;
                 }
             }
@@ -451,18 +458,49 @@ pub async fn race_dial(
     }
 }
 
-/// Dial ONE roster device endpoint over the mesh.
-/// The endpoint_id IS the device's ed25519 pubkey, so `connect` reaches the holder of that key or
-/// fails — no MITM among racers. An id-only [`iroh::EndpointAddr`] lets discovery (or the localhost
-/// `MemoryLookup`) resolve the address.
+/// Attach each candidate's stored dial hint, so a RACED dial is no more discovery-dependent than a
+/// single-device one (#186).
+///
+/// `stored_dial_addr` validates: a hint recorded for a different id is discarded rather than
+/// dialled, and a peer with no stored row degrades to a bare id — which is what every raced dial
+/// used to be. So this can only ever add reachability.
+///
+/// One store read per candidate, on the blocking pool. A race has at most a handful of candidates
+/// (one person's devices), and the read happens once per dial rather than per attempt.
+async fn hinted_addrs(
+    mesh: &Arc<MeshState>,
+    candidates: Vec<[u8; 32]>,
+) -> Result<Vec<iroh::EndpointAddr>> {
+    let store = mesh.store.clone();
+    crate::util::blocking("join dial-candidate hints", move || {
+        let mut out = Vec::with_capacity(candidates.len());
+        for eid in candidates {
+            let Ok(id) = iroh::EndpointId::from_bytes(&eid) else {
+                continue; // a corrupt id is skipped, not fatal — another device may work
+            };
+            let last = store.resolve(&eid).ok().flatten().and_then(|e| e.last_addr);
+            out.push(stored_dial_addr(last.as_deref(), id));
+        }
+        Ok(out)
+    })
+    .await?
+}
+
+/// Dial ONE candidate over the mesh.
+///
+/// The endpoint_id inside `addr` IS the device's ed25519 pubkey, so `connect` reaches the holder of
+/// that key or fails — no MITM among racers, whatever address it carries.
+///
+/// Takes a PREPARED address rather than a bare id (#186). It used to build
+/// `EndpointAddr::from(endpoint_id)` itself, which made every raced dial discovery-only — so a
+/// person's SECOND device silently made their first unreachable on a network with no discovery,
+/// dropping the invariant #27 established for the single-device path three lines away. The caller
+/// now attaches the stored hint, exactly as the single-device path does.
 async fn dial_one(
     endpoint: &iroh::Endpoint,
-    eid: [u8; 32],
+    addr: iroh::EndpointAddr,
     service: &str,
 ) -> Result<(SessionTransport, iroh::endpoint::Connection)> {
-    let endpoint_id = iroh::EndpointId::from_bytes(&eid)
-        .map_err(|e| anyhow::anyhow!("roster device endpoint id is invalid: {e}"))?;
-    let addr = iroh::EndpointAddr::from(endpoint_id);
     connect_with_timeout(endpoint, addr, service, DIAL_TIMEOUT).await
 }
 
@@ -815,6 +853,71 @@ mod tests {
         })
         .await
         .expect("pipe_session drain test timed out");
+    }
+
+    /// #186: a RACED dial must carry the same stored hints a single-device dial does.
+    ///
+    /// The single-entry path attached `last_addr` citing #27 — "a cold daemon must not depend on
+    /// external discovery to reach a paired peer" — and the multi-device path three lines away
+    /// kept only the endpoint ids, throwing away hints it had literally just read out of the store.
+    /// So one person with one device worked offline and the same person with two did not, with
+    /// nothing saying the second device had changed that.
+    ///
+    /// Asserted on the ADDRESSES the race would dial, which is where the information was lost.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_raced_dial_carries_the_stored_hints() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+        std::fs::write(&cfg, "").unwrap();
+        let mesh = crate::daemon::testutil::hermetic_mesh(cfg).await;
+
+        let first = *iroh::SecretKey::from_bytes(&[61u8; 32]).public().as_bytes();
+        let second = *iroh::SecretKey::from_bytes(&[62u8; 32]).public().as_bytes();
+        let sock: std::net::SocketAddr = "127.0.0.1:4455".parse().unwrap();
+        let hint = serde_json::to_string(&iroh::EndpointAddr::from_parts(
+            iroh::EndpointId::from_bytes(&first).unwrap(),
+            [iroh::TransportAddr::Ip(sock)],
+        ))
+        .unwrap();
+
+        // One person, two devices: the first has a persisted hint, the second never dialled.
+        for (eid, nick, last) in [
+            (first, "alice-laptop", Some(hint.clone())),
+            (second, "alice-phone", None),
+        ] {
+            mesh.store
+                .add(crate::allowlist::PeerEntry {
+                    endpoint_id: eid,
+                    nickname: nick.into(),
+                    services: vec![],
+                    paired_at: None,
+                    user_id: Some("b64u:alice".into()),
+                    last_addr: last,
+                })
+                .unwrap();
+        }
+
+        let addrs = super::hinted_addrs(&mesh, vec![first, second])
+            .await
+            .expect("candidates resolve");
+        assert_eq!(addrs.len(), 2, "every candidate stays a candidate");
+
+        // The device WITH a hint must be dialable without discovery.
+        assert!(
+            !addrs[0].addrs.is_empty(),
+            "a raced candidate must carry its stored hint — a bare id is discovery-only, which is \
+             exactly what made a two-device person unreachable on a LAN with no discovery"
+        );
+        assert_eq!(
+            *addrs[0].id.as_bytes(),
+            first,
+            "and it must be THAT device's address"
+        );
+
+        // The device WITHOUT one degrades to a bare id rather than being dropped: presence and
+        // hints never remove a candidate, they only change how it is reached.
+        assert!(addrs[1].addrs.is_empty());
+        assert_eq!(*addrs[1].id.as_bytes(), second);
     }
 
     /// `stored_dial_addr` attaches the persisted hint only when it parses AND names the
