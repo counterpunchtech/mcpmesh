@@ -309,6 +309,27 @@ async fn an_embedder_protocol_runs_behind_the_nodes_own_trust_gate() {
         "the mcpmesh/ ALPN namespace must be reserved"
     );
     assert!(a.accept_protocol(b"", Arc::new(rec.clone())).is_err());
+    // …and so are the built-ins that are NOT in that namespace. `/iroh-gossip/1` and
+    // `/iroh-bytes/4` are named by iroh-gossip and iroh-blobs, so a prefix-only check accepted
+    // them — and both arms sit ABOVE the app arm in the dispatch, so the handler was registered,
+    // advertised, and silently dead. On a pairing-mode node it was worse: the registration ADDED
+    // the ALPN, and the peer negotiated straight into a "gossip not enabled" close. Found by
+    // review, by execution.
+    for reserved in [b"/iroh-gossip/1".as_slice(), b"/iroh-bytes/4".as_slice()] {
+        assert!(
+            a.accept_protocol(reserved, Arc::new(rec.clone())).is_err(),
+            "a built-in ALPN must be refused even when it is not in the mcpmesh/ namespace: {}",
+            String::from_utf8_lossy(reserved)
+        );
+    }
+    // The refusal must not depend on how THIS node booted — a is pairing-mode and serves no
+    // gossip, but an embedder must not be able to write a registration that works here and breaks
+    // on a roster node.
+    assert!(
+        a.accept_protocol(b"app/echo/1", Arc::new(rec.clone()))
+            .is_ok(),
+        "re-registering an app ALPN replaces the handler and stays allowed"
+    );
 
     // (2) UNPAIRED first, so a later pass cannot be explained by ordering.
     //
@@ -371,9 +392,13 @@ async fn an_embedder_protocol_runs_behind_the_nodes_own_trust_gate() {
         .expect("pair");
 
     // (1) PAIRED: the handler runs, and sees b's authenticated identity.
-    // Dialled by NICKNAME now, through the same resolution `open_session` uses — which is most of
-    // what `connect_protocol` buys over a raw endpoint: an embedder holding only "alice" has no
-    // other way to turn that into an address.
+    // Dialled by NICKNAME now — which is most of what `connect_protocol` buys over a raw endpoint:
+    // an embedder holding only "alice" has no other way to turn that into an address.
+    //
+    // Note what this does NOT prove: the stored dial-hint attachment. b dialled a during pairing
+    // moments ago, so iroh has a's address cached and the hint is redundant here — review verified
+    // that by mutation. The hint matters for a peer this node has not contacted since boot, which
+    // this test does not construct.
     let conn = timeout(
         Duration::from_secs(30),
         b.connect_protocol(&paired.peer_nickname, ALPN),
@@ -399,6 +424,109 @@ async fn an_embedder_protocol_runs_behind_the_nodes_own_trust_gate() {
         "the handler must see the AUTHENTICATED endpoint id — the same identity the MCP path \
          injects, which is what makes this seam worth using"
     );
+
+    b.shutdown().await;
+    a.shutdown().await;
+}
+
+/// #67: revoking a peer SEVERS its live custom-protocol connection, mid-protocol.
+///
+/// This is the headline claim of the seam — the thing an embedder's own iroh endpoint could not
+/// give it — and it was asserted nowhere. Review found it by mutation: changing
+/// `let Some(_registration) = gate_and_register(..)` to `let Some(_) = ..` drops the registry
+/// entry at the end of the statement instead of holding it for the handler's life, so
+/// `sever_matching` can no longer reach the connection. Every other test still passed.
+///
+/// The handler here holds the connection open until it is cut, so the revocation has something to
+/// sever rather than racing a handler that had already returned.
+#[tokio::test(flavor = "multi_thread")]
+async fn revoking_a_peer_severs_its_live_custom_protocol_connection() {
+    use std::sync::Arc;
+
+    const ALPN: &[u8] = b"app/hold/1";
+
+    /// Accepts, then holds the connection until the far side (or a sever) closes it.
+    #[derive(Debug, Clone)]
+    struct Holder {
+        open: Arc<tokio::sync::Notify>,
+    }
+
+    impl mcpmesh_node::iroh::protocol::ProtocolHandler for Holder {
+        async fn accept(
+            &self,
+            conn: mcpmesh_node::iroh::endpoint::Connection,
+        ) -> Result<(), mcpmesh_node::iroh::protocol::AcceptError> {
+            self.open.notify_waiters();
+            conn.closed().await;
+            Ok(())
+        }
+    }
+
+    let (a_root, b_root) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = NodeBuilder::new(a_root.path())
+        .config(hermetic())
+        .start()
+        .await
+        .expect("node a starts");
+    let b = NodeBuilder::new(b_root.path())
+        .config(hermetic())
+        .start()
+        .await
+        .expect("node b starts");
+
+    let open = Arc::new(tokio::sync::Notify::new());
+    a.accept_protocol(ALPN, Arc::new(Holder { open: open.clone() }))
+        .expect("register");
+
+    let mut a_ctl = a.control().await.expect("a control");
+    a_ctl
+        .register_service(
+            "notes",
+            BackendSpec::Run {
+                cmd: vec![STUB.into()],
+                env: Default::default(),
+                cwd: None,
+            },
+            vec![],
+        )
+        .await
+        .expect("register notes");
+    let invite = a_ctl.invite(vec!["notes".into()]).await.expect("invite");
+    let mut b_ctl = b.control().await.expect("b control");
+    let paired = timeout(Duration::from_secs(30), b_ctl.pair(&invite.invite_line))
+        .await
+        .expect("pair within 30s")
+        .expect("pair");
+
+    let conn = timeout(
+        Duration::from_secs(30),
+        b.connect_protocol(&paired.peer_nickname, ALPN),
+    )
+    .await
+    .expect("connect within 30s")
+    .expect("a paired peer connects");
+    // The handler must be RUNNING before the revocation, or "it closed" proves nothing.
+    timeout(Duration::from_secs(30), open.notified())
+        .await
+        .expect("a's handler accepted the connection");
+
+    // a revokes b. `peer_remove` is IMMEDIATE (#54): it severs live connections rather than
+    // waiting for them to end.
+    let a_status = a_ctl.status().await.expect("status");
+    let b_name = a_status
+        .peers
+        .first()
+        .map(|p| p.name.clone())
+        .expect("a stored b as a peer");
+    a_ctl.peer_remove(&b_name).await.expect("peer_remove");
+
+    timeout(Duration::from_secs(30), conn.closed())
+        .await
+        .expect(
+            "the live custom-protocol connection must be SEVERED by the revocation — this is the \
+             property an embedder's own endpoint could not give it, and it holds only because the \
+             accept arm keeps its registry Registration for the handler's whole life",
+        );
 
     b.shutdown().await;
     a.shutdown().await;

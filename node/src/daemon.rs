@@ -415,7 +415,7 @@ pub struct MeshState {
     /// Embedder-registered ALPNs → their handlers (#67), read by the accept loop's dispatch.
     ///
     /// mcpmesh had built the hard parts of a P2P application platform — identity, pairing, a trust
-    /// gate, relay fallback, discovery, rate limiting, a connection registry — and exposed exactly
+    /// gate, relay fallback, discovery, a connection registry — and exposed exactly
     /// ONE protocol shape on top: request/response MCP over bi-streams. Anything else (realtime
     /// media wanting datagrams, bulk transfer, an app-level overlay) was out of reach no matter how
     /// well the identity layer suited it, and the only alternative was a SECOND endpoint with a
@@ -426,11 +426,21 @@ pub struct MeshState {
     /// they inherit authorization, the connection registry and severing rather than bypassing them.
     /// That is the whole point: a composition of pieces that already exist, not a second door.
     ///
+    /// What they do NOT inherit is a rate limit. The pair/ping/app-blob arms each meter admission
+    /// (`admit_pair_accept`, `admit_ping`, `admit_blob_conn`); this arm has none, so an AUTHORIZED
+    /// peer can churn custom-ALPN connections as fast as it likes — the same shape the MCP arm has,
+    /// where the metering is per request rather than per connection. An embedder that needs a bound
+    /// imposes it in its own handler.
+    ///
     /// `RwLock` because registration is rare and the accept loop reads it per connection. Held only
     /// for the clone-out, never across the handler's `accept`.
     pub(crate) app_protocols: std::sync::RwLock<
         std::collections::HashMap<Vec<u8>, Arc<dyn iroh::protocol::DynProtocolHandler>>,
     >,
+    /// The ALPN set boot actually bound on the endpoint (#67), so a re-advertise can restore it
+    /// verbatim instead of recomputing one from a signal that may not match. See
+    /// [`MeshState::rebind_alpns`].
+    pub(crate) bound_alpns: std::sync::OnceLock<Vec<Vec<u8>>>,
     /// EPHEMERAL service registrations (#36): in-memory only, never written to config, torn down
     /// when the registering control connection closes. Keyed by service name → its backend spec +
     /// allow list. Overlaid onto the config-built registry on every hot-reload
@@ -581,6 +591,7 @@ impl MeshState {
             probes_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
             org_author_lock: tokio::sync::Mutex::new(()),
             app_protocols: std::sync::RwLock::new(std::collections::HashMap::new()),
+            bound_alpns: std::sync::OnceLock::new(),
             ephemeral_services: std::sync::Mutex::new(std::collections::HashMap::new()),
             fetches: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
@@ -810,6 +821,27 @@ impl MeshState {
         handler: Arc<dyn iroh::protocol::DynProtocolHandler>,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(!alpn.is_empty(), "an ALPN must not be empty");
+        // Refused against the ACTUAL built-in set, not just the `mcpmesh/` prefix. Two of the six
+        // built-in arms are NOT in that namespace — `/iroh-gossip/1` and `/iroh-bytes/4`, whose
+        // names iroh-gossip and iroh-blobs own — so a prefix check let an embedder register on
+        // them. Both arms sit above the app arm in the dispatch, so the handler was accepted,
+        // advertised, and silently dead; on a pairing-mode node it was worse, because the
+        // registration ADDED the ALPN to the advertised set and the peer then negotiated into a
+        // "gossip not enabled" close. Caught by review, by execution.
+        //
+        // `alpns_for(true)` is the SUPERSET (roster mode), so the refusal does not depend on how
+        // this particular node booted: an ALPN that would collide on any node is refused on every
+        // node, and an embedder cannot write code that works in pairing mode and breaks in roster
+        // mode.
+        anyhow::ensure!(
+            !crate::daemon::boot::alpns_for(true)
+                .iter()
+                .any(|a| a == alpn),
+            "that ALPN is one of mcpmesh's own protocols and is dispatched before this registry, \
+             so a handler on it would never run"
+        );
+        // …and the namespace is reserved on top, so a protocol mcpmesh adds LATER cannot turn a
+        // working registration into a dead one on upgrade.
         anyhow::ensure!(
             !alpn.starts_with(b"mcpmesh/"),
             "the `mcpmesh/` ALPN namespace is reserved for mcpmesh's own protocols; use your own \
@@ -829,18 +861,60 @@ impl MeshState {
     /// Re-advertise the endpoint's ALPN set: the built-ins this node booted with, plus every
     /// registered embedder protocol (#67).
     ///
-    /// `set_alpns` REPLACES the whole set, so the built-ins are recomputed here rather than
-    /// appended to — appending to a stale list is how an endpoint quietly stops answering its own
-    /// protocols. The built-in list is derived from the same `roster_mode` signal boot used, so it
-    /// cannot drift from what was originally bound.
+    /// `set_alpns` REPLACES the whole set, so the built-ins must be included every time —
+    /// appending to a partial list is how an endpoint quietly stops answering its own protocols.
+    ///
+    /// It reads the set boot ACTUALLY BOUND rather than recomputing one. The first version
+    /// recomputed via `alpns_for(self.roster_transport_live())`, which is a DIFFERENT signal from
+    /// the `roster_mode` boot used (`org_root_pk.is_some()` vs `gossip.is_some()`); they diverge
+    /// exactly where this file already documents — roster mode on, no `org_id` resolvable — and a
+    /// registration there silently NARROWED the advertised set. Measured, in review. Asking what
+    /// was bound cannot drift from what was bound.
+    ///
+    /// Falls back to `alpns_for(true)`, the superset, if boot never recorded a set. That direction
+    /// is deliberate: advertising a roster ALPN a node cannot serve costs a clean close, while
+    /// dropping one costs the protocol.
+    ///
+    /// **The read guard is held across `set_alpns` on purpose.** It blocks a concurrent
+    /// registration's insert, so two racing registrations produce strictly ordered `set_alpns`
+    /// calls and the later one always sees the fuller map. Releasing it early looks tidier and
+    /// reintroduces a lost update.
     fn rebind_alpns(&self) {
-        let mut alpns = crate::daemon::boot::alpns_for(self.roster_transport_live());
+        let mut alpns = self
+            .bound_alpns
+            .get()
+            .cloned()
+            .unwrap_or_else(|| crate::daemon::boot::alpns_for(true));
         let map = self
             .app_protocols
             .read()
             .expect("app_protocols lock not poisoned");
         alpns.extend(map.keys().cloned());
         self.endpoint.set_alpns(alpns);
+    }
+
+    /// What  would advertise right now — test-only, so the never-narrow property is
+    /// checked against the actual bytes rather than through a live handshake.
+    #[cfg(test)]
+    pub(crate) fn advertised_alpns_for_test(&self) -> Vec<Vec<u8>> {
+        let mut alpns = self
+            .bound_alpns
+            .get()
+            .cloned()
+            .unwrap_or_else(|| crate::daemon::boot::alpns_for(true));
+        let map = self
+            .app_protocols
+            .read()
+            .expect("app_protocols lock not poisoned");
+        alpns.extend(map.keys().cloned());
+        alpns
+    }
+
+    /// Record the ALPN set boot bound on the endpoint (#67). Boot calls this once; nothing else
+    /// should. See [`rebind_alpns`](Self::rebind_alpns) for why it is recorded rather than
+    /// recomputed.
+    pub(crate) fn set_bound_alpns(&self, alpns: Vec<Vec<u8>>) {
+        let _ = self.bound_alpns.set(alpns);
     }
 
     /// The handler registered for `alpn`, if any (#67). Cloned out — the lock is never held across
@@ -1523,6 +1597,69 @@ pub(crate) mod testutil {
             ),
         );
         mesh
+    }
+}
+
+#[cfg(test)]
+mod alpn_rebind_tests {
+    use crate::daemon::testutil::hermetic_mesh;
+
+    /// #67: re-advertising after a registration must never NARROW the built-in ALPN set.
+    ///
+    /// The first `rebind_alpns` recomputed the built-ins from `alpns_for(roster_transport_live())`
+    /// — `gossip.is_some()` — while boot binds `alpns_for(org_root_pk.is_some())`. Those diverge
+    /// exactly where this file documents (roster mode on, no `org_id` resolvable), and a
+    /// registration there silently dropped the gossip and roster-blob ALPNs the endpoint had been
+    /// serving. Measured, in review.
+    ///
+    /// Asserted against the recorded set rather than through a live handshake, because the
+    /// divergent state needs a node booted with a pinned org root and no resolvable org_id — and
+    /// the property is about which bytes get re-advertised, which is exactly what this compares.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_registration_never_narrows_the_bound_alpn_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+        std::fs::write(&cfg, "").unwrap();
+        let mesh = hermetic_mesh(cfg).await;
+
+        // Model the divergent case directly: boot recorded the ROSTER set (as it would with an org
+        // root pinned), while this mesh composes no gossip — so `roster_transport_live()` is false
+        // and the old recomputation would have produced the smaller pairing set.
+        let bound = crate::daemon::boot::alpns_for(true);
+        mesh.set_bound_alpns(bound.clone());
+        assert!(
+            !mesh.roster_transport_live(),
+            "precondition: the two signals disagree here, which is the whole case"
+        );
+
+        mesh.register_app_protocol(b"app/x/1", std::sync::Arc::new(Nothing))
+            .expect("an app ALPN registers");
+
+        // Every ALPN the endpoint was bound with must survive the re-advertise.
+        let after = mesh.advertised_alpns_for_test();
+        for a in &bound {
+            assert!(
+                after.contains(a),
+                "re-advertising dropped a built-in ALPN the endpoint was serving: {}",
+                String::from_utf8_lossy(a)
+            );
+        }
+        assert!(
+            after.iter().any(|a| a == b"app/x/1"),
+            "…and the registered one must be added"
+        );
+    }
+
+    #[derive(Debug)]
+    struct Nothing;
+
+    impl iroh::protocol::ProtocolHandler for Nothing {
+        async fn accept(
+            &self,
+            _conn: iroh::endpoint::Connection,
+        ) -> Result<(), iroh::protocol::AcceptError> {
+            Ok(())
+        }
     }
 }
 

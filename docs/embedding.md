@@ -240,10 +240,14 @@ Four things worth knowing:
   peer is closed *before* `accept` is called, and the connection is entered in the registry — so
   revoking that peer **severs it mid-protocol** rather than waiting for it to end. That inheritance
   is the whole reason to use this rather than your own endpoint.
-- **`mcpmesh/` is reserved** and registering under it is an error. The accept loop dispatches its own
-  protocols by exact ALPN before consulting your registry, so a handler there would be silently
-  dead — and one on a name mcpmesh adds *later* would flip from working to dead on an upgrade.
-  `app/…` is the suggested convention.
+- **mcpmesh's own ALPNs are refused**, and that is more than the `mcpmesh/` prefix: two built-ins
+  are named by their upstream crates (`/iroh-gossip/1`, `/iroh-bytes/4`). The accept loop dispatches
+  all of them by exact ALPN *before* consulting your registry, so a handler on one would be silently
+  dead. The whole `mcpmesh/` namespace is reserved on top, so a protocol mcpmesh adds *later* cannot
+  turn a working registration into a dead one on upgrade. `app/…` is the suggested convention.
+- **You do not inherit a rate limit.** The pair, ping and blob arms each meter admission; this one
+  does not, so an *authorized* peer can churn connections as fast as it likes (the same shape the
+  MCP arm has, where metering is per request). Impose a bound in your handler if you need one.
 - **Registration takes effect for connections negotiated from now on.** ALPN is chosen at handshake,
   so a peer already connected cannot use the new protocol. Register during startup, before you
   announce the node as ready.
@@ -261,15 +265,18 @@ passphrase, no keychain, no hardware seam. You could not change that from outsid
 inside the mesh root you are told not to hand-write, and nothing accepted a decrypted key at boot.
 
 ```rust
-use mcpmesh_trust::ed25519_dalek::SigningKey;
+use mcpmesh_node::mcpmesh_trust::ed25519_dalek::SigningKey;   // ← the re-export, not your own dep
 
 let signing = SigningKey::from_bytes(&secret_from_your_keychain);
 let node = NodeBuilder::new(root).device_key(signing).start().await?;
 ```
 
-**When set, no key file is read, minted, or written** — so the raw secret never lands on disk, and
-the node cannot silently fall back to a file key (which would boot happily under a *different*
+**When set, no DEVICE key file is read, minted, or written** — so that secret never lands on disk,
+and the node cannot silently fall back to a file key (which would boot happily under a *different*
 identity, leaving every paired peer unable to reach it).
+
+It covers the device key only. The node still mints `<root>/config/user.key`, the pairing-identity
+key — #85 asks 2–3 are about that one and are not shipped.
 
 **Custody moves to you.** mcpmesh cannot recover this identity if you lose the key — there is no
 escrow and no recovery path today (#85 asks 2–3). It is also the identity every peer pinned at

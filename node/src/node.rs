@@ -126,7 +126,10 @@ impl NodeBuilder {
     /// and there was no way to supply a decrypted key at boot. This is that way — unwrap the key
     /// from wherever your platform keeps secrets and hand it over.
     ///
-    /// **When set, no key file is read, minted, or written.** So the on-disk key never exists to be
+    /// **When set, no DEVICE key file is read, minted, or written.** So that secret never lands on
+    /// disk. (The node still mints `<root>/config/user.key` — the pairing-identity key — which this
+    /// seam does not cover; #85 asks 2-3 are about that one and are not shipped.) The on-disk key
+    /// never exists to be
     /// stolen — and a node whose embedder holds the key cannot silently fall back to a file one,
     /// which would boot happily under a DIFFERENT identity and leave every peer unable to reach it.
     ///
@@ -276,12 +279,18 @@ impl Node {
     /// Dial `peer` on a custom `alpn` — the client half of [`accept_protocol`](Self::accept_protocol)
     /// (#67).
     ///
-    /// `peer` is resolved exactly as `open_session` resolves it: a paired nickname, a `b64u:`
-    /// user_id (any of that person's devices), or an `eid:` device principal. That resolution — plus
-    /// the stored dial-address hint and this node's relay configuration — is most of what makes this
-    /// worth using over a raw endpoint: an embedder holding only "alice" has no way to turn that
-    /// into an address, and an embedder that stood up its own endpoint would not have the pairing
-    /// that produced it.
+    /// `peer` may be a paired nickname, a `b64u:` user_id, an `eid:` device principal, or — in
+    /// roster mode — a rostered user_id. That resolution, plus the stored dial-address hint and
+    /// this node's relay configuration, is most of what makes this worth using over a raw endpoint:
+    /// an embedder holding only "alice" has no way to turn that into an address, and one that stood
+    /// up its own endpoint would not have the pairing that produced it.
+    ///
+    /// For a person with several devices the candidates are tried IN ORDER — roster candidates
+    /// first, primary before mirror — and the first that connects wins. That is weaker than
+    /// `open_session`'s staggered race, which this deliberately does not reproduce: racing means
+    /// opening connections you then abandon, and an embedder's protocol may not be safe to
+    /// half-open. Each attempt is bounded by the same `DIAL_TIMEOUT` the service dial uses, so an
+    /// unreachable first device costs that timeout rather than hanging.
     ///
     /// ```no_run
     /// # async fn f(node: &mcpmesh_node::Node) -> anyhow::Result<()> {
@@ -303,25 +312,45 @@ impl Node {
         alpn: &[u8],
     ) -> anyhow::Result<iroh::endpoint::Connection> {
         let mesh = self.mesh();
-        let endpoint_id = crate::daemon::handlers::resolve_peer_endpoint(mesh, peer).await?;
-        let id = iroh::EndpointId::from_bytes(&endpoint_id)
-            .map_err(|e| anyhow::anyhow!("stored endpoint id for '{peer}' is invalid: {e}"))?;
-        // The stored last-addr hint, attached exactly as the service dial attaches it — so a
-        // hermetic/localhost mesh with no discovery can still reach the peer, and a hint for a
-        // DIFFERENT id is discarded rather than dialled.
-        let addr = {
+        let candidates = crate::daemon::dial::protocol_candidates(mesh, peer).await?;
+        anyhow::ensure!(
+            !candidates.is_empty(),
+            "no peer '{peer}' — 'status' lists your peers and roster members"
+        );
+        let mut last: Option<anyhow::Error> = None;
+        for endpoint_id in candidates {
+            let Ok(id) = iroh::EndpointId::from_bytes(&endpoint_id) else {
+                continue; // a corrupt stored id is skipped, not fatal — another device may work
+            };
+            // The stored last-addr hint, attached exactly as the service dial attaches it. It is
+            // what lets a hermetic/localhost mesh with no discovery reach a peer it has never
+            // dialled, and a hint recorded for a DIFFERENT id is discarded rather than dialled.
             let store = mesh.store.clone();
             let entry = crate::util::blocking("join connect_protocol store read", move || {
                 store.resolve(&endpoint_id)
             })
             .await??;
-            crate::daemon::dial::stored_dial_addr(entry.and_then(|e| e.last_addr).as_deref(), id)
-        };
-        self.mesh()
-            .endpoint
-            .connect(addr, alpn)
+            let addr = crate::daemon::dial::stored_dial_addr(
+                entry.and_then(|e| e.last_addr).as_deref(),
+                id,
+            );
+            // Bounded, like every other dial in the codebase: an unreachable candidate must cost a
+            // timeout, not the caller's future.
+            match tokio::time::timeout(
+                crate::daemon::dial::DIAL_TIMEOUT,
+                mesh.endpoint.connect(addr, alpn),
+            )
             .await
-            .map_err(|e| anyhow::anyhow!("dial '{peer}' on a custom protocol: {e}"))
+            {
+                Ok(Ok(conn)) => return Ok(conn),
+                Ok(Err(e)) => last = Some(anyhow::Error::new(e)),
+                Err(_) => last = Some(anyhow::anyhow!("dial timed out")),
+            }
+        }
+        Err(match last {
+            Some(e) => e.context(format!("dial '{peer}' on a custom protocol")),
+            None => anyhow::anyhow!("dial '{peer}' on a custom protocol: no usable candidate"),
+        })
     }
 
     /// Sign an application payload with this node's DEVICE key, under the embedder's own

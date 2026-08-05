@@ -392,6 +392,9 @@ async fn boot_node(
     );
     // Install the process audit sink on the mesh BEFORE serving, so the reload sites +
     // trust-event hooks can re-thread/read it.
+    // #67: record what the endpoint ACTUALLY bound, so registering a custom protocol re-advertises
+    // this exact set rather than a recomputation that can disagree with it.
+    mesh.set_bound_alpns(alpns_for(roster_mode));
     mesh.set_audit(audit.clone());
     mesh.set_limits(limiters.clone());
     // Seed the live relay posture from the boot `[network]` so the `set_relays` verb (#53) diffs
