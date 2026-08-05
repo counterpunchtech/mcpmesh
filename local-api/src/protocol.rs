@@ -462,6 +462,19 @@ pub struct SelfNetwork {
     /// render it to users as invisibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub presence_mode: Option<String>,
+    /// This node's `[network].local_discovery` (#68): `"off"` | `"on"` | `"resolve"` — whether it
+    /// finds peers on the local link with no internet, and whether it announces itself there.
+    ///
+    /// Reported for the same reason `presence_mode` is: the setting is otherwise unobservable, and
+    /// this one has two questions behind it. "Why can these two machines on one LAN not find each
+    /// other" is answered by `"off"`; and **`"on"` means this node is multicasting its endpoint id
+    /// and addresses to every device on the link**, which a product backing a privacy switch has to
+    /// be able to show the user. `"resolve"` never publishes this node's identity or addresses,
+    /// but still emits a service query roughly once a second — quieter than `"on"`, not silent.
+    ///
+    /// Always present from `api_minor >= 50`; absent below it, and absent without a mesh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_discovery: Option<String>,
     /// When the relay last reported that ANOTHER endpoint is presenting this node's identity
     /// (#134, epoch seconds), or absent if never — the overwhelmingly common case.
     ///
@@ -2417,7 +2430,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   thirty have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.49";
+pub const API_VERSION: &str = "1.50";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -2503,7 +2516,18 @@ pub const API_VERSION: &str = "1.49";
 /// refusals — expired line, no live invite, inviter unreachable, id mismatch, name conflict, and
 /// the deliberately-opaque refusal. `ERR_NICKNAME_TAKEN` had been the only coded pairing failure,
 /// so every other one arrived as `-32000` and an embedder could either forward our prose to end
-/// users or substring-match it (#159); to 49 with [`StorageInfo::blobs_gc`] — app-blob GARBAGE
+/// users or substring-match it (#159); to 50 with [`SelfNetwork::local_discovery`] — LOCAL (mDNS)
+/// peer discovery, off unless `[network].local_discovery` asks for it (#68). Peer resolution
+/// otherwise needs external infrastructure, so two machines on one LAN with no uplink could not
+/// find each other though the path between them was fine. Three modes: `"off"` (default), `"on"`
+/// (resolve AND announce), `"resolve"` (resolve without publishing this node's identity — it still
+/// QUERIES about once a second, so it is quieter, not silent). Reported on `status` because the
+/// setting was
+/// otherwise unobservable and because **`"on"` means this node multicasts its endpoint id and
+/// addresses to every device on the link** — a product backing a privacy switch has to be able to
+/// show that. Deliberately NOT on by default, against what #68 asked for: pkarr publishes a signed
+/// record you must already know the endpoint id to look up, while mDNS announces to strangers on a
+/// café or hotel network, and a multicast packet cannot be un-sent. Guard on `>= 50`; to 49 with [`StorageInfo::blobs_gc`] — app-blob GARBAGE
 /// COLLECTION, off unless `[blobs].gc_interval` is set (#80). `blob_unpublish` and `blob_revoke`
 /// closed the AUTHORIZATION half at 15; neither reclaimed a byte, so `<data_dir>/blobs/` grew
 /// monotonically for the life of the node and an embedder that had told a user "this file is
@@ -2616,7 +2640,7 @@ pub const API_VERSION: &str = "1.49";
 /// its REAL content is a meaning change to `reachable` — the field exists so the new meaning is
 /// observable at all. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 49;
+pub const API_MINOR: u32 = 50;
 
 #[cfg(test)]
 mod tests {
@@ -2938,6 +2962,10 @@ mod tests {
                 // #89: seeded NON-default so the round-trip actually carries it — an empty value
                 // here would round-trip through a `skip_serializing_if` and prove nothing.
                 presence_mode: Some("granted".into()),
+                // #68: seeded `"resolve"`, deliberately NOT the `"off"` default — a fixture equal
+                // to the default would round-trip identically whether or not the field was carried
+                // at all, and the assertion below would measure nothing.
+                local_discovery: Some("resolve".into()),
             },
         };
         let v = serde_json::to_value(&frame).unwrap();
@@ -2950,6 +2978,12 @@ mod tests {
             "#89: the live presence mode must reach the wire — it is the only way an operator can \
              confirm the knob took effect, and a product's privacy switch has nothing to render \
              without it"
+        );
+        assert_eq!(
+            v["self_network"]["local_discovery"], "resolve",
+            "#68: the live local-discovery mode must reach the wire — `\"on\"` means this node is \
+             multicasting its endpoint id to every device on the link, and a privacy switch has \
+             nothing to render without it"
         );
         let back: StreamFrame = serde_json::from_value(v).unwrap();
         assert_eq!(back, frame);

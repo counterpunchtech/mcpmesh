@@ -617,9 +617,13 @@ async fn an_embedder_can_supply_the_device_key_and_no_key_file_is_written() {
 ///
 /// Peer resolution depends on external infrastructure — the pkarr publisher/resolver a relay
 /// provides, or an address someone already handed you in an invite. Two machines on one LAN with no
-/// internet cannot find each other, though the network path between them is fine. iroh 1.0.3 ships
-/// no mDNS lookup, so mcpmesh cannot switch one on; what it can do is stop the resolver set being
-/// closed, so an implementation can live outside this crate.
+/// internet cannot find each other, though the network path between them is fine. This is the SEAM
+/// that stops the resolver set being closed, so an implementation can live outside this crate.
+///
+/// (The seam shipped in 0.41.0 saying "iroh 1.0.3 ships no mDNS lookup, so mcpmesh cannot switch
+/// one on". Half right: the iroh CORE crate has none, but n0 publishes `iroh-mdns-address-lookup`
+/// separately, which 0.44.0 wires in behind `[network].local_discovery`. The seam is still the
+/// seam — an embedder can supply any resolver — and this test still covers exactly that.)
 ///
 /// The test constructs exactly that situation. Both nodes run `relay_mode = "disabled"` — no relay,
 /// no discovery — and node b is given ONLY a nickname to dial, with no stored address for it. So:
@@ -947,4 +951,247 @@ async fn a_recovery_phrase_restores_an_identity_on_new_hardware() {
 
     b.shutdown().await;
     a.shutdown().await;
+}
+
+/// #68 END TO END over REAL MULTICAST: two nodes with no relay, no discovery and no stored address
+/// find each other purely over the local link.
+///
+/// **`#[ignore]` on purpose.** Whether multicast works is a property of the machine and its
+/// network, not of this code: CI runners routinely isolate or drop it, and a suite that depended on
+/// it would be red for reasons unrelated to the change under test. Run explicitly:
+///
+/// ```text
+/// cargo test -p mcpmesh --test embedded_loopback -- --ignored local_discovery
+/// ```
+///
+/// Everything this exercises that CAN be tested deterministically already is: the config parse and
+/// the boot wiring in `node/tests/start.rs`, and the resolver seam itself in
+/// `an_embedder_can_supply_its_own_peer_resolver` above, which is not ignored.
+///
+/// The construction mirrors that seam test, and for the same reason: node b is given only a's
+/// `eid:` — never an address — so the dial depends on resolution and nothing else. The difference
+/// is that the resolver here is the real mDNS one, wired by config rather than injected.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs real multicast on the local link; run with --ignored"]
+async fn local_discovery_resolves_a_peer_over_the_link_with_no_relay() {
+    use std::sync::Arc;
+
+    const ALPN: &[u8] = b"app/mdns/1";
+
+    #[derive(Debug)]
+    struct Echo;
+    impl mcpmesh_node::iroh::protocol::ProtocolHandler for Echo {
+        async fn accept(
+            &self,
+            conn: mcpmesh_node::iroh::endpoint::Connection,
+        ) -> Result<(), mcpmesh_node::iroh::protocol::AcceptError> {
+            conn.closed().await;
+            Ok(())
+        }
+    }
+
+    // Both announce AND listen: one-sided discovery cannot work, since a needs to be findable and
+    // b needs to be looking.
+    let cfg = || {
+        Config::from_toml_str("[network]\nrelay_mode = \"disabled\"\nlocal_discovery = \"on\"\n")
+            .expect("valid test config")
+    };
+    let (a_root, b_root) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = NodeBuilder::new(a_root.path())
+        .config(cfg())
+        .start()
+        .await
+        .expect("node a starts");
+    let b = NodeBuilder::new(b_root.path())
+        .config(cfg())
+        .start()
+        .await
+        .expect("node b starts");
+    a.accept_protocol(ALPN, Arc::new(Echo)).expect("register");
+
+    // Identity only — no address, no pairing row, no relay to fall back on.
+    let a_eid = format!("eid:{}", a.endpoint_id());
+
+    // Generous: an mDNS announcement is periodic, so the first dial may precede a's first packet.
+    // The dial itself is what proves resolution happened — a's gate will then refuse it, which is
+    // the expected outcome and NOT what is under test here.
+    let mut resolved = false;
+    for _ in 0..12 {
+        match timeout(Duration::from_secs(10), b.connect_protocol(&a_eid, ALPN)).await {
+            // Connected: resolution worked.
+            Ok(Ok(_)) => {
+                resolved = true;
+                break;
+            }
+            // A REFUSAL also proves resolution: b could not have been refused by a node it never
+            // reached. Only "no address" means discovery failed, so the error is inspected rather
+            // than treated as a uniform failure — the distinction this whole test exists for.
+            Ok(Err(e)) => {
+                let msg = format!("{e:#}").to_lowercase();
+                if !msg.contains("no address") && !msg.contains("address lookup") {
+                    resolved = true;
+                    break;
+                }
+            }
+            Err(_) => {}
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    assert!(
+        resolved,
+        "two nodes on one link, both with local_discovery = \"on\", must resolve each other with \
+         no relay and no stored address — that is the air-gapped-LAN case #68 filed"
+    );
+
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+/// Join the mDNS multicast group and collect raw packets for `dur`.
+///
+/// Returns `(payload, from_ip)` per datagram. Deliberately raw bytes: the assertions below look for
+/// ASCII labels (`_mcpmesh`, a base32 endpoint id), which survive DNS name compression in every
+/// shape these two libraries emit, and a real DNS parser here would be a second implementation to
+/// get wrong.
+async fn sniff_mdns(dur: Duration) -> Vec<(Vec<u8>, std::net::IpAddr)> {
+    use std::net::{Ipv4Addr, SocketAddrV4};
+    let sock = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )
+    .expect("mdns sniffer socket");
+    sock.set_reuse_address(true).expect("reuse addr");
+    #[cfg(unix)]
+    sock.set_reuse_port(true).expect("reuse port");
+    sock.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 5353).into())
+        .expect("bind 5353");
+    sock.join_multicast_v4(&Ipv4Addr::new(224, 0, 0, 251), &Ipv4Addr::UNSPECIFIED)
+        .expect("join 224.0.0.251");
+    sock.set_nonblocking(true).expect("nonblocking");
+    let sock = tokio::net::UdpSocket::from_std(sock.into()).expect("into tokio socket");
+
+    let mut out = Vec::new();
+    let deadline = tokio::time::Instant::now() + dur;
+    let mut buf = vec![0u8; 9000];
+    while tokio::time::Instant::now() < deadline {
+        let left = deadline - tokio::time::Instant::now();
+        match timeout(left, sock.recv_from(&mut buf)).await {
+            Ok(Ok((n, from))) => out.push((buf[..n].to_vec(), from.ip())),
+            Ok(Err(_)) => break,
+            Err(_) => break,
+        }
+    }
+    out
+}
+
+fn contains(packets: &[(Vec<u8>, std::net::IpAddr)], needle: &str) -> bool {
+    let n = needle.as_bytes();
+    packets
+        .iter()
+        .any(|(p, _)| p.windows(n.len()).any(|w| w == n))
+}
+
+/// #68 ON THE WIRE: `"on"` announces this node's endpoint id; `"resolve"` never does — and both use
+/// the `_mcpmesh` service name rather than iroh's shared `irohv1`.
+///
+/// **This test exists because the 0.44.0 gate proved the deterministic suite could not see any of
+/// it.** Two single-character mutations went completely undetected:
+///
+/// - `build(our_id, local_disc)` → `build(our_id, /* advertise */ true)`: a node configured
+///   `"resolve"` broadcast its endpoint id to the entire link, and all 4 unit tests plus all 10
+///   boot tests stayed green. The config knob is a **privacy** promise; nothing verified it.
+/// - deleting `.service_name(SERVICE_NAME)`: both nodes fell into iroh's shared namespace together,
+///   so even the connectivity test above still passed, with zero `_mcpmesh` packets on the wire.
+///
+/// The crate exposes no way to read either value back, so the multicast group is the only place
+/// these are observable. `#[ignore]`d for the same reason as the connectivity test — whether
+/// multicast works is a property of the machine, not of this code.
+///
+/// ```text
+/// cargo test -p mcpmesh --test embedded_loopback -- --ignored --test-threads=1 local_discovery
+/// ```
+///
+/// `--test-threads=1` matters: two nodes announcing at once would let one test observe the other's
+/// packets.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs real multicast on the local link; run with --ignored --test-threads=1"]
+async fn local_discovery_announces_only_under_the_mcpmesh_service_name() {
+    // Base32-nopad-lowercase is how the crate renders an endpoint id into a DNS label.
+    let eid_label = |id: mcpmesh_node::iroh::EndpointId| {
+        data_encoding::BASE32_NOPAD
+            .encode(id.as_bytes())
+            .to_ascii_lowercase()
+    };
+
+    // (1) ADVERTISING: the endpoint id must appear, under _mcpmesh.
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("config")).unwrap();
+    std::fs::write(
+        root.path().join("config/config.toml"),
+        "[network]\nrelay_mode = \"disabled\"\nlocal_discovery = \"on\"\n",
+    )
+    .unwrap();
+    let node = NodeBuilder::new(root.path())
+        .config(
+            Config::from_toml_str(
+                "[network]\nrelay_mode = \"disabled\"\nlocal_discovery = \"on\"\n",
+            )
+            .unwrap(),
+        )
+        .start()
+        .await
+        .expect("node starts");
+    let id = eid_label(node.endpoint_id());
+    let packets = sniff_mdns(Duration::from_secs(8)).await;
+    node.shutdown().await;
+
+    assert!(
+        contains(&packets, "_mcpmesh"),
+        "an advertising node must use OUR service name — deleting `.service_name(..)` drops the \
+         node into iroh's shared `irohv1` namespace, which every deterministic test misses \
+         ({} packets seen)",
+        packets.len()
+    );
+    assert!(
+        !contains(&packets, "irohv1"),
+        "…and must NOT be announcing into the shared iroh namespace"
+    );
+    assert!(
+        contains(&packets, &id),
+        "local_discovery = \"on\" must announce this node's endpoint id — that is what \
+         \"announce\" means, and it is the disclosure the docs warn about ({} packets seen)",
+        packets.len()
+    );
+
+    // (2) RESOLVE: the endpoint id must NOT appear. This is the privacy promise.
+    let root2 = tempfile::tempdir().unwrap();
+    let node2 = NodeBuilder::new(root2.path())
+        .config(
+            Config::from_toml_str(
+                "[network]\nrelay_mode = \"disabled\"\nlocal_discovery = \"resolve\"\n",
+            )
+            .unwrap(),
+        )
+        .start()
+        .await
+        .expect("node starts");
+    let id2 = eid_label(node2.endpoint_id());
+    let packets2 = sniff_mdns(Duration::from_secs(8)).await;
+    node2.shutdown().await;
+
+    assert!(
+        !contains(&packets2, &id2),
+        "local_discovery = \"resolve\" must NEVER put this node's endpoint id on the link — that \
+         is the whole promise of the mode, and hard-coding the advertise flag breaks it with every \
+         other test still green ({} packets seen)",
+        packets2.len()
+    );
+    // …but it DOES query, which is the honest limit of "resolve" and is documented as such.
+    assert!(
+        contains(&packets2, "_mcpmesh"),
+        "resolve still QUERIES for the service — asserted so the docs cannot drift back to \
+         claiming this mode is silent ({} packets seen)",
+        packets2.len()
+    );
 }

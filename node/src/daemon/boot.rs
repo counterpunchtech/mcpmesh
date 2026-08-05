@@ -249,8 +249,74 @@ async fn boot_node(
     // #63: a `0` per-service rate is the most restrictive setting there is, not unlimited. Refused
     // before binding, like every other config error.
     validate_service_rates(&cfg)?;
+    // #68: parsed BEFORE the bind, like `presence_mode` and `validate_service_rates` above — an
+    // unknown value must fail the boot without first binding sockets and doing relay/discovery
+    // work. (0.44.0 shipped this parse after `build_endpoint` with a comment claiming otherwise;
+    // the gate caught the comment.)
+    let local_disc = local_discovery(&cfg.network)?;
     let endpoint = build_endpoint(secret, &cfg.network, roster_mode).await?;
     let our_id = endpoint.id();
+
+    // #68: local (mDNS) peer discovery, off unless `[network].local_discovery` asks for it.
+    // Registration only — the PARSE happened above, before the bind, alongside its siblings.
+    if local_disc.enabled {
+        // `relay_only` DOES NOT restrain what goes out here on a stock build.
+        //
+        // The original wording of this warning said the opposite — that the address filter strips
+        // direct addresses before mDNS sees them — and the 0.44.0 gate disproved it on the wire.
+        // `AddrFilter::relay_only()` is installed only under `#[cfg(feature = "unstable-relay-only")]`
+        // (`apply_relay_only`); without the feature `relay_only = true` is inert, and the gate
+        // captured the full direct set going out: LAN address, PUBLIC WAN IPv4, and global IPv6.
+        //
+        // So the two knobs contradict in opposite directions depending on the build, and an
+        // operator who set `relay_only` for a quiet posture must be told which one they got.
+        if cfg.network.relay_only && local_disc.advertise {
+            if cfg!(feature = "unstable-relay-only") {
+                tracing::warn!(
+                    "[network] local_discovery advertises, but relay_only is active — the address \
+                     filter strips direct addresses before mDNS sees them, so peers on this LAN \
+                     learn only a relay URL. Resolution still works, but announcing achieves \
+                     nothing here."
+                );
+            } else {
+                tracing::warn!(
+                    "[network] local_discovery advertises AND relay_only is set — but this binary \
+                     was built without `unstable-relay-only`, so relay_only is inert and mDNS \
+                     announces this node's FULL direct address set (LAN, public WAN IPv4, global \
+                     IPv6) to every device on the link."
+                );
+            }
+        }
+        // #68 gate: `presence_mode = "off"` exists so a node never discloses its reachability, and
+        // advertising broadcasts exactly that to the whole link, roughly once a second. Neither
+        // knob knows about the other, so the combination is silently self-defeating; say so.
+        if local_disc.advertise && presence == PresenceMode::Off {
+            tracing::warn!(
+                "[network] presence_mode = \"off\" withholds reachability from paired peers, but \
+                 local_discovery = \"on\" announces this node's presence and addresses to every \
+                 device on the local link. Use local_discovery = \"resolve\" to keep the LAN quiet."
+            );
+        }
+        match crate::discovery::local::build(our_id, local_disc) {
+            Ok(lookup) => {
+                endpoint
+                    .address_lookup()
+                    .map_err(|e| anyhow::anyhow!("endpoint closed before local discovery: {e}"))?
+                    .add(lookup);
+                tracing::info!(
+                    advertise = local_disc.advertise,
+                    "local discovery enabled on this link"
+                );
+            }
+            // A machine with no multicast-capable interface, or one where the socket is refused, is
+            // a working node that cannot do LAN discovery — not a boot failure. Refusing to start
+            // would turn a networking condition into an outage for every other feature.
+            Err(e) => tracing::warn!(
+                %e,
+                "local discovery could not start; peers on this LAN will not be resolved locally"
+            ),
+        }
+    }
 
     // 3. The peer allowlist store + gate. redb open + reads are blocking; open on a blocking
     //    thread so a slow trust-file fsync never stalls a runtime worker.
@@ -405,6 +471,10 @@ async fn boot_node(
     // the config-validation block) so an unknown value is a startup error, never a silent fall back
     // to the permissive default — a privacy knob that fails open is worse than no knob.
     mesh.set_presence_mode(presence);
+    // #68: record the SPELLING an operator wrote, so `status.self_network.local_discovery` reads
+    // back in the same vocabulary as `config.toml`. Parsed and validated far above — a bad value
+    // already failed the boot — so this cannot report a mode the node is not on.
+    mesh.set_local_discovery(cfg.network.local_discovery.clone());
     // Self-sovereign pairing identity: load
     // (or mint) this person's UserKey and precompute this daemon's binding over `our_id`, so the
     // pairing handlers PRESENT it and paired peers store a VERIFIED `user_id`. The key path mirrors
@@ -695,6 +765,40 @@ pub fn presence_mode(net: &crate::config::NetworkCfg) -> Result<PresenceMode> {
         "off" => Ok(PresenceMode::Off),
         other => anyhow::bail!(
             "[network] unknown presence_mode {other:?} (expected \"paired\" | \"granted\" | \"off\")"
+        ),
+    }
+}
+
+/// How `[network].local_discovery` resolves: `(enabled, advertise)` (#68).
+///
+/// Two booleans rather than one, because the halves have very different disclosure: resolving
+/// listens, advertising broadcasts your endpoint id and addresses to the whole link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalDiscovery {
+    pub enabled: bool,
+    pub advertise: bool,
+}
+
+/// Parse `[network].local_discovery`. An unknown value is a STARTUP ERROR, for the same reason
+/// `presence_mode` and `relay_mode` are: `local_discovery = "of"` silently meaning "off" would be a
+/// lucky accident, and `= "resolv"` silently meaning "on" would announce a node whose operator
+/// asked it not to. A privacy knob must fail loudly or not exist.
+pub fn local_discovery(net: &crate::config::NetworkCfg) -> Result<LocalDiscovery> {
+    match net.local_discovery.as_str() {
+        "off" => Ok(LocalDiscovery {
+            enabled: false,
+            advertise: false,
+        }),
+        "on" => Ok(LocalDiscovery {
+            enabled: true,
+            advertise: true,
+        }),
+        "resolve" => Ok(LocalDiscovery {
+            enabled: true,
+            advertise: false,
+        }),
+        other => anyhow::bail!(
+            "[network] unknown local_discovery {other:?} (expected \"off\" | \"on\" | \"resolve\")"
         ),
     }
 }
@@ -1932,5 +2036,60 @@ mod tests {
             .await
             .expect("custom relay+discovery endpoint binds offline");
         ep.close().await;
+    }
+
+    /// #68: every `local_discovery` spelling maps to the right (resolve, advertise) pair, and an
+    /// unknown one is a STARTUP ERROR.
+    ///
+    /// The error case is the point, and it is the same reason `presence_mode` has one:
+    /// `local_discovery = "of"` silently meaning "off" would be a lucky accident, and `"resolv"`
+    /// silently meaning "on" would put a node on the air whose operator asked it not to be. A
+    /// multicast packet cannot be un-sent.
+    #[test]
+    fn local_discovery_modes_parse_and_an_unknown_one_fails_the_boot() {
+        let cfg = |mode: &str| crate::config::NetworkCfg {
+            local_discovery: mode.into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            local_discovery(&cfg("off")).unwrap(),
+            LocalDiscovery {
+                enabled: false,
+                advertise: false
+            }
+        );
+        assert_eq!(
+            local_discovery(&cfg("on")).unwrap(),
+            LocalDiscovery {
+                enabled: true,
+                advertise: true
+            }
+        );
+        // The whole reason the knob is a string and not a bool: listening without announcing.
+        assert_eq!(
+            local_discovery(&cfg("resolve")).unwrap(),
+            LocalDiscovery {
+                enabled: true,
+                advertise: false
+            },
+            "\"resolve\" must LISTEN and must NOT announce — that distinction is the knob"
+        );
+        // The default, from a config that never mentions the key.
+        assert!(
+            !local_discovery(&crate::config::NetworkCfg::default())
+                .unwrap()
+                .enabled,
+            "absent means off — a node must not start multicasting because of an upgrade"
+        );
+
+        for bad in ["of", "resolv", "true", "yes", "ON", ""] {
+            let e = local_discovery(&cfg(bad))
+                .expect_err("an unknown local_discovery must fail the boot, never default");
+            let msg = format!("{e:#}");
+            assert!(
+                msg.contains(bad) && msg.contains("local_discovery"),
+                "the error must name the offending value so it is fixable: {msg}"
+            );
+        }
     }
 }

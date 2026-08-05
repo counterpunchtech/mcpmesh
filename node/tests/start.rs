@@ -233,3 +233,95 @@ async fn an_unparseable_gc_interval_boots_with_collection_off() {
         node.shutdown().await;
     }
 }
+
+/// #68 THROUGH BOOT: `[network].local_discovery` in a real config reaches the node and is reported.
+///
+/// The 0.43.0 gate found exactly this gap in #80 — a fully unit-tested config accessor joined to
+/// the daemon by an unpinned line, so severing it left the whole feature a no-op with a green
+/// suite. `NodeBuilder` shares `boot_node` with `serve_forever`, so this pins the standalone daemon
+/// too.
+///
+/// It asserts the REPORTED MODE, not that multicast works: whether a runner permits multicast is a
+/// property of the machine, and a suite that depended on it would be red on CI for reasons that
+/// have nothing to do with this code.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_configured_local_discovery_mode_reaches_the_node_and_is_reported() {
+    for mode in ["on", "resolve", "off"] {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("config")).unwrap();
+        // relay_mode = "disabled" so the test needs no network at all; local discovery is
+        // orthogonal to it, which is itself the point of the feature.
+        std::fs::write(
+            root.path().join("config/config.toml"),
+            format!("[network]\nrelay_mode = \"disabled\"\nlocal_discovery = \"{mode}\"\n"),
+        )
+        .unwrap();
+        let node = NodeBuilder::new(root.path()).start().await.expect("start");
+        let mut control = node.control().await.expect("control");
+        let reported = control
+            .status()
+            .await
+            .expect("status")
+            .self_network
+            .expect("self_network block")
+            .local_discovery
+            .expect("api_minor >= 50 always reports the mode");
+        assert_eq!(
+            reported, mode,
+            "the reported mode must be the one written in config, in the SAME vocabulary — a \
+             read-back an operator cannot match against their own file confirms nothing"
+        );
+        node.shutdown().await;
+    }
+}
+
+/// A node that never mentions `local_discovery` reports `"off"`.
+///
+/// The control for the test above: without it, a boot that hard-coded a mode would still pass, and
+/// an upgrade could silently start multicasting a node's identity onto its LAN.
+#[tokio::test(flavor = "multi_thread")]
+async fn local_discovery_is_off_on_a_node_that_never_configured_it() {
+    let root = tempfile::tempdir().unwrap();
+    let node = NodeBuilder::new(root.path()).start().await.expect("start");
+    let mut control = node.control().await.expect("control");
+    assert_eq!(
+        control
+            .status()
+            .await
+            .expect("status")
+            .self_network
+            .expect("self_network")
+            .local_discovery
+            .as_deref(),
+        Some("off"),
+        "the default must be OFF — an upgrade must never put a node on the air"
+    );
+    node.shutdown().await;
+}
+
+/// An unknown `local_discovery` must REFUSE THE BOOT, not fall back.
+///
+/// `"resolv"` quietly meaning "on" would announce a node whose operator asked it only to listen,
+/// and a multicast packet cannot be un-sent. Same discipline as `relay_mode` and `presence_mode`.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unknown_local_discovery_refuses_to_boot() {
+    for bad in ["resolv", "of", "true"] {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("config")).unwrap();
+        std::fs::write(
+            root.path().join("config/config.toml"),
+            format!("[network]\nlocal_discovery = \"{bad}\"\n"),
+        )
+        .unwrap();
+        let e = NodeBuilder::new(root.path())
+            .start()
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{bad:?} must refuse the boot rather than default"));
+        let msg = format!("{e:#}");
+        assert!(
+            msg.contains("local_discovery"),
+            "the refusal must name the knob: {msg}"
+        );
+    }
+}

@@ -2461,7 +2461,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "mcpmesh"
-version = "0.43.0"
+version = "0.44.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -2469,6 +2469,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "clap_mangen",
+ "data-encoding",
  "ed25519-dalek 2.2.0",
  "iroh",
  "iroh-blobs",
@@ -2481,6 +2482,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "socket2",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -2490,7 +2492,7 @@ dependencies = [
 
 [[package]]
 name = "mcpmesh-codec"
-version = "0.43.0"
+version = "0.44.0"
 dependencies = [
  "serde_json",
  "tokio",
@@ -2498,7 +2500,7 @@ dependencies = [
 
 [[package]]
 name = "mcpmesh-local-api"
-version = "0.43.0"
+version = "0.44.0"
 dependencies = [
  "mcpmesh-codec",
  "rustix",
@@ -2512,7 +2514,7 @@ dependencies = [
 
 [[package]]
 name = "mcpmesh-net"
-version = "0.43.0"
+version = "0.44.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2529,7 +2531,7 @@ dependencies = [
 
 [[package]]
 name = "mcpmesh-node"
-version = "0.43.0"
+version = "0.44.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2565,7 +2567,7 @@ dependencies = [
 
 [[package]]
 name = "mcpmesh-trust"
-version = "0.43.0"
+version = "0.44.0"
 dependencies = [
  "chrono",
  "data-encoding",
@@ -5654,7 +5656,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.43.0"
+version = "0.44.0"
 dependencies = [
  "anyhow",
  "clap",

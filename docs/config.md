@@ -62,11 +62,102 @@ are in the [operator runbook §5](operator.md#5-self-hosting-relay--discovery-10
 | `discovery_urls` | `[]` | Your self-hosted discovery URLs, used for both publishing and resolving peer addresses. Required when `discovery_mode = "custom"`. |
 | `idle_timeout_secs` | iroh's (**30 s**) | QUIC idle timeout. **Negotiated** — the connection uses the minimum of both peers' values, so raising it needs every node configured. See [Idle timeout and keepalive](#idle-timeout-and-keepalive-56). |
 | `keep_alive_secs` | iroh's (**5 s**) | QUIC keepalive interval. **Legal range is `1`–`5`** — iroh caps the per-path keepalive at 5 s, so a larger value is a **startup error**, not a slower ping. `0` is refused too (a PING storm, not "disabled"). Must additionally be less than the effective idle timeout. See [Idle timeout and keepalive](#idle-timeout-and-keepalive-56). |
+| `local_discovery` | `"off"` | **Find peers on the LAN with no internet at all** (#68). `"off"` \| `"on"` (resolve *and* announce) \| `"resolve"` (listen only, never announce). See [Local discovery](#local-discovery-finding-peers-with-no-internet-68). |
 | `presence_mode` | `"paired"` | **Who gets a reachability pong** on `mcpmesh/ping/1` (#89). `"paired"` = any paired peer (today's behaviour) \| `"granted"` = only a peer currently holding at least one service grant \| `"off"` = never pong. See [Presence](#presence-who-can-see-that-you-are-online-89). |
 | `relay_only` | `false` | **TESTING ONLY (#116).** Force application data over the **relay** even when a direct path exists. Requires building with the `unstable-relay-only` cargo feature — without it the field still parses (configs stay portable) but is **ignored with a warning**, never a startup error. See the caveats below. |
 
 An unknown mode, or a `"custom"` mode without its URL list, is a **startup error** — the daemon
 refuses to run rather than silently falling back to public infrastructure.
+
+### Local discovery — finding peers with no internet (#68)
+
+Peer resolution normally needs external infrastructure: the pkarr publisher a relay provides, or an
+address someone already handed you in an invite. So two machines on the same LAN with **no uplink**
+cannot find each other, though the network path between them is fine — a boat, a workshop, a failed
+uplink, a deliberately air-gapped network. There is a commoner weak version too: a LAN where the
+internet is merely *flaky*, so peers that could talk directly fail to resolve because resolution
+goes out first.
+
+```toml
+[network]
+local_discovery = "on"        # resolve peers on this link, and announce this node to it
+```
+
+| Value | Resolves peers | Announces **your identity** | Emits mDNS queries |
+|---|---|---|---|
+| `"off"` *(default)* | no | no | **no** |
+| `"on"` | yes | yes | yes |
+| `"resolve"` | yes | **no** | **yes — see below** |
+
+**`"resolve"` is not silent.** Resolving over mDNS means *asking*, and the underlying library asks
+on a fixed cadence: a node in this mode multicasts a query for `_mcpmesh._udp.local` roughly **once
+a second, continuously**, from the moment it boots. It never publishes your endpoint id or your
+addresses — that part of the promise holds, and is pinned by a test that reads the multicast group
+directly — but every device on the link can see that *something at this IP is running mcpmesh and is
+up right now*.
+
+If that matters where you are, the mode you want is `"off"`.
+
+An unknown value is a **startup error**, like `relay_mode` and `presence_mode`, and it is refused
+*before* the endpoint binds. `local_discovery = "resolv"` quietly meaning `"on"` would put a node on
+the air whose operator asked it only to listen.
+
+#### Read this before turning it on
+
+**`"on"` multicasts this node's endpoint id and its addresses to every device on the link**,
+unprompted and repeatedly, including machines that had no idea it existed.
+
+"Its addresses" is broader than it sounds, and worth stating exactly: the announcement carries the
+**LAN address, the public WAN IPv4, and global IPv6 addresses**. So a café LAN learns your home or
+ISP address, not just your presence on that café's network.
+
+That is not the same disclosure as the default relay setup, and the difference is why this ships
+off:
+
+- **pkarr** publishes a *signed record* that someone must already know your endpoint id to look up.
+  It is a lookup table.
+- **mDNS** is an announcement to strangers. Your endpoint id is the identity peers *pin*, so
+  broadcasting it on each network you join correlates you across them.
+
+On a home or office LAN that is exactly what you want. On a café, hotel, conference or coworking
+network, decide deliberately. A node cannot un-send a multicast packet — which is why `"resolve"`
+exists, for the benefit without the announcement.
+
+**#68 asked for this on by default. It is not**, for the reason above. Turning it on is one line.
+
+One honest tension: naming the service `mcpmesh` rather than iroh's shared `irohv1` (below) makes
+the query in `"resolve"` mode *more* identifying, not less — it says "mcpmesh" rather than "some
+iroh app". That trade is taken deliberately: cross-advertising with unrelated iroh applications is a
+disclosure on the `"on"` path, which is the one that carries your identity, and blending into other
+traffic is not a privacy property anyone should rely on.
+
+#### What actually goes on the wire
+
+Records take the form `<endpoint-id>._mcpmesh._udp.local`, carrying this node's direct addresses and
+its relay URL if it has one. The service name is `mcpmesh`, deliberately **not** iroh's shared
+`irohv1` default — otherwise every unrelated iroh application on the link would advertise into the
+same namespace and be resolved out of it.
+
+**`relay_only` does NOT restrain this on a stock build.** `AddrFilter::relay_only()` is installed
+only when the binary is built with the `unstable-relay-only` cargo feature; without it,
+`relay_only = true` is inert (it says so in its own section below) and mDNS announces the **full**
+direct address set. With the feature, the filter strips direct addresses before mDNS sees them and
+the announcement carries only a relay URL — useless on a LAN with no uplink, but quiet. Boot warns
+either way, naming which of the two you actually got.
+
+An earlier version of this section claimed the filter always applied. It does not; that was caught
+on the wire.
+
+`presence_mode = "off"` and `local_discovery = "on"` also work against each other — the first
+withholds reachability from paired peers, the second broadcasts it to the whole link. Boot warns.
+
+**Discovery is not authorization.** A peer found this way faces the trust gate exactly as one found
+any other way; resolution answers *where*, never *who may*. That is what makes it safe to switch on
+at all — it cannot widen who this node admits.
+
+`status.self_network.local_discovery` reports the effective mode (`api_minor >= 50`), so a product
+backing a privacy switch can show its real state and "why can't these two machines see each other"
+has an answer from the control API.
 
 ### `relay_only` — CURRENTLY NON-FUNCTIONAL (#116)
 

@@ -193,6 +193,43 @@ pub struct NetworkCfg {
     /// keepalive traffic on a metered link with iroh 1.0.3.
     #[serde(default)]
     pub keep_alive_secs: Option<u64>,
+    /// `[network].local_discovery` (#68) — find peers on the LAN with **no internet at all**.
+    ///
+    /// - `"off"` (default): no multicast sent, none listened for.
+    /// - `"on"`: resolve peers on the link AND announce this node to it.
+    /// - `"resolve"`: learn where peers are without publishing this node's identity or addresses.
+    ///   NOT silent: resolving over mDNS means asking, and the library asks on a fixed cadence, so
+    ///   this mode multicasts a `_mcpmesh._udp.local` query roughly once a second for as long as
+    ///   the node runs. Every device on the link can see that something here runs mcpmesh and is
+    ///   up. If that matters, the mode is `"off"`.
+    ///
+    /// Peer resolution otherwise needs external infrastructure — the pkarr publisher a relay
+    /// provides, or an address someone already handed over — so two machines on the same LAN with
+    /// no uplink cannot find each other though the path between them is fine. That is the scenario
+    /// where "peer to peer" earns its keep, and the commoner weak version too: a LAN where the
+    /// internet is merely flaky, so peers that could talk directly fail to resolve because
+    /// resolution goes out first.
+    ///
+    /// **OFF by default, and #68 asked for on.** The two disclosures are not comparable. pkarr
+    /// publishes a signed record someone must already know your endpoint id to look up. mDNS
+    /// announces your endpoint id and addresses to EVERY device on the link, unprompted and
+    /// repeatedly, to machines that had no idea you existed — and that id is the one peers pin, so
+    /// it correlates you across networks. On a home LAN that is the point; on a café, hotel or
+    /// conference network it is a broadcast to strangers. A node cannot un-send a multicast packet:
+    /// turning this on is one line and reversible, turning it on for someone silently is not.
+    /// `"resolve"` is there for whoever wants the benefit without publishing their identity — with
+    /// the query caveat above, which is the honest limit of that mode.
+    ///
+    /// What `"on"` puts on the link is broader than "addresses" suggests: the LAN address, the
+    /// PUBLIC WAN IPv4, and global IPv6 addresses. A café LAN learns your home/ISP address.
+    ///
+    /// Read at BOOT. Like `relay_mode`/`presence_mode`, an unknown value is a startup ERROR.
+    #[serde(default = "default_local_discovery")]
+    pub local_discovery: String,
+}
+
+fn default_local_discovery() -> String {
+    "off".into()
 }
 impl Default for NetworkCfg {
     fn default() -> Self {
@@ -205,6 +242,7 @@ impl Default for NetworkCfg {
             presence_mode: "paired".into(),
             idle_timeout_secs: None,
             keep_alive_secs: None,
+            local_discovery: default_local_discovery(),
         }
     }
 }
