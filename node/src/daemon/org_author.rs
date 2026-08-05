@@ -348,6 +348,133 @@ pub(crate) async fn org_revoke(
     })
 }
 
+/// `org_rotate` (#93 ask c): mint a SUCCESSOR org root and publish the bridge to it.
+///
+/// The org's trust anchor is one pinned key. Until now nothing could move it: an operator laptop
+/// that died took the org with it 90 days later, when the roster expired — and the delay is what
+/// made it hard to diagnose. Recovery was O(N) fresh ceremonies with every member.
+///
+/// What this publishes is a roster **signed by the successor**, carrying `successor_root_pk` and a
+/// `successor_sig` by the CURRENT root over `domain ∥ org_id ∥ successor_pk`. A member still pinned
+/// to the current root verifies that cross-signature with the key it already has, adopts the
+/// successor, and then verifies the body with it.
+///
+/// **The bridge rides every subsequent roster**, which is the property that makes rotation
+/// survivable rather than merely possible: a member offline for one publication still catches up.
+/// A member two rotations behind needs a fresh `org_join` — chaining further would mean carrying a
+/// history.
+///
+/// The successor is staged at `<config>/org_root_next.key` and PROMOTED to `org-root.key` BEFORE
+/// the roster is published, with a rollback if publishing then fails. The first cut promoted last,
+/// "so a half-finished rotation is a no-op" — and the 0.47.0 gate proved the opposite: publishing
+/// pins the new anchor and gossip-announces the roster, so a failed rename left this node pinned to
+/// the successor while still signing with the predecessor, and the org could no longer publish
+/// membership changes at all.
+pub(crate) async fn org_rotate(
+    state: &DaemonState,
+    new_key_path: Option<String>,
+) -> Result<mcpmesh_local_api::OrgRotateResult> {
+    let mesh = state.mesh_required()?;
+    let _authoring = mesh.org_author_lock.lock().await;
+    let (current, mut roster) = load_operator_roster(mesh)?;
+
+    let key_path = org_root_key_path(mesh);
+    let next_path = match new_key_path {
+        Some(p) => std::path::PathBuf::from(p),
+        None => key_path.with_file_name("org_root_next.key"),
+    };
+    // Generated if absent, reused if the operator staged one — so a rotation can be prepared on a
+    // machine that is not the one publishing.
+    let (successor, _created) = OrgRootKey::load_or_generate(&next_path)
+        .map_err(|e| anyhow::anyhow!("successor root key error at {}: {e}", next_path.display()))?;
+    let successor_pk = successor.public_bytes();
+    anyhow::ensure!(
+        successor_pk != current.public_bytes(),
+        "the successor key is the same as the current root — rotation would be a no-op, and \
+         publishing it would tell every member to re-anchor to the key they already have"
+    );
+
+    // The bridge, signed by the CURRENT root. This is what a member still pinned to it verifies.
+    let cross = mcpmesh_trust::roster::sign::sign_org_rotation(
+        current.signing_key(),
+        &roster.org_id,
+        &successor_pk,
+    );
+    roster.serial += 1;
+    roster.successor_root_pk = Some(mcpmesh_trust::roster::encode_b64u(&successor_pk));
+    roster.successor_sig = Some(mcpmesh_trust::roster::encode_b64u(&cross));
+    // A rotation declares the ROTATION FORMAT. The schema's own rule is that additive fields are a
+    // format bump, and honouring it turns "unknown field" on a pre-0.47.0 member into "unexpected
+    // roster format", which is the difference between an operator upgrading and an operator hunting
+    // for corruption.
+    roster.format = mcpmesh_trust::roster::ROSTER_FORMAT_ROTATION.to_string();
+    // Signed by the SUCCESSOR: from here on the new key is the one that signs.
+    sign(successor.signing_key(), &mut roster)
+        .map_err(|e| anyhow::anyhow!("sign roster with the successor root: {e}"))?;
+
+    // PROMOTE FIRST, then publish — and roll back if publishing fails.
+    //
+    // The first cut promoted last, "so a half-finished rotation is a no-op". The gate proved the
+    // opposite: `install_authored` pins the new anchor AND gossip-announces the roster, so a failed
+    // rename (a `--new-key` on another filesystem, a read-only config dir, any I/O error) left the
+    // operator PINNED TO THE SUCCESSOR WHILE STILL HOLDING THE PREDECESSOR AS ITS SIGNING KEY. The
+    // next `org_approve` would then sign with a key its own node rejects, and the org could no
+    // longer publish membership changes at all.
+    //
+    // Promoting first inverts the failure: if the rename fails, nothing has been published and the
+    // roster is untouched — a genuine no-op. If the publish then fails, we restore the predecessor,
+    // and the worst case is a staged key left behind, which the next rotation reuses harmlessly.
+    let (np, kp) = (next_path.clone(), key_path.clone());
+    let predecessor_bytes = crate::util::blocking("join org root promote", move || {
+        let prior = std::fs::read(&kp).ok();
+        std::fs::rename(&np, &kp)
+            .with_context(|| format!("promote {} to {}", np.display(), kp.display()))?;
+        anyhow::Ok(prior)
+    })
+    .await??;
+
+    let new_pk_b64u = mcpmesh_trust::roster::encode_b64u(&successor_pk);
+    let installed = match install_authored(state, &roster, Some(new_pk_b64u.clone())).await {
+        Ok(v) => v,
+        Err(e) => {
+            // Put the predecessor back, so the operator is exactly where they started.
+            if let Some(prior) = predecessor_bytes {
+                let kp = key_path.clone();
+                let _ = crate::util::blocking("join org root rollback", move || {
+                    let bytes: [u8; 32] = prior
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("saved predecessor key is not 32 bytes"))?;
+                    mcpmesh_trust::keys::write_signing_key(
+                        &kp,
+                        &mcpmesh_trust::ed25519_dalek::SigningKey::from_bytes(&bytes),
+                        true,
+                    )
+                    .map_err(|e| anyhow::anyhow!("restore org root key: {e}"))
+                })
+                .await;
+            }
+            return Err(e.context(
+                "the rotation was NOT published; this node's org root key has been restored",
+            ));
+        }
+    };
+
+    tracing::warn!(
+        org_id = %installed.org_id,
+        serial = installed.serial,
+        new_root = %new_pk_b64u,
+        "ORG ROOT ROTATED — members re-anchor as they receive this roster"
+    );
+    Ok(mcpmesh_local_api::OrgRotateResult {
+        org_id: installed.org_id,
+        serial: installed.serial,
+        new_root_pk: new_pk_b64u,
+        old_root_fingerprint: crate::pairing::sas::fingerprint_words(&current.public_bytes()),
+        new_root_fingerprint: crate::pairing::sas::fingerprint_words(&successor_pk),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -728,5 +855,285 @@ mod tests {
             format!("{err:#}").contains("not an org operator"),
             "approve on a non-operator must say so once the code itself is valid: {err:#}"
         );
+    }
+
+    /// #93 ask c END TO END on the operator side: `org_rotate` publishes a roster a member still
+    /// pinned to the OLD root can install, and promotes the key.
+    ///
+    /// The consuming half — that such a roster validates and re-anchors — is pinned in
+    /// `trust::roster::validate`. This is the half that produces it, and the two meet here: the
+    /// published document is fed to the REAL validator against the OLD anchor.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn org_rotate_publishes_a_roster_the_old_anchor_can_still_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = operator_state(dir.path()).await;
+        let mesh = state.mesh().unwrap();
+        org_create(&state, "acme".into(), None, None)
+            .await
+            .expect("org created");
+
+        let key_path = org_root_key_path(mesh);
+        let old_pk = {
+            let (k, _) = OrgRootKey::load_or_generate(&key_path).unwrap();
+            k.public_bytes()
+        };
+        let installed_before: Roster = serde_json::from_slice(
+            &std::fs::read(crate::daemon::roster_install::installed_roster_path(mesh)).unwrap(),
+        )
+        .unwrap();
+
+        let out = org_rotate(&state, None).await.expect("rotate succeeds");
+        assert_ne!(
+            out.new_root_pk,
+            mcpmesh_trust::roster::encode_b64u(&old_pk),
+            "the anchor actually moved"
+        );
+        assert_ne!(out.old_root_fingerprint, out.new_root_fingerprint);
+
+        // The key was PROMOTED: `org-root.key` is now the successor, and the staging file is gone.
+        // A rotation that left the old key in place would sign the next roster with a key members
+        // have been told to stop trusting.
+        let (now_key, _) = OrgRootKey::load_or_generate(&key_path).unwrap();
+        assert_eq!(
+            mcpmesh_trust::roster::encode_b64u(&now_key.public_bytes()),
+            out.new_root_pk,
+            "org-root.key must BE the successor after a rotation"
+        );
+        assert!(
+            !key_path.with_file_name("org_root_next.key").exists(),
+            "the staging key is promoted, not left behind for the next rotation to reuse"
+        );
+
+        // THE property: a member still pinned to the OLD root installs the published roster,
+        // through the real validator, and is told to re-anchor.
+        let published: Roster = serde_json::from_slice(
+            &std::fs::read(crate::daemon::roster_install::installed_roster_path(mesh)).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            published.serial > installed_before.serial,
+            "rotation bumps the serial, so members converge on it"
+        );
+        let old_vk = mcpmesh_trust::ed25519_dalek::VerifyingKey::from_bytes(&old_pk).unwrap();
+        let (_view, anchor) = mcpmesh_trust::roster::validate::validate_for_install_with_anchor(
+            &published,
+            &old_vk,
+            installed_before.serial,
+            crate::util::epoch_now_i64(),
+        )
+        .expect("a member on the OLD anchor must be able to install the rotated roster");
+        assert_eq!(
+            anchor.adopted_root_pk.as_deref(),
+            Some(out.new_root_pk.as_str()),
+            "…and must be told to re-anchor to exactly the key the operator published"
+        );
+
+        // The operator's OWN config was re-pinned, durably — otherwise its next restart trusts a
+        // key that no longer signs anything.
+        let cfg = crate::config::Config::load(&mesh.config_path).unwrap();
+        assert_eq!(
+            cfg.identity.org_root_pk.as_deref(),
+            Some(out.new_root_pk.as_str()),
+            "the operator node re-pins too"
+        );
+    }
+
+    /// Rotating to the SAME key is refused rather than published.
+    ///
+    /// It would tell every member to re-anchor to the key they already have — a no-op that still
+    /// burns a serial and, worse, reads in the audit log as a rotation that happened.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rotating_to_the_same_key_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = operator_state(dir.path()).await;
+        let mesh = state.mesh().unwrap();
+        org_create(&state, "acme".into(), None, None)
+            .await
+            .expect("org created");
+        let key_path = org_root_key_path(mesh);
+        let e = org_rotate(&state, Some(key_path.display().to_string()))
+            .await
+            .expect_err("rotating to the current key must be refused");
+        assert!(
+            format!("{e:#}").contains("same as the current root"),
+            "the refusal must say why: {e:#}"
+        );
+    }
+
+    /// #93 ask c — THE MEMBER SIDE: a node pinned to the OLD root installs a rotated roster and
+    /// re-anchors DURABLY.
+    ///
+    /// This is the path the feature exists for, and it is NOT the one the operator takes: an
+    /// operator re-pins by authoring (it passes an explicit `org_root_pk`), so a test of the
+    /// operator proves nothing about adoption. Deleting `adopt_successor_root`'s body left the
+    /// operator test green — this is what catches it.
+    ///
+    /// The member is deliberately never told the new key out of band. All it has is its old pin and
+    /// the roster, which is exactly the situation of a machine that was closed when the operator
+    /// rotated.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_member_on_the_old_anchor_re_anchors_when_it_installs_a_rotated_roster() {
+        // --- operator: create + rotate, and keep the published roster.
+        let op_dir = tempfile::tempdir().unwrap();
+        let op = operator_state(op_dir.path()).await;
+        let op_mesh = op.mesh().unwrap();
+        org_create(&op, "acme".into(), None, None).await.unwrap();
+        let old_pk_b64u = {
+            let (k, _) = OrgRootKey::load_or_generate(&org_root_key_path(op_mesh)).unwrap();
+            mcpmesh_trust::roster::encode_b64u(&k.public_bytes())
+        };
+        let before = std::fs::read(crate::daemon::roster_install::installed_roster_path(
+            op_mesh,
+        ))
+        .expect("pre-rotation roster");
+        let rotated = org_rotate(&op, None).await.expect("rotate");
+        let after = std::fs::read(crate::daemon::roster_install::installed_roster_path(
+            op_mesh,
+        ))
+        .expect("rotated roster");
+
+        // --- member: a separate node, pinned to the OLD root, already holding the pre-rotation
+        // roster so the serial actually advances.
+        let m_dir = tempfile::tempdir().unwrap();
+        let m = operator_state(m_dir.path()).await;
+        let m_mesh = m.mesh().unwrap();
+        let pre = m_dir.path().join("pre.json");
+        std::fs::write(&pre, &before).unwrap();
+        crate::daemon::roster_install::install_roster(
+            &m,
+            pre.display().to_string(),
+            Some(old_pk_b64u.clone()),
+        )
+        .await
+        .expect("the member installs the pre-rotation roster on its old anchor");
+        assert_eq!(
+            crate::config::Config::load(&m_mesh.config_path)
+                .unwrap()
+                .identity
+                .org_root_pk
+                .as_deref(),
+            Some(old_pk_b64u.as_str()),
+            "precondition: the member is pinned to the OLD root"
+        );
+
+        // …and now the rotated one, with NO out-of-band knowledge of the new key.
+        let rot = m_dir.path().join("rotated.json");
+        std::fs::write(&rot, &after).unwrap();
+        crate::daemon::roster_install::install_roster(&m, rot.display().to_string(), None)
+            .await
+            .expect(
+                "a member on the old anchor must be able to install the rotated roster — that is \
+                 the entire feature",
+            );
+
+        assert_eq!(
+            crate::config::Config::load(&m_mesh.config_path)
+                .unwrap()
+                .identity
+                .org_root_pk
+                .as_deref(),
+            Some(rotated.new_root_pk.as_str()),
+            "the member must RE-ANCHOR DURABLY — a rotation held only in memory reverts on restart \
+             and re-strands the node, which is the failure this feature exists to remove"
+        );
+    }
+
+    /// #93 ask c gate: an ADOPTED successor beats the caller's explicit `--org-root-pk`.
+    ///
+    /// The caller's pk is by construction the OLD anchor — it is what they had to supply to make
+    /// the roster verify at all. The first cut pinned it AFTER adoption, silently reverting the
+    /// re-anchor while the `org_root_rotated` audit record had already fired. That is exactly the
+    /// "reads as durable, then silently reverts" failure the code cites #107 for, and it is
+    /// reachable by the by-hand distribution the CLI itself recommends.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_adopted_successor_beats_an_explicit_old_pk() {
+        let op_dir = tempfile::tempdir().unwrap();
+        let op = operator_state(op_dir.path()).await;
+        let op_mesh = op.mesh().unwrap();
+        org_create(&op, "acme".into(), None, None).await.unwrap();
+        let old_pk_b64u = {
+            let (k, _) = OrgRootKey::load_or_generate(&org_root_key_path(op_mesh)).unwrap();
+            mcpmesh_trust::roster::encode_b64u(&k.public_bytes())
+        };
+        let before = std::fs::read(crate::daemon::roster_install::installed_roster_path(
+            op_mesh,
+        ))
+        .unwrap();
+        let rotated = org_rotate(&op, None).await.expect("rotate");
+        let after = std::fs::read(crate::daemon::roster_install::installed_roster_path(
+            op_mesh,
+        ))
+        .unwrap();
+
+        let m_dir = tempfile::tempdir().unwrap();
+        let m = operator_state(m_dir.path()).await;
+        let m_mesh = m.mesh().unwrap();
+        let pre = m_dir.path().join("pre.json");
+        std::fs::write(&pre, &before).unwrap();
+        crate::daemon::roster_install::install_roster(
+            &m,
+            pre.display().to_string(),
+            Some(old_pk_b64u.clone()),
+        )
+        .await
+        .unwrap();
+
+        // The member is handed the rotated roster WITH the old pk again — the natural shape when
+        // distributing by hand, or for a joiner holding only the org_create invite.
+        let rot = m_dir.path().join("rotated.json");
+        std::fs::write(&rot, &after).unwrap();
+        crate::daemon::roster_install::install_roster(
+            &m,
+            rot.display().to_string(),
+            Some(old_pk_b64u.clone()),
+        )
+        .await
+        .expect("installs on the strength of the bridge");
+
+        assert_eq!(
+            crate::config::Config::load(&m_mesh.config_path)
+                .unwrap()
+                .identity
+                .org_root_pk
+                .as_deref(),
+            Some(rotated.new_root_pk.as_str()),
+            "the ADOPTED successor must win over the explicit old pk — pinning the caller's value \
+             back reverts the rotation while the audit record says it happened"
+        );
+    }
+
+    /// A rotated roster declares the ROTATION FORMAT, and the two must agree.
+    ///
+    /// The schema's own rule is that additive fields on this security document are a format bump,
+    /// never a silent `#[serde(default)]`. The first cut broke that rule, and the gate proved the
+    /// cost: `deny_unknown_fields` means a rotated roster does not PARSE on a pre-0.47.0 member, so
+    /// — because the bridge rides every later roster — that member is partitioned permanently, with
+    /// "unknown field" as its only clue. Declaring `/2` cannot make an old binary verify a key it
+    /// has never seen; it makes the refusal legible.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rotated_roster_declares_the_rotation_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = operator_state(dir.path()).await;
+        let mesh = state.mesh().unwrap();
+        org_create(&state, "acme".into(), None, None).await.unwrap();
+
+        let path = crate::daemon::roster_install::installed_roster_path(mesh);
+        let before: Roster = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            before.format,
+            mcpmesh_trust::roster::ROSTER_FORMAT,
+            "an org that never rotated keeps declaring /1, byte-identically"
+        );
+        assert!(before.successor_root_pk.is_none());
+
+        org_rotate(&state, None).await.expect("rotate");
+        let after: Roster = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            after.format,
+            mcpmesh_trust::roster::ROSTER_FORMAT_ROTATION,
+            "a rotation MUST bump the format, or a pre-0.47.0 member sees `unknown field` and has \
+             no way to tell a newer format from a corrupt document"
+        );
+        assert!(after.successor_root_pk.is_some() && after.successor_sig.is_some());
     }
 }

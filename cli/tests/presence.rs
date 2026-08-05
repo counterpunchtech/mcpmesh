@@ -73,6 +73,8 @@ fn alice_two_device_view(root: &SigningKey, primary: [u8; 32], mirror: [u8; 32])
                 ],
             }],
             revoked_endpoints: vec![],
+            successor_root_pk: None,
+            successor_sig: None,
             sig: String::new(),
         },
     );

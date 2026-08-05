@@ -67,6 +67,7 @@ pub use handlers::{
     remove_peer, rename_peer, revoke_service_access, revoke_service_allow,
 };
 pub(crate) use handlers::{attest_offer, attest_to, device_revocation_import, device_revoke};
+pub(crate) use org_author::org_rotate;
 pub(crate) use reach::caller_admitted_services;
 /// The services this identity is admitted to, as the accept path computes them (#100). Test seam:
 /// it lets a test assert that the reported set matches what a session would actually be granted.

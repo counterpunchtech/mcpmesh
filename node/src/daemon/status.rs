@@ -582,6 +582,8 @@ mod roster_members_tests {
                 // alice's `old-phone` is revoked — it must not appear as a member device at all.
                 // zoe's ONLY device is revoked, which must not remove zoe.
                 revoked_endpoints: vec![encode_b64u(&[0xA2; 32]), encode_b64u(&[0xC1; 32])],
+                successor_root_pk: None,
+                successor_sig: None,
                 sig: String::new(),
             },
         );

@@ -19,7 +19,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use ed25519_dalek::VerifyingKey;
-use mcpmesh_trust::roster::validate::{RosterView, load_installed, validate_for_install};
+use mcpmesh_trust::roster::validate::{
+    AnchorChange, RosterView, load_installed, validate_for_install_with_anchor,
+};
 use mcpmesh_trust::roster::{Roster, decode_b64u};
 
 /// Persists the installed `roster.json` and re-loads it. Path-agnostic (the daemon supplies
@@ -69,24 +71,30 @@ impl RosterStore {
     /// The sig re-verifies on reload because it is over the JCS canonical form, not the byte layout
     /// (so pretty-printing is safe). Returns the resolvable view for the gate to hot-swap in. A
     /// FAILED validation returns Err BEFORE the write, so the on-disk roster is left UNTOUCHED.
+    ///
+    /// Also returns an [`AnchorChange`] (#93 ask c): when the roster was accepted on the strength
+    /// of a cross-signed SUCCESSOR root, the caller must persist the new anchor to
+    /// `[identity].org_root_pk`. A rotation that lived only in memory would revert on restart and
+    /// re-strand the node.
     pub fn install_from_file(
         &self,
         file: &Path,
         root_pk: &VerifyingKey,
         now_epoch: i64,
-    ) -> Result<RosterView> {
+    ) -> Result<(RosterView, AnchorChange)> {
         let bytes =
             std::fs::read(file).with_context(|| format!("read roster file {}", file.display()))?;
         let roster: Roster = serde_json::from_slice(&bytes)
             .with_context(|| format!("parse roster file {}", file.display()))?;
         let installed = self.installed_serial()?;
-        let view = validate_for_install(&roster, root_pk, installed, now_epoch)
-            .context("roster failed validation")?;
+        let (view, anchor) =
+            validate_for_install_with_anchor(&roster, root_pk, installed, now_epoch)
+                .context("roster failed validation")?;
         // Persist a field-set-preserving re-serialization of the parsed Roster (the sig is a schema
         // field, so it survives; it re-verifies over the JCS canonical form on load).
         let out = serde_json::to_vec_pretty(&roster).context("serialize roster for persist")?;
         crate::util::atomic_write(&self.path, &out)?;
-        Ok(view)
+        Ok((view, anchor))
     }
 }
 
@@ -142,6 +150,8 @@ mod tests {
                 }],
             }],
             revoked_endpoints: vec![],
+            successor_root_pk: None,
+            successor_sig: None,
             sig: String::new(),
         }
     }
@@ -160,7 +170,7 @@ mod tests {
             serde_json::to_vec(&mint_signed(&root(), body(5))).unwrap(),
         )
         .unwrap();
-        let view = store
+        let (view, _anchor) = store
             .install_from_file(&f1, &root_pk, now)
             .expect("install serial 5");
         assert_eq!(view.serial(), 5);
@@ -195,6 +205,7 @@ mod tests {
             store
                 .install_from_file(&f3, &root_pk, now)
                 .unwrap()
+                .0
                 .serial(),
             6
         );

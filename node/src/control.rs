@@ -714,6 +714,15 @@ pub(crate) async fn handle_request(req: &Value, state: &DaemonState) -> Value {
         // (no inheriting another identity's grants), rewrites allow lists, and reloads.
         // #85 ask 3 — device attestation. `attest_offer` says where another of this person's
         // devices should dial; `attest_to` runs the ceremony from the device being admitted.
+        // #93 ask c — rotate the org root, publishing a bridge members adopt as they receive it.
+        Some("org_rotate") => respond(
+            id,
+            "org_rotate",
+            with_params(&params, |p: mcpmesh_local_api::OrgRotateParams| {
+                crate::daemon::org_rotate(state, p.new_key_path)
+            })
+            .await,
+        ),
         Some("attest_offer") => {
             respond(id, "attest_offer", crate::daemon::attest_offer(state).await)
         }
@@ -1714,6 +1723,17 @@ mod tests {
             "blob_grant",
             "blob_list",
             "blob_fetch",
+            // #85 asks 3/4 + #93 ask c. Every one of these dispatch arms could be DELETED with a
+            // green suite until they were listed here — the 0.45.0 gate proved it for the
+            // revocation four, and the 0.47.0 gate proved it again for `org_rotate`. The verbs
+            // would answer -32601 over the wire and every embedder's client call would fail.
+            "peer_revoke",
+            "peer_unrevoke",
+            "device_revoke",
+            "device_revocation_import",
+            "attest_offer",
+            "attest_to",
+            "org_rotate",
         ] {
             let r = handle_request(&req(method, json!({})), &st).await;
             // Graceful error, never a panic or a success. With empty params, a method whose

@@ -169,6 +169,8 @@ mod tests {
                 groups: vec!["team-eng".into(), "team-ops".into()],
                 users: vec![user("alice", "team-eng", 10), user("carol", "team-ops", 11)],
                 revoked_endpoints: vec![],
+                successor_root_pk: None,
+                successor_sig: None,
                 sig: String::new(),
             },
         );

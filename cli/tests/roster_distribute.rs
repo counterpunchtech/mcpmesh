@@ -79,6 +79,8 @@ fn mint_signed_roster(
             groups: vec!["team-eng".into()],
             users: roster_users,
             revoked_endpoints: vec![],
+            successor_root_pk: None,
+            successor_sig: None,
             sig: String::new(),
         },
     );

@@ -429,7 +429,7 @@ async fn full_enrollment_via_porcelain_admits_a_group_service_and_revocation_cut
         // yet, so it severs 0. One `RosterStore` tracks the installed serial (0 → 2 → 3, monotone).
         let rstore = RosterStore::new(bdir.path().join("installed-roster.json"));
         let now = now_epoch_i64();
-        let view2 = rstore
+        let (view2, _) = rstore
             .install_from_file(&serial2_file, &org_root_pub, now)
             .expect("install the porcelain-produced serial-2 roster");
         assert_eq!(
@@ -471,7 +471,7 @@ async fn full_enrollment_via_porcelain_admits_a_group_service_and_revocation_cut
         wait_for_len(&conn_registry, 1).await;
 
         // ── B.5: install the PORCELAIN-produced serial-3 roster → D8 severs the live session.
-        let view3 = rstore
+        let (view3, _) = rstore
             .install_from_file(&serial3_file, &org_root_pub, now)
             .expect("install the porcelain-produced serial-3 (revoking) roster");
         let severed = install_roster_view_and_sever(&mesh, view3);

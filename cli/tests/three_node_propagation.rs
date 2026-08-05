@@ -96,6 +96,8 @@ fn mint_signed_roster(
             groups: vec!["team-eng".into()],
             users: roster_users,
             revoked_endpoints: revoked.iter().map(|e| encode_b64u(e)).collect(),
+            successor_root_pk: None,
+            successor_sig: None,
             sig: String::new(),
         },
     );

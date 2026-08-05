@@ -52,6 +52,8 @@ pub fn empty_roster(org_id: &str, serial: u64, issued_epoch: i64, expires_epoch:
         groups: Vec::new(),
         users: Vec::new(),
         revoked_endpoints: Vec::new(),
+        successor_root_pk: None,
+        successor_sig: None,
         sig: String::new(),
     }
 }

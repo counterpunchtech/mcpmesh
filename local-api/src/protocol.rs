@@ -1424,6 +1424,21 @@ pub enum Request {
     /// think it did stays an out-of-band human step, and `join_code_fingerprint` in the result is
     /// what the two humans compare.
     OrgApprove(OrgApproveParams),
+    /// ROTATE the org root (#93 ask c). Tag `"org_rotate"`.
+    ///
+    /// The org's trust anchor is one pinned key, and nothing could move it: an operator laptop that
+    /// died took the org with it 90 days later, when the roster expired — and the delay is what
+    /// made that hard to diagnose. Recovery was O(N) fresh ceremonies with every member.
+    ///
+    /// Publishes a roster signed by the SUCCESSOR carrying a cross-signature by the CURRENT root, so
+    /// a member still pinned to the current key adopts the successor with the key it already has.
+    /// The bridge rides every subsequent roster, so a member offline for one publication catches up
+    /// — but one two rotations behind needs a fresh `org_join`.
+    ///
+    /// **This is not escrow.** If the current root key is LOST there is nothing to sign the bridge
+    /// with. Copying `org-root.key` to a second operator machine already works and remains the
+    /// answer for that.
+    OrgRotate(OrgRotateParams),
     /// INSPECT a join code without approving it (#66): who it claims to be, and the fingerprint the
     /// two humans compare. Read-only — nothing is signed, installed, or persisted.
     /// Tag `"org_join_code"`.
@@ -1621,6 +1636,30 @@ pub struct OrgCreateResult {
     /// The org root's fingerprint in short words, for the out-of-band read-back that anchors every
     /// joiner's trust. NOT the key.
     pub org_root_fingerprint: String,
+}
+
+/// Params of [`Request::OrgRotate`] (#93 ask c).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrgRotateParams {
+    /// Where to read or write the successor key. Omit for `<config>/org_root_next.key`.
+    ///
+    /// Reused if it already exists, so a rotation can be prepared on a machine that is not the one
+    /// publishing it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_key_path: Option<String>,
+}
+
+/// Result of [`Request::OrgRotate`] (#93 ask c).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct OrgRotateResult {
+    pub org_id: String,
+    pub serial: u64,
+    /// The new anchor, `b64u:`. Members adopt it as they receive the roster.
+    pub new_root_pk: String,
+    /// Short fingerprints, for an operator to read out when telling members what changed.
+    pub old_root_fingerprint: String,
+    pub new_root_fingerprint: String,
 }
 
 /// Params of [`Request::OrgApprove`] (#66).
@@ -2628,7 +2667,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   thirty have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.52";
+pub const API_VERSION: &str = "1.53";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -2714,7 +2753,19 @@ pub const API_VERSION: &str = "1.52";
 /// refusals — expired line, no live invite, inviter unreachable, id mismatch, name conflict, and
 /// the deliberately-opaque refusal. `ERR_NICKNAME_TAKEN` had been the only coded pairing failure,
 /// so every other one arrived as `-32000` and an embedder could either forward our prose to end
-/// users or substring-match it (#159); to 52 with `attest_offer` and the DEVICE ATTESTATION
+/// users or substring-match it (#159); to 53 with `org_rotate` and the roster's
+/// `successor_root_pk`/`successor_sig` — ORG ROOT ROTATION (#93 ask c). The schema pinned exactly
+/// one signature slot against one key, so an operator laptop that died took the org with it 90 days
+/// later when the roster expired, and the delay is what made it undiagnosable; recovery was O(N)
+/// fresh ceremonies with every member. A roster now carries a successor root cross-signed by its
+/// predecessor, and the bridge rides EVERY subsequent roster — so a member offline for the
+/// announcing publication still catches up, which the obvious one-shot design does not give you. A
+/// successor is adopted only when the pinned key no longer signs directly, only on a statement that
+/// key signed, and never resets rollback protection. **A rotated roster declares
+/// `mcpmesh-roster/2`**, so EVERY member must be on 0.47.0+ before an org rotates — an older binary
+/// refuses the closed-schema document and stops receiving membership changes entirely; an org that
+/// never rotates keeps producing `/1` byte-identically. NOT escrow: a LOST root cannot sign a bridge —
+/// copy `org-root.key` to a second operator machine for that. Guard on `>= 53`; to 52 with `attest_offer` and the DEVICE ATTESTATION
 /// ceremony (#85 ask 3) — a peer that already holds your `b64u:` admits a replacement device on the
 /// strength of a user-key binding, with no fresh SAS ceremony with everyone you ever paired with.
 /// `PeerEntry.user_id` was written once at pairing and never refreshed, so a machine restored from
@@ -2861,7 +2912,7 @@ pub const API_VERSION: &str = "1.52";
 /// its REAL content is a meaning change to `reachable` — the field exists so the new meaning is
 /// observable at all. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 52;
+pub const API_MINOR: u32 = 53;
 
 #[cfg(test)]
 mod tests {

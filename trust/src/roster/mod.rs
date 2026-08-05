@@ -12,6 +12,23 @@ pub mod validate;
 
 /// The only `format` value this version accepts.
 pub const ROSTER_FORMAT: &str = "mcpmesh-roster/1";
+/// The format a roster carrying a ROTATION bridge declares (#93 ask c).
+///
+/// The struct doc below is explicit that additive fields on this document are a format bump, never
+/// a silent `#[serde(default)]` — and 0.47.0's first cut added the successor pair without one. The
+/// gate proved the cost: `deny_unknown_fields` means a rotated roster does not PARSE on an older
+/// binary, and because the bridge rides every subsequent roster, that member is partitioned
+/// permanently — its poll loop retrying forever against a document claiming a format it does
+/// support. That is verbatim the "90 days later, nobody connects cause to effect" failure #93 opens
+/// with, reintroduced by the fix for it.
+///
+/// Declaring `/2` does not make an old binary able to verify a rotated roster — nothing could, it
+/// has never seen the new key. What it buys is a LEGIBLE refusal: `unexpected roster format
+/// "mcpmesh-roster/2"` instead of `unknown field successor_root_pk`, which tells an operator to
+/// upgrade rather than to go looking for corruption.
+///
+/// Emitted ONLY by a rotation. An org that never rotates keeps producing `/1` byte-identically.
+pub const ROSTER_FORMAT_ROTATION: &str = "mcpmesh-roster/2";
 /// The scheme prefix on every key/id/signature string in the schema (`"b64u:…"`).
 pub const B64U_PREFIX: &str = "b64u:";
 /// Clock-skew tolerance for the validity window (rule 3, ±10 min).
@@ -36,7 +53,28 @@ pub struct Roster {
     pub groups: Vec<String>,
     pub users: Vec<RosterUser>,
     pub revoked_endpoints: Vec<String>, // each `b64u:<endpoint_id>`
-    pub sig: String,                    // `b64u:<ed25519 signature>` over JCS(doc \ sig)
+    /// ORG ROOT ROTATION (#93 ask c): the root that supersedes the one this roster is signed by,
+    /// `b64u:<ed25519 pk>`. Absent on every roster of an org that has never rotated.
+    ///
+    /// Carried on EVERY roster after a rotation, not only the one that introduces it — that is the
+    /// whole point. A node validates against one pinned key, so if the successor appeared only in
+    /// the announcing roster, a node offline for that single publication would find every later
+    /// roster unverifiable and be stranded exactly as it is today. Being offline for one
+    /// publication is a laptop closed for a week.
+    ///
+    /// `#[serde(default)]` + `skip_serializing_if` so a pre-0.47.0 roster round-trips unchanged and
+    /// an org that never rotates carries no new bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub successor_root_pk: Option<String>,
+    /// The PREDECESSOR root's signature over `domain ∥ org_id ∥ successor_pk` (#93 ask c) — the
+    /// bridge that lets a node still pinned to the old anchor adopt the new one.
+    ///
+    /// Verified with the PINNED key, never the successor. That is the entire security of rotation:
+    /// an attacker who can serve a roster still cannot introduce their own root without the current
+    /// root's signature over it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub successor_sig: Option<String>,
+    pub sig: String, // `b64u:<ed25519 signature>` over JCS(doc \ sig)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,7 +115,11 @@ pub enum RosterError {
     Encoding(String),
     #[error("bad timestamp: {0}")]
     BadTimestamp(String),
-    #[error("unexpected roster format {0:?} (want {ROSTER_FORMAT:?})")]
+    #[error(
+        "unexpected roster format {0:?} (want {ROSTER_FORMAT:?} or {ROSTER_FORMAT_ROTATION:?} — \
+         a {ROSTER_FORMAT_ROTATION:?} roster carries an org-root rotation and needs mcpmesh 0.47.0 \
+         or newer on every member)"
+    )]
     BadFormat(String),
     /// Rule 1: the org-root signature does not verify.
     #[error("signature does not verify against the pinned org root")]

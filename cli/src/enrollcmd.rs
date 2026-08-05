@@ -701,6 +701,40 @@ pub fn run_attest_to(offer: Option<String>, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `mcpmesh org rotate` (#93 ask c).
+pub fn run_org_rotate(new_key: Option<String>, json: bool) -> anyhow::Result<()> {
+    let out = with_daemon(async move |mut client| Ok(client.org_rotate(new_key).await?))?;
+    if json {
+        println!("{}", serde_json::to_string(&out)?);
+        return Ok(());
+    }
+    println!(
+        "Rotated the org root for {} (serial {}).",
+        out.org_id, out.serial
+    );
+    println!();
+    println!("  old root: {}", out.old_root_fingerprint);
+    println!("  new root: {}", out.new_root_fingerprint);
+    println!();
+    println!("Members re-anchor automatically as they receive this roster — including any that");
+    println!("were offline just now, because the bridge rides every later roster.");
+    println!();
+    println!(
+        "  → A member TWO rotations behind cannot catch up; they need a fresh `mcpmesh join`."
+    );
+    println!(
+        "  → EVERY member must be on mcpmesh 0.47.0 or newer. A rotated roster declares a new"
+    );
+    println!("    schema version, and an older member refuses it — it stops receiving membership");
+    println!("    changes, and will not say why beyond an unsupported-format error.");
+    println!("  → Publish the roster wherever your members read it ([roster].url, or by hand).");
+    println!(
+        "  → The previous root key is GONE — it was replaced in place. If you want a rollback,"
+    );
+    println!("    copy `org-root.key` somewhere safe BEFORE rotating.");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

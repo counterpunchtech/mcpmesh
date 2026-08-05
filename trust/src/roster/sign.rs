@@ -113,6 +113,60 @@ pub fn verify_introduction(
         .map_err(|_| RosterError::BadSignature)
 }
 
+/// The domain the CURRENT org root signs its SUCCESSOR under (#93 ask c).
+///
+/// Separate from the roster body signature and from every other domain here, so a rotation
+/// statement can never be replayed as a roster, a device binding, an introduction, or a device
+/// revocation — and, more to the point, so a roster body signature can never be replayed as a
+/// statement that moves an org's trust anchor.
+const ORG_ROTATION_DOMAIN: &[u8] = b"mcpmesh/org-root-rotation/1";
+
+/// The bytes the current org root signs to name its successor:
+/// `domain ∥ len(org_id) as u32 BE ∥ org_id ∥ successor_pk`.
+///
+/// `org_id` is INSIDE the signature so a rotation statement cannot be replayed into a different org
+/// that happens to share an operator. Length-prefixed rather than concatenated raw: `org_id` is
+/// variable-length and operator-chosen, so without a prefix `("ab", pk)` and `("a", b"b" ∥ pk)`
+/// would produce the same preimage — a confusion an operator could be walked into by naming an org
+/// carefully.
+fn org_rotation_preimage(org_id: &str, successor_pk: &[u8; 32]) -> Vec<u8> {
+    let mut m = Vec::with_capacity(ORG_ROTATION_DOMAIN.len() + 4 + org_id.len() + 32);
+    m.extend_from_slice(ORG_ROTATION_DOMAIN);
+    m.extend_from_slice(&(org_id.len() as u32).to_be_bytes());
+    m.extend_from_slice(org_id.as_bytes());
+    m.extend_from_slice(successor_pk);
+    m
+}
+
+/// Sign a successor org root with the CURRENT root (#93 ask c).
+pub fn sign_org_rotation(
+    current_root: &SigningKey,
+    org_id: &str,
+    successor_pk: &[u8; 32],
+) -> [u8; 64] {
+    use ed25519_dalek::Signer;
+    current_root
+        .sign(&org_rotation_preimage(org_id, successor_pk))
+        .to_bytes()
+}
+
+/// Verify a successor statement against the anchor a node CURRENTLY pins.
+///
+/// The whole security of rotation is that this is checked with the PINNED key — the one the node
+/// already trusts — never with the successor being introduced. Verified with `verify_strict`, like
+/// every other signature here.
+pub fn verify_org_rotation(
+    pinned_root_pk: &[u8; 32],
+    org_id: &str,
+    successor_pk: &[u8; 32],
+    sig: &[u8],
+) -> Result<(), RosterError> {
+    let vk = VerifyingKey::from_bytes(pinned_root_pk).map_err(|_| RosterError::BadSignature)?;
+    let sig = Signature::from_slice(sig).map_err(|_| RosterError::BadSignature)?;
+    vk.verify_strict(&org_rotation_preimage(org_id, successor_pk), &sig)
+        .map_err(|_| RosterError::BadSignature)
+}
+
 /// The domain a user key signs a REVOCATION of one of its own devices under (#85 ask 4).
 ///
 /// Separate from [`DEVICE_BINDING_DOMAIN`] for a sharper reason than the others: a device binding
@@ -229,6 +283,8 @@ fn sample_body() -> crate::roster::Roster {
             }],
         }],
         revoked_endpoints: vec![],
+        successor_root_pk: None,
+        successor_sig: None,
         sig: String::new(),
     }
 }
@@ -483,5 +539,50 @@ mod tests {
             .verifying_key()
             .to_bytes();
         assert!(verify_device_revocation(&other, &device, 1000, &sig).is_err());
+    }
+
+    /// #93 ask c: a rotation statement is confusable with nothing else in this tree.
+    ///
+    /// Every domain here guards a different confusion, and this one guards the sharpest: a
+    /// statement that MOVES AN ORG'S TRUST ANCHOR. If a roster body signature, a device binding, an
+    /// introduction or a device revocation could be replayed as one, anyone holding an artifact the
+    /// org root has ever signed could re-anchor a node.
+    #[test]
+    fn a_rotation_statement_is_confusable_with_nothing_else() {
+        let root = SigningKey::from_bytes(&[3u8; 32]);
+        let pk = root.verifying_key().to_bytes();
+        let successor = [11u8; 32];
+
+        let rotation = sign_org_rotation(&root, "acme", &successor);
+        verify_org_rotation(&pk, "acme", &successor, &rotation).expect("verifies as itself");
+
+        // A device BINDING over the same 32 bytes must not verify as a rotation, and vice versa.
+        let binding = sign_device_binding(&root, &successor);
+        assert!(
+            verify_org_rotation(&pk, "acme", &successor, &binding).is_err(),
+            "a device binding must not move an org's trust anchor"
+        );
+        assert!(
+            verify_device_binding(&pk, &successor, &rotation).is_err(),
+            "…and a rotation statement must not bind a device"
+        );
+
+        // An INTRODUCTION and a device REVOCATION over the same subject, likewise.
+        let intro = sign_introduction(&root, &successor, None);
+        assert!(verify_org_rotation(&pk, "acme", &successor, &intro).is_err());
+        let revocation = sign_device_revocation(&root, &successor, 0);
+        assert!(verify_org_rotation(&pk, "acme", &successor, &revocation).is_err());
+        assert!(
+            verify_device_revocation(&pk, &successor, 0, &rotation).is_err(),
+            "…and a rotation must not read as a revocation of the successor it names"
+        );
+
+        // The org_id is length-prefixed, so a carefully-chosen pair of org names cannot collide:
+        // without the prefix ("ab", pk) and ("a", "b" ∥ pk) share a preimage.
+        let a = sign_org_rotation(&root, "ab", &successor);
+        assert!(
+            verify_org_rotation(&pk, "a", &successor, &a).is_err(),
+            "the length prefix must stop an org-name splitting confusion"
+        );
     }
 }

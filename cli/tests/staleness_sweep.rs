@@ -59,6 +59,8 @@ fn mint_view(root: &SigningKey, serial: u64, eid: [u8; 32], uid: &str) -> Roster
                 }],
             }],
             revoked_endpoints: vec![],
+            successor_root_pk: None,
+            successor_sig: None,
             sig: String::new(),
         },
     );

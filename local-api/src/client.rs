@@ -466,6 +466,18 @@ impl ControlClient {
         .await
     }
 
+    /// Rotate the org root (#93 ask c), publishing a bridge members adopt as they receive it.
+    pub async fn org_rotate(
+        &mut self,
+        new_key_path: Option<String>,
+    ) -> Result<crate::protocol::OrgRotateResult, ClientError> {
+        self.request_typed(
+            Request::OrgRotate(crate::protocol::OrgRotateParams { new_key_path }),
+            "org_rotate result",
+        )
+        .await
+    }
+
     /// Mint an attestation offer (#85 ask 3) — where another of this person's devices should dial.
     pub async fn attest_offer(
         &mut self,
