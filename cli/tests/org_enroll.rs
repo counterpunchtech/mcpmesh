@@ -74,6 +74,17 @@ async fn shutdown_daemon(socket: &Path) {
 /// The `roster.staging.*` temps `install_signed_roster` leaves in `config_dir` — must be empty after
 /// EVERY install (success or failure): the RAII `TempFile` guard removes the stage on any exit.
 fn staged_temps(config: &Path) -> Vec<PathBuf> {
+    // #66: the staging file moved with the logic. It used to be `roster.staging.*` written by the
+    // CLI's `install_signed_roster`; authoring now happens in the daemon, which stages via
+    // `write_temp_roster` as `mcpmesh-roster-in*`.
+    //
+    // This helper kept scanning for the OLD prefix after that move, so both call sites — including
+    // the one whose whole purpose is "the RAII guard removes it even when the install FAILS" —
+    // became `[].is_empty()`, permanently true. Caught by review.
+    //
+    // It scans the node's CONFIG dir, which is where the daemon now stages: a shared temp dir made
+    // this cross-talk between parallel tests, since one node's in-flight staging file is
+    // indistinguishable from another's leak.
     std::fs::read_dir(config)
         .into_iter()
         .flatten()
@@ -81,7 +92,7 @@ fn staged_temps(config: &Path) -> Vec<PathBuf> {
         .map(|e| e.path())
         .filter(|p| {
             p.file_name()
-                .map(|n| n.to_string_lossy().starts_with("roster.staging."))
+                .map(|n| n.to_string_lossy().starts_with("mcpmesh-roster-in"))
                 .unwrap_or(false)
         })
         .collect()

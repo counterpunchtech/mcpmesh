@@ -142,7 +142,7 @@ pub(crate) async fn converge_roster_bytes(
     let pk = crate::roster::parse_org_root_pk(
         &mesh_config_org_root_pk(mesh)?.context("no pinned org root; cannot accept roster")?,
     )?;
-    let tmp = write_temp_roster(bytes)?;
+    let tmp = write_temp_roster(&roster_staging_dir(mesh), bytes)?;
     let rstore = RosterStore::new(installed_roster_path(mesh));
     let now = epoch_now_i64();
     // `tmp` moves into the closure: its guard removes the temp file when the install returns
@@ -327,6 +327,15 @@ pub(crate) fn mesh_config_org_root_pk(mesh: &MeshState) -> Result<Option<String>
 /// read that resolves the trust anchor (`mesh_config_org_root_pk`) already uses the same per-node
 /// `config_path`, so the anchor and the roster file always co-locate. **DECLARED** as the one
 /// deviation from the plan's literal `paths::default_roster_path()` in `distribute.rs`.
+/// Where a roster is STAGED before the install judges it — the installed roster's own directory,
+/// derived from `config_path` exactly as [`installed_roster_path`] derives `roster.json`.
+pub(crate) fn roster_staging_dir(mesh: &MeshState) -> PathBuf {
+    mesh.config_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 pub(crate) fn installed_roster_path(mesh: &MeshState) -> PathBuf {
     mesh.config_path
         .parent()
@@ -411,8 +420,16 @@ pub(crate) async fn reconcile_user_id_from_roster(mesh: &MeshState) {
 /// this bridges the two. The returned [`TempPathGuard`] removes the temp file on drop — the caller
 /// holds it across the install. A per-call-unique name ([`unique_temp_path`]: pid + seq — never
 /// a fixed temp name); the file is only ever READ by `install_from_file`.
-pub(crate) fn write_temp_roster(bytes: &[u8]) -> Result<TempPathGuard> {
-    let tmp = TempPathGuard::new(unique_temp_path(&std::env::temp_dir(), "mcpmesh-roster-in"));
+///
+/// Staged BESIDE the installed roster (`mesh.config_path`'s directory), not in the system temp
+/// dir. It is per-node state — same argument as [`installed_roster_path`] — so it belongs under the
+/// node's own root, where a `--profile` root or an embedded node keeps it separate. The shared temp
+/// dir also made it impossible to tell one node's in-flight staging file from another's, which is
+/// the difference between "this node leaked a temp" and "some other process is mid-install".
+pub(crate) fn write_temp_roster(dir: &Path, bytes: &[u8]) -> Result<TempPathGuard> {
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("create roster staging dir {}", dir.display()))?;
+    let tmp = TempPathGuard::new(unique_temp_path(dir, "mcpmesh-roster-in"));
     let mut f = File::create(tmp.path())
         .with_context(|| format!("create temp roster {}", tmp.path().display()))?;
     f.write_all(bytes).context("write temp roster")?;
@@ -444,8 +461,25 @@ pub(crate) async fn org_join(
         write_join_pin(&config_path, &oid, &pk, &uid, &uk)
     })
     .await??;
-    tracing::info!(org_id = %org_id, "pinned org root (join)");
-    Ok(OrgJoinResult { org_id })
+    // #93b: the pin is durable, but roster mode is a BOOT decision — the ALPN set and the
+    // gossip/presence/blob transport were fixed when this process started. A node that booted in
+    // pairing mode is now half-live: its gate will accept org members as soon as a roster arrives,
+    // while presence stays empty and blobs hard-close. Say so, rather than returning a bare success
+    // that reads as "fully joined". Same shape #53 established for persisted-but-not-live.
+    let restart_required = !mesh.roster_transport_live();
+    if restart_required {
+        tracing::warn!(
+            org_id = %org_id,
+            "org root pinned, but this node booted without the roster transport — presence and \
+             app-blobs need a restart to take effect"
+        );
+    } else {
+        tracing::info!(org_id = %org_id, "pinned org root (join)");
+    }
+    Ok(OrgJoinResult {
+        org_id,
+        restart_required,
+    })
 }
 
 /// Handle a `set_nickname` control request (#37): validate, persist
@@ -634,7 +668,13 @@ mod tests {
         assert_eq!(
             res,
             OrgJoinResult {
-                org_id: "acme".into()
+                org_id: "acme".into(),
+                // #93b: this hermetic mesh has no composed roster transport (gossip/blobs are
+                // `None`), which is exactly the pairing-mode-node-joins-an-org case. The join must
+                // SAY the node is half-live rather than answering a bare success — presence will
+                // stay empty and blobs will hard-close until a restart, and nothing else on the
+                // control surface reveals that.
+                restart_required: true,
             }
         );
 
@@ -832,6 +872,107 @@ mod tests {
         assert!(
             !super::should_staleness_sever(None),
             "no roster → never sweep"
+        );
+    }
+}
+
+#[cfg(test)]
+mod org_join_liveness_tests {
+    use super::org_join;
+    use crate::daemon::MeshState;
+    use crate::daemon::testutil::hermetic_mesh;
+    use mcpmesh_trust::roster::encode_b64u;
+    use std::sync::Arc;
+
+    /// A mesh with the roster transport ACTUALLY composed — a gossip handle on a real endpoint,
+    /// which is what `compose_roster_transport` builds when a node boots with an org root pinned.
+    async fn mesh_with_roster_transport(config_path: std::path::PathBuf) -> Arc<MeshState> {
+        let dir = config_path.parent().unwrap();
+        let store = Arc::new(crate::allowlist::PeerStore::open(&dir.join("s2.redb")).unwrap());
+        let pairs = Arc::new(crate::allowlist::AllowlistGate::new(store.clone()));
+        let roster = Arc::new(crate::roster::gate::RosterGate::empty());
+        let gate: Arc<dyn mcpmesh_net::TrustGate> = Arc::new(
+            crate::roster::gate::ComposedGate::new(roster.clone(), pairs),
+        );
+        let hermetic = crate::config::NetworkCfg {
+            relay_mode: "disabled".into(),
+            ..Default::default()
+        };
+        let endpoint = crate::daemon::boot::build_endpoint(
+            iroh::SecretKey::from_bytes(&[31u8; 32]),
+            &hermetic,
+            true,
+        )
+        .await
+        .unwrap();
+        let gossip = crate::roster::transport::spawn_gossip(&endpoint);
+        MeshState::new(
+            endpoint,
+            gate,
+            store,
+            Arc::new(crate::pairing::LiveInvites::new()),
+            "test".into(),
+            config_path,
+            roster,
+            Arc::new(mcpmesh_net::registry::ConnRegistry::new()),
+            Some(gossip),
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// #93(b): `org_join` must report when the join is only HALF live.
+    ///
+    /// Roster mode is a boot-time decision — it fixes the bound ALPN set and whether gossip,
+    /// presence and app-blobs exist at all — while the roster GATE hot-swaps. So a node that booted
+    /// in pairing mode and then joins reaches a state where MCP sessions to org members start
+    /// working while presence stays permanently empty and blobs hard-close. It succeeded, partially,
+    /// with no error anywhere.
+    ///
+    /// Both branches are asserted, because either alone is satisfied by a constant: a hardcoded
+    /// `true` would tell every joiner to restart (including one that booted in roster mode and
+    /// needs nothing), and a hardcoded `false` is the bug.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn org_join_reports_whether_the_roster_transport_is_actually_running() {
+        let root = mcpmesh_trust::ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let pk = encode_b64u(root.verifying_key().as_bytes());
+
+        // (a) A node that booted in PAIRING mode: no transport composed → the join is half-live.
+        let d1 = tempfile::tempdir().unwrap();
+        let c1 = d1.path().join("config.toml");
+        std::fs::write(&c1, "").unwrap();
+        let m1 = hermetic_mesh(c1).await;
+        assert!(
+            !m1.roster_transport_live(),
+            "a pairing-mode mesh composes no gossip — this is the precondition, not the assertion"
+        );
+        let s1 = crate::control::DaemonState::with_mesh("test", m1);
+        let r1 = org_join(&s1, "acme".into(), pk.clone(), "alice".into(), "/k".into())
+            .await
+            .expect("the pin itself succeeds either way");
+        assert!(
+            r1.restart_required,
+            "a node whose roster transport is not running must SAY the join needs a restart — \
+             nothing else on the control surface reveals that presence will stay empty"
+        );
+
+        // (b) A node that booted WITH the transport: the join is fully in effect.
+        let d2 = tempfile::tempdir().unwrap();
+        let c2 = d2.path().join("config.toml");
+        std::fs::write(&c2, "").unwrap();
+        let m2 = mesh_with_roster_transport(c2).await;
+        assert!(
+            m2.roster_transport_live(),
+            "precondition: gossip is composed"
+        );
+        let s2 = crate::control::DaemonState::with_mesh("test", m2);
+        let r2 = org_join(&s2, "acme".into(), pk, "alice".into(), "/k".into())
+            .await
+            .expect("valid join pins");
+        assert!(
+            !r2.restart_required,
+            "a node that already runs the roster transport must NOT tell its user to restart"
         );
     }
 }

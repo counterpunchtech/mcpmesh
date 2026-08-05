@@ -551,9 +551,18 @@ pub fn presence_lines(presence: &[PresencePeer]) -> Vec<String> {
     presence
         .iter()
         .map(|p| {
+            // #93: prefer the human name when the roster carries one, keeping the `user_id` in
+            // parentheses — that id is what an `allow` entry names, so an operator reading this
+            // line to write a grant still needs it. Falls back to the bare id for a roster whose
+            // `display_name` is empty, which is what every pre-46 daemon reports.
+            let who = if p.display_name.is_empty() {
+                p.user_id.clone()
+            } else {
+                format!("{} ({})", p.display_name, p.user_id)
+            };
             let mut line = format!(
                 "  {} · {} · {} · {}",
-                p.user_id,
+                who,
                 p.device_label,
                 p.role,
                 if p.online { "online" } else { "offline" }
@@ -1333,6 +1342,7 @@ mod tests {
             serial: 42,
             state: "approved".into(),
             org_root_fingerprint: "tango-fig-cabbage-anchor".into(),
+            groups: vec![],
         };
         let lines = roster_status_lines(&roster, true); // url configured → no hint
         assert_eq!(lines[0], "roster: org acme · serial 42 · approved");
@@ -1350,6 +1360,7 @@ mod tests {
             serial: 7,
             state: "degraded".into(),
             org_root_fingerprint: String::new(),
+            groups: vec![],
         };
         let lines = roster_status_lines(&roster, true); // url configured → no hint
         assert_eq!(lines, vec!["roster: org acme · serial 7 · degraded"]);
@@ -1364,6 +1375,7 @@ mod tests {
             serial: 7,
             state: "approved".into(),
             org_root_fingerprint: String::new(),
+            groups: vec![],
         };
         let lines = roster_status_lines(&roster, false); // no url configured
         assert!(
@@ -1380,11 +1392,55 @@ mod tests {
         );
     }
 
+    /// #93: a roster carries a human name, and the presence block should use it — while keeping
+    /// the `user_id` visible, because that is the string an `allow` entry names and an operator
+    /// reading this line to write a grant needs it.
+    ///
+    /// The fallback matters as much as the branch: every pre-46 daemon reports an empty
+    /// `display_name`, and rendering `" (alice)"` with nothing before it would be worse than the
+    /// bare id it replaced.
+    #[test]
+    fn presence_lines_show_the_human_name_and_keep_the_grantable_id() {
+        let named = vec![PresencePeer {
+            user_id: "alice".into(),
+            display_name: "Alice Example".into(),
+            groups: vec!["eng".into()],
+            device_label: "laptop".into(),
+            role: "primary".into(),
+            online: true,
+            meta: String::new(),
+        }];
+        let line = presence_lines(&named).join("\n");
+        assert!(
+            line.contains("Alice Example (alice)"),
+            "the human name must lead, with the grantable id kept: {line}"
+        );
+
+        // No display_name — an older daemon, or a roster that carries none.
+        let anon = vec![PresencePeer {
+            user_id: "alice".into(),
+            display_name: String::new(),
+            groups: vec![],
+            device_label: "laptop".into(),
+            role: "primary".into(),
+            online: true,
+            meta: String::new(),
+        }];
+        let line = presence_lines(&anon).join("\n");
+        assert!(
+            line.contains("  alice · laptop") && !line.contains('('),
+            "an empty display_name must fall back to the bare id, not render an empty prefix: \
+             {line}"
+        );
+    }
+
     #[test]
     fn presence_lines_render_user_label_role_and_online_flag() {
         let presence = vec![
             PresencePeer {
                 user_id: "alice".into(),
+                display_name: String::new(),
+                groups: vec![],
                 device_label: "laptop".into(),
                 role: "primary".into(),
                 online: true,
@@ -1392,6 +1448,8 @@ mod tests {
             },
             PresencePeer {
                 user_id: "alice".into(),
+                display_name: String::new(),
+                groups: vec![],
                 device_label: "desktop".into(),
                 role: "mirror".into(),
                 online: false,
@@ -1422,6 +1480,8 @@ mod tests {
     fn presence_meta_is_sanitized_and_truncated_in_status_lines() {
         let peer = |meta: &str| PresencePeer {
             user_id: "alice".into(),
+            display_name: String::new(),
+            groups: vec![],
             device_label: "laptop".into(),
             role: "primary".into(),
             online: true,
@@ -1483,6 +1543,8 @@ mod tests {
         // online) — never a raw key, endpoint id, hash, or protocol name.
         let presence = vec![PresencePeer {
             user_id: "alice".into(),
+            display_name: String::new(),
+            groups: vec![],
             device_label: "laptop".into(),
             role: "primary".into(),
             online: true,
@@ -1506,6 +1568,7 @@ mod tests {
             serial: 42,
             state: "approved".into(),
             org_root_fingerprint: "tango-fig-cabbage-anchor".into(),
+            groups: vec![],
         };
         let rendered = roster_status_lines(&roster, true).join("\n");
         for term in [

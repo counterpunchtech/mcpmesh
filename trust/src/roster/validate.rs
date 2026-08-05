@@ -21,12 +21,45 @@ pub struct RosterView {
     devices: HashMap<[u8; 32], ResolvedDevice>,
     /// Every revoked endpoint (revocation wins over any active listing).
     revoked: HashSet<[u8; 32]>,
+    /// The org's DECLARED group namespace (`roster.groups`), verbatim and in document order (#93).
+    ///
+    /// Kept because an embedder in roster mode has managed group membership it could not display:
+    /// the view knew which groups each device carries but not which groups EXIST, so a UI could
+    /// not offer the set to pick from. Rule 5b already validates every user group against this
+    /// list; this just stops it being discarded afterwards.
+    groups: Vec<String>,
+    /// Every PERSON the roster carries, in document order — including one whose devices are all
+    /// revoked (#93).
+    ///
+    /// Separate from `devices` because that map answers "which endpoint resolves to whom" and is
+    /// therefore keyed by device, so a person with no active device does not exist in it. That is
+    /// right for the GATE and wrong for a member list: revoking someone's only device is an
+    /// ordinary operation that leaves their user entry in the signed roster, and deriving members
+    /// from the device map made them indistinguishable from removed.
+    users: Vec<RosterMemberEntry>,
+}
+
+/// One person in a [`RosterView`], for the membership read (#93). Device-independent: a member with
+/// no active device still appears.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RosterMemberEntry {
+    pub user_id: String,
+    pub display_name: String,
+    pub groups: Vec<String>,
 }
 
 /// A rostered device's resolved identity (the roster-mode half of a `PeerIdentity`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedDevice {
     pub user_id: String,
+    /// The owner's human display name (`RosterUser.display_name`) (#93). Display-only, exactly like
+    /// [`label`](Self::label) — never an authorization input, which stays keyed on `user_id` and
+    /// `groups`.
+    ///
+    /// Resolved here rather than left in the document because the roster is daemon-owned: an
+    /// embedder that had to read `<root>/config/roster.json` to render a name would be hand-parsing
+    /// state it is told not to touch.
+    pub display_name: String,
     pub groups: Vec<String>,
     /// The device's role in its user's device set (`"primary"` | `"mirror"`; free-form otherwise).
     /// Feeds the person→device dial candidate ORDER (`devices_for_user`) — primary before mirror
@@ -112,6 +145,29 @@ impl RosterView {
     /// Every revoked endpoint (the sever rule's revoked set).
     pub fn revoked_endpoints(&self) -> impl Iterator<Item = &[u8; 32]> {
         self.revoked.iter()
+    }
+
+    /// Every PERSON the roster carries, in document order — INCLUDING one whose devices are all
+    /// revoked (#93).
+    ///
+    /// Use this for a member list; use [`devices`](Self::devices) for "which endpoint is whom".
+    /// Building a member list from the device map omits anyone with no active device, and revoking
+    /// someone's only device is an ordinary operation that leaves their user entry in the signed
+    /// roster — so it makes "revoked their last device" indistinguishable from "removed".
+    ///
+    /// Display data. Authorization resolves through [`resolve`](Self::resolve), which is
+    /// device-keyed on purpose.
+    pub fn users(&self) -> &[RosterMemberEntry] {
+        &self.users
+    }
+
+    /// The org's DECLARED group namespace, in document order (#93).
+    ///
+    /// This is the set an `allow` entry may name — rule 5b rejects any user group outside it — so
+    /// it is what a UI offers when assigning membership. Display/authoring input, not an
+    /// authorization decision: naming a group here grants nothing.
+    pub fn groups(&self) -> &[String] {
+        &self.groups
     }
 
     /// The EXPIRY-driven degraded-mode state machine. [`effective_state`](Self::effective_state)
@@ -296,6 +352,7 @@ fn build_view(roster: &Roster, expires_at_epoch: i64) -> Result<RosterView, Rost
                 eid,
                 ResolvedDevice {
                     user_id: u.user_id.clone(),
+                    display_name: u.display_name.clone(),
                     groups: u.groups.clone(),
                     role: d.role.clone(),
                     label: d.label.clone(),
@@ -310,6 +367,18 @@ fn build_view(roster: &Roster, expires_at_epoch: i64) -> Result<RosterView, Rost
         expires_at_epoch,
         devices,
         revoked,
+        groups: roster.groups.clone(),
+        // Every user in the document, whether or not any of their devices survived the revoked
+        // filter above — see `RosterView::users`.
+        users: roster
+            .users
+            .iter()
+            .map(|u| RosterMemberEntry {
+                user_id: u.user_id.clone(),
+                display_name: u.display_name.clone(),
+                groups: u.groups.clone(),
+            })
+            .collect(),
     })
 }
 

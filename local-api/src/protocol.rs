@@ -295,6 +295,17 @@ pub struct RosterStatus {
     pub serial: u64,
     pub state: String, // "pending" | "approved" | "degraded" | "stopped"
     pub org_root_fingerprint: String, // short-word form
+    /// The org's DECLARED group namespace, in roster document order (#93). `api_minor >= 46`.
+    ///
+    /// The set an `allow` entry may name — a roster is refused if any user carries a group outside
+    /// it — so this is what a UI offers when assigning membership. Without it an embedder in roster
+    /// mode had managed group membership it could not enumerate, and the only way to learn the
+    /// groups was to hand-parse the daemon-owned `roster.json`.
+    ///
+    /// Display/authoring input, never an authorization answer: naming a group grants nothing.
+    /// Additive — a payload from an older daemon reads as an empty list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
 }
 
 /// One reachable roster peer device as reported by `status` (the advisory presence read).
@@ -304,6 +315,21 @@ pub struct RosterStatus {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PresencePeer {
     pub user_id: String,
+    /// The person's human display name from the roster (#93). `api_minor >= 46`.
+    ///
+    /// `user_id` is an authorization handle; this is what a UI puts next to a face. The roster
+    /// carried it all along and the control seam dropped it, so an embedder had a presence list it
+    /// could only label with an opaque id. Display-only — never an authz input.
+    ///
+    /// Additive: absent from an older daemon's payload, and empty when the roster's own field is.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub display_name: String,
+    /// The groups this person belongs to (#93). `api_minor >= 46`.
+    ///
+    /// The same strings an `allow` entry names, so a UI can show why someone is admitted without
+    /// re-deriving it. Advisory display data: the gate reads the roster, never this. Additive.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
     pub device_label: String,
     pub role: String, // "primary" | "mirror" (roster vocabulary)
     /// Whether the device has a live presence heartbeat (advisory — absence never blocks a dial).
@@ -1086,6 +1112,45 @@ pub enum Request {
     /// pins the org root on FIRST install (`b64u:`); omit it
     /// once pinned (config carries it). Tag `"roster_install"`.
     RosterInstall(RosterInstallParams),
+    /// Read the installed roster's MEMBERSHIP: the declared groups, and every person with their
+    /// display name, groups, and devices (#93). Parameterless. Tag `"roster_members"`.
+    ///
+    /// The read half of roster mode. `status` reports that a roster exists (`RosterStatus`) and who
+    /// is currently online (`PresencePeer`); neither answered "who is in this org" — a person with
+    /// no live device appeared nowhere at all, so an embedder could not draw a member list, and
+    /// the only route to one was hand-parsing the daemon-owned `roster.json`.
+    ///
+    /// ADVISORY and display-oriented, like `status`: the gate reads the roster document, never
+    /// this. Empty in a pure-pairing daemon or before the first roster is installed.
+    RosterMembers,
+    /// AUTHOR an org: mint this node's org root key, sign an empty roster (serial 1), install it
+    /// (which pins the root), and return the copyable org invite (#66). Tag `"org_create"`.
+    ///
+    /// One-time per node — a second call is refused rather than replacing the key, because
+    /// replacing it would orphan every roster it has signed.
+    OrgCreate(OrgCreateParams),
+    /// APPROVE a join code into the roster: verify its device→user-key binding, upsert the member
+    /// with the given groups, bump the serial, re-sign, install (#66). Tag `"org_approve"`.
+    ///
+    /// The cryptographic half of the ceremony. Verifying that the code came from the PERSON you
+    /// think it did stays an out-of-band human step, and `join_code_fingerprint` in the result is
+    /// what the two humans compare.
+    OrgApprove(OrgApproveParams),
+    /// INSPECT a join code without approving it (#66): who it claims to be, and the fingerprint the
+    /// two humans compare. Read-only — nothing is signed, installed, or persisted.
+    /// Tag `"org_join_code"`.
+    ///
+    /// This is what makes an "approve this person" button correct rather than merely possible. The
+    /// fingerprint has to be shown and confirmed out-of-band BEFORE the approval, because a
+    /// substituted code is caught there or not at all — and reading it off `OrgApprove`'s result
+    /// is too late, the member is already in the signed roster. The CLI always had this (it
+    /// decoded the code locally); an embedder could not, since the join-code format lives in
+    /// `mcpmesh-node` and not on this seam.
+    OrgJoinCode(OrgJoinCodeParams),
+    /// REVOKE from the roster: remove a person, one device, or a person's user key, then bump,
+    /// re-sign, and install — which severs the cut devices' live sessions (#66).
+    /// Tag `"org_revoke"`.
+    OrgRevoke(OrgRevokeParams),
     /// Pin the org root on a JOINER — WITHOUT a roster (the joiner has none yet; its poll loop
     /// fetches the first one). Records `[identity]` org_id / org_root_pk / user_id / user_key.
     /// `user_key` is a LOCAL path
@@ -1188,6 +1253,28 @@ pub enum Request {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrgJoinResult {
     pub org_id: String,
+    /// `true` when the org root was pinned but this node's ROSTER TRANSPORT is not running, so the
+    /// join is only half in effect until the daemon restarts (#93). `api_minor >= 46`.
+    ///
+    /// Roster mode is decided at BOOT: it fixes the ALPN set bound on the endpoint and whether
+    /// gossip, presence and app-blobs are constructed at all. The roster GATE hot-swaps live. So a
+    /// node that booted in pairing mode and then joins an org reaches a state where MCP sessions to
+    /// org members work as soon as a roster arrives, while `status.presence` stays permanently
+    /// empty and every blob verb hard-closes with `blobs not enabled` — succeeding partially, with
+    /// no error anywhere, which a caller previously had no way to detect.
+    ///
+    /// **What to do with it:** if `true`, tell the user the join succeeded and the node must
+    /// restart before presence and file sharing work. Do not treat it as a failure — nothing was
+    /// left half-written; the pin is durable and the restart is sufficient.
+    ///
+    /// `false` when the transport is already composed (the node booted with an org root pinned), or
+    /// on a re-join of an org this node is already in.
+    ///
+    /// Same shape as [`SetRelaysResult::restart_required`] (#53), for the same reason. Additive:
+    /// absent from an older daemon's payload and reads as `false` — which was that daemon's
+    /// implicit, and wrong, answer.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub restart_required: bool,
 }
 
 /// Result of a [`Request::RosterInstall`] request (the manual install path): the installed roster's
@@ -1203,6 +1290,192 @@ pub struct RosterInstallResult {
     /// How many live sessions were severed, for the porcelain's confirmation line.
     #[serde(default)]
     pub severed: u32,
+}
+
+/// Params of [`Request::OrgCreate`] (#66).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrgCreateParams {
+    /// The org's name — its `org_id`, the value every member's roster carries.
+    pub name: String,
+    /// How long the signed roster stays valid, in seconds. Omit for the 90-day default.
+    ///
+    /// This is an operator-grade default and a sharp edge at small scale: past it the roster
+    /// degrades and the group stops working, which for a handful of laptops can arrive days after
+    /// one of them was closed for a long weekend. A small team should pass a long value here
+    /// deliberately rather than discover the default later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_secs: Option<i64>,
+    /// An HTTPS URL where the signed roster will be published. Carried in the org invite (so a
+    /// joiner bootstraps its first roster) AND pinned in this operator's `[roster].url`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roster_url: Option<String>,
+}
+
+/// Result of [`Request::OrgCreate`] (#66).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrgCreateResult {
+    pub org_id: String,
+    pub serial: u64,
+    /// The copyable `mcpmesh-org:` invite to hand a joiner — one of the two permitted opaque
+    /// artifacts on this surface, the same carve-out the pairing invite line takes.
+    pub org_invite: String,
+    /// The org root's fingerprint in short words, for the out-of-band read-back that anchors every
+    /// joiner's trust. NOT the key.
+    pub org_root_fingerprint: String,
+}
+
+/// Params of [`Request::OrgApprove`] (#66).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrgApproveParams {
+    /// The `mcpmesh-join:` code the joiner sent.
+    pub join_code: String,
+    /// The groups to grant. Each must be DECLARED in the roster (see
+    /// [`RosterMembersResult::groups`]) — an undeclared one is refused, because it would make an
+    /// `allow` entry naming it ambiguous.
+    #[serde(default)]
+    pub groups: Vec<String>,
+    /// Override the `user_id` the joiner requested. Omit to accept theirs.
+    ///
+    /// Worth using: the requested id is chosen by the person being approved, and it is the string
+    /// every `allow` entry will name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+}
+
+/// Result of [`Request::OrgApprove`] (#66).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrgApproveResult {
+    pub user_id: String,
+    pub groups: Vec<String>,
+    pub org_id: String,
+    pub serial: u64,
+    /// The join code's fingerprint in short words — the enrollment analogue of the pairing SAS.
+    ///
+    /// **Show this to the operator and have them confirm it out-of-band before trusting the
+    /// approval.** Nothing else binds the person to the `user_pk` in the code, so a substituted
+    /// code is caught here or not at all. Returned rather than checked, because only the human can
+    /// check it.
+    pub join_code_fingerprint: String,
+}
+
+/// Params of [`Request::OrgJoinCode`] (#66).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrgJoinCodeParams {
+    /// The `mcpmesh-join:` code to inspect.
+    pub join_code: String,
+}
+
+/// Result of [`Request::OrgJoinCode`] (#66): what a join code claims, plus the fingerprint that
+/// decides whether to believe it.
+///
+/// The claims are ATTACKER-CONTROLLED — they come out of a code someone handed you. `display_name`
+/// and `requested_user_id` are what the sender asked for, not facts. What is verified is the
+/// device→user-key binding (a bad one is refused rather than reported), and what is *checkable* is
+/// `join_code_fingerprint`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrgJoinCodeResult {
+    /// The human name the code carries. Sender-chosen — render it, do not trust it.
+    pub display_name: String,
+    /// The `user_id` the sender is asking for. Sender-chosen, and it is what every `allow` entry
+    /// would name, so it is worth an operator's attention before approving.
+    pub requested_user_id: String,
+    /// The label of the device being enrolled. Sender-chosen.
+    pub device_label: String,
+    /// The fingerprint in short words — the enrollment analogue of the pairing SAS.
+    ///
+    /// **Show this and have the operator confirm it out-of-band before calling
+    /// [`Request::OrgApprove`].** Nothing in a join code binds it to a person; a substituted code
+    /// carries a different `user_pk` and so diverges here. This is the entire check.
+    pub join_code_fingerprint: String,
+}
+
+/// Params of [`Request::OrgRevoke`] (#66).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrgRevokeParams {
+    /// Who or what to revoke: a `user_id` (the person and every device), or `"<user_id>/<label>"`
+    /// (one device).
+    pub target: String,
+    /// Treat this as a USER-KEY rotation instead: remove the person but leave their devices
+    /// un-revoked, so the same hardware re-enrolls under a fresh user key and is re-approved with
+    /// the same `user_id`.
+    ///
+    /// The distinction is the point — a departure must revoke the devices, a rotation must not.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub user_key: bool,
+}
+
+/// Result of [`Request::OrgRevoke`] (#66).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrgRevokeResult {
+    pub target: String,
+    /// `"person"` | `"device"` | `"user-key-rotation"` — which grammar the target resolved to, so a
+    /// caller can confirm the destructive reading it got was the one it meant.
+    pub mode: String,
+    pub org_id: String,
+    pub serial: u64,
+    /// Live sessions severed by the install. Revocation is IMMEDIATE (#54): a cut device's existing
+    /// connections are closed, not left to drain.
+    #[serde(default)]
+    pub severed: u32,
+}
+
+/// Result of [`Request::RosterMembers`]: the org's membership as an embedder renders it (#93).
+///
+/// Distinct from `status.presence` in what it enumerates: that lists reachable DEVICES and omits a
+/// person entirely when none of their devices is up. This lists every person the roster carries,
+/// online or not — a member list, not a presence list — with `online` per device so a UI can draw
+/// both from one read.
+///
+/// ADVISORY. Every field here is display or authoring input; nothing in it is an authorization
+/// answer. The gate reads the signed roster.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RosterMembersResult {
+    /// The org's declared group namespace, in document order — the set an `allow` entry may name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
+    /// Every person in the roster, ordered by `user_id` for a stable display.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub users: Vec<RosterMember>,
+}
+
+/// One person in a [`RosterMembersResult`] (#93).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RosterMember {
+    /// The stable authorization handle — what an `allow` entry names.
+    pub user_id: String,
+    /// The human name, for display. Empty if the roster's own field is.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub display_name: String,
+    /// The groups this person belongs to, each declared in [`RosterMembersResult::groups`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
+    /// Their ACTIVE devices — revoked ones are absent, exactly as the gate sees it. Ordered
+    /// primary-before-mirror, then by label.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<RosterMemberDevice>,
+}
+
+/// One device of a [`RosterMember`] (#93).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RosterMemberDevice {
+    /// The device's human label.
+    pub label: String,
+    /// `"primary"` | `"mirror"` — the advisory dial-ordering hint, never a security property.
+    pub role: String,
+    /// The device's stable `eid:` principal — the SAME vocabulary [`PeerInfo::principal`] carries,
+    /// and what a per-device `allow` entry names.
+    ///
+    /// Included where `PresencePeer` deliberately omits it, because this surface exists to be
+    /// ACTED on: an embedder granting or revoking one device of a person needs the handle to name
+    /// it, and the alternative is a nickname that does not exist in roster mode.
+    pub principal: String,
+    /// Whether the device has a live presence heartbeat. Advisory — absence never blocks a dial,
+    /// and never removes a dial candidate.
+    pub online: bool,
 }
 
 /// Result of [`Request::BlobPublish`]: the copyable `mcpmesh/blob/1` ticket + the blob's blake3 hash.
@@ -1989,7 +2262,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   thirty have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.45";
+pub const API_VERSION: &str = "1.46";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -2075,7 +2348,21 @@ pub const API_VERSION: &str = "1.45";
 /// refusals — expired line, no live invite, inviter unreachable, id mismatch, name conflict, and
 /// the deliberately-opaque refusal. `ERR_NICKNAME_TAKEN` had been the only coded pairing failure,
 /// so every other one arrived as `-32000` and an embedder could either forward our prose to end
-/// users or substring-match it (#159); to 45 with [`PairParams::allow_self_enroll`] +
+/// users or substring-match it (#159); to 46 with the roster-mode embedding surface (#66, #93):
+/// the `org_create` / `org_approve` / `org_revoke` AUTHORING verbs, the `roster_members` read,
+/// `PresencePeer::display_name` + `groups`, `RosterStatus::groups`, and
+/// `OrgJoinResult::restart_required`. Two gaps close together. Authoring existed only as CLI
+/// porcelain, so an embedded node could CONSUME a roster and never author one — no "approve this
+/// person" button without shelling out to a second binary. And the roster's own contents never
+/// crossed the seam: an embedder had managed group membership it could not display, and the only
+/// route to a member list was hand-parsing the daemon-owned `roster.json`. `roster_members` is a
+/// different question from `status.presence` — that lists reachable DEVICES and omits a person
+/// whose devices are all down. `restart_required` closes a silent partial success: `roster_mode` is
+/// a BOOT decision fixing the bound ALPNs and whether gossip/presence/blobs exist at all, so a
+/// pairing-mode node that ran `org_join` got working MCP sessions with permanently empty presence
+/// and no way to detect it. Guard on `>= 46` before offering org authoring in a UI; the read fields
+/// are additive and degrade to empty. What did NOT land: org root ROTATION (#93c) — an operator
+/// laptop that dies still takes the org with it once the roster expires; to 45 with [`PairParams::allow_self_enroll`] +
 /// [`ERR_SELF_ENROLL_NOT_OFFERED`] — `pair` now REFUSES a `mcpmesh-enroll:` line unless the caller
 /// asked for that ceremony. A behaviour change for existing callers, deliberately: at 43-44 a caller
 /// whose UI only ever offered "add a contact" completed a self-enrollment and learned which
@@ -2144,7 +2431,7 @@ pub const API_VERSION: &str = "1.45";
 /// its REAL content is a meaning change to `reachable` — the field exists so the new meaning is
 /// observable at all. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 45;
+pub const API_MINOR: u32 = 46;
 
 #[cfg(test)]
 mod tests {
@@ -3007,9 +3294,27 @@ mod tests {
         // OrgJoinResult echoes the pinned org id (surface-clean; the fingerprint is porcelain-side).
         let res = OrgJoinResult {
             org_id: "acme".into(),
+            restart_required: true,
         };
         let v = serde_json::to_value(&res).unwrap();
         assert_eq!(v["org_id"], "acme");
+        assert_eq!(
+            v["restart_required"], true,
+            "#93: a half-live join must reach the wire — the caller cannot detect it any other way"
+        );
+        // Additive: an older daemon omits it, and absent reads as `false` — which was that
+        // daemon's implicit answer. Pinned so the default cannot silently flip to `true` and start
+        // telling every caller to restart.
+        let legacy: OrgJoinResult =
+            serde_json::from_value(serde_json::json!({"org_id": "acme"})).unwrap();
+        assert!(!legacy.restart_required);
+        // …and the false case must not bloat the payload.
+        let quiet = serde_json::to_value(OrgJoinResult {
+            org_id: "acme".into(),
+            restart_required: false,
+        })
+        .unwrap();
+        assert!(quiet.get("restart_required").is_none());
         assert_eq!(serde_json::from_value::<OrgJoinResult>(v).unwrap(), res);
     }
 
@@ -3216,10 +3521,13 @@ mod tests {
                 serial: 42,
                 state: "approved".into(),
                 org_root_fingerprint: "tango-fig-cabbage-anchor".into(),
+                groups: vec!["eng".into(), "ops".into()],
             }),
             presence: vec![
                 PresencePeer {
                     user_id: "alice".into(),
+                    display_name: "Alice Example".into(),
+                    groups: vec!["eng".into()],
                     device_label: "laptop".into(),
                     role: "primary".into(),
                     online: true,
@@ -3227,6 +3535,8 @@ mod tests {
                 },
                 PresencePeer {
                     user_id: "alice".into(),
+                    display_name: "Alice Example".into(),
+                    groups: vec!["eng".into()],
                     device_label: "desktop".into(),
                     role: "mirror".into(),
                     online: false,

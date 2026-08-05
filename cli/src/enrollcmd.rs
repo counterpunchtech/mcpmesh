@@ -5,15 +5,15 @@
 //! verb, and keeps only the pure render helpers.
 
 use anyhow::Context;
-use mcpmesh_local_api::RosterInstallResult;
+use mcpmesh_trust::roster::encode_b64u;
 use mcpmesh_trust::{DeviceKey, paths};
 
-use crate::{client, config, pairing, roster, util};
+use crate::{client, config, pairing, roster};
 
 /// Build a runtime, auto-start/connect the daemon, and run `f` against the connected control
 /// client — the shared preamble every daemon-backed porcelain verb repeated (runtime build +
 /// `ensure_daemon` + block_on). One runtime per call is fine: each verb is a short-lived CLI
-/// process (and `install_signed_roster` may run it once per org mutation).
+/// process (and an org mutation runs one).
 pub fn with_daemon<T>(
     f: impl AsyncFnOnce(client::ControlClient) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
@@ -25,10 +25,6 @@ pub fn with_daemon<T>(
         f(client).await
     })
 }
-
-/// Default roster validity window when `--expires` is omitted (a modest, operator-managed
-/// default; freshness is bounded separately by `[roster].max_staleness`). 90 days.
-const DEFAULT_EXPIRES_SECS: i64 = 90 * 86_400;
 
 /// Slug a display name to a stable, human-legible user_id: lowercase, non-[a-z0-9] → '-', collapse
 /// and trim '-'. `"Alice Nguyen"` → `"alice-nguyen"`. Empty → "user".
@@ -63,7 +59,6 @@ pub fn run_join(
     json: bool,
 ) -> anyhow::Result<()> {
     use mcpmesh_trust::keys::UserKey;
-    use mcpmesh_trust::roster::encode_b64u;
     use mcpmesh_trust::roster::sign::sign_device_binding;
 
     // No added context: the decode error is already the user-facing sentence ("not an
@@ -103,20 +98,31 @@ pub fn run_join(
     .encode();
 
     // Pin the org root (+ user id/key path) through the daemon (single-writer; no roster yet).
-    with_daemon(async |mut client| {
-        client
-            .org_join(
-                &invite.org_id,
-                &invite.org_root_pk,
-                &requested_user_id,
-                &user_key_path.to_string_lossy(),
-            )
+    // #93b: the daemon reports whether its roster TRANSPORT is running. A daemon that booted in
+    // pairing mode has now pinned the org root but bound no gossip/blob ALPNs, so presence stays
+    // empty and blobs hard-close until it restarts — carried out so the porcelain can say so.
+    let restart_required = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let restart_flag = restart_required.clone();
+    let (join_org_id, join_root_pk, join_user_id, join_key_path) = (
+        invite.org_id.clone(),
+        invite.org_root_pk.clone(),
+        requested_user_id.clone(),
+        user_key_path.to_string_lossy().into_owned(),
+    );
+    let join_url = invite.roster_url.clone();
+    with_daemon(async move |mut client| {
+        let joined = client
+            .org_join(&join_org_id, &join_root_pk, &join_user_id, &join_key_path)
             .await?;
+        restart_flag.store(
+            joined.restart_required,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         // If the invite carried a roster URL, pin it to config `[roster].url` so the joiner's poll
         // loop fetches its FIRST roster on the next daemon start (the joiner has no other way to
         // obtain one before it holds a roster). Same daemon connection, immediately after the
         // org-root pin.
-        if let Some(url) = &invite.roster_url {
+        if let Some(url) = &join_url {
             client.set_roster_url(url).await?;
         }
         Ok(())
@@ -132,11 +138,21 @@ pub fn run_join(
                 "join_code": join,
                 "join_code_fingerprint": code_fp,
                 "org_root_fingerprint": fingerprint,
+                "restart_required": restart_required.load(std::sync::atomic::Ordering::Relaxed),
             })
         );
         return Ok(());
     }
     println!("Joined org '{}' as '{requested_user_id}'.", invite.org_id);
+    // #93b: stated BEFORE the approval instructions, because it changes what the user should do
+    // next. Without it the join looked wholly successful and the missing presence/file sharing
+    // surfaced later as an unexplained absence.
+    if restart_required.load(std::sync::atomic::Ordering::Relaxed) {
+        println!(
+            "  → Restart the daemon before this fully takes effect: this one started in pairing \
+             mode, so presence and file sharing stay off until it does. The join itself is saved."
+        );
+    }
     println!("Org root fingerprint: {fingerprint}");
     println!(
         "  → Confirm this matches what the operator reads back, out-of-band, before they approve you."
@@ -161,170 +177,110 @@ pub fn run_org_create(
     roster_url: Option<String>,
     json: bool,
 ) -> anyhow::Result<()> {
-    use mcpmesh_trust::keys::OrgRootKey;
-    use mcpmesh_trust::roster::sign::mint_signed;
-    use mcpmesh_trust::roster::{encode_b64u, mutate};
-
-    let key_path = paths::default_org_root_key_path()?;
-    let (root, created) = OrgRootKey::load_or_generate(&key_path)
-        .map_err(|e| anyhow::anyhow!("org root key error at {}: {e}", key_path.display()))?;
-    if !created {
-        anyhow::bail!(
-            "this node already holds an org root key ({}); `org create` is one-time per node",
-            key_path.display()
-        );
-    }
     let expires_secs = match &expires {
-        Some(s) => config::parse_duration(s).map_err(|e| anyhow::anyhow!("bad --expires: {e}"))?,
-        None => DEFAULT_EXPIRES_SECS,
+        Some(s) => {
+            Some(config::parse_duration(s).map_err(|e| anyhow::anyhow!("bad --expires: {e}"))?)
+        }
+        None => None,
     };
-    let now = util::epoch_now_i64();
-    let roster = mint_signed(
-        root.signing_key(),
-        mutate::empty_roster(&name, 1, now, now.saturating_add(expires_secs)),
-    );
-    let org_root_pk = encode_b64u(&root.public_bytes());
-    let result = install_signed_roster(&roster, Some(org_root_pk.clone()))?;
-    // Pin the roster URL in the operator's config `[roster].url` (through the daemon — single-writer)
-    // so the daemon's poll loop keeps the hosted document current on the next start.
-    if let Some(url) = &roster_url {
-        with_daemon(async |mut client| {
-            client.set_roster_url(url).await?;
-            Ok(())
-        })?;
-    }
-    // The two permitted opaque artifacts: the org invite code (copyable) + the root fingerprint
-    // (words). The invite CARRIES the roster URL so a joiner bootstraps its first roster.
-    let invite = roster::enroll::OrgInviteCode {
-        org_id: name.clone(),
-        org_root_pk,
-        roster_url: roster_url.clone(),
-    }
-    .encode();
-    let fingerprint = pairing::sas::fingerprint_words(&root.public_bytes());
+    // #66: the whole ceremony is now the `org_create` verb — one implementation behind the
+    // control seam, shared with every embedder. This function is porcelain: flags in, words out.
+    // It used to mint the key, sign the roster, and stage an install here, which meant the
+    // operator path and the embedder path were two copies free to drift.
+    let out = with_daemon(async move |mut client| {
+        Ok(client.org_create(&name, expires_secs, roster_url).await?)
+    })?;
     if json {
         println!(
             "{}",
             serde_json::json!({
-                "org_id": result.org_id,
-                "serial": result.serial,
-                "org_invite": invite,
-                "org_root_fingerprint": fingerprint,
+                "org_id": out.org_id,
+                "serial": out.serial,
+                "org_invite": out.org_invite,
+                "org_root_fingerprint": out.org_root_fingerprint,
             })
         );
         return Ok(());
     }
     println!(
         "Created org '{}' (roster serial {}).",
-        result.org_id, result.serial
+        out.org_id, out.serial
     );
-    println!("Invite someone: {invite}");
-    println!("Org root fingerprint: {fingerprint} (read this aloud when you approve joiners)");
+    println!("Invite someone: {}", out.org_invite);
+    println!(
+        "Org root fingerprint: {} (read this aloud when you approve joiners)",
+        out.org_root_fingerprint
+    );
     Ok(())
 }
 
-/// Load this operator's org root key (the node must have run `org create`) + the installed roster
-/// document (`roster.json`). The two artifacts `approve`/`revoke` mutate then re-sign + install.
-fn load_operator_roster() -> anyhow::Result<(
-    mcpmesh_trust::keys::OrgRootKey,
-    mcpmesh_trust::roster::Roster,
-)> {
-    let key_path = paths::default_org_root_key_path()?;
-    if !key_path.exists() {
-        anyhow::bail!(
-            "this node is not an org operator (no org root key); run `mcpmesh org create` first"
-        );
-    }
-    let (root, _) = mcpmesh_trust::keys::OrgRootKey::load_or_generate(&key_path)
-        .map_err(|e| anyhow::anyhow!("org root key error at {}: {e}", key_path.display()))?;
-    let roster_path = paths::default_roster_path()?;
-    let bytes = std::fs::read(&roster_path).with_context(|| {
-        format!(
-            "no installed roster at {} — run `org create`",
-            roster_path.display()
-        )
-    })?;
-    let roster: mcpmesh_trust::roster::Roster =
-        serde_json::from_slice(&bytes).context("parse installed roster")?;
-    Ok((root, roster))
-}
-
-/// `mcpmesh org approve <join-code> --groups …`: verify the device binding, upsert the member, bump
-/// serial, re-sign, install. The human ceremony (verifying the PERSON) is the operator's out-of-band
-/// step; this command trusts it ran and adds the cryptographic DEVICE-binding check.
 pub fn run_org_approve(
     join_code: String,
     groups: String,
     user_id: Option<String>,
     json: bool,
 ) -> anyhow::Result<()> {
-    use mcpmesh_trust::roster::sign::{sign, verify_device_binding};
-    use mcpmesh_trust::roster::{decode_endpoint_id, mutate};
-
-    // No added context — the decode error is already the user-facing sentence (issue #10).
-    let jc = roster::enroll::JoinCode::decode(&join_code)?;
-    // Verify the device→user-key binding (the device provably belongs to this user key)
-    // BEFORE any mutation — a forged/corrupt code is rejected before the roster is touched.
-    let user_pk = decode_endpoint_id(&jc.user_pk).context("join code has an invalid user_pk")?;
-    let device_id = decode_endpoint_id(&jc.device_endpoint_id)
-        .context("join code has an invalid device endpoint")?;
-    let sig = mcpmesh_trust::roster::decode_b64u(&jc.binding_sig)
-        .context("join code has an invalid signature")?;
-    verify_device_binding(&user_pk, &device_id, &sig).map_err(|_| {
-        anyhow::anyhow!("join code device binding failed — the code is forged or corrupt")
-    })?;
-
-    let (root, mut roster) = load_operator_roster()?;
-    let uid = user_id.unwrap_or(jc.requested_user_id);
     let groups = split_csv(Some(groups));
-    // Pre-install confirmation ([Important] A): surface the join-code fingerprint so the operator
-    // can confirm — out-of-band — they are approving the SAME code the joiner read back (catching a
-    // substituted code). Same derivation as `join`'s output (over user_pk ∥ device endpoint).
-    let code_fp = pairing::sas::join_code_fingerprint(&user_pk, &device_id);
+    // #66: the binding check, the mutation, the re-sign and the install all happen in the daemon
+    // now. What stays here is the human step it cannot do.
+    //
+    // The confirmation is printed BEFORE the call, deliberately. It is the substitution-MITM
+    // closer ([Important] A): the operator compares these words with what the joiner read back,
+    // and a substituted code — carrying a different user_pk — diverges here. Printing it after the
+    // install would demote the remedy from "don't approve this" to "now go revoke it", which is a
+    // strictly worse position to put an operator in, and the roster would already carry the
+    // attacker's device.
+    //
+    // Routed through the `org_join_code` VERB, not a local decode. Same reason the rest of this
+    // function moved: the daemon owns the decode+verify+fingerprint path, and computing the
+    // confirmation words a second way here would let the code an operator confirms drift from the
+    // code the approval acts on.
+    //
+    // It also means the binding is VERIFIED before these words print, so a forged code fails here
+    // instead of being announced as a person awaiting approval.
     if !json {
+        let seen = with_daemon({
+            let join_code = join_code.clone();
+            async move |mut client| Ok(client.org_join_code(&join_code).await?)
+        })?;
         println!(
-            "Approving join code {code_fp} for '{}' as user '{uid}', groups [{}].",
-            jc.display_name,
+            "Approving join code {} for '{}' as user '{}', groups [{}].",
+            seen.join_code_fingerprint,
+            seen.display_name,
+            user_id
+                .clone()
+                .unwrap_or_else(|| seen.requested_user_id.clone()),
             groups.join(", ")
         );
         println!(
-            "  → Verify {code_fp} matches what the joiner read back to you out-of-band; if it doesn't, \
-             run `org revoke` on this device."
+            "  → Verify {} matches what the joiner read back to you out-of-band; if it doesn't, \
+             stop now and ask them for a fresh join code.",
+            seen.join_code_fingerprint
         );
     }
-    roster.serial += 1;
-    mutate::upsert_member(
-        &mut roster,
-        &uid,
-        &jc.display_name,
-        &jc.user_pk, // b64u: straight into the roster device/user record
-        &groups,
-        &jc.device_endpoint_id, // b64u: straight into the roster device record
-        &jc.device_label,
-    )
-    .map_err(|e| anyhow::anyhow!("roster mutation rejected: {e}"))?;
-    sign(root.signing_key(), &mut roster).map_err(|e| anyhow::anyhow!("sign roster: {e}"))?;
-
-    let result = install_signed_roster(&roster, None)?; // org root already pinned
+    let out = with_daemon({
+        let groups = groups.clone();
+        async move |mut client| Ok(client.org_approve(&join_code, groups, user_id).await?)
+    })?;
     if json {
         println!(
             "{}",
             serde_json::json!({
-                "user_id": uid,
-                "groups": groups,
-                "org_id": result.org_id,
-                "serial": result.serial,
-                "join_code_fingerprint": code_fp,
+                "user_id": out.user_id,
+                "groups": out.groups,
+                "org_id": out.org_id,
+                "serial": out.serial,
+                "join_code_fingerprint": out.join_code_fingerprint,
             })
         );
         return Ok(());
     }
     println!(
         "Approved '{}' into [{}] (org '{}', serial {}).",
-        uid,
-        groups.join(", "),
-        result.org_id,
-        result.serial
+        out.user_id,
+        out.groups.join(", "),
+        out.org_id,
+        out.serial
     );
     Ok(())
 }
@@ -332,52 +288,46 @@ pub fn run_org_approve(
 /// `mcpmesh org revoke <person|device> [--user-key]`: mutate the installed roster per the
 /// target grammar, bump serial, re-sign, install (which severs the cut devices' live sessions).
 pub fn run_org_revoke(target: String, user_key: bool, json: bool) -> anyhow::Result<()> {
-    use mcpmesh_trust::roster::mutate;
-    use mcpmesh_trust::roster::sign::sign;
-
-    let (root, mut roster) = load_operator_roster()?;
-    roster.serial += 1;
-    let mode: &str;
-    let action: String = if user_key {
-        // Rotation: remove the person, keep their devices un-revoked (same device re-enrolls).
-        mutate::remove_user(&mut roster, &target, false).map_err(|e| anyhow::anyhow!("{e}"))?;
-        mode = "user-key-rotation";
-        format!(
-            "Rotated '{target}': removed from the roster. They re-enroll with a fresh user key \
-             (same device), then re-approve with the same user_id"
-        )
-    } else if let Some((person, device)) = target.split_once('/') {
-        // One device.
-        mutate::revoke_device(&mut roster, person, device).map_err(|e| anyhow::anyhow!("{e}"))?;
-        mode = "device";
-        format!("Revoked device '{person}/{device}'")
-    } else {
-        // Person departing — remove + revoke every device (hard cut).
-        mutate::remove_user(&mut roster, &target, true).map_err(|e| anyhow::anyhow!("{e}"))?;
-        mode = "person";
-        format!("Revoked person '{target}' (all devices)")
-    };
-    sign(root.signing_key(), &mut roster).map_err(|e| anyhow::anyhow!("sign roster: {e}"))?;
-    let result = install_signed_roster(&roster, None)?;
+    // #66: the target grammar is the daemon's to interpret now — and it reports which `mode` it
+    // applied, because the three readings differ in what they destroy.
+    let out = with_daemon({
+        let target = target.clone();
+        async move |mut client| Ok(client.org_revoke(&target, user_key).await?)
+    })?;
     if json {
         println!(
             "{}",
             serde_json::json!({
-                "target": target,
-                "mode": mode,
-                "org_id": result.org_id,
-                "serial": result.serial,
-                "severed": result.severed,
+                "target": out.target,
+                "mode": out.mode,
+                "org_id": out.org_id,
+                "serial": out.serial,
+                "severed": out.severed,
             })
         );
         return Ok(());
     }
+    let action = match out.mode.as_str() {
+        "user-key-rotation" => format!(
+            "Rotated '{}': removed from the roster. They re-enroll with a fresh user key (same \
+             device), then re-approve with the same user_id",
+            out.target
+        ),
+        "device" => format!("Revoked device '{}'", out.target),
+        "person" => format!("Revoked person '{}' (all devices)", out.target),
+        // A mode this porcelain does not know — a newer daemon. Report it VERBATIM rather than
+        // falling through to the person wording: that is the most destructive sentence of the
+        // three, and printing it for an unknown mode would tell an operator something worse
+        // happened than did (or something milder, if the new mode is worse). Neither is safe to
+        // guess about a revocation.
+        other => format!("Revoked '{}' (mode: {other})", out.target),
+    };
     println!(
         "{action} (org '{}', serial {}). Severed {} live session{}.",
-        result.org_id,
-        result.serial,
-        result.severed,
-        if result.severed == 1 { "" } else { "s" }
+        out.org_id,
+        out.serial,
+        out.severed,
+        if out.severed == 1 { "" } else { "s" }
     );
     Ok(())
 }
@@ -387,7 +337,6 @@ pub fn run_org_revoke(target: String, user_key: bool, json: bool) -> anyhow::Res
 /// device key, exactly like `internal id`); the already-enrolled device signs the binding with the
 /// SHARED user key it holds. Surface-clean: only the opaque `mcpmesh-device:` code prints.
 pub fn run_devices_code(label: String, json: bool) -> anyhow::Result<()> {
-    use mcpmesh_trust::roster::encode_b64u;
     let device_id = load_device_key()?.public_bytes();
     let code = roster::enroll::DeviceCode {
         device_endpoint_id: encode_b64u(&device_id),
@@ -473,36 +422,6 @@ pub fn run_devices_add(device_code: String, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Sign+persist a roster to a per-call-unique temp under `config_dir()` (same-uid; the daemon
-/// reads it — path-not-bytes is within the local trust boundary), install it via the existing
-/// `RosterInstall` control method (the single-writer discipline), and return the result. The
-/// temp is removed on every exit — success, install error, or an early `?`-return — by the
-/// [`util::TempPathGuard`] RAII guard. `org_root_pk` is `Some` only on the FIRST install
-/// (`org create`) to pin the
-/// anchor; `None` afterwards (the pinned config value is reused). Shared by org create / approve / revoke.
-fn install_signed_roster(
-    roster: &mcpmesh_trust::roster::Roster,
-    org_root_pk: Option<String>,
-) -> anyhow::Result<RosterInstallResult> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let temp = paths::config_dir()?.join(format!(
-        "roster.staging.{}.{}.json",
-        std::process::id(),
-        seq
-    ));
-    // The guard removes `temp` on ANY return below (including the `?` early-exits that follow).
-    let _guard = util::TempPathGuard::new(temp.clone());
-    if let Some(parent) = temp.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&temp, serde_json::to_vec(roster)?)
-        .with_context(|| format!("write staged roster {}", temp.display()))?;
-    let path = temp.to_string_lossy().into_owned();
-    with_daemon(async move |mut client| Ok(client.roster_install(&path, org_root_pk).await?))
-}
-
 /// Split a comma-separated `--allow` flag into trimmed, non-empty entries.
 pub fn split_csv(value: Option<String>) -> Vec<String> {
     value
@@ -534,8 +453,6 @@ pub fn load_device_key() -> anyhow::Result<DeviceKey> {
 
 #[cfg(test)]
 mod tests {
-    use mcpmesh_trust::roster::encode_b64u;
-
     use super::*;
 
     #[test]
@@ -546,35 +463,6 @@ mod tests {
         // Nothing usable degrades to the generic id, never an empty user_id.
         assert_eq!(slug(""), "user");
         assert_eq!(slug("---"), "user");
-    }
-
-    #[test]
-    fn a_forged_join_code_binding_is_rejected_before_any_roster_access() {
-        // `org approve` verifies the device→user-key binding BEFORE touching any
-        // operator state, so a substituted code dies on the signature check itself — this test runs
-        // on a machine with NO org root key and still gets the binding error, not "not an operator".
-        let mallory = mcpmesh_trust::ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-        let alice_pk = mcpmesh_trust::ed25519_dalek::SigningKey::from_bytes(&[9u8; 32])
-            .verifying_key()
-            .to_bytes();
-        let device_id = [42u8; 32];
-        // Mallory signs the binding with HER key but the code claims Alice's user_pk — the
-        // substitution the binding check exists to catch.
-        let sig = mcpmesh_trust::roster::sign::sign_device_binding(&mallory, &device_id);
-        let code = roster::enroll::JoinCode {
-            display_name: "Alice".into(),
-            requested_user_id: "alice".into(),
-            user_pk: encode_b64u(&alice_pk),
-            device_endpoint_id: encode_b64u(&device_id),
-            device_label: "laptop".into(),
-            binding_sig: encode_b64u(&sig),
-        }
-        .encode();
-        let err = run_org_approve(code, "team-eng".into(), None, false).unwrap_err();
-        assert!(
-            err.to_string().contains("device binding failed"),
-            "the forged binding must be the failure, not roster/operator state: {err}"
-        );
     }
 
     #[test]

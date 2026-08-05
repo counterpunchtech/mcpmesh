@@ -21,10 +21,10 @@ use mcpmesh_local_api::transport::{LocalListener, LocalStream};
 use mcpmesh_local_api::{
     API_NAME, API_VERSION, AuditListParams, AuditPruneParams, BlobFetchCancelParams,
     BlobFetchParams, BlobGrantParams, BlobPublishParams, BlobRepublishParams, BlobRevokeParams,
-    BlobUnpublishParams, Hello, InviteParams, OpenSessionParams, OrgJoinParams, PairParams,
-    PeerServicesParams, RosterInstallParams, ServiceAllowParams, SetAppMetadataParams,
-    SetNicknameParams, SetRelaysParams, SetRosterUrlParams, StatusResult, UnregisterServiceParams,
-    method_of,
+    BlobUnpublishParams, Hello, InviteParams, OpenSessionParams, OrgApproveParams, OrgCreateParams,
+    OrgJoinCodeParams, OrgJoinParams, OrgRevokeParams, PairParams, PeerServicesParams,
+    RosterInstallParams, ServiceAllowParams, SetAppMetadataParams, SetNicknameParams,
+    SetRelaysParams, SetRosterUrlParams, StatusResult, UnregisterServiceParams, method_of,
 };
 use mcpmesh_net::framing::{FrameReader, Inbound, write_frame};
 use serde_json::{Value, json};
@@ -764,6 +764,56 @@ pub(crate) async fn handle_request(req: &Value, state: &DaemonState) -> Value {
         // (a local file the same-uid daemon reads) and an OPTIONAL `org_root_pk`
         // that pins the org root on first install. `install_roster` validates (rules 1–6),
         // persists, hot-swaps the gate, and severs revoked sessions.
+        // #93: the READ half of roster mode — the declared groups plus every person the installed
+        // roster carries, online or not. Parameterless and read-only; `status` answers who is
+        // REACHABLE, which is a different question and omits anyone whose devices are all down.
+        Some("roster_members") => respond(
+            id,
+            "roster_members",
+            async {
+                let mesh = state.mesh_required()?;
+                Ok(crate::daemon::roster_members(mesh))
+            }
+            .await,
+        ),
+        // #66: the AUTHORING verbs. Roster mode's operator side used to be CLI-only, so an
+        // embedded node could consume a roster and never author one — no "approve this person"
+        // button without shelling out to a second binary. The porcelain now calls these too, so
+        // both front doors run ONE implementation.
+        Some("org_create") => respond(
+            id,
+            "org_create",
+            with_params(&params, |p: OrgCreateParams| {
+                crate::daemon::org_create(state, p.name, p.expires_secs, p.roster_url)
+            })
+            .await,
+        ),
+        Some("org_approve") => respond(
+            id,
+            "org_approve",
+            with_params(&params, |p: OrgApproveParams| {
+                crate::daemon::org_approve(state, p.join_code, p.groups, p.user_id)
+            })
+            .await,
+        ),
+        // Read-only: decode + verify a join code and return the fingerprint the operator confirms
+        // OUT-OF-BAND before approving. Nothing is signed, installed, or persisted.
+        Some("org_join_code") => respond(
+            id,
+            "org_join_code",
+            with_params(&params, |p: OrgJoinCodeParams| {
+                crate::daemon::org_join_code(state, p.join_code)
+            })
+            .await,
+        ),
+        Some("org_revoke") => respond(
+            id,
+            "org_revoke",
+            with_params(&params, |p: OrgRevokeParams| {
+                crate::daemon::org_revoke(state, p.target, p.user_key)
+            })
+            .await,
+        ),
         Some("roster_install") => respond(
             id,
             "roster_install",
