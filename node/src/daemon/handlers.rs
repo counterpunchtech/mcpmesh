@@ -410,12 +410,18 @@ pub(crate) async fn blob_fetch(
     // on work that has already stopped. Dropping `work` here is what actually halts the transfer —
     // the iroh-blobs get stream and the export both stop when their future is dropped.
     let outcome = tokio::select! {
-        r = work => r,
+        // Set INSIDE this arm, not after the select (#182). The fetch ANSWERED here — success or a
+        // genuine transfer failure, both of which the provider has already reported terminally on
+        // the transfer ring, so the guard must not emit a second frame.
+        //
+        // Setting it after the select covered the CANCEL arm too, and there the claim is false:
+        // `work` was DROPPED, so nothing inside it emitted anything. `finished` was then true and
+        // `Drop` skipped the frame — so an explicit `blob_fetch_cancel` left every subscriber
+        // watching a progress bar that never terminated, which is exactly the case the guard's own
+        // comment says it exists to cover.
+        r = work => { guard.finished = true; r }
         () = guard.token.cancelled() => Err(Cancelled(hash_hex).into()),
     };
-    // The fetch ANSWERED — success or a genuine transfer failure, both of which the provider has
-    // already reported terminally on the transfer ring. Only a stop needs the guard's `Aborted`.
-    guard.finished = true;
     outcome
 }
 
@@ -4522,6 +4528,171 @@ allow = []
 
         // The guard deregistered on unwind, so a later cancel does not claim a live fetch.
         assert!(!blob_fetch_cancel(&state, &hash_hex).unwrap().cancelled);
+    }
+
+    /// #182: a cancelled fetch OWES its subscribers a terminal frame, and did not send one.
+    ///
+    /// `FetchGuard::drop` emits `Aborted` only when `finished` is false, and `blob_fetch` used to
+    /// set that flag after the `select!` — on BOTH arms. On the cancel arm the comment's claim
+    /// ("the provider has already reported terminally") is false, because `work` was DROPPED and
+    /// nothing inside it emitted anything. So every subscriber watching an explicitly-cancelled
+    /// transfer saw `Started`, some `Progress`, and then silence: a progress bar with nothing to
+    /// close it, and an embedder keying "transfer over" on a terminal frame waiting forever for a
+    /// transfer that had already stopped.
+    ///
+    /// The #172 cancel test above asserts the error and the deregistration, and never subscribes —
+    /// which is why this went unnoticed. Moving `finished = true` back after the select makes this
+    /// test time out on the frame.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancelled_fetch_still_emits_a_terminal_frame() {
+        let (dir, mesh, state) = blob_mesh().await;
+        // Subscribe BEFORE the fetch starts, so no frame can be missed.
+        let mut rx = mesh.blob_bcast_for_test().subscribe();
+
+        // Same blackholed address as the test above: the dial hangs in its QUIC handshake, so the
+        // fetch is genuinely in flight when the cancel lands rather than already over.
+        let nowhere = iroh::SecretKey::from_bytes(&[21u8; 32]).public();
+        let hash = iroh_blobs::Hash::new(b"cancel-frame");
+        let addr = iroh::EndpointAddr::from_parts(
+            nowhere,
+            [iroh::TransportAddr::Ip(std::net::SocketAddr::from((
+                [203, 0, 113, 1],
+                44445,
+            )))],
+        );
+        let ticket = iroh_blobs::ticket::BlobTicket::new(addr, hash, iroh_blobs::BlobFormat::Raw)
+            .to_string();
+        let hash_hex = hash.to_hex().to_string();
+
+        let dest = dir.path().join("out.bin");
+        let fetch_state = state.clone();
+        let fetching = tokio::spawn(async move {
+            blob_fetch(
+                &fetch_state,
+                ticket,
+                dest.to_string_lossy().into_owned(),
+                Vec::new(),
+            )
+            .await
+        });
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            if mesh
+                .fetches
+                .lock()
+                .expect("fetches lock not poisoned")
+                .contains_key(&hash_hex)
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the fetch never registered itself"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert!(blob_fetch_cancel(&state, &hash_hex).unwrap().cancelled);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(30), fetching).await;
+
+        // THE assertion: a terminal frame for this hash reaches the ring. Read with a bounded,
+        // SLEEPING wait — the ring also carries this fetch's `Started`, so the loop drains until
+        // it finds the terminal one or gives up.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut saw_terminal = None;
+        while tokio::time::Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(f)
+                    if f.hash == hash_hex
+                        && matches!(
+                            f.state,
+                            mcpmesh_local_api::BlobTransferState::Aborted
+                                | mcpmesh_local_api::BlobTransferState::Completed
+                        ) =>
+                {
+                    saw_terminal = Some(f.state);
+                    break;
+                }
+                Ok(_) => continue,
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                Err(_) => break,
+            }
+        }
+        assert_eq!(
+            saw_terminal,
+            Some(mcpmesh_local_api::BlobTransferState::Aborted),
+            "a cancelled fetch must send a terminal Aborted frame — without it a subscriber's \
+             progress bar never closes, and an embedder that keys 'transfer over' on this frame \
+             waits forever for a transfer that already stopped"
+        );
+    }
+
+    /// #182, the other direction: a fetch that ANSWERS must emit EXACTLY ONE terminal frame.
+    ///
+    /// The guard's `Aborted` exists for a fetch that stopped without answering. If `finished` is
+    /// not set on the answering arm, the guard fires on top of the terminal frame the fetch already
+    /// sent — so a subscriber sees `Aborted` after a `Completed`, or two `Aborted`s, and a UI that
+    /// tears down on the first terminal frame processes a second for a transfer that no longer
+    /// exists.
+    ///
+    /// Driven through `blob_fetch` (the control verb) rather than `AppBlobs::fetch`, because the
+    /// guard only exists on the verb path — the acceptance test in `blob_ac.rs` calls the provider
+    /// directly and cannot see this at all, which is why the double-emit survived it.
+    ///
+    /// A fetch that fails on its OWN (no cancel) is the cheap case: on a hermetic mesh with no
+    /// discovery, an id-only address fails immediately rather than spending a dial timeout.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fetch_that_answers_emits_exactly_one_terminal_frame() {
+        let (dir, mesh, state) = blob_mesh().await;
+        let mut rx = mesh.blob_bcast_for_test().subscribe();
+
+        // Id-only, no direct address: nothing to dial and no discovery, so this fails fast.
+        let nowhere = iroh::SecretKey::from_bytes(&[22u8; 32]).public();
+        let hash = iroh_blobs::Hash::new(b"answers-once");
+        let ticket = iroh_blobs::ticket::BlobTicket::new(
+            iroh::EndpointAddr::from(nowhere),
+            hash,
+            iroh_blobs::BlobFormat::Raw,
+        )
+        .to_string();
+        let hash_hex = hash.to_hex().to_string();
+
+        let dest = dir.path().join("out.bin");
+        let r = blob_fetch(
+            &state,
+            ticket,
+            dest.to_string_lossy().into_owned(),
+            Vec::new(),
+        )
+        .await;
+        assert!(r.is_err(), "precondition: an undialable source fails");
+
+        // Drain everything the ring holds and COUNT terminal frames for this hash.
+        let mut terminal = 0usize;
+        loop {
+            match rx.try_recv() {
+                Ok(f)
+                    if f.hash == hash_hex
+                        && matches!(
+                            f.state,
+                            mcpmesh_local_api::BlobTransferState::Aborted
+                                | mcpmesh_local_api::BlobTransferState::Completed
+                        ) =>
+                {
+                    terminal += 1;
+                }
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+        assert_eq!(
+            terminal, 1,
+            "a fetch that answered must emit ONE terminal frame — the guard's Aborted is for a \
+             fetch that stopped WITHOUT answering, and firing it here means a subscriber tears \
+             down twice for one transfer"
+        );
     }
 
     /// The blob control operations fail gracefully (Err, never a panic) in control-only mode — the
