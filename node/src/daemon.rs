@@ -127,7 +127,7 @@ pub(crate) use handlers::{
     add_peer, blob_fetch, blob_fetch_cancel, blob_grant, blob_list, blob_publish, blob_republish,
     blob_revoke, blob_unpublish, mint_invite, open_session, peer_diagnostics, peer_services,
     redeem, register_service, service_allow_grant, service_allow_revoke, set_relays,
-    unregister_service,
+    unregister_service, user_key_export, user_key_import,
 };
 pub(crate) use org_author::{org_approve, org_create, org_join_code, org_revoke};
 pub(crate) use roster_install::{
@@ -341,9 +341,37 @@ pub struct MeshState {
     /// (else the default). `peer_endorse` reloads it to SIGN an endorsement — the key is never held
     /// in memory beyond a request, matching how boot uses it.
     pub(crate) user_key_path: std::sync::OnceLock<PathBuf>,
+    /// Did BOOT mint the user key, rather than load an existing one (#85 ask 2)?
+    ///
+    /// The import's `replace` guard exists to stop someone discarding a real identity. Without this
+    /// it could not tell one from a key minted 200 ms earlier by the very daemon the import
+    /// auto-started — so on the primary use case, a NEW laptop, `identity import` always refused
+    /// and pushed the user to a flag whose help text says it destroys things irreversibly. Training
+    /// people to pass that flag is worse than not having it.
+    ///
+    /// A key this node minted itself and has never presented to anyone is not an identity worth
+    /// protecting; a key it loaded from disk might be.
+    pub(crate) user_key_minted_at_boot: std::sync::OnceLock<bool>,
+    /// A user key RESTORED from a recovery phrase (#85 ask 2), overriding the boot-derived binding.
+    ///
+    /// **Separate from [`adopted_binding`](Self::adopted_binding), and the distinction is
+    /// load-bearing.** That field does not mean "the binding to present" — it means *this device
+    /// was enrolled into someone else's identity and holds no authority over it*, and two other
+    /// sites gate on exactly that reading: `peer_endorse` refuses, and `sign_binding` returns
+    /// `None` so `invite --as-self` cannot enroll a third device.
+    ///
+    /// An IMPORT is the opposite situation: the device now holds that user key. Reusing the
+    /// adopted slot for it made a freshly-recovered machine unable to endorse or to enroll its
+    /// owner's other devices — the very remedy the recovery CLI prints — with an error message
+    /// stating it did not hold a key it had just imported. Caught by review, by probe.
+    pub(crate) imported_binding: std::sync::RwLock<Option<crate::pairing::rendezvous::SelfBinding>>,
     /// A self-enrollment binding ADOPTED from another device of this person (#86), overriding the
     /// locally-derived one. `RwLock`, not `OnceLock`: enrolling installs it live, and a device may
     /// later be re-enrolled into a different identity.
+    ///
+    /// **`is_some()` means "this device holds NO user key of its own"** — see
+    /// [`imported_binding`](Self::imported_binding) for why that is not the same question as which
+    /// binding to present, and for what happened when the two were conflated.
     pub(crate) adopted_binding: std::sync::RwLock<Option<crate::pairing::rendezvous::SelfBinding>>,
     /// Recent INVITER-side pairing completions — a tiny in-memory ring (cap
     /// [`RECENT_PAIRINGS_CAP`]) `status` surfaces so the inviter's HUMAN can read the SAS and
@@ -412,6 +440,14 @@ pub struct MeshState {
     /// authoring → `reload_lock` and never the reverse — nothing acquires this while holding
     /// `reload_lock` — so the graph stays acyclic.
     pub(crate) org_author_lock: tokio::sync::Mutex<()>,
+    /// Serializes a user-key EXPORT or IMPORT (#85 ask 2).
+    ///
+    /// The import is a read-modify-write over a key file with no other guard, and control requests
+    /// dispatch concurrently (#172). Two concurrent `replace` imports could otherwise leave the
+    /// file holding one key while the node PRESENTS another — both answering `Ok` with different
+    /// `user_id`s, and the divergence surfacing only at the next restart. The export shares the
+    /// lock so it cannot read a half-replaced file.
+    pub(crate) user_key_lock: tokio::sync::Mutex<()>,
     /// Embedder-registered ALPNs → their handlers (#67), read by the accept loop's dispatch.
     ///
     /// mcpmesh had built the hard parts of a P2P application platform — identity, pairing, a trust
@@ -578,6 +614,8 @@ impl MeshState {
             roster_addr_book: std::sync::OnceLock::new(),
             self_binding: std::sync::OnceLock::new(),
             user_key_path: std::sync::OnceLock::new(),
+            user_key_minted_at_boot: std::sync::OnceLock::new(),
+            imported_binding: std::sync::RwLock::new(None),
             adopted_binding: std::sync::RwLock::new(None),
             recent_pairings: std::sync::Mutex::new(std::collections::VecDeque::new()),
             reachability: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -590,6 +628,7 @@ impl MeshState {
             probe_seq: std::sync::atomic::AtomicU64::new(0),
             probes_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
             org_author_lock: tokio::sync::Mutex::new(()),
+            user_key_lock: tokio::sync::Mutex::new(()),
             app_protocols: std::sync::RwLock::new(std::collections::HashMap::new()),
             bound_alpns: std::sync::OnceLock::new(),
             ephemeral_services: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -1056,6 +1095,23 @@ impl MeshState {
             .expect("adopted_binding lock not poisoned") = binding;
     }
 
+    /// Install a binding restored from a recovery phrase (#85 ask 2), and SUPERSEDE any enrollment.
+    ///
+    /// Clearing the adopted slot is not tidiness. That slot means "this device holds no user key",
+    /// and after an import it does — leaving it set makes `peer_endorse` and `invite --as-self`
+    /// refuse on a machine that has just recovered its own identity, which is the machine most
+    /// likely to need them.
+    pub(crate) fn set_imported_binding(&self, binding: crate::pairing::rendezvous::SelfBinding) {
+        *self
+            .imported_binding
+            .write()
+            .expect("imported_binding lock not poisoned") = Some(binding);
+        *self
+            .adopted_binding
+            .write()
+            .expect("adopted_binding lock not poisoned") = None;
+    }
+
     /// Install the resolved `UserKey` path (#65). Set once, at boot, like `self_binding`.
     pub fn set_user_key_path(&self, path: PathBuf) {
         let _ = self.user_key_path.set(path);
@@ -1070,9 +1126,20 @@ impl MeshState {
     /// A clone of this daemon's self-sovereign pairing identity, or `None` when unset (control-only /
     /// test daemon) or when this daemon has no user key. The pairing handlers present it to peers.
     pub(crate) fn self_binding(&self) -> Option<crate::pairing::rendezvous::SelfBinding> {
-        // An ADOPTED binding wins (#86): this device was enrolled into another device's identity,
-        // so presenting the locally-derived one would resolve it to a stranger again — the exact
-        // symptom the issue reports.
+        // An IMPORTED key wins over everything (#85 ask 2). It is the most recent explicit act, and
+        // unlike an adoption it means this device HOLDS the key — so it also supersedes any earlier
+        // enrollment, which `user_key_import` clears rather than leaving to out-rank it here.
+        if let Some(imported) = self
+            .imported_binding
+            .read()
+            .expect("imported_binding lock not poisoned")
+            .clone()
+        {
+            return Some(imported);
+        }
+        // An ADOPTED binding wins over the boot-derived one (#86): this device was enrolled into
+        // another device's identity, so presenting the locally-derived one would resolve it to a
+        // stranger again — the exact symptom the issue reports.
         if let Some(adopted) = self
             .adopted_binding
             .read()

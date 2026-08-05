@@ -20,7 +20,7 @@
 /// short, lowercase, unambiguous common words (designed for a unique 4-char prefix, no
 /// near-homophones, no profanity) — ideal for human read-aloud comparison. It is display-only
 /// (see the module doc), so the exact membership is not security-critical beyond entropy.
-static WORDS: &[&str] = &[
+pub(crate) static WORDS: &[&str] = &[
     "abandon", "ability", "able", "about", "above", "absent", "absorb", "abstract", "absurd",
     "abuse", "access", "accident", "account", "accuse", "achieve", "acid", "acoustic", "acquire",
     "across", "act", "action", "actor", "actress", "actual", "adapt", "add", "addict", "address",

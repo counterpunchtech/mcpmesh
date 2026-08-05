@@ -416,7 +416,10 @@ async fn boot_node(
         None => paths.user_key_path.clone(),
     };
     let self_binding = match mcpmesh_trust::UserKey::load_or_generate(&user_key_path) {
-        Ok((user_key, _created)) => {
+        Ok((user_key, created)) => {
+            // #85 ask 2: a key we just minted is not an identity anyone has seen, so the import's
+            // replace guard must not defend it as though it were.
+            let _ = mesh.user_key_minted_at_boot.set(created);
             let (user_pk, sig) = mcpmesh_trust::binding::present(&user_key, our_id.as_bytes());
             Some(crate::pairing::rendezvous::SelfBinding { user_pk, sig })
         }

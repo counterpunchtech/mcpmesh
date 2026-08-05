@@ -74,7 +74,8 @@ pub use protocol::{
     RelayInfo, Request, RosterInstallParams, RosterInstallResult, RosterMember, RosterMemberDevice,
     RosterMembersResult, RosterStatus, ScopeInfo, SelfNetwork, ServiceAllowParams, ServiceInfo,
     SetAppMetadataParams, SetNicknameParams, SetRelaysParams, SetRelaysResult, SetRosterUrlParams,
-    StatusResult, StorageInfo, StreamFrame, UnregisterServiceParams, method_of, one_use,
+    StatusResult, StorageInfo, StreamFrame, UnregisterServiceParams, UserKeyExportResult,
+    UserKeyImportParams, UserKeyImportResult, method_of, one_use,
 };
 
 #[cfg(feature = "client")]

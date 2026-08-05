@@ -336,3 +336,42 @@ metadata through them. Validate what your implementation accepts.
 
 **An in-tree mDNS implementation behind `[network].local_discovery` is still open** (#68). This is
 the seam that unblocks writing one outside; it is not the discovery itself.
+
+## Recovering a person's identity on new hardware (#85 ask 2)
+
+A person's `b64u:` user id is what peers pin, kb audiences key on, and a roster names. It lives in
+one file on one machine. Before this, replacing a laptop destroyed it — the new machine mints a
+fresh user key, presents a new `b64u:`, and is a stranger even to peers that had pinned the old one.
+
+```rust
+let out = ctl.user_key_export().await?;      // 33 words + the user_id they restore
+show_once(&out.recovery_phrase);
+
+// …on the new machine:
+let restored = ctl.user_key_import(&phrase, /* replace */ false).await?;
+assert_eq!(restored.user_id, expected);       // check it — see below
+```
+
+CLI: `mcpmesh identity export`, and `… | mcpmesh identity import` (pipe it; an argument is visible
+in `ps` and lands in shell history).
+
+- **The phrase IS the private key**, not a password over one. Show it once, to its owner. It is
+  deliberately absent from the audit log, from `status`, and from every other surface — the export
+  response is the only place it exists. The *event* is audited; the phrase is not.
+- **Check the returned `user_id`.** The phrase carries a checksum, so a mistyped word is refused
+  rather than silently restoring a *different* identity — but that failure is invisible if it ever
+  happens, because it looks exactly like every peer having forgotten you. The `user_id` is the
+  definitive check.
+- **`replace` is only needed for a key the node loaded from disk.** A key its own boot minted
+  seconds earlier is not an identity anyone has seen, so a genuine new-machine recovery does not
+  need the destructive flag. `replaced: true` in the result means a *real* identity was discarded.
+- **It does not get this device admitted by anyone.** Peers authorize per **device**, and a restored
+  user key puts this endpoint in nobody's allowlist. You still pair — or enroll this device from
+  another one you still hold (`invite --as-self`), which a recovered machine can also *initiate*.
+- **In roster mode it desyncs you from the roster**, which pins the device→user binding against the
+  key that was current when the operator approved this device. Nothing re-signs; an operator must
+  re-approve.
+
+Not shipped: a device attestation so a peer admits a replacement device without a fresh SAS, and
+pairing-mode revocation (#85 asks 3 and 4). Restoring the identity is not the same as restoring
+access, and this is only the first half.

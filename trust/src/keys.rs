@@ -86,6 +86,57 @@ fn mint_signing_key_at(path: &Path) -> Result<SigningKey, KeyError> {
     result.map(|_| key)
 }
 
+/// Write SPECIFIC key bytes to `path` with the same discipline `load_or_generate` mints under:
+/// 0600, a per-call-unique temp, `create_new` so nothing is clobbered by a race (#85 ask 2).
+///
+/// Used by the recovery import. Separate from the mint path because the caller supplies the key —
+/// and separate from a plain `atomic_write` because a key file's MODE is load-bearing: a
+/// world-readable user key is an identity anyone on the box can present, and `doctor` reports
+/// exactly that.
+///
+/// `replace` decides what happens when `path` already exists: `false` refuses, `true` overwrites
+/// ATOMICALLY.
+///
+/// The overwrite is a `rename` over the target, not an unlink-then-link. The first version of the
+/// caller did the latter and left a window where a failed or interrupted write — ENOSPC, EPERM, a
+/// read-only mount — destroyed the key outright. That is not a small window to leave open, because
+/// the next boot does not come up keyless: `load_or_generate` mints a FRESH random identity, so the
+/// node returns as a third stranger and pairs as one if nobody notices. `rename` has no such
+/// window: the old key is in place until the instant the new one replaces it.
+pub fn write_signing_key(path: &Path, key: &SigningKey, replace: bool) -> Result<(), KeyError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), seq));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let result = (|| -> Result<(), KeyError> {
+        let mut f = opts.open(&tmp)?;
+        use std::io::Write;
+        f.write_all(&key.to_bytes())?;
+        f.sync_all()?;
+        if replace {
+            // ATOMIC overwrite: the old key is readable until the instant the new one replaces it,
+            // so no failure mode leaves the node with no key at all.
+            std::fs::rename(&tmp, path)?;
+        } else {
+            // `hard_link` FAILS if the target exists, so a concurrent writer cannot be clobbered —
+            // the same choice `load_or_generate` makes, for the same reason.
+            std::fs::hard_link(&tmp, path)?;
+        }
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    result
+}
+
 pub struct DeviceKey(SigningKey);
 
 impl DeviceKey {
@@ -175,6 +226,94 @@ impl UserKey {
     /// The user PUBLIC key bytes — carried in the join code (`user_pk` b64u) + the roster.
     pub fn public_bytes(&self) -> [u8; 32] {
         self.0.verifying_key().to_bytes()
+    }
+
+    /// Wrap a key the caller already holds — the recovery import (#85 ask 2), which decodes it
+    /// from a phrase rather than reading a file.
+    pub fn from_signing_key(key: SigningKey) -> Self {
+        Self(key)
+    }
+}
+
+#[cfg(test)]
+mod write_key_tests {
+    use super::*;
+
+    /// #85 ask 2: `write_signing_key` had NO tests. Deleting its `mode(0o600)` left the whole
+    /// `mcpmesh-trust` suite green — and without it the file is created `0666 & ~umask`, typically
+    /// 0644: a WORLD-READABLE user key, which is an identity anyone on the box can present. The
+    /// existing 0600 assertions all go through `mint_signing_key_at`, a separate copy of this code.
+    #[test]
+    #[cfg(unix)]
+    fn a_written_key_is_0600_and_holds_the_supplied_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // A path whose PARENT does not exist, so `create_dir_all` is exercised too.
+        let path = dir.path().join("nested").join("user.key");
+        let key = SigningKey::from_bytes(&[77u8; 32]);
+
+        write_signing_key(&path, &key, false).expect("writes");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "a key file's mode is load-bearing — 0644 is an identity anyone on the box can present"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            key.to_bytes(),
+            "and the bytes written must be the bytes supplied"
+        );
+    }
+
+    /// Without `replace` an existing key is REFUSED, not clobbered — the caller must decide to
+    /// discard an identity explicitly.
+    #[test]
+    fn writing_over_an_existing_key_needs_replace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("user.key");
+        let first = SigningKey::from_bytes(&[1u8; 32]);
+        let second = SigningKey::from_bytes(&[2u8; 32]);
+
+        write_signing_key(&path, &first, false).expect("first write");
+        assert!(
+            write_signing_key(&path, &second, false).is_err(),
+            "an existing key must not be clobbered without an explicit replace"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            first.to_bytes(),
+            "…and the refusal must leave the original INTACT, not half-replaced"
+        );
+
+        write_signing_key(&path, &second, true).expect("replace writes");
+        assert_eq!(std::fs::read(&path).unwrap(), second.to_bytes());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "the REPLACE path must set the mode too — it renames a temp over the target, and a \
+                 temp created without the mode would silently widen it"
+            );
+        }
+    }
+
+    /// No temp file is left behind on either path.
+    #[test]
+    fn no_temp_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("user.key");
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        write_signing_key(&path, &key, false).unwrap();
+        write_signing_key(&path, &key, true).unwrap();
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files leaked: {leftovers:?}");
     }
 }
 

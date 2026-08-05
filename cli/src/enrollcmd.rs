@@ -451,6 +451,90 @@ pub fn load_device_key() -> anyhow::Result<DeviceKey> {
     Ok(key)
 }
 
+/// `mcpmesh identity export`: print the recovery phrase for this node's user key (#85 ask 2).
+///
+/// The phrase IS the private key. This is the one command whose plain output is secret, so the
+/// human framing is deliberate: it leads with what the words are, not with the words.
+pub fn run_identity_export(json: bool) -> anyhow::Result<()> {
+    let out = with_daemon(async move |mut client| Ok(client.user_key_export().await?))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "recovery_phrase": out.recovery_phrase,
+                "user_id": out.user_id,
+            })
+        );
+        return Ok(());
+    }
+    println!("Recovery phrase for this identity ({}).", out.user_id);
+    println!();
+    println!("  {}", out.recovery_phrase);
+    println!();
+    println!("Write it down and keep it somewhere you keep valuables.");
+    println!("  → It IS the key: anyone who reads it can be you. It is not stored anywhere else,");
+    println!("    and nobody — including mcpmesh — can recover it for you.");
+    println!(
+        "  → It restores your identity on new hardware. It does NOT get that machine admitted"
+    );
+    println!("    by your peers; you still pair with them.");
+    Ok(())
+}
+
+/// `mcpmesh identity import <phrase>`: restore a user key on new hardware (#85 ask 2).
+pub fn run_identity_import(
+    phrase: Option<String>,
+    replace: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    // No argument → read stdin. An argv phrase is visible in `ps` to every process on the box and
+    // lands in shell history, which for a value that IS the private key is the wrong channel — and
+    // it contradicts what this command's own help says about the phrase not being stored anywhere.
+    // The argument stays supported because a person recovering an identity on a strange machine
+    // should not also have to work out how to pipe.
+    let phrase = match phrase {
+        Some(p) => p,
+        None => {
+            use std::io::Read;
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .context("read the recovery phrase from stdin")?;
+            anyhow::ensure!(
+                !buf.trim().is_empty(),
+                "no recovery phrase on stdin — pipe it in, or pass it as an argument"
+            );
+            buf
+        }
+    };
+    let out =
+        with_daemon(async move |mut client| Ok(client.user_key_import(&phrase, replace).await?))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "user_id": out.user_id, "replaced": out.replaced })
+        );
+        return Ok(());
+    }
+    if out.replaced {
+        println!(
+            "Replaced this node's user key. Identity is now {}.",
+            out.user_id
+        );
+    } else {
+        println!("Restored identity {}.", out.user_id);
+    }
+    println!(
+        "  → Check that is the id you meant to recover. A phrase that decodes to a DIFFERENT key \
+         looks exactly like your peers having forgotten you."
+    );
+    println!(
+        "  → Your peers do not admit this machine yet — they authorize per device. Pair with them, \
+         or enroll this device from another one you still hold (`mcpmesh invite --as-self`)."
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

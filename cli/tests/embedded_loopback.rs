@@ -739,3 +739,212 @@ async fn an_embedder_can_supply_its_own_peer_resolver() {
     b.shutdown().await;
     a.shutdown().await;
 }
+
+/// #85 ask 2: a person's `b64u:` identity survives the hardware.
+///
+/// It lived in one file on one machine with no export, import, or escrow verb anywhere. Replacing
+/// a laptop destroyed it — the new machine mints a fresh user key, presents a new `b64u:`, and is a
+/// stranger even to peers that had pinned the old one. The reporter's framing: the equivalent event
+/// in a centralized product is a password reset.
+///
+/// Driven through two SEPARATE node roots, which is the whole claim — a phrase written down on one
+/// machine restores the identity on a different one:
+///
+/// 1. Node a exports a phrase. Node b, a fresh root, has its OWN different identity.
+/// 2. b imports a's phrase and now presents a's `user_id`.
+/// 3. The change is LIVE — b's pairing identity is the restored one immediately, not after a
+///    restart, which is what a peer would actually see.
+/// 4. A second import is REFUSED without `replace`, because it would discard a live identity.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_recovery_phrase_restores_an_identity_on_new_hardware() {
+    let (a_root, b_root) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = NodeBuilder::new(a_root.path())
+        .config(hermetic())
+        .start()
+        .await
+        .expect("node a starts");
+    let b = NodeBuilder::new(b_root.path())
+        .config(hermetic())
+        .start()
+        .await
+        .expect("node b starts");
+
+    let mut a_ctl = a.control().await.expect("a control");
+    let exported = a_ctl
+        .user_key_export()
+        .await
+        .expect("a exports its identity");
+    assert_eq!(
+        exported.recovery_phrase.split_whitespace().count(),
+        33,
+        "a phrase is one word per key byte plus a checksum"
+    );
+    assert!(
+        exported.user_id.starts_with("b64u:"),
+        "the exported id is the stable b64u: identity peers pin: {}",
+        exported.user_id
+    );
+
+    // b starts life as somebody else. Without this the restore below could be a no-op.
+    let mut b_ctl = b.control().await.expect("b control");
+    let b_before = b_ctl
+        .user_key_export()
+        .await
+        .expect("b has its own identity")
+        .user_id;
+    assert_ne!(
+        b_before, exported.user_id,
+        "precondition: two fresh roots are two different people"
+    );
+
+    // THE primary use case — a new laptop — must NOT need `replace`. b's key was minted by the very
+    // boot that is about to import over it, seconds ago, and defending that is defending nothing:
+    // it pushed every recovering user to a flag whose help says it destroys things irreversibly,
+    // which trains exactly the wrong habit. Review found this by tracing that a fresh node always
+    // has a key on disk before the import can run.
+    let restored = b_ctl
+        .user_key_import(&exported.recovery_phrase, false)
+        .await
+        .expect("a key this boot minted must not require the destructive flag");
+    assert!(
+        !restored.replaced,
+        "…and it is not reported as replacing a real identity, because it did not"
+    );
+    assert_eq!(
+        restored.user_id, exported.user_id,
+        "THE claim: the same person, on different hardware"
+    );
+
+    // And the guard DOES protect a key that was not minted this boot. Constructed by restarting b
+    // on the same root: the key is now loaded, not minted, so it is an identity worth defending.
+    // Without this the S3 fix would read as "the guard was deleted".
+    b.shutdown().await;
+    let b = NodeBuilder::new(b_root.path())
+        .config(hermetic())
+        .start()
+        .await
+        .expect("b restarts on the same root");
+    let mut b_ctl = b.control().await.expect("b control after restart");
+    let refused = b_ctl
+        .user_key_import(&exported.recovery_phrase, false)
+        .await
+        .expect_err("a LOADED key must be defended");
+    assert!(
+        format!("{refused}").contains("did not mint just now"),
+        "and refused for THAT reason, not some incidental failure: {refused}"
+    );
+    let replaced = b_ctl
+        .user_key_import(&exported.recovery_phrase, true)
+        .await
+        .expect("an explicit replace still works");
+    assert!(replaced.replaced, "and reports that it replaced one");
+
+    // LIVE, not at the next restart — and asserted through what a PEER actually sees, not by
+    // re-reading the file. Re-exporting only proves the key landed on disk; the binding a node
+    // PRESENTS at pairing is separate state, and a node that kept presenting the OLD identity while
+    // its operator believed the recovery had taken would go on to pair and have the peer store the
+    // wrong person. That is the failure worth pinning, and re-export cannot see it: with the live
+    // install deleted, the re-export assertion still passed.
+    let c_root = tempfile::tempdir().unwrap();
+    let c = NodeBuilder::new(c_root.path())
+        .config(hermetic())
+        .start()
+        .await
+        .expect("node c starts");
+    b_ctl
+        .register_service(
+            "notes",
+            BackendSpec::Run {
+                cmd: vec![STUB.into()],
+                env: Default::default(),
+                cwd: None,
+            },
+            vec![],
+        )
+        .await
+        .expect("register notes");
+    let invite = b_ctl.invite(vec!["notes".into()]).await.expect("invite");
+    let mut c_ctl = c.control().await.expect("c control");
+    let paired = timeout(Duration::from_secs(30), c_ctl.pair(&invite.invite_line))
+        .await
+        .expect("pair within 30s")
+        .expect("pair");
+    assert_eq!(
+        paired.peer_user_id.as_deref(),
+        Some(exported.user_id.as_str()),
+        "a peer pairing with b RIGHT NOW must see the RESTORED identity — this is what recovery \
+         is for, and it is live state the on-disk key does not prove"
+    );
+    c.shutdown().await;
+
+    // A mistyped phrase is refused rather than restoring a different identity — the case that
+    // otherwise looks exactly like every peer having forgotten you.
+    //
+    // Corrupt the CHECKSUM word, not a key word. That is the one corruption which can never
+    // validate by luck: the key bytes are untouched, so the expected checksum is unchanged and any
+    // other word mismatches it, deterministically.
+    //
+    // Two earlier versions of this assertion were flaky-by-construction and both were caught here.
+    // The first swapped two positions inside an `if let Ok(..)`, so it asserted anything only when
+    // those words happened to be identical (~1/256). The second replaced a KEY word, which changes
+    // the key — and therefore its checksum — so it passed 255 times in 256 and failed the 256th,
+    // which is exactly the flake it was meant to remove.
+    let mut words: Vec<String> = exported
+        .recovery_phrase
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    let last = words.len() - 1;
+    let original = words[last].clone();
+    words[last] = if original == "abandon" {
+        "ability"
+    } else {
+        "abandon"
+    }
+    .to_string();
+    assert_ne!(
+        words[last], original,
+        "precondition: the phrase really is corrupted"
+    );
+    let typo = b_ctl.user_key_import(&words.join(" "), true).await;
+    assert!(
+        typo.is_err(),
+        "a corrupted phrase must be REFUSED, never silently restore a different identity — that \
+         failure is invisible, and looks exactly like the problem the person is trying to fix"
+    );
+
+    // …and the refusal left the identity ALONE. A guard that refuses after having already written
+    // would be worse than none.
+    assert_eq!(
+        b_ctl
+            .user_key_export()
+            .await
+            .expect("still exportable")
+            .user_id,
+        exported.user_id,
+        "a refused import must not have touched the key"
+    );
+
+    // #85: the phrase is a PRIVATE KEY, and every doc site says it reaches no other surface. The
+    // audit log is the one that would be worst — a durable, operator-readable file. Pinned here
+    // because the claim was asserted in four places and by nothing.
+    let audit = b_ctl
+        .request(mcpmesh_local_api::Request::AuditList(Default::default()))
+        .await
+        .expect("audit is readable");
+    let dumped = serde_json::to_string(&audit).expect("audit serializes");
+    for word in exported.recovery_phrase.split_whitespace() {
+        assert!(
+            !dumped.contains(&format!("\"{word}\"")),
+            "no word of the recovery phrase may reach the audit log: {word}"
+        );
+    }
+    assert!(
+        dumped.contains("user_key_import"),
+        "…while the EVENT itself must be recorded — not logging the secret is not the same as not \
+         logging the act"
+    );
+
+    b.shutdown().await;
+    a.shutdown().await;
+}

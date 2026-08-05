@@ -214,6 +214,11 @@ enum Cmd {
         /// The shell to emit a script for.
         shell: clap_complete::Shell,
     },
+    /// Back up or restore THIS person's identity — the `b64u:` user id peers pin (#85).
+    Identity {
+        #[command(subcommand)]
+        command: IdentityCmd,
+    },
     /// Internal, non-porcelain subcommands (auto-started by the CLI; not for direct use).
     Internal {
         #[command(subcommand)]
@@ -286,6 +291,35 @@ enum DevicesCmd {
     Add {
         /// The `mcpmesh-device:…` code from the new machine's `devices code`.
         device_code: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum IdentityCmd {
+    /// Print the recovery phrase for this node's user key.
+    ///
+    /// WRITE IT DOWN. The phrase IS the private key: anyone who reads it can present this
+    /// identity, and mcpmesh cannot recover it for you if you lose it. It is not stored anywhere
+    /// else, not logged, and not written to the audit file.
+    Export,
+    /// Restore a user key from a recovery phrase, on a new machine.
+    ///
+    /// Restores the `b64u:` identity — the one peers pinned, kb audiences key on, and a roster
+    /// names. It does NOT get this machine admitted by your peers: they authorize per device, and
+    /// this device is not in their allowlists. You still pair (or re-pair) with each of them.
+    Import {
+        /// The phrase, quoted. **Omit it to read from stdin instead, which is what you want.**
+        ///
+        /// An argument is visible in `ps` to every process on the machine and lands in your shell
+        /// history — for a value that IS the private key, that is the wrong channel. Piping it
+        /// (`… | mcpmesh identity import`) avoids both.
+        phrase: Option<String>,
+        /// Replace an existing user key on this node.
+        ///
+        /// Refused without it, because importing over a live key discards the identity this
+        /// machine currently presents — irreversibly, unless you have THAT key's phrase too.
+        #[arg(long)]
+        replace: bool,
     },
 }
 
@@ -574,6 +608,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             as_self,
         }) => run_pair(invite, remove, as_nickname, as_self, cli.json),
         Some(Cmd::Use { target }) => run_use(target, cli.json),
+        Some(Cmd::Identity {
+            command: IdentityCmd::Export,
+        }) => enrollcmd::run_identity_export(cli.json),
+        Some(Cmd::Identity {
+            command: IdentityCmd::Import { phrase, replace },
+        }) => enrollcmd::run_identity_import(phrase, replace, cli.json),
         Some(Cmd::Join {
             org_invite,
             name,
