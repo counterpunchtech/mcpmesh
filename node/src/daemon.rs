@@ -24,9 +24,9 @@
 mod accept;
 pub(crate) mod boot;
 pub(crate) mod config_write;
-mod dial;
+pub(crate) mod dial;
 mod dial_hint;
-mod handlers;
+pub(crate) mod handlers;
 mod org_author;
 mod path_watch;
 pub(crate) mod reach;
@@ -412,6 +412,25 @@ pub struct MeshState {
     /// authoring → `reload_lock` and never the reverse — nothing acquires this while holding
     /// `reload_lock` — so the graph stays acyclic.
     pub(crate) org_author_lock: tokio::sync::Mutex<()>,
+    /// Embedder-registered ALPNs → their handlers (#67), read by the accept loop's dispatch.
+    ///
+    /// mcpmesh had built the hard parts of a P2P application platform — identity, pairing, a trust
+    /// gate, relay fallback, discovery, rate limiting, a connection registry — and exposed exactly
+    /// ONE protocol shape on top: request/response MCP over bi-streams. Anything else (realtime
+    /// media wanting datagrams, bulk transfer, an app-level overlay) was out of reach no matter how
+    /// well the identity layer suited it, and the only alternative was a SECOND endpoint with a
+    /// second identity — discarding the gate, the pairing relationship and the relay config, and
+    /// making users pair twice.
+    ///
+    /// **Registered protocols go through the same `gate_and_register` as every built-in arm**, so
+    /// they inherit authorization, the connection registry and severing rather than bypassing them.
+    /// That is the whole point: a composition of pieces that already exist, not a second door.
+    ///
+    /// `RwLock` because registration is rare and the accept loop reads it per connection. Held only
+    /// for the clone-out, never across the handler's `accept`.
+    pub(crate) app_protocols: std::sync::RwLock<
+        std::collections::HashMap<Vec<u8>, Arc<dyn iroh::protocol::DynProtocolHandler>>,
+    >,
     /// EPHEMERAL service registrations (#36): in-memory only, never written to config, torn down
     /// when the registering control connection closes. Keyed by service name → its backend spec +
     /// allow list. Overlaid onto the config-built registry on every hot-reload
@@ -561,6 +580,7 @@ impl MeshState {
             probe_seq: std::sync::atomic::AtomicU64::new(0),
             probes_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
             org_author_lock: tokio::sync::Mutex::new(()),
+            app_protocols: std::sync::RwLock::new(std::collections::HashMap::new()),
             ephemeral_services: std::sync::Mutex::new(std::collections::HashMap::new()),
             fetches: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
@@ -769,6 +789,71 @@ impl MeshState {
             .read()
             .expect("app_metadata lock not poisoned")
             .clone()
+    }
+
+    /// Register an embedder protocol on `alpn` (#67), replacing any handler already on it, and
+    /// rebind the endpoint's advertised ALPN set so peers can negotiate it.
+    ///
+    /// Returns an error rather than registering when `alpn` is empty or begins with `mcpmesh/`.
+    /// That prefix is RESERVED: the accept loop dispatches the built-in arms by exact ALPN, and
+    /// this registry is consulted only for ALPNs it does not own — so a handler on `mcpmesh/mcp/1`
+    /// would be silently dead rather than dangerous, and one on a `mcpmesh/*` name mcpmesh adds
+    /// LATER would flip from working to dead on an upgrade. Refusing the namespace makes both
+    /// impossible. `app/*` is the suggested convention for embedder ALPNs.
+    ///
+    /// **Takes effect for connections negotiated from now on.** ALPN is chosen at handshake, so a
+    /// peer that connected before this call cannot use the new protocol — register during startup,
+    /// before announcing the node as ready, if that matters.
+    pub(crate) fn register_app_protocol(
+        &self,
+        alpn: &[u8],
+        handler: Arc<dyn iroh::protocol::DynProtocolHandler>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(!alpn.is_empty(), "an ALPN must not be empty");
+        anyhow::ensure!(
+            !alpn.starts_with(b"mcpmesh/"),
+            "the `mcpmesh/` ALPN namespace is reserved for mcpmesh's own protocols; use your own \
+             prefix (`app/…` by convention)"
+        );
+        {
+            let mut map = self
+                .app_protocols
+                .write()
+                .expect("app_protocols lock not poisoned");
+            map.insert(alpn.to_vec(), handler);
+        }
+        self.rebind_alpns();
+        Ok(())
+    }
+
+    /// Re-advertise the endpoint's ALPN set: the built-ins this node booted with, plus every
+    /// registered embedder protocol (#67).
+    ///
+    /// `set_alpns` REPLACES the whole set, so the built-ins are recomputed here rather than
+    /// appended to — appending to a stale list is how an endpoint quietly stops answering its own
+    /// protocols. The built-in list is derived from the same `roster_mode` signal boot used, so it
+    /// cannot drift from what was originally bound.
+    fn rebind_alpns(&self) {
+        let mut alpns = crate::daemon::boot::alpns_for(self.roster_transport_live());
+        let map = self
+            .app_protocols
+            .read()
+            .expect("app_protocols lock not poisoned");
+        alpns.extend(map.keys().cloned());
+        self.endpoint.set_alpns(alpns);
+    }
+
+    /// The handler registered for `alpn`, if any (#67). Cloned out — the lock is never held across
+    /// the handler's `accept`, which is long-running by design.
+    pub(crate) fn app_protocol(
+        &self,
+        alpn: &[u8],
+    ) -> Option<Arc<dyn iroh::protocol::DynProtocolHandler>> {
+        self.app_protocols
+            .read()
+            .expect("app_protocols lock not poisoned")
+            .get(alpn)
+            .cloned()
     }
 
     /// Is the roster TRANSPORT actually composed on this process (#93b)?

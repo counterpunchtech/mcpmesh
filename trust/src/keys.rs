@@ -95,6 +95,19 @@ impl DeviceKey {
         Ok((Self(key), created))
     }
 
+    /// Wrap a key the EMBEDDER already holds (#85), instead of loading one from disk.
+    ///
+    /// The point is what it does NOT do: no file is read, minted, or written. An application
+    /// keeping the key in the OS keychain (or a passphrase-wrapped blob, or hardware) never has to
+    /// materialise 32 raw secret bytes at a path the node owns — which was the entire at-rest
+    /// posture, and something an embedder could not fix from outside, because the file lives inside
+    /// the mesh root it is told not to hand-write.
+    ///
+    /// Custody moves with it: nothing here can recover the identity if the caller loses the key.
+    pub fn from_signing_key(key: SigningKey) -> Self {
+        Self(key)
+    }
+
     pub fn public_bytes(&self) -> [u8; 32] {
         self.0.verifying_key().to_bytes()
     }

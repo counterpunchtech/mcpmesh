@@ -362,6 +362,32 @@ pub fn spawn_accept_loop(mesh: Arc<MeshState>, services: Arc<Services>) -> JoinH
                             tracing::debug!(%e, "app-blob accept error");
                         }
                     }
+                    // #67: an EMBEDDER-registered protocol, if one claims this ALPN.
+                    //
+                    // Consulted only for ALPNs none of the arms above own, so a registration can
+                    // never shadow a built-in — and `register_app_protocol` additionally refuses
+                    // the whole `mcpmesh/` namespace, so it cannot even try, nor be broken by a
+                    // future `mcpmesh/*` protocol landing above it.
+                    //
+                    // Gated through the SAME `gate_and_register` as every other arm. That is the
+                    // entire value of this seam over an embedder standing up its own endpoint: the
+                    // custom protocol inherits authorization, the connection registry, and
+                    // severing on revocation, rather than being a second door into the node.
+                    other if mesh.app_protocol(other).is_some() => {
+                        let Some(handler) = mesh.app_protocol(other) else {
+                            return; // unregistered between the guard and here
+                        };
+                        let Some(_registration) = gate_and_register(&mesh, &conn, false) else {
+                            return;
+                        };
+                        // `_registration` is held for the handler's whole life, so the connection
+                        // stays in the registry and a revocation severs it mid-protocol.
+                        if let Err(e) =
+                            iroh::protocol::DynProtocolHandler::accept(handler.as_ref(), conn).await
+                        {
+                            tracing::debug!(%e, "app protocol accept error");
+                        }
+                    }
                     // An endpoint we never advertised should be unreachable (ALPN negotiation
                     // rejects it at handshake), but close defensively rather than hang.
                     _ => conn.close(0u32.into(), b"unknown alpn"),

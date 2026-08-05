@@ -1597,7 +1597,7 @@ pub(crate) async fn peer_diagnostics(
 
 /// Resolve a `peer` selector to a stored endpoint id (#52): an `eid:<hex>` decodes directly;
 /// else a stored `PeerEntry` by nickname; else the first device under a `b64u:` user_id.
-async fn resolve_peer_endpoint(mesh: &Arc<MeshState>, peer: &str) -> Result<[u8; 32]> {
+pub(crate) async fn resolve_peer_endpoint(mesh: &Arc<MeshState>, peer: &str) -> Result<[u8; 32]> {
     if let Some(hex) = peer.strip_prefix("eid:") {
         let bytes = data_encoding::HEXLOWER
             .decode(hex.as_bytes())

@@ -10,7 +10,7 @@ use mcpmesh_local_api::{ControlClient, connect_control_io};
 
 use crate::config::Config;
 use crate::control::serve_control_io;
-use crate::daemon::boot::{BootedNode, start_node};
+use crate::daemon::boot::{BootOverrides, BootedNode, start_node};
 use crate::paths::NodePaths;
 
 /// Everything that can refuse a [`NodeBuilder::start`]. Embedders branch on
@@ -56,6 +56,7 @@ pub struct NodeBuilder {
     root: PathBuf,
     config: Option<Config>,
     identity_conflict: Option<std::sync::Arc<crate::diag::IdentityConflict>>,
+    overrides: BootOverrides,
 }
 
 impl NodeBuilder {
@@ -68,6 +69,7 @@ impl NodeBuilder {
             root: root.into(),
             config: None,
             identity_conflict: None,
+            overrides: BootOverrides::default(),
         }
     }
 
@@ -116,13 +118,36 @@ impl NodeBuilder {
         self
     }
 
+    /// Run as `key` instead of reading (or minting) `<root>/config/device.key` (#85).
+    ///
+    /// **What this is for.** The default posture is 32 raw ed25519 secret bytes at 0600, in a
+    /// directory the node owns — no passphrase, no keychain, no hardware seam. An embedder could
+    /// not fix that from outside: the file is inside the mesh root it is told not to hand-write,
+    /// and there was no way to supply a decrypted key at boot. This is that way — unwrap the key
+    /// from wherever your platform keeps secrets and hand it over.
+    ///
+    /// **When set, no key file is read, minted, or written.** So the on-disk key never exists to be
+    /// stolen — and a node whose embedder holds the key cannot silently fall back to a file one,
+    /// which would boot happily under a DIFFERENT identity and leave every peer unable to reach it.
+    ///
+    /// **Custody moves to you.** mcpmesh cannot recover this identity if you lose the key: there is
+    /// no escrow and no recovery path (#85 asks 2-3, not shipped). It is also the identity every
+    /// peer pinned at pairing, so replacing it makes this node a stranger to all of them.
+    ///
+    /// The key must stay STABLE across restarts of the same node — passing a fresh one each boot
+    /// mints a new identity every time.
+    pub fn device_key(mut self, key: mcpmesh_trust::ed25519_dalek::SigningKey) -> Self {
+        self.overrides.device_key = Some(key);
+        self
+    }
+
     /// Boot the node: identity, stores, gates, the iroh endpoint, and every serving loop
     /// the daemon runs. Requires a multi-thread tokio runtime (the node spawns its serving
     /// loops onto the ambient runtime). Installs a process-default rustls `CryptoProvider`
     /// (ring) if the host application has not installed one — idempotent, the host's wins.
     pub async fn start(self) -> Result<Node, StartError> {
         let paths = NodePaths::under_root(&self.root);
-        let booted = start_node(paths, self.config).await?;
+        let booted = start_node(paths, self.config, self.overrides).await?;
         // #134: adopt the host's shared observation, so the layer IN THEIR subscriber and this
         // node's `status` read the same cell. Set after boot rather than threaded through it —
         // the field is only ever read by the status projection, never during construction.
@@ -176,6 +201,127 @@ impl Node {
     /// This node's mesh identity — what a peer's invite/pair flow binds to.
     pub fn endpoint_id(&self) -> iroh::EndpointId {
         self.mesh().endpoint.id()
+    }
+
+    /// Serve a custom protocol on `alpn`, through this node's existing trust gate (#67).
+    ///
+    /// **What this is for.** mcpmesh has already built the hard parts of a P2P application
+    /// platform — identity, pairing, a trust gate, relay fallback, discovery, rate limiting, a
+    /// connection registry — and exposes one protocol shape on top: request/response MCP over
+    /// bi-streams. Anything that does not fit (realtime media wanting datagrams, efficient bulk
+    /// transfer, an app-level overlay) was out of reach however well the identity layer suited it.
+    /// The alternative was a SECOND endpoint with a second identity, which discards the gate, the
+    /// pairing relationship and the relay config — and makes your users pair twice.
+    ///
+    /// **Your handler runs behind the same gate as every built-in protocol.** An unauthorized or
+    /// revoked peer is closed before `accept` is called; the connection is entered in the registry,
+    /// so revoking that peer SEVERS it mid-protocol rather than waiting for it to end. You get the
+    /// authenticated `EndpointId` from `connection.remote_id()`, and it is the same identity
+    /// `_meta["mcpmesh/peer"]` names on the MCP path.
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    /// use mcpmesh_node::iroh;
+    ///
+    /// #[derive(Debug)]
+    /// struct MyProto;
+    ///
+    /// impl iroh::protocol::ProtocolHandler for MyProto {
+    ///     async fn accept(
+    ///         &self,
+    ///         conn: iroh::endpoint::Connection,
+    ///     ) -> Result<(), iroh::protocol::AcceptError> {
+    ///         let _peer = conn.remote_id(); // the AUTHENTICATED caller
+    ///         Ok(())
+    ///     }
+    /// }
+    ///
+    /// # fn f(node: &mcpmesh_node::Node) -> anyhow::Result<()> {
+    /// node.accept_protocol(b"app/myproto/1", Arc::new(MyProto))?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// **The `mcpmesh/` prefix is reserved** and registering under it is an error — the accept loop
+    /// dispatches its own protocols by exact ALPN before consulting this registry, so a handler
+    /// there would be silently dead, and one on a name mcpmesh adds later would flip from working
+    /// to dead on an upgrade. `app/…` is the suggested convention.
+    ///
+    /// **Takes effect for connections negotiated from now on.** ALPN is chosen at handshake, so a
+    /// peer already connected cannot use the new protocol. Register during startup, before you
+    /// announce the node as ready, unless that is genuinely what you want.
+    ///
+    /// Registering the same `alpn` twice replaces the handler; connections already running under
+    /// the old one continue on it.
+    pub fn accept_protocol(
+        &self,
+        alpn: &[u8],
+        handler: Arc<dyn iroh::protocol::DynProtocolHandler>,
+    ) -> anyhow::Result<()> {
+        self.mesh().register_app_protocol(alpn, handler)
+    }
+
+    /// This node's currently-dialable address (#67) — its endpoint id plus whatever direct
+    /// addresses and relay it has, exactly what a pairing invite embeds.
+    ///
+    /// For handing an address to a peer OUT-OF-BAND, when your application has its own channel for
+    /// that and does not want a pairing invite. Carries transport vocabulary by nature, which is
+    /// why it is a typed accessor rather than anything on the control surface.
+    ///
+    /// A snapshot: addresses change as the network does, and immediately after boot it may hold
+    /// only local ones. It authorizes nothing — a peer dialling this still faces the trust gate.
+    pub fn endpoint_addr(&self) -> iroh::EndpointAddr {
+        self.mesh().endpoint.addr()
+    }
+
+    /// Dial `peer` on a custom `alpn` — the client half of [`accept_protocol`](Self::accept_protocol)
+    /// (#67).
+    ///
+    /// `peer` is resolved exactly as `open_session` resolves it: a paired nickname, a `b64u:`
+    /// user_id (any of that person's devices), or an `eid:` device principal. That resolution — plus
+    /// the stored dial-address hint and this node's relay configuration — is most of what makes this
+    /// worth using over a raw endpoint: an embedder holding only "alice" has no way to turn that
+    /// into an address, and an embedder that stood up its own endpoint would not have the pairing
+    /// that produced it.
+    ///
+    /// ```no_run
+    /// # async fn f(node: &mcpmesh_node::Node) -> anyhow::Result<()> {
+    /// let conn = node.connect_protocol("alice", b"app/myproto/1").await?;
+    /// let (send, recv) = conn.open_bi().await?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    ///
+    /// **This does not authorize anything.** It dials; the REMOTE side's gate decides whether to
+    /// admit you, and will close the connection if you are not paired with them. Symmetrically,
+    /// your own handler is protected by your gate — see `accept_protocol`.
+    ///
+    /// Errors when `peer` resolves to nobody, or when the dial fails. A peer that is simply offline
+    /// is a dial failure, not a distinct condition.
+    pub async fn connect_protocol(
+        &self,
+        peer: &str,
+        alpn: &[u8],
+    ) -> anyhow::Result<iroh::endpoint::Connection> {
+        let mesh = self.mesh();
+        let endpoint_id = crate::daemon::handlers::resolve_peer_endpoint(mesh, peer).await?;
+        let id = iroh::EndpointId::from_bytes(&endpoint_id)
+            .map_err(|e| anyhow::anyhow!("stored endpoint id for '{peer}' is invalid: {e}"))?;
+        // The stored last-addr hint, attached exactly as the service dial attaches it — so a
+        // hermetic/localhost mesh with no discovery can still reach the peer, and a hint for a
+        // DIFFERENT id is discarded rather than dialled.
+        let addr = {
+            let store = mesh.store.clone();
+            let entry = crate::util::blocking("join connect_protocol store read", move || {
+                store.resolve(&endpoint_id)
+            })
+            .await??;
+            crate::daemon::dial::stored_dial_addr(entry.and_then(|e| e.last_addr).as_deref(), id)
+        };
+        self.mesh()
+            .endpoint
+            .connect(addr, alpn)
+            .await
+            .map_err(|e| anyhow::anyhow!("dial '{peer}' on a custom protocol: {e}"))
     }
 
     /// Sign an application payload with this node's DEVICE key, under the embedder's own

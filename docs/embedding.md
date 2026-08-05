@@ -198,3 +198,80 @@ Three things worth knowing:
 Not yet available: **org root rotation** (#93c). An operator machine that dies takes the org with it
 once the roster expires, so back up `<root>/config/org-root.key` alongside `roster.json` — copying
 both to a second operator machine works today.
+
+## Your own protocol on the node's endpoint (`accept_protocol`, #67)
+
+mcpmesh has already built the hard parts of a P2P application platform — identity, pairing, a trust
+gate, relay fallback, discovery, rate limiting, a connection registry — and exposes one protocol
+shape on top: request/response MCP over bi-streams. Anything that does not fit (realtime media
+wanting datagrams, efficient bulk transfer, an app-level overlay) used to be out of reach however
+well the identity layer suited it.
+
+The alternative was a second iroh endpoint with a second identity, which discards the gate, the
+pairing relationship and the relay config — and makes your users pair twice.
+
+```rust
+use mcpmesh_node::iroh;                      // ← always this re-export, never your own dep
+
+#[derive(Debug)]
+struct MyProto;
+
+impl iroh::protocol::ProtocolHandler for MyProto {
+    async fn accept(&self, conn: iroh::endpoint::Connection)
+        -> Result<(), iroh::protocol::AcceptError>
+    {
+        // conn.remote_id() is the AUTHENTICATED peer — the same identity the MCP path injects.
+        let (send, recv) = conn.accept_bi().await?;
+        // …your protocol…
+        Ok(())
+    }
+}
+
+node.accept_protocol(b"app/myproto/1", std::sync::Arc::new(MyProto))?;
+
+// The client half. `peer` resolves exactly as `open_session` resolves it — a paired nickname,
+// a `b64u:` user_id, or an `eid:` principal.
+let conn = node.connect_protocol("alice", b"app/myproto/1").await?;
+```
+
+Four things worth knowing:
+
+- **Your handler runs behind the same gate as every built-in protocol.** An unauthorized or revoked
+  peer is closed *before* `accept` is called, and the connection is entered in the registry — so
+  revoking that peer **severs it mid-protocol** rather than waiting for it to end. That inheritance
+  is the whole reason to use this rather than your own endpoint.
+- **`mcpmesh/` is reserved** and registering under it is an error. The accept loop dispatches its own
+  protocols by exact ALPN before consulting your registry, so a handler there would be silently
+  dead — and one on a name mcpmesh adds *later* would flip from working to dead on an upgrade.
+  `app/…` is the suggested convention.
+- **Registration takes effect for connections negotiated from now on.** ALPN is chosen at handshake,
+  so a peer already connected cannot use the new protocol. Register during startup, before you
+  announce the node as ready.
+- `connect_protocol` **dials; it does not authorize**. The remote side's gate decides whether to
+  admit you, and closes the connection if you are not paired with them.
+
+`Node::endpoint_addr()` gives this node's currently-dialable address if your application has its own
+out-of-band channel and does not want a pairing invite. It authorizes nothing — a peer dialling it
+still faces the gate.
+
+## Holding the device key yourself (`device_key`, #85)
+
+By default the device key is 32 raw ed25519 secret bytes at 0600, in a directory the node owns — no
+passphrase, no keychain, no hardware seam. You could not change that from outside: the file lives
+inside the mesh root you are told not to hand-write, and nothing accepted a decrypted key at boot.
+
+```rust
+use mcpmesh_trust::ed25519_dalek::SigningKey;
+
+let signing = SigningKey::from_bytes(&secret_from_your_keychain);
+let node = NodeBuilder::new(root).device_key(signing).start().await?;
+```
+
+**When set, no key file is read, minted, or written** — so the raw secret never lands on disk, and
+the node cannot silently fall back to a file key (which would boot happily under a *different*
+identity, leaving every paired peer unable to reach it).
+
+**Custody moves to you.** mcpmesh cannot recover this identity if you lose the key — there is no
+escrow and no recovery path today (#85 asks 2–3). It is also the identity every peer pinned at
+pairing, so replacing it makes this node a stranger to all of them. Pass the **same** key on every
+restart of the same node; a fresh one mints a new identity each boot.
