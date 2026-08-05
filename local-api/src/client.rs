@@ -684,10 +684,38 @@ impl ControlClient {
         ticket: &str,
         dest_path: &str,
     ) -> Result<BlobFetchResult, ClientError> {
+        self.blob_fetch_from(ticket, dest_path, Vec::new()).await
+    }
+
+    /// [`blob_fetch`](Self::blob_fetch) with ADDITIONAL sources to try when the ticket's publisher
+    /// does not answer (#83).
+    ///
+    /// Content addressing makes every recipient a potential source; a single-address ticket made
+    /// that unusable, so a file shared with a room became unfetchable the moment the sender closed
+    /// their laptop — even though others in the room already held the identical verified bytes.
+    ///
+    /// `from` takes stable principals (`eid:`, `b64u:`) or paired nicknames — the same vocabulary
+    /// `open_session` takes, and naming a PERSON offers every device of theirs. They are tried in
+    /// order, **after** the publisher, so a live publisher costs nothing and an offline one costs
+    /// one dial timeout.
+    ///
+    /// **The bytes are BLAKE3-verified against the ticket's hash whoever serves them**, so an
+    /// alternate cannot substitute content. It can refuse: an alternate serves only hashes it has
+    /// republished into a scope that grants you (see `blob_republish`), and an ungranted one
+    /// answers a permission error and the fetch moves on. Every failure mode falls through, not
+    /// only an unreachable dial — a refusal, a missing hash, a reset, and a stalled transfer all
+    /// move to the next source. `api_minor >= 47`.
+    pub async fn blob_fetch_from(
+        &mut self,
+        ticket: &str,
+        dest_path: &str,
+        from: Vec<String>,
+    ) -> Result<BlobFetchResult, ClientError> {
         self.request_typed(
             Request::BlobFetch(BlobFetchParams {
                 ticket: ticket.to_string(),
                 dest_path: dest_path.to_string(),
+                from,
             }),
             "blob_fetch result",
         )

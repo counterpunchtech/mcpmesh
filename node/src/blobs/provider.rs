@@ -287,6 +287,15 @@ pub struct AppBlobs {
     publish_delay: std::sync::Mutex<Option<std::time::Duration>>,
 }
 
+/// How long ONE source gets to complete the transfer before the fetch moves on (#83).
+///
+/// Generous, because a large blob over a slow link is not a failure — but bounded, because a source
+/// that accepts the connection and then stalls would otherwise hold the whole fetch open with live
+/// alternates untried, which is the failure this feature exists to prevent. A caller wanting a
+/// tighter budget cancels (`blob_fetch_cancel`, #172); a caller wanting a looser one is asking for
+/// an unbounded wait, which is not on offer.
+const SOURCE_TRANSFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
 impl AppBlobs {
     /// End the request-time gate loop, releasing the `TrustGate` (and with it the redb handle).
     /// Idempotent; a fetcher has no loop and is a no-op.
@@ -647,12 +656,57 @@ impl AppBlobs {
     /// Returns the verified hash. A provider that refuses this
     /// caller (accept-time 401 or request-time Permission) surfaces here as an `Err`.
     pub async fn fetch(&self, ticket_str: &str) -> Result<Hash> {
+        self.fetch_from(ticket_str, &[]).await
+    }
+
+    /// [`fetch`](Self::fetch), with ADDITIONAL sources to try when the publisher does not answer
+    /// (#83).
+    ///
+    /// Content addressing makes every recipient a potential source, and the single-address ticket
+    /// made that unusable: a file shared with a room became unfetchable the moment the sender
+    /// closed their laptop, even though other people in the room already held the identical
+    /// verified bytes.
+    ///
+    /// **Order: the ticket's own address first, then `alternates` in the caller's order.** The
+    /// publisher is the authoritative source and a live one costs nothing; an offline one costs one
+    /// dial timeout before the first alternate is tried. Every attempt is bounded, so an
+    /// unreachable source costs a timeout rather than the caller's future.
+    ///
+    /// **Substitution is impossible whoever answers.** `store.remote().fetch(conn, hash)` verifies
+    /// the BLAKE3 hash from the ticket against the bytes as they stream, so an alternate can serve
+    /// the blob or fail — it cannot serve a different one. What an alternate CAN do is refuse: it
+    /// serves only hashes it has republished into a scope granting us, so an ungranted alternate
+    /// answers a permission error and the fetch moves on to the next.
+    ///
+    /// **Every failure mode falls through**, not only an unreachable dial: a refusal, a source that
+    /// does not hold the hash, a mid-stream reset, and a transfer that stalls past
+    /// [`SOURCE_TRANSFER_TIMEOUT`] all move to the next source. The first version broke out of the
+    /// loop as soon as a dial SUCCEEDED, which meant one online-but-ungranted peer ended the fetch
+    /// with a live alternate untried — the ordinary case for a room where only some recipients
+    /// republished.
+    ///
+    /// Errors carry the LAST failure with every source's count, rather than only the publisher's —
+    /// "dial failed" for a blob nobody could serve is a misleading thing to hand a user.
+    pub async fn fetch_from(
+        &self,
+        ticket_str: &str,
+        alternates: &[iroh::EndpointAddr],
+    ) -> Result<Hash> {
         let ticket: BlobTicket = ticket_str.parse().context("parse blob ticket")?;
-        let conn = self
-            .endpoint
-            .connect(ticket.addr().clone(), APP_BLOB_ALPN)
-            .await
-            .context("dial app-blob provider")?;
+        // The publisher first, then the caller's alternates.
+        let mut sources: Vec<iroh::EndpointAddr> = Vec::with_capacity(1 + alternates.len());
+        sources.push(ticket.addr().clone());
+        // The ticket's address is already source 0. An alternate naming the SAME endpoint would
+        // otherwise be dialled twice for one timeout each — natural when a caller names the
+        // publisher to reach their OTHER devices, since a person expands to all of them.
+        sources.extend(
+            alternates
+                .iter()
+                .filter(|a| a.id != ticket.addr().id)
+                .cloned(),
+        );
+        let total = sources.len();
+
         // #82 ask 2: consume the progress stream instead of dropping it on the floor. Same
         // coalescing rule as the serving side — `GetProgressItem::Progress` arrives per chunk, so
         // an uncoalesced fetch would flood the ring exactly as an uncoalesced serve would.
@@ -660,11 +714,8 @@ impl AppBlobs {
         // `bytes_total` is NOT known here: the fetch side learns the size only as bytes arrive, so
         // the frame carries `None` and a consumer renders an indeterminate bar until `Completed`.
         // Reporting the ticket's hash as a size, or guessing, would be worse than saying so.
-        use n0_future::StreamExt as _;
-        let hash_hex = ticket.hash().to_hex().to_string();
-        let mut stream = std::pin::pin!(self.store.remote().fetch(conn, ticket.hash()).stream());
         let mut st = TransferProgressState {
-            hash: hash_hex,
+            hash: ticket.hash().to_hex().to_string(),
             peer: None,
             total: None,
             done: 0,
@@ -672,43 +723,109 @@ impl AppBlobs {
             epochs: 0,
             in_epoch: 0,
         };
+        // `Started` fires ONCE, before any source is tried — not per attempt. A subscriber is
+        // watching one logical transfer; emitting a Started/Aborted pair per failed source would
+        // make a UI show a file failing several times before it succeeded.
         if let Some(b) = &self.transfers {
             emit_fetch(b, &st, mcpmesh_local_api::BlobTransferState::Started);
         }
-        // Starts as an ERROR, not Ok: the old `.complete()` returned `LocalFailure("stream closed
-        // without result")` when the stream ended with neither Done nor Error. Defaulting to Ok
-        // turned that into a silent success — a fail-OPEN where the previous code failed closed
-        // (#82 gate). Practically unreachable; the direction of the default is the point.
-        let mut outcome: Result<()> = Err(anyhow::anyhow!("fetch stream closed without a result"));
-        while let Some(item) = stream.next().await {
-            match item {
-                iroh_blobs::api::remote::GetProgressItem::Progress(done) => {
-                    st.done = done;
-                    if let Some(b) = &self.transfers
-                        && st.done.saturating_sub(st.last_emitted) >= st.stride()
-                    {
-                        st.note_emitted();
-                        emit_fetch(b, &st, mcpmesh_local_api::BlobTransferState::Progress);
+
+        let mut last: Option<anyhow::Error> = None;
+        for (i, addr) in sources.into_iter().enumerate() {
+            // EVERY failure mode falls through to the next source, not just an unreachable dial.
+            // The first version broke out of the loop as soon as a dial SUCCEEDED, so a source that
+            // was online but had not republished the hash — which answers a permission refusal
+            // post-connect — ended the whole fetch with a live alternate sitting untried. That is
+            // the ordinary case for the room-of-eight this feature exists for: some recipients
+            // republished, some did not. Caught by review, by execution.
+            match self.try_source(addr, &ticket, &mut st).await {
+                Ok(()) => {
+                    if i > 0 {
+                        tracing::info!(
+                            source = i,
+                            of = total,
+                            "app-blob fetch fell back to an alternate source"
+                        );
                     }
-                }
-                iroh_blobs::api::remote::GetProgressItem::Done(_) => {
                     if let Some(b) = &self.transfers {
                         emit_fetch(b, &st, mcpmesh_local_api::BlobTransferState::Completed);
                     }
-                    outcome = Ok(());
+                    return Ok(ticket.hash());
                 }
-                iroh_blobs::api::remote::GetProgressItem::Error(e) => {
-                    if let Some(b) = &self.transfers {
-                        emit_fetch(b, &st, mcpmesh_local_api::BlobTransferState::Aborted);
-                    }
-                    // `{e:#}` keeps the GetError source chain that `.context(..)` used to
-                    // preserve; `{e}` alone flattened it to the outermost message.
-                    outcome = Err(anyhow::anyhow!("{e:#}"));
+                Err(e) => {
+                    tracing::debug!(source = i, of = total, %e, "app-blob source failed");
+                    last = Some(e);
                 }
             }
         }
-        outcome.context("fetch app blob")?;
-        Ok(ticket.hash())
+        // Only now is the transfer over. ONE terminal frame, after every source has been tried.
+        if let Some(b) = &self.transfers {
+            emit_fetch(b, &st, mcpmesh_local_api::BlobTransferState::Aborted);
+        }
+        let e = last.unwrap_or_else(|| anyhow::anyhow!("no source to try"));
+        Err(e.context(format!(
+            "fetch app blob (tried {total} source{})",
+            if total == 1 { "" } else { "s" }
+        )))
+    }
+
+    /// One source attempt: dial, then stream. Returns `Ok` only on a completed, verified transfer.
+    ///
+    /// Both halves are bounded — the dial by [`DIAL_TIMEOUT`], the transfer by
+    /// [`SOURCE_TRANSFER_TIMEOUT`] — because a source that accepts and then stalls would otherwise
+    /// hold the fetch open forever with live alternates untried. Progress is reported into the
+    /// SHARED `st`, so a transfer that resumes on a later source continues the same counter rather
+    /// than restarting a consumer's progress bar.
+    ///
+    /// [`DIAL_TIMEOUT`]: crate::daemon::dial::DIAL_TIMEOUT
+    async fn try_source(
+        &self,
+        addr: iroh::EndpointAddr,
+        ticket: &BlobTicket,
+        st: &mut TransferProgressState,
+    ) -> Result<()> {
+        use n0_future::StreamExt as _;
+        let conn = tokio::time::timeout(
+            crate::daemon::dial::DIAL_TIMEOUT,
+            self.endpoint.connect(addr, APP_BLOB_ALPN),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("dial timed out"))?
+        .context("dial app-blob provider")?;
+
+        let transfer = async {
+            let mut stream =
+                std::pin::pin!(self.store.remote().fetch(conn, ticket.hash()).stream());
+            // Starts as an ERROR, not Ok: the old `.complete()` returned `LocalFailure("stream
+            // closed without result")` when the stream ended with neither Done nor Error.
+            // Defaulting to Ok turned that into a silent success — a fail-OPEN where the previous
+            // code failed closed (#82 gate). Practically unreachable; the direction is the point.
+            let mut outcome: Result<()> =
+                Err(anyhow::anyhow!("fetch stream closed without a result"));
+            while let Some(item) = stream.next().await {
+                match item {
+                    iroh_blobs::api::remote::GetProgressItem::Progress(done) => {
+                        st.done = done;
+                        if let Some(b) = &self.transfers
+                            && st.done.saturating_sub(st.last_emitted) >= st.stride()
+                        {
+                            st.note_emitted();
+                            emit_fetch(b, st, mcpmesh_local_api::BlobTransferState::Progress);
+                        }
+                    }
+                    iroh_blobs::api::remote::GetProgressItem::Done(_) => outcome = Ok(()),
+                    iroh_blobs::api::remote::GetProgressItem::Error(e) => {
+                        // `{e:#}` keeps the GetError source chain that `.context(..)` used to
+                        // preserve; `{e}` alone flattened it to the outermost message.
+                        outcome = Err(anyhow::anyhow!("{e:#}"));
+                    }
+                }
+            }
+            outcome
+        };
+        tokio::time::timeout(SOURCE_TRANSFER_TIMEOUT, transfer)
+            .await
+            .map_err(|_| anyhow::anyhow!("transfer stalled"))?
     }
 
     /// Broadcast a terminal `Aborted` for a fetch that was STOPPED rather than finished (#172).

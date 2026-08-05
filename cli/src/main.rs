@@ -378,6 +378,17 @@ enum BlobCmd {
         ticket: String,
         /// Local path to write the verified blob to.
         dest: PathBuf,
+        /// Also try these peers if the publisher does not answer (#83). Repeatable.
+        ///
+        /// A ticket names ONE address, so a file shared with a group becomes unfetchable the
+        /// moment the sender closes their laptop — even though others already hold the identical
+        /// verified bytes. Name them here and the fetch falls back, in order, after the publisher.
+        ///
+        /// Takes a paired nickname or an `eid:`/`b64u:` principal. They can only help if they have
+        /// republished the blob into a scope that grants you; the bytes are hash-verified whoever
+        /// serves them, so none of them can substitute a different file.
+        #[arg(long = "from", value_name = "peer")]
+        from: Vec<String>,
     },
     /// Stop an in-flight `blob fetch` of this hash (#172).
     ///
@@ -1162,9 +1173,9 @@ fn run_internal_blob(command: BlobCmd, json: bool) -> anyhow::Result<()> {
                     }
                 }
             }
-            BlobCmd::Fetch { ticket, dest } => {
+            BlobCmd::Fetch { ticket, dest, from } => {
                 let dest_path = dest.to_string_lossy().into_owned();
-                let r = client.blob_fetch(&ticket, &dest_path).await?;
+                let r = client.blob_fetch_from(&ticket, &dest_path, from).await?;
                 if json {
                     println!(
                         "{}",

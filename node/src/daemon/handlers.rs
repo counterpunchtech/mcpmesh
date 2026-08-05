@@ -377,6 +377,7 @@ pub(crate) async fn blob_fetch(
     state: &DaemonState,
     ticket: String,
     dest_path: String,
+    from: Vec<String>,
 ) -> Result<BlobFetchResult> {
     let mesh = state.mesh_required()?;
     let provider = mesh.app_blobs().await.context(
@@ -388,7 +389,13 @@ pub(crate) async fn blob_fetch(
     let mut guard = FetchGuard::register(mesh, hash_hex.clone(), provider.clone());
     let dest = PathBuf::from(dest_path);
     let work = async {
-        let hash = provider.fetch(&ticket).await.context("fetch blob")?;
+        // #83: resolve the caller's alternate sources to dialable addresses BEFORE the fetch, so a
+        // name that resolves to nobody is a clean error rather than a silent skip mid-transfer.
+        let alternates = crate::daemon::dial::blob_source_addrs(mesh, &from).await?;
+        let hash = provider
+            .fetch_from(&ticket, &alternates)
+            .await
+            .context("fetch blob")?;
         // STREAM to disk (#82). The previous `read_bytes` + `fs::write` held the entire blob in
         // memory before a byte landed, so peak RSS was blob-sized and a large fetch OOM-killed the
         // node rather than merely being slow. `export` writes incrementally and reports the size,
@@ -4471,7 +4478,13 @@ allow = []
         let dest = dir.path().join("out.bin");
         let fetch_state = state.clone();
         let fetching = tokio::spawn(async move {
-            blob_fetch(&fetch_state, ticket, dest.to_string_lossy().into_owned()).await
+            blob_fetch(
+                &fetch_state,
+                ticket,
+                dest.to_string_lossy().into_owned(),
+                Vec::new(),
+            )
+            .await
         });
 
         // Wait until the fetch has registered itself, so the cancel cannot arrive before it starts.
@@ -4524,7 +4537,7 @@ allow = []
         );
         assert!(blob_grant(&st, "scope".into(), "bob".into()).await.is_err());
         assert!(
-            blob_fetch(&st, "ticket".into(), "/tmp/dst".into())
+            blob_fetch(&st, "ticket".into(), "/tmp/dst".into(), Vec::new())
                 .await
                 .is_err()
         );

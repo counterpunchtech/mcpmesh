@@ -225,7 +225,7 @@ Methods split into two groups by audience:
 > the node they run on. Treat them as "stop serving from here", never as "unshare from everyone".
 
 | `blob_list` | `{scope?, hash?, limit?, offset?, counts_only?}` — the daemon's scopes (name → hashes + grants + withdrawn + counts). **All params optional; `blob_list {}` still works.** `scope` is an EXACT match, never a prefix. `hash` is normalized before comparing. **A DEFAULT LIMIT of 256 scopes applies when `limit` is absent (#84b, `api_minor >= 20`)** — unpaged, this verb rendered every scope into one frame against the 16 MiB cap; past it the CLIENT rejects the frame as malformed. The control surface carries **no** strike bound, so the connection survives — but you get an opaque error and no way to page, which is an unusable answer rather than a large one. **Note the cap counts SCOPES, not bytes:** one legacy scope holding very many hashes can still exceed the frame at `limit: 1` (see #84a). Check `truncated` and page with `offset`; `total` is the match count BEFORE limit/offset. `counts_only` omits the three vectors and keeps `hash_count`/`grant_count`/`withdrawn_count`. | `{scopes:[…], total, truncated}` |
-| `blob_fetch` | `{ticket, dest_path}` | `{hash, bytes_len}` |
+| `blob_fetch` | `{ticket, dest_path, from?}`  — **`from`** (`api_minor >= 47`, #83) names ADDITIONAL sources to try when the publisher does not answer: stable principals or paired nicknames, tried in order **after** the ticket's own address, so a live publisher costs nothing. **Every** failure falls through to the next source — unreachable, refused, or a stalled transfer — not only an unreachable dial. The bytes stay BLAKE3-verified against the ticket's hash whoever serves them, so an alternate can refuse but never substitute; it must have republished the hash into a scope that grants you. At most 32 sources; more is an error, not a truncation. | `{hash, bytes_len}` |
 | `blob_fetch_cancel` | `{hash}` — stop every in-flight `blob_fetch` of that blob, `api_minor >= 44` (#172). Send it on a **different** control connection than the fetch (see below). | `{cancelled}` |
 
 > **`blob_fetch` no longer blocks the connection, and IS cancellable — from `api_minor >= 44`**
@@ -638,6 +638,41 @@ pipe**. The client sends:
 the mesh and, from that point, every byte in each direction is the remote MCP session verbatim —
 `initialize`, `tools/list`, `tools/call`, and so on, in the same newline-framed JSON. The client
 pumps its consumer's stdin/stdout against this connection until either side closes.
+
+### What happens when a session drops (#167)
+
+A held session does **not** survive a suspend-and-resume — a closed laptop lid, a machine sleeping,
+an interface change. This section states the contract plainly rather than leaving it to be
+discovered, because the honest answer is currently "the embedder owns it".
+
+**Why no `[network]` knob fixes it.** While a machine is suspended it sends nothing, and *the peer's
+idle timer keeps running*. After the negotiated idle timeout (30 s by default) the peer tears the
+connection down — before the lid is even reopened. `keep_alive_secs` cannot help: a suspended
+process emits no PINGs. `idle_timeout_secs` is negotiated to the **minimum of both peers' values**
+(RFC 9000 §10.1), so surviving a lid close would need *every* peer raised in lockstep to a value
+covering the longest expected suspend — which is the "a dead peer is never detected" trade in a
+worse form, not a fix. Resume also often brings a new network: iroh can migrate paths on a live
+connection, but not on one the peer already closed.
+
+**The three questions, answered:**
+
+| | Today |
+|---|---|
+| Does `open_session` transparently re-establish? | **No.** The connection ends and your client sees EOF on the pipe. There is no automatic re-dial, and no retry budget. |
+| Is there a resume/suspend signal to hook? | **No.** mcpmesh surfaces no OS suspend/resume event. Your platform has one; mcpmesh does not wrap it. |
+| What does `subscribe` do? | The stream **terminates** with the connection. It does not resume, and events that occurred while you were gone are not replayed. You do learn about in-session loss: a `{"type":"lagged","dropped":N}` frame reports events dropped because your consumer fell behind — but that is backpressure, not a reconnect. |
+
+**So: hold the session loosely and re-dial on failure.** Treat `open_session` as a pipe that can end
+at any time, keep the state your application needs outside it, and re-open on EOF rather than
+assuming a long-lived session. For presence, poll `status` or re-`subscribe` after a reconnect and
+take a fresh snapshot — the stream gives you transitions, and a reconnect means you missed some.
+
+`reachable` on a `status` row is the signal that a peer is currently dialable; it is advisory, and
+absence never blocks a dial, so re-dialling an "unreachable" peer is legitimate and often works.
+
+**Not implemented, and worth knowing it is not:** transparent session resumption, a resume signal,
+and replay of missed `subscribe` events. These need reconnection semantics rather than transport
+tuning — see #167.
 
 ### Server-initiated frames (push), and what is metered
 
@@ -1347,6 +1382,8 @@ things:
   `43`–`44` a `mcpmesh-enroll:` line pasted into an ordinary "join" field completed the enrollment,
   and the caller learned which ceremony had run from `enrolled_as_self` afterwards. A consumer that
   does not offer device enrollment should require `>= 45` rather than pair without the guard.
+  `BlobFetchParams.from` (#83) is `api_minor >= 47` — additive and absent-tolerant, so guard only
+  before sending it.
   The roster-mode embedding surface (#66, #93) is `api_minor >= 46`: the `org_create` /
   `org_approve` / `org_revoke` authoring verbs, the `roster_members` read,
   `PresencePeer.display_name` + `groups`, `RosterStatus.groups`, and
