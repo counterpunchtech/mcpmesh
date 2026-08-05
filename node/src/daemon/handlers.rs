@@ -2415,6 +2415,7 @@ pub(crate) async fn user_key_export(
     state: &DaemonState,
 ) -> Result<mcpmesh_local_api::UserKeyExportResult> {
     let mesh = state.mesh_required()?;
+    let _guard = mesh.user_key_lock.lock().await;
     let path = mesh
         .user_key_path
         .get()
@@ -2425,22 +2426,35 @@ pub(crate) async fn user_key_export(
         "this node has no user key to export ({})",
         path.display()
     );
-    let (key, created) = blocking("join user key export", {
+    // READ, never `load_or_generate` — that mints when the file is absent, so a "read-only" export
+    // racing a missing key would leave a fresh random identity behind that became this node's at
+    // the next restart. Refusing AFTER the side effect is not refusing.
+    let bytes = blocking("join user key export", {
         let path = path.clone();
-        move || mcpmesh_trust::UserKey::load_or_generate(&path)
+        move || std::fs::read(&path)
     })
     .await?
-    .map_err(|e| anyhow::anyhow!("user key error at {}: {e}", path.display()))?;
-    // `load_or_generate` MINTS when absent. The `exists` check above makes that unreachable, and
-    // this refuses rather than trusting the check to have raced correctly: a phrase for a key that
-    // did not exist a moment ago is a phrase for an identity nobody has.
-    anyhow::ensure!(
-        !created,
-        "refusing to export a user key that was just minted — there was nothing to recover"
+    .with_context(|| format!("read user key at {}", path.display()))?;
+    let bytes: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("the user key at {} is not 32 bytes", path.display()))?;
+    let key = mcpmesh_trust::UserKey::from_signing_key(
+        mcpmesh_trust::ed25519_dalek::SigningKey::from_bytes(&bytes),
     );
+    let user_id = mcpmesh_trust::binding::user_id(&key);
+    // AUDITED — the event, never the phrase. Exporting lifts the private key off this machine, and
+    // leaving the more dangerous of the two verbs untraced while the import is recorded confuses
+    // "do not log the secret" (right) with "do not log the act" (wrong).
+    mesh.audit().record(crate::audit::AuditRecord::trust(
+        crate::audit::now_ts(),
+        "user_key_export".into(),
+        Some(user_id.clone()),
+        None,
+    ));
     Ok(mcpmesh_local_api::UserKeyExportResult {
-        recovery_phrase: crate::pairing::recovery::encode(&key.signing_key().to_bytes()),
-        user_id: mcpmesh_trust::binding::user_id(&key),
+        recovery_phrase: crate::pairing::recovery::encode(&bytes),
+        user_id,
     })
 }
 
@@ -2466,44 +2480,84 @@ pub(crate) async fn user_key_import(
     let mesh = state.mesh_required()?;
     // Decoded FIRST, before anything is touched: a mistyped phrase must not have moved a key file.
     let bytes = crate::pairing::recovery::decode(&recovery_phrase)?;
+    let _guard = mesh.user_key_lock.lock().await;
     let path = mesh
         .user_key_path
         .get()
         .cloned()
         .context("this node has no user key path resolved")?;
     let existed = path.exists();
+    // A key BOOT minted is not an identity anyone has seen — and on the primary use case, a new
+    // laptop, that is the only key there is: `identity import` auto-starts a daemon, which mints
+    // one before the import runs. Guarding it made the common path always refuse and pushed people
+    // to a flag whose help says it destroys things irreversibly. Training that habit is worse than
+    // not having the guard.
+    //
+    // Unset (a control-only or test daemon that never resolved a key) is treated as "not minted
+    // here", which fails CLOSED: the guard applies, and the caller can still pass `replace`.
+    let minted_here = *mesh.user_key_minted_at_boot.get().unwrap_or(&false);
+    let protects = existed && !minted_here;
     anyhow::ensure!(
-        !existed || replace,
-        "this node already has a user key ({}); importing over it discards the identity it \
-         currently presents, which cannot be undone without that key's own recovery phrase. Pass \
-         replace to do it anyway",
+        !protects || replace,
+        "this node already has a user key ({}) that it did not mint just now; importing over it \
+         discards the identity it currently presents, which cannot be undone without that key's \
+         own recovery phrase. Pass replace to do it anyway",
         path.display()
     );
 
     let key = mcpmesh_trust::ed25519_dalek::SigningKey::from_bytes(&bytes);
     let write_key = key.clone();
     let write_path = path.clone();
+    let overwrite = existed; // any file present must be renamed over, throwaway or not
     blocking("join user key import", move || {
-        if write_path.exists() {
-            // `write_signing_key` refuses an existing target by design, so the explicit replace
-            // removes it first. Ordered so a failed write cannot leave the node with NO key: the
-            // remove and the write are adjacent, and a crash between them is recoverable with the
-            // same phrase the caller just supplied.
-            std::fs::remove_file(&write_path)?;
-        }
-        mcpmesh_trust::keys::write_signing_key(&write_path, &write_key)
+        // ONE atomic step. The first version removed the old key and then wrote — leaving a window
+        // where any write failure destroyed the identity outright, and the next boot came up as a
+        // fresh random stranger rather than keyless. `write_signing_key(replace)` renames over the
+        // target instead: the old key is readable until the new one replaces it.
+        mcpmesh_trust::keys::write_signing_key(&write_path, &write_key, overwrite)
             .map_err(|e| anyhow::anyhow!("write user key at {}: {e}", write_path.display()))
     })
     .await??;
 
-    // LIVE, via #86's adopted-binding path: the identity this node presents changes now.
+    // LIVE: the identity this node presents changes now, not at the next restart. A
+    // restart-required answer would leave it presenting the OLD identity while its operator
+    // believed the recovery had taken — they would go on to pair, and the peer would store the
+    // wrong person.
+    //
+    // Its OWN slot, not #86's adopted one. That slot means "this device holds no user key", and
+    // after an import it does; conflating them made a freshly-recovered machine refuse to endorse
+    // or to enroll its owner's other devices — the very remedy the recovery CLI prints.
+    // `set_imported_binding` also CLEARS the adopted slot, because an import supersedes an
+    // enrollment: this device now holds the key.
     let user_key = mcpmesh_trust::UserKey::from_signing_key(key);
     let (user_pk, sig) = mcpmesh_trust::binding::present(&user_key, mesh.endpoint.id().as_bytes());
-    mesh.set_self_binding_live(Some(crate::pairing::rendezvous::SelfBinding {
-        user_pk,
-        sig,
-    }));
+    mesh.set_imported_binding(crate::pairing::rendezvous::SelfBinding { user_pk, sig });
+    // …and the adopted-binding SIDECAR, or boot re-reads it and the import silently reverts at the
+    // next restart. Best-effort: the live state is already correct, and a node that cannot remove
+    // the file is better off running with the right identity than refusing the whole import.
+    let sidecar = mesh.adopted_binding_path();
+    if sidecar.exists()
+        && let Err(e) = std::fs::remove_file(&sidecar)
+    {
+        tracing::warn!(
+            %e,
+            path = %sidecar.display(),
+            "could not remove the superseded enrollment binding; it will be re-read at the next restart"
+        );
+    }
     let user_id = mcpmesh_trust::binding::user_id(&user_key);
+    // #85/#66: in ROSTER mode the org's signed roster pins the device→user binding for THIS
+    // endpoint, against the user_pk that was current when the operator approved it. Importing a
+    // different key desyncs this device from its roster entry, and nothing re-signs — an operator
+    // has to re-approve. Said out loud rather than left to be discovered as "roster mode stopped
+    // working"; not refused, because a person recovering an identity may legitimately need to.
+    if mesh.roster.view().is_some() {
+        tracing::warn!(
+            %user_id,
+            "user key imported on a ROSTER-mode node — the signed roster still pins the previous \
+             user key for this device, so an operator must re-approve it"
+        );
+    }
     // Trust event: an identity change is exactly the kind of thing an operator reads a log to find.
     // The user_id only — never the phrase, never the key.
     mesh.audit().record(crate::audit::AuditRecord::trust(
@@ -2515,7 +2569,11 @@ pub(crate) async fn user_key_import(
     tracing::info!(%user_id, replaced = existed, "user key imported from a recovery phrase");
     Ok(mcpmesh_local_api::UserKeyImportResult {
         user_id,
-        replaced: existed,
+        // `protects`, not `existed`: it answers "was a real identity discarded", which is what a UI
+        // would warn about. A key this boot minted seconds ago existed on disk and was worth
+        // nothing, so reporting that as a replacement would have every new-laptop recovery claim
+        // it destroyed something.
+        replaced: protects,
     })
 }
 
@@ -3537,6 +3595,67 @@ mod tests {
     /// The commit claimed "an enrolled device cannot enroll a third — it holds no private key".
     /// That was FALSE: boot always mints a local user key, so the device signed with the LOCAL key
     /// while PRESENTING the adopted one — producing endorsements under an id no peer has ever
+    /// #85 ask 2: a machine that just RECOVERED its identity must still be able to endorse and to
+    /// enroll its owner's other devices.
+    ///
+    /// The first version of `user_key_import` installed the restored binding through #86's
+    /// `adopted_binding` slot. But that slot does not mean "the binding to present" — it means
+    /// *this device was enrolled into someone else's identity and holds no authority over it*, and
+    /// `peer_endorse` and `sign_binding` both gate on exactly that reading.
+    ///
+    /// So importing your own key made the node refuse to endorse, with a message saying it did not
+    /// hold a key it had just imported — and silently disabled `invite --as-self`, which is the
+    /// very remedy the recovery CLI prints ("enroll this device from another one you still hold").
+    /// A recovered person could not re-enroll their other devices FROM the recovered machine.
+    ///
+    /// Review found it by probe. The fix gives the import its own slot; this pins that the two
+    /// questions stay separate.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recovered_device_can_still_endorse_and_enroll() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        let key_path = dir.path().join("user.key");
+        mesh.set_user_key_path(key_path.clone());
+        // Model a node whose key was LOADED, not minted this boot — the case the replace guard
+        // defends, and the one an import has to survive.
+        let (existing, _) = mcpmesh_trust::UserKey::load_or_generate(&key_path).unwrap();
+        let _ = mesh.user_key_minted_at_boot.set(false);
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+
+        // Precondition: before the import this device holds its own key and can enroll.
+        assert!(
+            (mesh.inviter_ctx().sign_binding)(&[7u8; 32]).is_some(),
+            "precondition: a device holding its own key can sign a device binding"
+        );
+
+        let phrase = crate::pairing::recovery::encode(&existing.signing_key().to_bytes());
+        let out = user_key_import(&state, phrase, true)
+            .await
+            .expect("import succeeds");
+        assert_eq!(out.user_id, mcpmesh_trust::binding::user_id(&existing));
+
+        // THE assertion. Both of these went false when the import borrowed #86's slot.
+        assert!(
+            mesh.adopted_binding.read().expect("lock").is_none(),
+            "an import must not mark this device as ENROLLED — it holds the key it just imported"
+        );
+        assert!(
+            (mesh.inviter_ctx().sign_binding)(&[7u8; 32]).is_some(),
+            "…so `invite --as-self` must still be able to enroll another device, which is exactly \
+             the remedy the recovery CLI tells a recovered person to use"
+        );
+
+        // And the restored binding IS the one presented.
+        let presented = mesh.self_binding().expect("a binding is presented");
+        assert_eq!(
+            presented.user_pk,
+            mcpmesh_trust::roster::encode_b64u(&existing.public_bytes()),
+            "the presented identity must be the restored one"
+        );
+    }
+
     /// paired with, silently unredeemable.
     #[tokio::test(flavor = "multi_thread")]
     async fn an_enrolled_device_cannot_endorse_or_enroll() {

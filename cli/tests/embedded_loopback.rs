@@ -797,27 +797,47 @@ async fn a_recovery_phrase_restores_an_identity_on_new_hardware() {
         "precondition: two fresh roots are two different people"
     );
 
-    // Restoring onto a node that already has a key must be REFUSED — it would discard the identity
-    // that node currently presents, irreversibly without that key's own phrase.
-    let refused = b_ctl
+    // THE primary use case — a new laptop — must NOT need `replace`. b's key was minted by the very
+    // boot that is about to import over it, seconds ago, and defending that is defending nothing:
+    // it pushed every recovering user to a flag whose help says it destroys things irreversibly,
+    // which trains exactly the wrong habit. Review found this by tracing that a fresh node always
+    // has a key on disk before the import can run.
+    let restored = b_ctl
         .user_key_import(&exported.recovery_phrase, false)
         .await
-        .expect_err("importing over a live key must be refused");
+        .expect("a key this boot minted must not require the destructive flag");
     assert!(
-        format!("{refused}").contains("already has a user key"),
-        "and refused for THAT reason, not some incidental failure: {refused}"
+        !restored.replaced,
+        "…and it is not reported as replacing a real identity, because it did not"
     );
-
-    // With the explicit replace, the identity moves.
-    let restored = b_ctl
-        .user_key_import(&exported.recovery_phrase, true)
-        .await
-        .expect("an explicit replace restores the identity");
     assert_eq!(
         restored.user_id, exported.user_id,
         "THE claim: the same person, on different hardware"
     );
-    assert!(restored.replaced, "and it reports that it replaced one");
+
+    // And the guard DOES protect a key that was not minted this boot. Constructed by restarting b
+    // on the same root: the key is now loaded, not minted, so it is an identity worth defending.
+    // Without this the S3 fix would read as "the guard was deleted".
+    b.shutdown().await;
+    let b = NodeBuilder::new(b_root.path())
+        .config(hermetic())
+        .start()
+        .await
+        .expect("b restarts on the same root");
+    let mut b_ctl = b.control().await.expect("b control after restart");
+    let refused = b_ctl
+        .user_key_import(&exported.recovery_phrase, false)
+        .await
+        .expect_err("a LOADED key must be defended");
+    assert!(
+        format!("{refused}").contains("did not mint just now"),
+        "and refused for THAT reason, not some incidental failure: {refused}"
+    );
+    let replaced = b_ctl
+        .user_key_import(&exported.recovery_phrase, true)
+        .await
+        .expect("an explicit replace still works");
+    assert!(replaced.replaced, "and reports that it replaced one");
 
     // LIVE, not at the next restart — and asserted through what a PEER actually sees, not by
     // re-reading the file. Re-exporting only proves the key landed on disk; the binding a node
@@ -859,17 +879,71 @@ async fn a_recovery_phrase_restores_an_identity_on_new_hardware() {
 
     // A mistyped phrase is refused rather than restoring a different identity — the case that
     // otherwise looks exactly like every peer having forgotten you.
-    let mut words: Vec<&str> = exported.recovery_phrase.split_whitespace().collect();
-    words.swap(0, 1);
+    //
+    // Corrupt the CHECKSUM word, not a key word. That is the one corruption which can never
+    // validate by luck: the key bytes are untouched, so the expected checksum is unchanged and any
+    // other word mismatches it, deterministically.
+    //
+    // Two earlier versions of this assertion were flaky-by-construction and both were caught here.
+    // The first swapped two positions inside an `if let Ok(..)`, so it asserted anything only when
+    // those words happened to be identical (~1/256). The second replaced a KEY word, which changes
+    // the key — and therefore its checksum — so it passed 255 times in 256 and failed the 256th,
+    // which is exactly the flake it was meant to remove.
+    let mut words: Vec<String> = exported
+        .recovery_phrase
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    let last = words.len() - 1;
+    let original = words[last].clone();
+    words[last] = if original == "abandon" {
+        "ability"
+    } else {
+        "abandon"
+    }
+    .to_string();
+    assert_ne!(
+        words[last], original,
+        "precondition: the phrase really is corrupted"
+    );
     let typo = b_ctl.user_key_import(&words.join(" "), true).await;
-    // A swap of two identical words is a no-op, so accept either outcome — but if it DID decode,
-    // it must have decoded to the same identity, never a different one.
-    if let Ok(r) = typo {
-        assert_eq!(
-            r.user_id, exported.user_id,
-            "a phrase must never restore an identity other than the one it encodes"
+    assert!(
+        typo.is_err(),
+        "a corrupted phrase must be REFUSED, never silently restore a different identity — that \
+         failure is invisible, and looks exactly like the problem the person is trying to fix"
+    );
+
+    // …and the refusal left the identity ALONE. A guard that refuses after having already written
+    // would be worse than none.
+    assert_eq!(
+        b_ctl
+            .user_key_export()
+            .await
+            .expect("still exportable")
+            .user_id,
+        exported.user_id,
+        "a refused import must not have touched the key"
+    );
+
+    // #85: the phrase is a PRIVATE KEY, and every doc site says it reaches no other surface. The
+    // audit log is the one that would be worst — a durable, operator-readable file. Pinned here
+    // because the claim was asserted in four places and by nothing.
+    let audit = b_ctl
+        .request(mcpmesh_local_api::Request::AuditList(Default::default()))
+        .await
+        .expect("audit is readable");
+    let dumped = serde_json::to_string(&audit).expect("audit serializes");
+    for word in exported.recovery_phrase.split_whitespace() {
+        assert!(
+            !dumped.contains(&format!("\"{word}\"")),
+            "no word of the recovery phrase may reach the audit log: {word}"
         );
     }
+    assert!(
+        dumped.contains("user_key_import"),
+        "…while the EVENT itself must be recorded — not logging the secret is not the same as not \
+         logging the act"
+    );
 
     b.shutdown().await;
     a.shutdown().await;

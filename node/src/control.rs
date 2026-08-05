@@ -797,8 +797,6 @@ pub(crate) async fn handle_request(req: &Value, state: &DaemonState) -> Value {
             })
             .await,
         ),
-        // Read-only: decode + verify a join code and return the fingerprint the operator confirms
-        // OUT-OF-BAND before approving. Nothing is signed, installed, or persisted.
         // #85 ask 2: the recovery phrase. The response carries a PRIVATE KEY — never audited,
         // never logged, and it exists nowhere else on this surface.
         Some("user_key_export") => respond(
@@ -814,6 +812,8 @@ pub(crate) async fn handle_request(req: &Value, state: &DaemonState) -> Value {
             })
             .await,
         ),
+        // Read-only: decode + verify a join code and return the fingerprint the operator confirms
+        // OUT-OF-BAND before approving. Nothing is signed, installed, or persisted.
         Some("org_join_code") => respond(
             id,
             "org_join_code",

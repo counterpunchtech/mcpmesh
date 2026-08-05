@@ -482,7 +482,31 @@ pub fn run_identity_export(json: bool) -> anyhow::Result<()> {
 }
 
 /// `mcpmesh identity import <phrase>`: restore a user key on new hardware (#85 ask 2).
-pub fn run_identity_import(phrase: String, replace: bool, json: bool) -> anyhow::Result<()> {
+pub fn run_identity_import(
+    phrase: Option<String>,
+    replace: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    // No argument → read stdin. An argv phrase is visible in `ps` to every process on the box and
+    // lands in shell history, which for a value that IS the private key is the wrong channel — and
+    // it contradicts what this command's own help says about the phrase not being stored anywhere.
+    // The argument stays supported because a person recovering an identity on a strange machine
+    // should not also have to work out how to pipe.
+    let phrase = match phrase {
+        Some(p) => p,
+        None => {
+            use std::io::Read;
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .context("read the recovery phrase from stdin")?;
+            anyhow::ensure!(
+                !buf.trim().is_empty(),
+                "no recovery phrase on stdin — pipe it in, or pass it as an argument"
+            );
+            buf
+        }
+    };
     let out =
         with_daemon(async move |mut client| Ok(client.user_key_import(&phrase, replace).await?))?;
     if json {

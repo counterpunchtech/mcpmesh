@@ -308,8 +308,12 @@ enum IdentityCmd {
     /// names. It does NOT get this machine admitted by your peers: they authorize per device, and
     /// this device is not in their allowlists. You still pair (or re-pair) with each of them.
     Import {
-        /// The phrase, quoted. Whitespace and case are forgiven; a mistyped word is refused.
-        phrase: String,
+        /// The phrase, quoted. **Omit it to read from stdin instead, which is what you want.**
+        ///
+        /// An argument is visible in `ps` to every process on the machine and lands in your shell
+        /// history — for a value that IS the private key, that is the wrong channel. Piping it
+        /// (`… | mcpmesh identity import`) avoids both.
+        phrase: Option<String>,
         /// Replace an existing user key on this node.
         ///
         /// Refused without it, because importing over a live key discards the identity this

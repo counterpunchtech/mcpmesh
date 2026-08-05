@@ -1409,7 +1409,7 @@ pub struct OrgApproveResult {
 }
 
 /// Params of [`Request::UserKeyImport`] (#85 ask 2).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserKeyImportParams {
     /// The recovery phrase, as written down. Whitespace and case are forgiven; a wrong word, the
@@ -1426,13 +1426,36 @@ pub struct UserKeyImportParams {
 ///
 /// **`recovery_phrase` is the private key.** Show it to the person who owns it, once, and do not
 /// persist it anywhere your application would not persist the key file itself.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserKeyExportResult {
     /// 33 words. Write them down in order.
     pub recovery_phrase: String,
     /// The `b64u:` identity this phrase restores — safe to display and to record, unlike the
     /// phrase. Compare it after an import to confirm the right identity came back.
     pub user_id: String,
+}
+
+/// REDACTING `Debug` — the phrase is a private key, and a derived one would put it in any
+/// `tracing::debug!(?params)` a future change adds to the dispatch, or in an embedder's `dbg!`.
+/// Three lines to make that leak unrepresentable rather than merely absent today.
+impl std::fmt::Debug for UserKeyImportParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserKeyImportParams")
+            .field("recovery_phrase", &"<redacted>")
+            .field("replace", &self.replace)
+            .finish()
+    }
+}
+
+/// REDACTING `Debug` — see [`UserKeyImportParams`]. The `user_id` is safe and is kept, because a
+/// `{:?}` with nothing in it is worse for debugging than one with the non-secret half.
+impl std::fmt::Debug for UserKeyExportResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserKeyExportResult")
+            .field("recovery_phrase", &"<redacted>")
+            .field("user_id", &self.user_id)
+            .finish()
+    }
 }
 
 /// Result of [`Request::UserKeyImport`] (#85 ask 2).
@@ -1443,7 +1466,12 @@ pub struct UserKeyImportResult {
     /// the definitive answer, and the only one that distinguishes "restored the wrong key" from
     /// "peers have not seen me yet".
     pub user_id: String,
-    /// `true` when this replaced a user key that already existed (`replace` was set).
+    /// `true` when this discarded a REAL identity — a user key the node had loaded from disk,
+    /// rather than one it minted at this boot and had never presented to anyone.
+    ///
+    /// The distinction is the useful one: a fresh node always has a key on disk before an import
+    /// can run (its own boot mints one), so "a file existed" would be `true` for every recovery on
+    /// new hardware and would have a UI warn that something was destroyed when nothing was.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub replaced: bool,
 }

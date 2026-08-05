@@ -133,13 +133,33 @@ mod tests {
         let phrase = encode(&key);
         let words: Vec<&str> = phrase.split_whitespace().collect();
 
-        // Case, extra whitespace, newlines, and stray punctuation from a numbered list.
+        // Case, extra whitespace and newlines.
         let messy = format!(
             "  {}\n\t{}  ",
             words[..4].join("  ").to_uppercase(),
             words[4..].join("\n")
         );
         assert_eq!(decode(&messy).unwrap(), key, "shape must not matter");
+
+        // PUNCTUATION — the shape someone actually transcribes from a numbered list, and the one
+        // this test used to CLAIM to cover while exercising only whitespace and case. A
+        // `to_lowercase`-only decoder passed it; review caught that by mutation.
+        let numbered: String = words
+            .iter()
+            .enumerate()
+            .map(|(i, w)| format!("{}. {w},", i + 1))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            decode(&numbered).unwrap(),
+            key,
+            "a phrase copied out of a numbered, comma-separated list must decode"
+        );
+        assert_eq!(
+            decode(&words.join("; ")).unwrap(),
+            key,
+            "…and stray separators between words"
+        );
 
         // A WRONG word is refused, and named by position.
         let mut bad = words.clone();
