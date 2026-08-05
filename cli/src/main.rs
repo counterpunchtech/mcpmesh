@@ -219,6 +219,15 @@ enum Cmd {
         #[command(subcommand)]
         command: IdentityCmd,
     },
+    /// Mark a device DEAD — locally, or with a signed statement your peers can apply (#85).
+    ///
+    /// Not the same as `pair --remove`. Removal says "we are not working together"; a re-pair
+    /// afterwards is normal. Revocation says "this device is compromised", outlives the pair row,
+    /// and cuts live sessions immediately.
+    Revoke {
+        #[command(subcommand)]
+        command: RevokeCmd,
+    },
     /// Internal, non-porcelain subcommands (auto-started by the CLI; not for direct use).
     Internal {
         #[command(subcommand)]
@@ -320,6 +329,52 @@ enum IdentityCmd {
         /// machine currently presents — irreversibly, unless you have THAT key's phrase too.
         #[arg(long)]
         replace: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum RevokeCmd {
+    /// Refuse a peer's device on THIS node.
+    ///
+    /// Your own local decision about someone else's device. Live sessions are severed now, not when
+    /// the peer next disconnects — an MCP session can stay open for days.
+    ///
+    /// A `b64u:` user id revokes EVERY device you know of that person's, which is what you want
+    /// when the answer is "not on any of their machines".
+    Peer {
+        /// A nickname, an `eid:` device principal, or a `b64u:` user id.
+        peer: String,
+        /// A note for yourself, shown in `mcpmesh status`.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Lift a local revocation (`revoke peer`), restoring the peer if its pair row survives.
+    Undo {
+        /// The same nickname, `eid:`, or `b64u:` you revoked.
+        peer: String,
+    },
+    /// Sign a revocation of ONE OF YOUR OWN devices, and print a token to send your peers.
+    ///
+    /// This is the one that matters when a machine is lost or stolen: your peers cannot discover
+    /// it, and until they act, whoever holds that disk authenticates as you. Run it from a machine
+    /// that still has your user key, naming the device you no longer have.
+    ///
+    /// The token is not a secret — it grants nothing and only asks that an endpoint be treated as
+    /// dead. Send it however you sent them the invite; mcpmesh has no channel of its own for it in
+    /// pairing mode.
+    Device {
+        /// The `eid:` principal of your lost device, from `mcpmesh status` on a peer, or your own
+        /// records.
+        endpoint: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Apply a `mcpmesh-revoke:` token a peer sent you.
+    ///
+    /// Honoured only from someone you have already paired with, and only for their OWN devices.
+    Import {
+        /// The `mcpmesh-revoke:...` token. Omit to read from stdin.
+        token: Option<String>,
     },
 }
 
@@ -615,6 +670,18 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Some(Cmd::Identity {
             command: IdentityCmd::Import { phrase, replace },
         }) => enrollcmd::run_identity_import(phrase, replace, cli.json),
+        Some(Cmd::Revoke {
+            command: RevokeCmd::Peer { peer, reason },
+        }) => enrollcmd::run_revoke_peer(peer, reason, cli.json),
+        Some(Cmd::Revoke {
+            command: RevokeCmd::Undo { peer },
+        }) => enrollcmd::run_revoke_undo(peer, cli.json),
+        Some(Cmd::Revoke {
+            command: RevokeCmd::Device { endpoint, reason },
+        }) => enrollcmd::run_revoke_device(endpoint, reason, cli.json),
+        Some(Cmd::Revoke {
+            command: RevokeCmd::Import { token },
+        }) => enrollcmd::run_revoke_import(token, cli.json),
         Some(Cmd::Join {
             org_invite,
             name,

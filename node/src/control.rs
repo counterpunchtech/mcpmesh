@@ -712,6 +712,33 @@ pub(crate) async fn handle_request(req: &Value, state: &DaemonState) -> Value {
         // Rename a contact's nickname (Contacts rename): the person's `user_id` (or a
         // provisional `nickname`) + the new nickname `to`. `rename_peer` guards the collision
         // (no inheriting another identity's grants), rewrites allow lists, and reloads.
+        // #85 ask 4 — pairing-mode revocation. `peer_revoke` is an operator's LOCAL decision about
+        // someone else's device; `device_revoke` signs a portable statement about one of THIS
+        // person's own. Deliberately distinct from `peer_remove`: removal is routine and
+        // re-pairable, revocation is a compromise claim that outlives the pair row.
+        Some("peer_revoke") => respond(
+            id,
+            "peer_revoke",
+            with_params(&params, |p| crate::daemon::peer_revoke(state, p)).await,
+        ),
+        Some("peer_unrevoke") => respond(
+            id,
+            "peer_unrevoke",
+            with_params(&params, |p| crate::daemon::peer_unrevoke(state, p)).await,
+        ),
+        Some("device_revoke") => respond(
+            id,
+            "device_revoke",
+            with_params(&params, |p| crate::daemon::device_revoke(state, p)).await,
+        ),
+        Some("device_revocation_import") => respond(
+            id,
+            "device_revocation_import",
+            with_params(&params, |p| {
+                crate::daemon::device_revocation_import(state, p)
+            })
+            .await,
+        ),
         Some("peer_rename") => respond(
             id,
             "peer_rename",
@@ -1377,7 +1404,33 @@ pub(crate) fn status_result(state: &DaemonState) -> Result<StatusResult> {
             .expect("self_net_change lock not poisoned");
         crate::daemon::self_network_now(mesh, stamp)
     });
+    // #85 ask 4: the revocation list, rendered with the local nickname where one survives —
+    // revocation never deletes the pair row, so it usually does, and a list of bare `eid:` hex is
+    // unreadable for the operator who has to act on it. `None` without a mesh.
+    let revoked: Vec<mcpmesh_local_api::RevokedEndpoint> = state
+        .mesh()
+        .map(|mesh| {
+            let rows = mesh.store.list().unwrap_or_default();
+            mesh.store
+                .list_revoked()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|r| mcpmesh_local_api::RevokedEndpoint {
+                    principal: mcpmesh_net::EndpointId::from_bytes(r.endpoint_id).principal(),
+                    revoked_at_epoch: r.revoked_at,
+                    source: r.source,
+                    signer_user_id: r.signer_user_id,
+                    reason: r.reason,
+                    nickname: rows
+                        .iter()
+                        .find(|e| e.endpoint_id == r.endpoint_id)
+                        .map(|e| e.nickname.clone()),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     Ok(StatusResult {
+        revoked,
         stack_version: state.stack_version.clone(),
         services,
         peers,

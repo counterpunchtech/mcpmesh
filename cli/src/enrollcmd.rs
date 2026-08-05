@@ -535,6 +535,122 @@ pub fn run_identity_import(
     Ok(())
 }
 
+/// `mcpmesh revoke peer <peer>` (#85 ask 4).
+pub fn run_revoke_peer(peer: String, reason: Option<String>, json: bool) -> anyhow::Result<()> {
+    let p = peer.clone();
+    let out = with_daemon(async move |mut client| Ok(client.peer_revoke(p, reason).await?))?;
+    if json {
+        println!("{}", serde_json::to_string(&out)?);
+        return Ok(());
+    }
+    println!(
+        "Revoked {} device(s) for {peer}; {} live connection(s) cut.",
+        out.revoked.len(),
+        out.severed
+    );
+    for p in &out.revoked {
+        println!("  {p}");
+    }
+    println!();
+    println!("They are refused from now on, even if they were paired — revocation outlives the");
+    println!("pair row, so this cannot be undone by re-pairing. Use `mcpmesh revoke undo` if you");
+    println!("did not mean it.");
+    println!("  → This is LOCAL. Your other devices, and your peers, still admit them.");
+    Ok(())
+}
+
+/// `mcpmesh revoke undo <peer>` (#85 ask 4).
+pub fn run_revoke_undo(peer: String, json: bool) -> anyhow::Result<()> {
+    let p = peer.clone();
+    let out = with_daemon(async move |mut client| Ok(client.peer_unrevoke(p).await?))?;
+    if json {
+        println!("{}", serde_json::to_string(&out)?);
+        return Ok(());
+    }
+    if out.unrevoked.is_empty() {
+        println!("Nothing to undo — no revocation for {peer} on this node.");
+        return Ok(());
+    }
+    println!(
+        "Lifted the revocation on {} device(s):",
+        out.unrevoked.len()
+    );
+    for p in &out.unrevoked {
+        println!("  {p}");
+    }
+    println!();
+    println!("They are admitted again only if their pair row still exists; revoking never");
+    println!("deleted it, so it normally does.");
+    Ok(())
+}
+
+/// `mcpmesh revoke device <eid:...>` (#85 ask 4).
+pub fn run_revoke_device(
+    endpoint: String,
+    reason: Option<String>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let e = endpoint.clone();
+    let out = with_daemon(async move |mut client| Ok(client.device_revoke(e, reason).await?))?;
+    if json {
+        println!("{}", serde_json::to_string(&out)?);
+        return Ok(());
+    }
+    println!(
+        "Signed a revocation of {} as {}.",
+        out.endpoint, out.user_id
+    );
+    println!();
+    println!("  {}", out.token);
+    println!();
+    println!("Send that to everyone you have paired with. They run:");
+    println!("  mcpmesh revoke import <token>");
+    println!();
+    println!("  → It is not a secret. It grants nothing and only asks that this endpoint be");
+    println!("    treated as dead; only peers who already trust you will act on it.");
+    println!("  → mcpmesh has no channel of its own for this in pairing mode. Until each peer");
+    println!("    applies it, whoever holds that device still authenticates as you to them.");
+    println!("  → This node already applies it to itself.");
+    Ok(())
+}
+
+/// `mcpmesh revoke import [token]` (#85 ask 4). Reads stdin when the token is omitted.
+pub fn run_revoke_import(token: Option<String>, json: bool) -> anyhow::Result<()> {
+    let token = match token {
+        Some(t) => t,
+        None => {
+            use std::io::Read;
+            let mut buf = String::new();
+            std::io::stdin().read_to_string(&mut buf)?;
+            buf
+        }
+    };
+    let t = token.trim().to_string();
+    anyhow::ensure!(
+        !t.is_empty(),
+        "no revocation token given (argument or stdin)"
+    );
+    let out = with_daemon(async move |mut client| Ok(client.device_revocation_import(t).await?))?;
+    if json {
+        println!("{}", serde_json::to_string(&out)?);
+        return Ok(());
+    }
+    if !out.applied {
+        println!(
+            "Already held an equal or newer revocation for {} — nothing changed.",
+            out.endpoint
+        );
+        return Ok(());
+    }
+    println!(
+        "Applied {}'s revocation of {}; {} live connection(s) cut.",
+        out.user_id, out.endpoint, out.severed
+    );
+    println!();
+    println!("That device is refused from now on, including if it tries to pair with you later.");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

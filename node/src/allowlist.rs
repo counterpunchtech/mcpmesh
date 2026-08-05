@@ -26,6 +26,44 @@ use std::sync::Arc;
 /// pattern for a table definition.
 const PEERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("peers");
 
+/// The pairing-mode REVOCATION table (#85 ask 4): key = 32-byte endpoint_id, value = JSON of a
+/// [`RevokedEntry`]. Separate from [`PEERS`] on purpose — a revocation must outlive the pair row it
+/// refers to, and must apply to an endpoint this node never paired with at all (a signed revocation
+/// can arrive before, or instead of, a pairing).
+const REVOKED: TableDefinition<&[u8], &[u8]> = TableDefinition::new("revoked");
+
+/// One revocation: "this endpoint is dead" (#85 ask 4).
+///
+/// Roster mode has had `revoked_endpoints` since the roster schema; pairing mode had nothing, so
+/// whoever held a stolen disk authenticated as its owner until every peer independently ran
+/// `peer_remove` — with nothing telling them they should.
+///
+/// **Additive-only durable JSON, like [`PeerEntry`] — but it fails closed in the OPPOSITE
+/// direction.** An unreadable pair row means "not paired" (deny). An unreadable revocation row must
+/// also mean deny, i.e. **revoked**, because this table exists to refuse. Both tables fail closed;
+/// they just disagree about which answer that is. [`PeerStore::is_revoked`] implements that.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RevokedEntry {
+    pub endpoint_id: [u8; 32],
+    /// When this node applied the revocation, epoch seconds.
+    pub revoked_at: u64,
+    /// Free-text operator note. Never interpreted.
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// `"local"` (this operator's own decision about someone else's device) or `"signed"` (a
+    /// user-key-signed statement the device's OWNER issued about their own device). The two are
+    /// different claims and an operator reading `status` needs to tell them apart.
+    #[serde(default)]
+    pub source: String,
+    /// For `"signed"`: the `b64u:` user_id that signed it.
+    #[serde(default)]
+    pub signer_user_id: Option<String>,
+    /// For `"signed"`: the `issued_at` inside the signature. Lets a later statement supersede an
+    /// earlier one about the same endpoint, and makes a replayed older token a no-op.
+    #[serde(default)]
+    pub issued_at: Option<u64>,
+}
+
 /// One pair-allowlist entry. `endpoint_id` is the routing key; `nickname` is
 /// the local human name the gate resolves peers to; `services` is the set the peer
 /// was granted at pairing time. Durable on-disk JSON — see the module additive-only note.
@@ -82,6 +120,7 @@ impl PeerStore {
         let txn = db.begin_write()?;
         // open_table creates the table if absent; commit persists the (empty) schema.
         txn.open_table(PEERS)?;
+        txn.open_table(REVOKED)?;
         txn.commit()?;
         Ok(Self {
             db,
@@ -92,6 +131,106 @@ impl PeerStore {
     /// The on-disk path this store was opened at — `status.storage.redb_bytes` stats it (#88).
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Is this endpoint REVOKED (#85 ask 4)?
+    ///
+    /// **Fails CLOSED as revoked.** Every other read in this file collapses an error to "not
+    /// present", which for the pair table means deny. Here "not present" means *allow*, so the same
+    /// reflex would fail OPEN on the one table whose entire job is refusal: a corrupt row, a redb
+    /// error or a schema surprise would silently resurrect a device its owner has declared stolen.
+    /// An error here answers `true` and logs — a node that cannot read its revocation list refuses
+    /// the endpoints it cannot read about, and an operator sees why.
+    ///
+    /// Note what that does NOT do: an error opening the table at all would deny every endpoint,
+    /// which is why `open` creates it up front and why the error is scoped to one lookup.
+    pub fn is_revoked(&self, endpoint_id: &[u8; 32]) -> bool {
+        match self.revoked_entry(endpoint_id) {
+            Ok(v) => v.is_some(),
+            Err(e) => {
+                tracing::warn!(
+                    %e,
+                    "revocation lookup failed; treating this endpoint as REVOKED (fail-closed)"
+                );
+                true
+            }
+        }
+    }
+
+    /// The revocation row for an endpoint, or `None`. Errors propagate — [`is_revoked`] is the
+    /// fail-closed wrapper; `status` rendering wants the real error.
+    pub fn revoked_entry(&self, endpoint_id: &[u8; 32]) -> Result<Option<RevokedEntry>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(REVOKED)?;
+        let Some(v) = table.get(endpoint_id.as_slice())? else {
+            return Ok(None);
+        };
+        // A row that exists but will not deserialize is still a revocation: SOMETHING was written
+        // here, and the only safe reading of "I cannot tell you why this is revoked" is that it is.
+        // Synthesized rather than propagated so one bad row cannot make `list_revoked` unusable.
+        Ok(Some(serde_json::from_slice(v.value()).unwrap_or_else(|e| {
+            tracing::warn!(%e, "unreadable revocation row; still treating the endpoint as revoked");
+            RevokedEntry {
+                endpoint_id: *endpoint_id,
+                revoked_at: 0,
+                reason: Some("unreadable revocation row".into()),
+                source: "unknown".into(),
+                signer_user_id: None,
+                issued_at: None,
+            }
+        })))
+    }
+
+    /// Write a revocation (idempotent upsert). One atomic redb transaction.
+    pub fn revoke(&self, e: RevokedEntry) -> Result<()> {
+        let bytes = serde_json::to_vec(&e)?;
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(REVOKED)?;
+            table.insert(e.endpoint_id.as_slice(), bytes.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Lift a revocation. Returns whether one was present.
+    ///
+    /// Reversible because this list is LOCAL and an operator mistake must be fixable — unlike a
+    /// roster revocation, which is a signed statement other nodes rely on. Audited by the caller in
+    /// both directions.
+    pub fn unrevoke(&self, endpoint_id: &[u8; 32]) -> Result<bool> {
+        let txn = self.db.begin_write()?;
+        let removed = {
+            let mut table = txn.open_table(REVOKED)?;
+            table.remove(endpoint_id.as_slice())?.is_some()
+        };
+        txn.commit()?;
+        Ok(removed)
+    }
+
+    /// Every revocation this node holds, for `status`. A row that will not deserialize is rendered
+    /// as an unknown-source revocation rather than dropped — dropping it would show an operator a
+    /// list that disagrees with the gate.
+    pub fn list_revoked(&self) -> Result<Vec<RevokedEntry>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(REVOKED)?;
+        let mut out = Vec::new();
+        for row in table.iter()? {
+            let (k, v) = row?;
+            let mut eid = [0u8; 32];
+            if k.value().len() == 32 {
+                eid.copy_from_slice(k.value());
+            }
+            out.push(serde_json::from_slice(v.value()).unwrap_or(RevokedEntry {
+                endpoint_id: eid,
+                revoked_at: 0,
+                reason: Some("unreadable revocation row".into()),
+                source: "unknown".into(),
+                signer_user_id: None,
+                issued_at: None,
+            }));
+        }
+        Ok(out)
     }
 
     /// Insert or replace the entry for its `endpoint_id` (idempotent upsert). One atomic
@@ -293,6 +432,13 @@ impl TrustGate for AllowlistGate {
     /// collapses to `None` = default-deny, logged at `warn!`: a gate read failing is
     /// operationally notable but must NEVER fail open.
     fn resolve(&self, endpoint: &EndpointId) -> Option<PeerIdentity> {
+        // (1) REVOCATION WINS over a live pair row (#85 ask 4), matching `ComposedGate`'s rule 1
+        // for the roster. A revoked endpoint that is still in the allowlist is the ordinary case —
+        // the whole point is to kill a device you previously paired with — so checking the pair row
+        // first and returning early would make the feature a no-op.
+        if self.store.is_revoked(endpoint.as_bytes()) {
+            return None;
+        }
         match self.store.resolve(endpoint.as_bytes()) {
             Ok(Some(e)) => Some(PeerIdentity {
                 endpoint: *endpoint,
@@ -306,6 +452,22 @@ impl TrustGate for AllowlistGate {
                 None
             }
         }
+    }
+
+    /// The check-register recheck (#85 ask 4) — closes the same TOCTOU window #54 closed for
+    /// roster revocation: a connection that registers just after a revoke must self-close rather
+    /// than run to completion on a decision that was true when it was accepted.
+    fn is_revoked(&self, endpoint: &EndpointId) -> bool {
+        self.store.is_revoked(endpoint.as_bytes())
+    }
+
+    /// Sever an EXISTING session on revocation, immediately.
+    ///
+    /// #54 established that a revocation which waits for the peer to disconnect is unbounded — MCP
+    /// sessions are long-lived by design, so "eventually" can mean days. `roster_user` is
+    /// irrelevant here: a pairing revocation applies whether or not the endpoint is also rostered.
+    fn should_sever_now(&self, endpoint: &EndpointId, _roster_user: Option<&str>) -> bool {
+        self.store.is_revoked(endpoint.as_bytes())
     }
 }
 
@@ -642,5 +804,147 @@ mod tests {
         // still works despite the corrupt row present.
         store.remove("good").unwrap();
         assert!(store.resolve(&good).unwrap().is_none());
+    }
+
+    /// #85 ask 4: a REVOCATION beats a live pair row, at every gate entry point.
+    ///
+    /// The ordinary case is a device you previously paired with — that is what revocation is FOR —
+    /// so a gate that consulted the pair row first would make the feature a no-op on exactly the
+    /// endpoints it exists for.
+    #[test]
+    fn a_revoked_endpoint_is_refused_even_with_a_live_pair_row() {
+        use mcpmesh_net::TrustGate;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(PeerStore::open(&dir.path().join("p.redb")).unwrap());
+        let eid = [5u8; 32];
+        store
+            .add(PeerEntry {
+                endpoint_id: eid,
+                nickname: "bob".into(),
+                services: vec!["notes".into()],
+                paired_at: None,
+                user_id: Some("b64u:BOB".into()),
+                last_addr: None,
+            })
+            .unwrap();
+        let gate = AllowlistGate::new(store.clone());
+        let id: EndpointId = eid.into();
+
+        // Precondition: without this the assertions below could pass on a gate that refuses
+        // everything.
+        assert!(
+            gate.resolve(&id).is_some(),
+            "precondition: the peer resolves before revocation"
+        );
+        assert!(!gate.is_revoked(&id));
+        assert!(!gate.should_sever_now(&id, None));
+
+        store
+            .revoke(RevokedEntry {
+                endpoint_id: eid,
+                revoked_at: 1_754_300_000,
+                reason: Some("laptop stolen".into()),
+                source: "local".into(),
+                signer_user_id: None,
+                issued_at: None,
+            })
+            .unwrap();
+
+        assert!(
+            gate.resolve(&id).is_none(),
+            "a revoked endpoint must not resolve, even though its pair row is untouched"
+        );
+        assert!(
+            gate.is_revoked(&id),
+            "the check-register recheck must see it — that is the TOCTOU close (#54)"
+        );
+        assert!(
+            gate.should_sever_now(&id, None),
+            "and a LIVE session must be severed, not left to end on its own"
+        );
+        // The pair row itself is untouched: revocation and removal are different acts.
+        assert!(
+            store.resolve(&eid).unwrap().is_some(),
+            "revocation must not delete the pair row — unrevoking has to restore the peer"
+        );
+
+        assert!(store.unrevoke(&eid).unwrap(), "the revocation was present");
+        assert!(
+            gate.resolve(&id).is_some(),
+            "unrevoking restores the peer, since the pair row survived"
+        );
+        assert!(!store.unrevoke(&eid).unwrap(), "idempotent");
+    }
+
+    /// A revocation must survive a restart.
+    ///
+    /// One that evaporated would read as durable and silently revert — the failure #107's
+    /// withdrawal tombstone was designed against, and worse here: the endpoint it names is one
+    /// somebody has physically taken.
+    #[test]
+    fn a_revocation_survives_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.redb");
+        let eid = [9u8; 32];
+        {
+            let store = PeerStore::open(&path).unwrap();
+            store
+                .revoke(RevokedEntry {
+                    endpoint_id: eid,
+                    revoked_at: 42,
+                    reason: Some("stolen".into()),
+                    source: "signed".into(),
+                    signer_user_id: Some("b64u:BOB".into()),
+                    issued_at: Some(1000),
+                })
+                .unwrap();
+        }
+        let store = PeerStore::open(&path).unwrap();
+        assert!(store.is_revoked(&eid));
+        let e = store.revoked_entry(&eid).unwrap().expect("row survives");
+        assert_eq!(
+            (e.source.as_str(), e.signer_user_id.as_deref(), e.issued_at),
+            ("signed", Some("b64u:BOB"), Some(1000)),
+            "the PROVENANCE survives too — an operator has to be able to tell a signed revocation \
+             from their own local one after a restart"
+        );
+        assert_eq!(store.list_revoked().unwrap().len(), 1);
+    }
+
+    /// An UNREADABLE revocation row still revokes.
+    ///
+    /// Every other read in this file collapses an error to "not present", which for the pair table
+    /// means deny. Here "not present" means ALLOW, so the same reflex fails OPEN on the one table
+    /// whose entire job is refusal — a corrupt row would silently resurrect a device its owner
+    /// declared stolen. Both tables fail closed; they disagree about which answer that is.
+    #[test]
+    fn an_unreadable_revocation_row_still_revokes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.redb");
+        let eid = [4u8; 32];
+        {
+            // Write garbage under the endpoint key, exactly as on-disk corruption or an older
+            // binary's schema would leave it.
+            let db = Database::create(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut t = txn.open_table(REVOKED).unwrap();
+                t.insert(eid.as_slice(), b"{not json".as_slice()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let store = PeerStore::open(&path).unwrap();
+        assert!(
+            store.is_revoked(&eid),
+            "an unreadable revocation row must still REVOKE — failing open here undoes the only \
+             remedy for a stolen device"
+        );
+        let listed = store.list_revoked().unwrap();
+        assert_eq!(listed.len(), 1, "and it must still be VISIBLE in status");
+        assert_eq!(
+            listed[0].source, "unknown",
+            "…rendered as unknown-provenance rather than dropped, so the list cannot disagree with \
+             the gate"
+        );
     }
 }

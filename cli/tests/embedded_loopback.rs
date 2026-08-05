@@ -1195,3 +1195,138 @@ async fn local_discovery_announces_only_under_the_mcpmesh_service_name() {
         packets2.len()
     );
 }
+
+/// #85 ask 4 THROUGH THE CONTROL SOCKET: all four revocation verbs dispatch, and `status` reports.
+///
+/// **The 0.45.0 gate renamed every one of the four dispatch arms and the entire suite stayed
+/// green** — every test called the handlers directly (`mcpmesh::daemon::peer_revoke(&state, …)`),
+/// so nothing ever sent a `method` string through `handle_request`. A typo in an arm would have
+/// shipped a binary where `mcpmesh revoke peer` answers `-32601` and every embedder's
+/// `ControlClient::peer_revoke` fails, with a green suite. The "tested helper nobody calls"
+/// pattern, in the security-critical verb set.
+///
+/// This drives the real `ControlClient`, which is the seam an embedder actually uses, and asserts
+/// the `status.revoked` rendering — itself a separate untested layer the gate found (hardcoding it
+/// to `Vec::new()` left everything green).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_revocation_verbs_round_trip_through_the_control_socket() {
+    let (a_root, b_root) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = NodeBuilder::new(a_root.path())
+        .config(hermetic())
+        .start()
+        .await
+        .expect("node a starts");
+    let b = NodeBuilder::new(b_root.path())
+        .config(hermetic())
+        .start()
+        .await
+        .expect("node b starts");
+    let mut a_ctl = a.control().await.expect("a control");
+    a_ctl
+        .register_service_with(
+            "notes",
+            mcpmesh_local_api::BackendSpec::Socket {
+                path: a_root.path().join("notes.sock").display().to_string(),
+            },
+            vec![],
+            true,
+        )
+        .await
+        .expect("register notes");
+    let invite = a_ctl.invite(vec!["notes".into()]).await.expect("invite");
+    let mut b_ctl = b.control().await.expect("b control");
+    let paired = timeout(Duration::from_secs(30), b_ctl.pair(&invite.invite_line))
+        .await
+        .expect("pair within 30s")
+        .expect("pair");
+    let b_principal = format!("eid:{}", b.endpoint_id());
+
+    // (1) peer_revoke — through the socket, by nickname.
+    let out = a_ctl
+        .peer_revoke(&paired.peer_nickname, Some("stolen".into()))
+        .await
+        .expect("peer_revoke must DISPATCH — a renamed arm answers -32601 here");
+    assert_eq!(out.revoked, vec![b_principal.clone()]);
+
+    // (2) status renders it, with provenance and the surviving nickname.
+    let st = a_ctl.status().await.expect("status");
+    let row = st
+        .revoked
+        .iter()
+        .find(|r| r.principal == b_principal)
+        .expect("status.revoked must render the revocation — an operator's only visibility");
+    assert_eq!(row.source, "local");
+    assert_eq!(row.reason.as_deref(), Some("stolen"));
+    assert_eq!(
+        row.nickname.as_deref(),
+        Some(paired.peer_nickname.as_str()),
+        "the nickname join makes the list readable; a list of bare eid: hex is not actionable"
+    );
+    assert!(row.signer_user_id.is_none(), "a local revoke has no signer");
+
+    // (3) peer_unrevoke — through the socket. Idempotent on the second call.
+    let out = a_ctl
+        .peer_unrevoke(&paired.peer_nickname)
+        .await
+        .expect("peer_unrevoke must DISPATCH");
+    assert_eq!(out.unrevoked, vec![b_principal.clone()]);
+    assert!(
+        a_ctl.status().await.expect("status").revoked.is_empty(),
+        "…and status must stop showing it"
+    );
+    assert!(
+        a_ctl
+            .peer_unrevoke(&paired.peer_nickname)
+            .await
+            .expect("idempotent")
+            .unrevoked
+            .is_empty()
+    );
+
+    // (4) device_revoke — b signs a revocation of ITS OWN endpoint. b has a user key because
+    // pairing minted one for the binding it presented.
+    let token = b_ctl
+        .device_revoke(&b_principal, Some("lost it".into()))
+        .await
+        .expect("device_revoke must DISPATCH");
+    assert!(
+        token.token.starts_with("mcpmesh-revoke:"),
+        "the token is a pasteable line, like an invite: {}",
+        token.token
+    );
+    assert_eq!(token.endpoint, b_principal);
+
+    // (5) device_revocation_import — a applies b's signed statement about b's own device.
+    let applied = a_ctl
+        .device_revocation_import(&token.token)
+        .await
+        .expect("device_revocation_import must DISPATCH");
+    assert!(applied.applied);
+    assert_eq!(applied.endpoint, b_principal);
+    assert_eq!(applied.user_id, token.user_id);
+
+    let st = a_ctl.status().await.expect("status");
+    let row = st
+        .revoked
+        .iter()
+        .find(|r| r.principal == b_principal)
+        .expect("the imported revocation shows up too");
+    assert_eq!(
+        (row.source.as_str(), row.signer_user_id.as_deref()),
+        ("signed", Some(token.user_id.as_str())),
+        "a SIGNED revocation must be distinguishable from a local one — only this one is evidence \
+         that the device's owner declared it dead"
+    );
+
+    // Re-importing is a clean no-op, not an error.
+    assert!(
+        !a_ctl
+            .device_revocation_import(&token.token)
+            .await
+            .expect("re-import is accepted")
+            .applied
+    );
+
+    a.shutdown().await;
+    b.shutdown().await;
+}

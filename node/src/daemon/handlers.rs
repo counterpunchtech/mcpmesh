@@ -1623,10 +1623,18 @@ pub(crate) async fn resolve_peer_endpoint(mesh: &Arc<MeshState>, peer: &str) -> 
         let bytes = data_encoding::HEXLOWER
             .decode(hex.as_bytes())
             .map_err(|_| anyhow::anyhow!("invalid eid principal: not lowercase hex"))?;
-        return bytes
+        let eid: [u8; 32] = bytes
             .as_slice()
             .try_into()
-            .map_err(|_| anyhow::anyhow!("invalid eid principal: expected 32 bytes"));
+            .map_err(|_| anyhow::anyhow!("invalid eid principal: expected 32 bytes"))?;
+        // The `eid:` arm returns EARLY, so the revocation check below never saw it — caught by the
+        // test for this guard, not by review. A direct device principal is the most precise way to
+        // reach a revoked machine, so of the three selectors it is the one that most needed it.
+        anyhow::ensure!(
+            !mesh.store.is_revoked(&eid),
+            "peer '{peer}' is REVOKED on this node"
+        );
+        return Ok(eid);
     }
     let store = mesh.store.clone();
     let peer_owned = peer.to_string();
@@ -1641,7 +1649,17 @@ pub(crate) async fn resolve_peer_endpoint(mesh: &Arc<MeshState>, peer: &str) -> 
     })
     .await
     .context("join peer resolve for peer_services")??;
-    eid.with_context(|| format!("no paired peer '{peer}' — 'mcpmesh status' lists your peers"))
+    let eid = eid
+        .with_context(|| format!("no paired peer '{peer}' — 'mcpmesh status' lists your peers"))?;
+    // #85 ask 4: this feeds `peer_services` and `peer_diagnostics`, both of which DIAL. Revocation
+    // was inbound-only in the first cut, so those still reached out to a device the operator had
+    // declared stolen. Checked here rather than at each caller — this is the one resolver they
+    // share.
+    anyhow::ensure!(
+        !mesh.store.is_revoked(&eid),
+        "peer '{peer}' is REVOKED on this node"
+    );
+    Ok(eid)
 }
 
 /// Handle an `unregister_service` control request/// Handle an `unregister_service` control request (#50): remove the whole `[services.<name>]`
@@ -5132,4 +5150,1006 @@ allow = []
         // No matching contact → error.
         assert!(rename_plan(&store, Some("b64u:NOBODY"), None, "x").is_err());
     }
+
+    /// #85 ask 4: a signed revocation is honoured ONLY from someone we already trust, and ONLY for
+    /// their OWN device.
+    ///
+    /// The middle case is the one that matters and the one a plausible implementation gets wrong.
+    /// A signature proves WHO ASKED; it does not prove the endpoint was ever theirs. Without the
+    /// second check, any peer you have paired with could mark a THIRD party's device dead in your
+    /// node — turning "you may kill your own devices here" into a denial-of-service primitive
+    /// against everyone else you know.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_signed_revocation_is_scoped_to_the_signers_own_devices() {
+        use mcpmesh_trust::UserKey;
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+
+        // Bob (paired, with a proven user_id) and Carol (paired, different person).
+        let bob_key = UserKey::from_signing_key(
+            mcpmesh_trust::ed25519_dalek::SigningKey::from_bytes(&[41u8; 32]),
+        );
+        let bob_uid = mcpmesh_trust::binding::user_id(&bob_key);
+        let stranger = UserKey::from_signing_key(
+            mcpmesh_trust::ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]),
+        );
+        let (bob_laptop, bob_phone, carol_laptop) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        for (eid, nick, uid) in [
+            (bob_laptop, "bob-laptop", Some(bob_uid.clone())),
+            (bob_phone, "bob-phone", Some(bob_uid.clone())),
+            (carol_laptop, "carol", Some("b64u:CAROL".to_string())),
+        ] {
+            mesh.store
+                .add(crate::allowlist::PeerEntry {
+                    endpoint_id: eid,
+                    nickname: nick.into(),
+                    services: vec![],
+                    paired_at: None,
+                    user_id: uid,
+                    last_addr: None,
+                })
+                .unwrap();
+        }
+
+        let token = |key: &UserKey, target: [u8; 32], issued_at: u64| {
+            let sig = mcpmesh_trust::roster::sign::sign_device_revocation(
+                key.signing_key(),
+                &target,
+                issued_at,
+            );
+            let t = RevocationToken {
+                user_id: mcpmesh_trust::binding::user_id(key),
+                endpoint: mcpmesh_net::EndpointId::from_bytes(target).principal(),
+                issued_at,
+                sig: mcpmesh_trust::roster::encode_b64u(&sig),
+                reason: None,
+            };
+            format!(
+                "{REVOKE_SCHEME}{}",
+                data_encoding::BASE64URL_NOPAD.encode(&serde_json::to_vec(&t).unwrap())
+            )
+        };
+        let import = async |tok: String| {
+            device_revocation_import(
+                &state,
+                mcpmesh_local_api::DeviceRevocationImportParams { token: tok },
+            )
+            .await
+        };
+
+        // (a) A STRANGER's signature — valid crypto, unknown signer.
+        let e = import(token(&stranger, carol_laptop, 100))
+            .await
+            .expect_err("a stranger's revocation must be refused");
+        assert!(
+            format!("{e:#}").contains("does not know"),
+            "the refusal must name the reason: {e:#}"
+        );
+        assert!(
+            !mesh.store.is_revoked(&carol_laptop),
+            "and must have changed nothing"
+        );
+
+        // (b) A TRUSTED peer revoking a THIRD PARTY's device. This is the weapon case.
+        let e = import(token(&bob_key, carol_laptop, 100))
+            .await
+            .expect_err("bob must not be able to revoke carol's device in our node");
+        assert!(
+            format!("{e:#}").contains("never a third party"),
+            "the refusal must say why: {e:#}"
+        );
+        assert!(
+            !mesh.store.is_revoked(&carol_laptop),
+            "carol's device must still be live — a paired peer is not an authority over everyone \
+             else you know"
+        );
+
+        // (c) A trusted peer revoking their OWN device: applied.
+        let r = import(token(&bob_key, bob_laptop, 100))
+            .await
+            .expect("bob may revoke bob's device");
+        assert!(r.applied);
+        assert_eq!(r.user_id, bob_uid);
+        assert!(mesh.store.is_revoked(&bob_laptop));
+        assert!(
+            !mesh.store.is_revoked(&bob_phone),
+            "…and only the device NAMED — revoking one device is not revoking the person"
+        );
+
+        // (d) Replaying an OLDER token must not displace the newer statement, and re-importing the
+        // same one is a clean no-op. `issued_at` is inside the signature, so it cannot be re-dated
+        // to win this comparison.
+        let r = import(token(&bob_key, bob_laptop, 200))
+            .await
+            .expect("a newer statement applies");
+        assert!(r.applied);
+        for stale in [50u64, 100, 200] {
+            let r = import(token(&bob_key, bob_laptop, stale))
+                .await
+                .expect("an older or equal token is accepted and ignored, not an error");
+            assert!(
+                !r.applied,
+                "issued_at={stale} must not displace the newer revocation"
+            );
+        }
+        assert_eq!(
+            mesh.store
+                .revoked_entry(&bob_laptop)
+                .unwrap()
+                .unwrap()
+                .issued_at,
+            Some(200),
+            "the newest statement survives every replay"
+        );
+
+        // (e) A tampered signature is refused before any store read.
+        let mut bad = token(&bob_key, bob_phone, 300);
+        bad.push('x');
+        assert!(import(bad).await.is_err());
+        assert!(!mesh.store.is_revoked(&bob_phone));
+    }
+
+    /// #85 ask 4: an endpoint this node has NEVER SEEN is refused, not recorded.
+    ///
+    /// **This test asserted the opposite until the 0.45.0 gate**, and in doing so it certified a
+    /// denial-of-service primitive: endpoint ids are public (invite lines, `status`, dial hints),
+    /// so any paired peer could sign a revocation of an endpoint we had not met yet and kill it
+    /// permanently on arrival — the pairing would complete, the gate would refuse it, and the only
+    /// remedy would be an operator running `revoke undo` on a principal they never revoked. The
+    /// gate proved it end to end.
+    ///
+    /// We cannot verify ownership of an endpoint we hold no row for, and a binding carried in the
+    /// token would not help: the signer could bind any endpoint to themselves, which is the same
+    /// lie wearing a signature. So the answer is to refuse, and to say what to do instead.
+    ///
+    /// The cost is real and is not hidden: a peer who pairs with the stolen device AFTER receiving
+    /// the token must import it again once the row exists.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_endpoint_we_have_never_seen_is_refused_not_pre_revoked() {
+        use mcpmesh_trust::UserKey;
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+
+        let bob = UserKey::from_signing_key(mcpmesh_trust::ed25519_dalek::SigningKey::from_bytes(
+            &[41u8; 32],
+        ));
+        let bob_uid = mcpmesh_trust::binding::user_id(&bob);
+        mesh.store
+            .add(crate::allowlist::PeerEntry {
+                endpoint_id: [1u8; 32],
+                nickname: "bob-phone".into(),
+                services: vec![],
+                paired_at: None,
+                user_id: Some(bob_uid.clone()),
+                last_addr: None,
+            })
+            .unwrap();
+
+        let stolen = [77u8; 32]; // never paired here
+        let sig =
+            mcpmesh_trust::roster::sign::sign_device_revocation(bob.signing_key(), &stolen, 10);
+        let t = RevocationToken {
+            user_id: bob_uid,
+            endpoint: mcpmesh_net::EndpointId::from_bytes(stolen).principal(),
+            issued_at: 10,
+            sig: mcpmesh_trust::roster::encode_b64u(&sig),
+            reason: Some("stolen".into()),
+        };
+        let token = format!(
+            "{REVOKE_SCHEME}{}",
+            data_encoding::BASE64URL_NOPAD.encode(&serde_json::to_vec(&t).unwrap())
+        );
+
+        let e = device_revocation_import(
+            &state,
+            mcpmesh_local_api::DeviceRevocationImportParams { token },
+        )
+        .await
+        .expect_err("a revocation for an endpoint we have never seen must be REFUSED");
+        let msg = format!("{e:#}");
+        assert!(
+            msg.contains("no record of"),
+            "the refusal must say why: {msg}"
+        );
+        assert!(
+            msg.contains("Pair with them first"),
+            "…and what to do instead, or the operator is stuck with a token that does nothing: \
+             {msg}"
+        );
+        assert!(
+            !mesh.store.is_revoked(&stolen),
+            "nothing may be recorded — a held revocation for an unmet endpoint is the DoS"
+        );
+        assert!(
+            mesh.store.list_revoked().unwrap().is_empty(),
+            "…not even as an inert row"
+        );
+
+        // And the case that IS the ask still works: once the device is known to be theirs.
+        mesh.store
+            .add(crate::allowlist::PeerEntry {
+                endpoint_id: stolen,
+                nickname: "bob-laptop".into(),
+                services: vec![],
+                paired_at: None,
+                user_id: Some(mcpmesh_trust::binding::user_id(&bob)),
+                last_addr: None,
+            })
+            .unwrap();
+        let sig2 =
+            mcpmesh_trust::roster::sign::sign_device_revocation(bob.signing_key(), &stolen, 10);
+        let t2 = RevocationToken {
+            user_id: mcpmesh_trust::binding::user_id(&bob),
+            endpoint: mcpmesh_net::EndpointId::from_bytes(stolen).principal(),
+            issued_at: 10,
+            sig: mcpmesh_trust::roster::encode_b64u(&sig2),
+            reason: Some("stolen".into()),
+        };
+        let r = device_revocation_import(
+            &state,
+            mcpmesh_local_api::DeviceRevocationImportParams {
+                token: format!(
+                    "{REVOKE_SCHEME}{}",
+                    data_encoding::BASE64URL_NOPAD.encode(&serde_json::to_vec(&t2).unwrap())
+                ),
+            },
+        )
+        .await
+        .expect("once we know the device is theirs, the same token applies");
+        assert!(r.applied);
+        assert!(
+            mesh.gate.resolve(&stolen.into()).is_none(),
+            "the live gate refuses it through the composition, not just the store"
+        );
+    }
+
+    /// #85 ask 4: a `b64u:` revokes EVERY device of that person, and ONLY those.
+    ///
+    /// The contract an operator reaches for when the answer is "not on any of their machines" —
+    /// promised in three places and, until the 0.45.0 gate, tested nowhere: `revocation_targets`
+    /// mutated to `.take(1)` left the whole suite green while reporting success and leaving the
+    /// other devices live.
+    ///
+    /// Also pins the negative half. Over-revoking would be a self-inflicted outage against someone
+    /// the operator never named.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_user_id_revokes_every_device_of_that_person_and_only_those() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+
+        let (bob1, bob2, bob3, carol) = ([1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]);
+        for (eid, nick, uid) in [
+            (bob1, "bob-laptop", "b64u:BOB"),
+            (bob2, "bob-phone", "b64u:BOB"),
+            (bob3, "bob-tablet", "b64u:BOB"),
+            (carol, "carol", "b64u:CAROL"),
+        ] {
+            mesh.store
+                .add(crate::allowlist::PeerEntry {
+                    endpoint_id: eid,
+                    nickname: nick.into(),
+                    services: vec![],
+                    paired_at: None,
+                    user_id: Some(uid.into()),
+                    last_addr: None,
+                })
+                .unwrap();
+        }
+
+        let out = peer_revoke(
+            &state,
+            mcpmesh_local_api::PeerRevokeParams {
+                peer: "b64u:BOB".into(),
+                reason: None,
+            },
+        )
+        .await
+        .expect("revoking a person succeeds");
+        assert_eq!(
+            out.revoked.len(),
+            3,
+            "all THREE of bob's devices must be revoked, not just the first: {:?}",
+            out.revoked
+        );
+        for eid in [bob1, bob2, bob3] {
+            assert!(mesh.store.is_revoked(&eid));
+        }
+        assert!(
+            !mesh.store.is_revoked(&carol),
+            "carol must be untouched — over-revoking is a self-inflicted outage"
+        );
+    }
+
+    /// A `peer_revoke` naming nothing is an ERROR, never an empty success.
+    ///
+    /// This is a revocation surface: a typo reading as "done" leaves an operator believing they cut
+    /// off a device they never touched. Untested until the gate deleted the guard and everything
+    /// stayed green.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn revoking_a_name_that_matches_nothing_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+        let e = peer_revoke(
+            &state,
+            mcpmesh_local_api::PeerRevokeParams {
+                peer: "nobody".into(),
+                reason: None,
+            },
+        )
+        .await
+        .expect_err("a name matching no device must be refused, not reported as success");
+        assert!(
+            format!("{e:#}").contains("nobody"),
+            "the error must name the value so a typo is fixable: {e:#}"
+        );
+    }
+
+    /// `peer_unrevoke` must still work once the pair row is gone.
+    ///
+    /// Revoke, then unpair: nothing resolves the principal any more, so without the bare-`eid:`
+    /// fallback the revocation becomes permanently unliftable — a trap an operator falls into by
+    /// doing the two obvious things in the obvious order.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_revocation_stays_liftable_after_the_pair_row_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+        let eid = [8u8; 32];
+        let principal = mcpmesh_net::EndpointId::from_bytes(eid).principal();
+        mesh.store
+            .add(crate::allowlist::PeerEntry {
+                endpoint_id: eid,
+                nickname: "gone".into(),
+                services: vec![],
+                paired_at: None,
+                user_id: None,
+                last_addr: None,
+            })
+            .unwrap();
+        peer_revoke(
+            &state,
+            mcpmesh_local_api::PeerRevokeParams {
+                peer: "gone".into(),
+                reason: None,
+            },
+        )
+        .await
+        .unwrap();
+        mesh.store.remove("gone").unwrap();
+        assert!(
+            mesh.store.is_revoked(&eid),
+            "precondition: still revoked after the row is deleted"
+        );
+
+        let out = peer_unrevoke(
+            &state,
+            mcpmesh_local_api::PeerUnrevokeParams {
+                peer: principal.clone(),
+            },
+        )
+        .await
+        .expect("a bare eid: must still lift the revocation");
+        assert_eq!(out.unrevoked, vec![principal]);
+        assert!(!mesh.store.is_revoked(&eid));
+    }
+
+    /// A LOCAL revoke must not overwrite a SIGNED one.
+    ///
+    /// Two things break if it does: `status` stops showing that the device's OWNER declared it
+    /// dead — strictly stronger evidence than the operator's own note — and clearing `issued_at`
+    /// disarms the replay guard, so an OLDER token from that peer re-applies and wins.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_local_revoke_does_not_destroy_a_signed_revocations_provenance() {
+        use mcpmesh_trust::UserKey;
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+
+        let bob = UserKey::from_signing_key(mcpmesh_trust::ed25519_dalek::SigningKey::from_bytes(
+            &[41u8; 32],
+        ));
+        let bob_uid = mcpmesh_trust::binding::user_id(&bob);
+        let eid = [1u8; 32];
+        mesh.store
+            .add(crate::allowlist::PeerEntry {
+                endpoint_id: eid,
+                nickname: "bob-laptop".into(),
+                services: vec![],
+                paired_at: None,
+                user_id: Some(bob_uid.clone()),
+                last_addr: None,
+            })
+            .unwrap();
+        let sig = mcpmesh_trust::roster::sign::sign_device_revocation(bob.signing_key(), &eid, 500);
+        let t = RevocationToken {
+            user_id: bob_uid.clone(),
+            endpoint: mcpmesh_net::EndpointId::from_bytes(eid).principal(),
+            issued_at: 500,
+            sig: mcpmesh_trust::roster::encode_b64u(&sig),
+            reason: None,
+        };
+        device_revocation_import(
+            &state,
+            mcpmesh_local_api::DeviceRevocationImportParams {
+                token: format!(
+                    "{REVOKE_SCHEME}{}",
+                    data_encoding::BASE64URL_NOPAD.encode(&serde_json::to_vec(&t).unwrap())
+                ),
+            },
+        )
+        .await
+        .expect("import the owner's statement");
+
+        peer_revoke(
+            &state,
+            mcpmesh_local_api::PeerRevokeParams {
+                peer: "bob-laptop".into(),
+                reason: Some("also me".into()),
+            },
+        )
+        .await
+        .expect("a local revoke on top succeeds");
+
+        let row = mesh.store.revoked_entry(&eid).unwrap().unwrap();
+        assert_eq!(
+            (
+                row.source.as_str(),
+                row.signer_user_id.as_deref(),
+                row.issued_at
+            ),
+            ("signed", Some(bob_uid.as_str()), Some(500)),
+            "the OWNER's statement must survive a local revoke on top of it — losing it downgrades \
+             the evidence and re-arms the replay an older token would win"
+        );
+    }
+
+    /// #85 ask 4: revocation must block the OUTBOUND direction too.
+    ///
+    /// The first cut was inbound-only — the gate refused a revoked device's connections, but every
+    /// outbound path still read `PeerStore` directly and connected to the machine the operator had
+    /// just declared stolen, handing it the request. The 0.45.0 gate proved it.
+    ///
+    /// That made the weaker verb stronger: `peer_remove` DELETES the row, so it blocked the dial;
+    /// `peer_revoke`, the compromise claim, did not. Backwards, and in the direction that leaks
+    /// data to whoever holds the device.
+    ///
+    /// All three selector shapes are exercised, because the dial path resolves each one
+    /// differently and a guard on only some of them is the shape of the original bug.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_revoked_peer_is_refused_on_the_outbound_path_by_every_selector() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+        let eid = [6u8; 32];
+        let principal = mcpmesh_net::EndpointId::from_bytes(eid).principal();
+        mesh.store
+            .add(crate::allowlist::PeerEntry {
+                endpoint_id: eid,
+                nickname: "stolen-laptop".into(),
+                services: vec!["notes".into()],
+                paired_at: None,
+                user_id: Some("b64u:BOB".into()),
+                last_addr: None,
+            })
+            .unwrap();
+
+        // Precondition: all three selectors resolve BEFORE the revoke, or the assertions below
+        // could pass on a resolver that never worked.
+        for sel in ["stolen-laptop", "b64u:BOB", principal.as_str()] {
+            resolve_peer_endpoint(&mesh, sel).await.unwrap_or_else(|e| {
+                panic!("precondition: {sel} resolves before revocation: {e:#}")
+            });
+        }
+
+        peer_revoke(
+            &state,
+            mcpmesh_local_api::PeerRevokeParams {
+                peer: "stolen-laptop".into(),
+                reason: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // The shared resolver behind `peer_services` / `peer_diagnostics`, which both DIAL.
+        for sel in ["stolen-laptop", "b64u:BOB", principal.as_str()] {
+            let e = resolve_peer_endpoint(&mesh, sel).await.expect_err(
+                "a revoked peer must not be resolved for a dial — that hands the request to the \
+                 device the operator declared compromised",
+            );
+            assert!(
+                format!("{e:#}").contains("REVOKED"),
+                "the refusal must say why, for {sel}: {e:#}"
+            );
+        }
+
+        // And the session dial itself, by nickname and by device principal.
+        for sel in ["stolen-laptop", principal.as_str()] {
+            let e = match crate::daemon::dial::dial_service(&mesh, sel, "notes").await {
+                Ok(_) => panic!("dial_service must refuse a revoked peer ({sel})"),
+                Err(e) => e,
+            };
+            assert!(
+                format!("{e:#}").contains("REVOKED"),
+                "dial refusal must say why, for {sel}: {e:#}"
+            );
+        }
+
+        // Lifting it restores the outbound path, which is what makes the guard a gate and not a
+        // one-way door.
+        peer_unrevoke(
+            &state,
+            mcpmesh_local_api::PeerUnrevokeParams {
+                peer: "stolen-laptop".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            resolve_peer_endpoint(&mesh, "stolen-laptop").await.is_ok(),
+            "unrevoking must restore the outbound path too"
+        );
+    }
+}
+
+// ============================================================================
+// #85 ask 4 — pairing-mode revocation
+// ============================================================================
+
+/// Parse an `eid:<64 hex>` principal back to an endpoint id (#85 ask 4).
+///
+/// The inverse of [`mcpmesh_net::EndpointId::principal`], and deliberately strict: anything that is
+/// not exactly that shape returns `None` rather than a best guess. Only `peer_unrevoke` needs it —
+/// to lift a revocation on an endpoint whose pair row is gone, which no store lookup can resolve.
+fn principal_to_endpoint(principal: &str) -> Option<mcpmesh_net::EndpointId> {
+    let hex = principal.strip_prefix("eid:")?;
+    let bytes = data_encoding::HEXLOWER.decode(hex.as_bytes()).ok()?;
+    let arr: [u8; 32] = bytes.as_slice().try_into().ok()?;
+    Some(mcpmesh_net::EndpointId::from_bytes(arr))
+}
+
+/// The `mcpmesh-revoke:` token scheme, mirroring `mcpmesh-invite:` / `mcpmesh-enroll:`.
+const REVOKE_SCHEME: &str = "mcpmesh-revoke:";
+
+/// The wire body of a signed device revocation (#85 ask 4).
+///
+/// Every field is inside the signature except `sig` itself — see
+/// [`mcpmesh_trust::roster::sign::sign_device_revocation`]. `reason` is deliberately OUTSIDE it:
+/// it is an operator note for humans, and signing it would mean a typo could not be corrected
+/// without re-issuing from a device that may no longer exist.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct RevocationToken {
+    /// The signer's `b64u:` user_id.
+    user_id: String,
+    /// The revoked endpoint's `eid:` principal.
+    endpoint: String,
+    /// Epoch seconds, INSIDE the signature — orders two statements about one endpoint and makes a
+    /// replayed older token a no-op.
+    issued_at: u64,
+    /// base64url of the 64-byte ed25519 signature.
+    sig: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+/// Resolve a revocation target (nickname | `eid:` | `b64u:`) to endpoint ids.
+///
+/// Nicknames are accepted here even though `allow` lists deliberately never hold them (#38): this
+/// is not an authorization grant, it is the operator naming a device they want dead, and the
+/// nickname is what they know it by. `peer_remove` takes one for the same reason.
+///
+/// **The vocabulary is wider than the docs used to say**, because this delegates to
+/// `endpoints_for_principal`, which in roster mode also matches a roster `user_id` and a roster
+/// GROUP NAME. So `revoke peer engineering` revokes every device in that group. That is a coherent
+/// operation and the sever path already accepts the same vocabulary — but it was undocumented,
+/// which made it a surprise rather than a feature. Named in `docs/local-protocol.md` now.
+async fn revocation_targets(
+    mesh: &Arc<MeshState>,
+    peer: &str,
+) -> Result<Vec<mcpmesh_net::EndpointId>> {
+    let store = mesh.store.clone();
+    let roster = mesh.roster.view();
+    let want = peer.to_string();
+    blocking("join revocation target resolution", move || {
+        let mut out: std::collections::HashSet<mcpmesh_net::EndpointId> =
+            crate::daemon::sever::endpoints_for_principal(&store, roster.as_deref(), &want)?;
+        // …plus the nickname arm, which `endpoints_for_principal` does not cover.
+        for e in store.list()? {
+            if e.nickname == want {
+                out.insert(mcpmesh_net::EndpointId::from_bytes(e.endpoint_id));
+            }
+        }
+        anyhow::Ok(out.into_iter().collect::<Vec<_>>())
+    })
+    .await?
+}
+
+/// `peer_revoke` (#85 ask 4): mark an endpoint dead LOCALLY, and cut it off now.
+pub async fn peer_revoke(
+    state: &DaemonState,
+    params: mcpmesh_local_api::PeerRevokeParams,
+) -> Result<mcpmesh_local_api::PeerRevokeResult> {
+    let mesh = state.mesh_required()?;
+    let targets = revocation_targets(mesh, &params.peer).await?;
+    // A name that resolves to nothing is an ERROR, never an empty success. This is a revocation
+    // surface: a typo reading as "done" would leave an operator believing they had cut off a device
+    // they had not touched — the same reasoning `peer_remove` uses for its all-no-op case.
+    anyhow::ensure!(
+        !targets.is_empty(),
+        "no paired device matches {:?} (expected a nickname, an eid: principal, or a b64u: user_id)",
+        params.peer
+    );
+
+    let store = mesh.store.clone();
+    let reason = params.reason.clone();
+    let ids: Vec<[u8; 32]> = targets.iter().map(|e| *e.as_bytes()).collect();
+    let now = crate::util::epoch_now_u64();
+    blocking("join peer revoke write", move || {
+        for id in ids {
+            // Do NOT overwrite a SIGNED revocation with a local one (#85 ask 4, 0.45.0 gate).
+            //
+            // Two things break if we do. The provenance is destroyed — `status` stops showing that
+            // the device's OWNER declared it dead, which is strictly stronger evidence than the
+            // operator's own note. And clearing `issued_at` disarms the replay guard: with no prior
+            // timestamp, an OLDER token from that peer re-applies and wins.
+            //
+            // The endpoint is already revoked either way, so there is nothing to gain by
+            // rewriting the row — only provenance to lose.
+            if let Some(existing) = store.revoked_entry(&id)?
+                && existing.source == "signed"
+            {
+                continue;
+            }
+            store.revoke(crate::allowlist::RevokedEntry {
+                endpoint_id: id,
+                revoked_at: now,
+                reason: reason.clone(),
+                source: "local".into(),
+                signer_user_id: None,
+                issued_at: None,
+            })?;
+        }
+        anyhow::Ok(())
+    })
+    .await??;
+
+    // IMMEDIATE, like `service_allow_revoke` (#54). The write above already makes the gate refuse
+    // NEW connections and makes `should_sever_now` true for the check-register recheck; this cuts
+    // the ones already established, which would otherwise run for as long as the peer kept them —
+    // unbounded for a warm MCP session.
+    let principals: Vec<String> = targets.iter().map(|e| e.principal()).collect();
+    let severed = sever_principals(mesh, &principals).await?;
+
+    for p in &principals {
+        mesh.audit().record(AuditRecord::trust(
+            now_ts(),
+            "peer_revoke".into(),
+            Some(params.peer.clone()),
+            Some(p.clone()),
+        ));
+    }
+    tracing::warn!(peer = %params.peer, count = principals.len(), severed, "peer revoked");
+    Ok(mcpmesh_local_api::PeerRevokeResult {
+        revoked: principals,
+        severed,
+    })
+}
+
+/// `peer_unrevoke` (#85 ask 4). Idempotent: lifting a revocation nobody holds is a clean empty
+/// result, unlike `peer_revoke`'s unmatched name — undoing nothing is harmless, cutting off nothing
+/// while reporting success is not.
+pub async fn peer_unrevoke(
+    state: &DaemonState,
+    params: mcpmesh_local_api::PeerUnrevokeParams,
+) -> Result<mcpmesh_local_api::PeerUnrevokeResult> {
+    let mesh = state.mesh_required()?;
+    let mut targets = revocation_targets(mesh, &params.peer).await?;
+    // A revoked endpoint whose pair row was ALSO removed resolves to nothing above, so accept a
+    // bare `eid:` directly — otherwise a revocation could become permanently unliftable, which is
+    // exactly the state an operator hits after revoking and then unpairing.
+    if targets.is_empty()
+        && let Some(id) = principal_to_endpoint(&params.peer)
+    {
+        targets.push(id);
+    }
+    let store = mesh.store.clone();
+    let ids: Vec<[u8; 32]> = targets.iter().map(|e| *e.as_bytes()).collect();
+    let lifted = blocking("join peer unrevoke write", move || {
+        let mut lifted = Vec::new();
+        for id in ids {
+            if store.unrevoke(&id)? {
+                lifted.push(mcpmesh_net::EndpointId::from_bytes(id).principal());
+            }
+        }
+        anyhow::Ok(lifted)
+    })
+    .await??;
+
+    for p in &lifted {
+        mesh.audit().record(AuditRecord::trust(
+            now_ts(),
+            "peer_unrevoke".into(),
+            Some(params.peer.clone()),
+            Some(p.clone()),
+        ));
+    }
+    tracing::info!(peer = %params.peer, count = lifted.len(), "revocation lifted");
+    Ok(mcpmesh_local_api::PeerUnrevokeResult { unrevoked: lifted })
+}
+
+/// Read this node's user key, or explain why it has none.
+///
+/// READ, never `load_or_generate` — the same discipline `user_key_export` follows: minting a key
+/// here would let a node with no identity sign a revocation under a freshly-invented one, which no
+/// peer would recognise and which would then become this node's identity at the next restart.
+async fn read_user_key(mesh: &Arc<MeshState>) -> Result<mcpmesh_trust::UserKey> {
+    let path = mesh
+        .user_key_path
+        .get()
+        .cloned()
+        .context("this node has no user key path resolved")?;
+    anyhow::ensure!(
+        path.exists(),
+        "this node has no user key, so it cannot speak for a person ({}). \
+         Pair with a binding, join an org, or import a recovery phrase first.",
+        path.display()
+    );
+    let bytes = blocking("join user key read", {
+        let path = path.clone();
+        move || std::fs::read(&path)
+    })
+    .await?
+    .with_context(|| format!("read user key at {}", path.display()))?;
+    let bytes: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("the user key at {} is not 32 bytes", path.display()))?;
+    Ok(mcpmesh_trust::UserKey::from_signing_key(
+        mcpmesh_trust::ed25519_dalek::SigningKey::from_bytes(&bytes),
+    ))
+}
+
+/// `device_revoke` (#85 ask 4): sign a portable revocation of one of MY OWN devices.
+///
+/// The direction local revocation cannot express. My peers cannot discover that my laptop was
+/// stolen; I have to tell them, and they have to be able to verify it was me.
+pub(crate) async fn device_revoke(
+    state: &DaemonState,
+    params: mcpmesh_local_api::DeviceRevokeParams,
+) -> Result<mcpmesh_local_api::DeviceRevokeResult> {
+    let mesh = state.mesh_required()?;
+    let endpoint = principal_to_endpoint(&params.endpoint).with_context(|| {
+        format!(
+            "{:?} is not an eid: device principal (expected eid:<64 hex>)",
+            params.endpoint
+        )
+    })?;
+    let key = read_user_key(mesh).await?;
+    let user_id = mcpmesh_trust::binding::user_id(&key);
+    let issued_at = crate::util::epoch_now_u64();
+    let sig = mcpmesh_trust::roster::sign::sign_device_revocation(
+        key.signing_key(),
+        endpoint.as_bytes(),
+        issued_at,
+    );
+    let token = RevocationToken {
+        user_id: user_id.clone(),
+        endpoint: endpoint.principal(),
+        issued_at,
+        sig: mcpmesh_trust::roster::encode_b64u(&sig),
+        reason: params.reason.clone(),
+    };
+    let encoded = format!(
+        "{REVOKE_SCHEME}{}",
+        data_encoding::BASE64URL_NOPAD.encode(&serde_json::to_vec(&token)?)
+    );
+
+    // Apply it to OURSELVES too. A node that hands out a revocation of a device while still
+    // admitting that device is telling its peers to do something it does not do — and the stolen
+    // laptop may well still be paired here.
+    let store = mesh.store.clone();
+    let eid_bytes = *endpoint.as_bytes();
+    let reason = params.reason.clone();
+    blocking("join device revoke self-apply", move || {
+        store.revoke(crate::allowlist::RevokedEntry {
+            endpoint_id: eid_bytes,
+            revoked_at: issued_at,
+            reason,
+            source: "signed".into(),
+            signer_user_id: Some(user_id.clone()),
+            issued_at: Some(issued_at),
+        })
+    })
+    .await??;
+    let severed = sever_principals(mesh, &[endpoint.principal()]).await?;
+
+    // AUDITED — the event and the subject. The token itself is not a secret (it authorizes
+    // nothing), but the record is what lets an operator reconstruct when they declared a device
+    // dead, which is the question asked after an incident.
+    mesh.audit().record(AuditRecord::trust(
+        now_ts(),
+        "device_revoke".into(),
+        None,
+        Some(endpoint.principal()),
+    ));
+    tracing::warn!(endpoint = %endpoint.principal(), severed, "signed a device revocation");
+    Ok(mcpmesh_local_api::DeviceRevokeResult {
+        token: encoded,
+        endpoint: endpoint.principal(),
+        user_id: mcpmesh_trust::binding::user_id(&key),
+    })
+}
+
+/// `device_revocation_import` (#85 ask 4): apply a peer's signed revocation of their own device.
+///
+/// Two independent checks, and BOTH are load-bearing:
+///
+/// 1. **The signature verifies against the claimed `user_id`.** Otherwise anyone could author one.
+/// 2. **We already trust that `user_id`, AND the revoked endpoint is one we associate with that
+///    same person** (or is entirely unknown to us). Without (2) a paired peer could mark a THIRD
+///    party's device dead in our node — a very different and much worse power than "kill your own
+///    devices here", which is the only thing this verb is meant to grant. A signature proves who
+///    asked; it does not prove the endpoint was ever theirs.
+///
+/// **An endpoint we have never seen is REFUSED, not recorded.** The first cut accepted it, so a
+/// stolen device could be pre-revoked before a peer had met it. The gate proved that is a
+/// denial-of-service primitive against everyone you have NOT met — endpoint ids are public, so any
+/// paired peer could kill an arbitrary future contact permanently, and the operator's only remedy
+/// is to `revoke undo` a principal they never revoked. There is no way to verify ownership of an
+/// endpoint we hold no row for; a binding carried in the token would not help, since the signer
+/// could bind any endpoint to themselves.
+///
+/// The cost is real and is stated rather than hidden: a peer who pairs with the stolen device AFTER
+/// receiving the token has to import it again once the row exists. Promoting a held "pending"
+/// revocation at pairing time would close that without reopening the hole, and is follow-up work.
+pub(crate) async fn device_revocation_import(
+    state: &DaemonState,
+    params: mcpmesh_local_api::DeviceRevocationImportParams,
+) -> Result<mcpmesh_local_api::DeviceRevocationImportResult> {
+    let mesh = state.mesh_required()?;
+    let body = params
+        .token
+        .trim()
+        .strip_prefix(REVOKE_SCHEME)
+        .context("not a revocation token (expected a mcpmesh-revoke: line)")?;
+    let raw = data_encoding::BASE64URL_NOPAD
+        .decode(body.as_bytes())
+        .context("revocation token is not valid base64url")?;
+    let token: RevocationToken =
+        serde_json::from_slice(&raw).context("revocation token is malformed")?;
+
+    let endpoint = principal_to_endpoint(&token.endpoint)
+        .context("revocation token names no valid eid: principal")?;
+    let user_pk: [u8; 32] = mcpmesh_trust::roster::decode_b64u(&token.user_id)
+        .ok()
+        .and_then(|v| v.as_slice().try_into().ok())
+        .context("revocation token carries no valid b64u: user_id")?;
+    let sig = mcpmesh_trust::roster::decode_b64u(&token.sig)
+        .context("revocation token signature is not base64url")?;
+
+    // (1) The signature. Before ANY store read, so a forged token costs nothing to refuse.
+    mcpmesh_trust::roster::sign::verify_device_revocation(
+        &user_pk,
+        endpoint.as_bytes(),
+        token.issued_at,
+        &sig,
+    )
+    .map_err(|_| anyhow::anyhow!("revocation signature does not verify against its user_id"))?;
+
+    // (2) Authorization: do we trust this signer, and is this endpoint theirs?
+    let store = mesh.store.clone();
+    let signer = token.user_id.clone();
+    let eid_bytes = *endpoint.as_bytes();
+    let (trusted, endpoint_is_theirs, endpoint_known, existing_issued_at) =
+        blocking("join revocation import checks", move || {
+            let entries = store.list()?;
+            let trusted = entries
+                .iter()
+                .any(|e| e.user_id.as_deref() == Some(&signer));
+            let row = entries.iter().find(|e| e.endpoint_id == eid_bytes);
+            let endpoint_is_theirs = row.is_some_and(|e| e.user_id.as_deref() == Some(&signer));
+            let prior = store.revoked_entry(&eid_bytes)?.and_then(|e| e.issued_at);
+            anyhow::Ok((trusted, endpoint_is_theirs, row.is_some(), prior))
+        })
+        .await??;
+
+    anyhow::ensure!(
+        trusted,
+        "this node does not know {} — a revocation is only honoured from a person you have paired \
+         with, or it becomes an unauthenticated way to mark any endpoint dead",
+        token.user_id
+    );
+    // The endpoint MUST already be known to us as that person's device.
+    //
+    // The first version also accepted an endpoint we had never seen, so a stolen device could be
+    // pre-revoked before a peer had met it. The 0.45.0 gate proved the cost, and it is not a close
+    // call: endpoint ids are public (invite lines, `status`, dial hints), so any paired peer could
+    // sign a revocation of an endpoint we had not met yet and kill it PERMANENTLY on arrival — the
+    // pairing would complete and the gate would refuse it, with the only remedy an operator
+    // running `revoke undo` on a principal they never revoked. That is the denial-of-service
+    // primitive this check exists to prevent, aimed at the larger set: everyone we have NOT met.
+    //
+    // We cannot verify ownership of an endpoint we hold no row for. A binding carried in the token
+    // would not help — the signer could bind any endpoint to themselves, which is the same lie
+    // wearing a signature. So: refuse, and say what to do about it.
+    anyhow::ensure!(
+        endpoint_known,
+        "this node has no record of {} — a revocation can only be applied to a device we already \
+         know is {}'s. Pair with them first, then import this token again",
+        token.endpoint,
+        token.user_id
+    );
+    anyhow::ensure!(
+        endpoint_is_theirs,
+        "{} is not a device of {} on this node — a peer may revoke their OWN devices here, never \
+         a third party's",
+        token.endpoint,
+        token.user_id
+    );
+
+    // Idempotent, and monotonic: an OLDER token must never displace a newer statement. `issued_at`
+    // is inside the signature, so it cannot be re-dated to win this comparison.
+    if existing_issued_at.is_some_and(|prior| prior >= token.issued_at) {
+        return Ok(mcpmesh_local_api::DeviceRevocationImportResult {
+            endpoint: endpoint.principal(),
+            user_id: token.user_id,
+            applied: false,
+            severed: 0,
+        });
+    }
+
+    let store = mesh.store.clone();
+    let signer = token.user_id.clone();
+    let reason = token.reason.clone();
+    let issued_at = token.issued_at;
+    let now = crate::util::epoch_now_u64();
+    blocking("join revocation import write", move || {
+        store.revoke(crate::allowlist::RevokedEntry {
+            endpoint_id: eid_bytes,
+            revoked_at: now,
+            reason,
+            source: "signed".into(),
+            signer_user_id: Some(signer),
+            issued_at: Some(issued_at),
+        })
+    })
+    .await??;
+    let severed = sever_principals(mesh, &[endpoint.principal()]).await?;
+
+    mesh.audit().record(AuditRecord::trust(
+        now_ts(),
+        "device_revocation_import".into(),
+        Some(token.user_id.clone()),
+        Some(endpoint.principal()),
+    ));
+    tracing::warn!(
+        endpoint = %endpoint.principal(),
+        signer = %token.user_id,
+        severed,
+        "applied a signed device revocation"
+    );
+    Ok(mcpmesh_local_api::DeviceRevocationImportResult {
+        endpoint: endpoint.principal(),
+        user_id: token.user_id,
+        applied: true,
+        severed,
+    })
 }

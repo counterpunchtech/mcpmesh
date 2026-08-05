@@ -1024,6 +1024,7 @@ mod tests {
             reachability: Vec::new(),
             self_nickname: String::new(),
             storage: None,
+            revoked: Vec::new(),
             self_network: None,
         }
     }

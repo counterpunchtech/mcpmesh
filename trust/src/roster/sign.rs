@@ -113,6 +113,65 @@ pub fn verify_introduction(
         .map_err(|_| RosterError::BadSignature)
 }
 
+/// The domain a user key signs a REVOCATION of one of its own devices under (#85 ask 4).
+///
+/// Separate from [`DEVICE_BINDING_DOMAIN`] for a sharper reason than the others: a device binding
+/// signs `domain ∥ user_pk ∥ endpoint_id` — the **identical field layout** with the identical
+/// values. Without a distinct domain, every binding a person has ever issued would verify as a
+/// revocation of that same device, so presenting your own binding would kill you. Not hypothetical;
+/// the preimages differ in nothing else but the prefix and the timestamp.
+const DEVICE_REVOCATION_DOMAIN: &[u8] = b"mcpmesh/device-revocation/1";
+
+/// The bytes a user key signs to revoke one of its own devices:
+/// `domain ∥ user_pk ∥ endpoint_id ∥ issued_at(8, big-endian)`.
+///
+/// `issued_at` is INSIDE the signature so a fresher statement about the same endpoint cannot be
+/// replaced by replaying an older one, and so an importer can order two statements it receives out
+/// of order. Big-endian and fixed-width, like the other preimages here: the layout is wire format.
+fn device_revocation_preimage(
+    user_pk: &[u8; 32],
+    device_endpoint_id: &[u8; 32],
+    issued_at: u64,
+) -> Vec<u8> {
+    let mut m = Vec::with_capacity(DEVICE_REVOCATION_DOMAIN.len() + 72);
+    m.extend_from_slice(DEVICE_REVOCATION_DOMAIN);
+    m.extend_from_slice(user_pk);
+    m.extend_from_slice(device_endpoint_id);
+    m.extend_from_slice(&issued_at.to_be_bytes());
+    m
+}
+
+/// Sign a revocation of `device_endpoint_id` with the USER key (#85 ask 4).
+///
+/// Says "the holder of this user key asks that this endpoint be treated as dead". It does NOT prove
+/// the endpoint was ever bound to that key — the importer enforces that separately, against rows it
+/// already holds. See `daemon::handlers::device_revocation_import`.
+pub fn sign_device_revocation(
+    user_key: &SigningKey,
+    device_endpoint_id: &[u8; 32],
+    issued_at: u64,
+) -> [u8; 64] {
+    use ed25519_dalek::Signer;
+    let user_pk = user_key.verifying_key().to_bytes();
+    let msg = device_revocation_preimage(&user_pk, device_endpoint_id, issued_at);
+    user_key.sign(&msg).to_bytes()
+}
+
+/// Verify a device revocation. `verify_strict`, like every other verifier here. Never panics on a
+/// malformed key or signature.
+pub fn verify_device_revocation(
+    user_pk: &[u8; 32],
+    device_endpoint_id: &[u8; 32],
+    issued_at: u64,
+    sig: &[u8],
+) -> Result<(), RosterError> {
+    let vk = VerifyingKey::from_bytes(user_pk).map_err(|_| RosterError::BadSignature)?;
+    let sig = Signature::from_slice(sig).map_err(|_| RosterError::BadSignature)?;
+    let msg = device_revocation_preimage(user_pk, device_endpoint_id, issued_at);
+    vk.verify_strict(&msg, &sig)
+        .map_err(|_| RosterError::BadSignature)
+}
+
 /// The bytes a user key signs to bind a device endpoint to itself: domain ∥ user_pk ∥ endpoint_id.
 fn device_binding_preimage(user_pk: &[u8; 32], device_endpoint_id: &[u8; 32]) -> Vec<u8> {
     let mut m = Vec::with_capacity(DEVICE_BINDING_DOMAIN.len() + 64);
@@ -314,5 +373,115 @@ mod tests {
         bad[0] ^= 0xFF;
         assert!(verify_device_binding(&user_pk, &device, &bad).is_err());
         assert!(verify_device_binding(&user_pk, &device, b"short").is_err());
+    }
+
+    /// #85 ask 4: a device BINDING must never verify as a device REVOCATION, or presenting your own
+    /// binding would kill you.
+    ///
+    /// A binding signs `domain ∥ user_pk ∥ endpoint_id`; a revocation signs
+    /// `domain ∥ user_pk ∥ endpoint_id ∥ issued_at`. Same key, same endpoint, same order — the
+    /// prefix and the eight trailing bytes are the only things standing between "this device is
+    /// mine" and "this device is dead". A binding is a public artifact: it rides the pairing wire,
+    /// and every peer who ever paired with this person holds one.
+    ///
+    /// **Which property is load-bearing, measured rather than assumed:** collapsing the two domains
+    /// to one leaves this test GREEN — the trailing `issued_at` still makes the preimages different
+    /// lengths. The distinct domain is defence in depth against a future layout change that removes
+    /// that accident, and it is `the_revocation_preimage_layout_is_fixed` below that actually
+    /// catches a collision. Recorded because calling this the sharpest domain case and then not
+    /// testing the domain would be exactly the vacuity the mutation exists to find.
+    #[test]
+    fn a_device_binding_can_never_be_replayed_as_a_revocation() {
+        let uk = SigningKey::from_bytes(&[3u8; 32]);
+        let pk = uk.verifying_key().to_bytes();
+        let device = [11u8; 32];
+
+        let binding = sign_device_binding(&uk, &device);
+        let revocation = sign_device_revocation(&uk, &device, 1_754_300_000);
+
+        // Each verifies as ITSELF — the precondition, without which the failures below prove
+        // nothing (two broken signers would also "not cross-verify").
+        verify_device_binding(&pk, &device, &binding).expect("a binding verifies as a binding");
+        verify_device_revocation(&pk, &device, 1_754_300_000, &revocation)
+            .expect("a revocation verifies as a revocation");
+        assert_ne!(
+            binding, revocation,
+            "precondition: the two signatures are actually different"
+        );
+
+        // Neither verifies as the OTHER, at any timestamp.
+        for t in [0u64, 1_754_300_000, u64::MAX] {
+            assert!(
+                verify_device_revocation(&pk, &device, t, &binding).is_err(),
+                "a device binding must NOT verify as a revocation at issued_at={t} — every peer \
+                 this person paired with holds one of these"
+            );
+        }
+        assert!(
+            verify_device_binding(&pk, &device, &revocation).is_err(),
+            "…and a revocation must not verify as a binding, which would let a kill statement \
+             admit the device it names"
+        );
+    }
+
+    /// The revocation preimage is WIRE FORMAT: domain ∥ user_pk ∥ endpoint ∥ issued_at(8, BE).
+    ///
+    /// Pinned by layout, not by a golden signature, for the same reason the introduction preimage
+    /// is: a peer signing one layout and a peer verifying another simply cannot interoperate, and a
+    /// silent change invalidates every revocation in existence — including ones already handed to
+    /// peers out of band, which cannot be re-issued from a stolen laptop.
+    #[test]
+    fn the_revocation_preimage_layout_is_fixed() {
+        let pk = [1u8; 32];
+        let device = [2u8; 32];
+        let m = super::device_revocation_preimage(&pk, &device, 0x0102_0304_0506_0708);
+        let d = super::DEVICE_REVOCATION_DOMAIN;
+        assert_eq!(&m[..d.len()], d);
+        assert_eq!(
+            m.len(),
+            d.len() + 72,
+            "domain ∥ pk(32) ∥ endpoint(32) ∥ issued_at(8)"
+        );
+        assert_eq!(&m[d.len()..][..32], &pk);
+        assert_eq!(&m[d.len() + 32..][..32], &device);
+        assert_eq!(
+            &m[d.len() + 64..],
+            &[1u8, 2, 3, 4, 5, 6, 7, 8],
+            "issued_at is big-endian — byte order is wire format too"
+        );
+        assert_ne!(
+            d,
+            super::DEVICE_BINDING_DOMAIN,
+            "the two domains must differ; the field layouts do not"
+        );
+    }
+
+    /// `issued_at` is inside the signature, so a revocation cannot be re-dated.
+    ///
+    /// Without this an attacker who holds a revocation could present it with any timestamp, which
+    /// defeats the ordering an importer uses to decide whether a newer statement supersedes it.
+    #[test]
+    fn a_revocations_timestamp_cannot_be_altered() {
+        let uk = SigningKey::from_bytes(&[5u8; 32]);
+        let pk = uk.verifying_key().to_bytes();
+        let device = [7u8; 32];
+        let sig = sign_device_revocation(&uk, &device, 1000);
+        verify_device_revocation(&pk, &device, 1000, &sig).expect("verifies at its own timestamp");
+        for t in [999u64, 1001, 0] {
+            assert!(
+                verify_device_revocation(&pk, &device, t, &sig).is_err(),
+                "re-dating to {t} must fail — issued_at is signed"
+            );
+        }
+        // …and it is bound to the ENDPOINT, so it cannot be transplanted onto another device.
+        assert!(
+            verify_device_revocation(&pk, &[8u8; 32], 1000, &sig).is_err(),
+            "a revocation must not transplant to a different endpoint"
+        );
+        // …nor to another signer.
+        let other = SigningKey::from_bytes(&[6u8; 32])
+            .verifying_key()
+            .to_bytes();
+        assert!(verify_device_revocation(&other, &device, 1000, &sig).is_err());
     }
 }
