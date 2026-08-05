@@ -282,3 +282,41 @@ key — #85 asks 2–3 are about that one and are not shipped.
 escrow and no recovery path today (#85 asks 2–3). It is also the identity every peer pinned at
 pairing, so replacing it makes this node a stranger to all of them. Pass the **same** key on every
 restart of the same node; a fresh one mints a new identity each boot.
+
+## Supplying your own peer resolver (`add_address_lookup`, #68)
+
+Peer resolution otherwise depends on external infrastructure — the pkarr publisher/resolver a relay
+provides, or an address someone already handed you in an invite. **Two machines on the same LAN with
+no internet cannot find each other**, even though the network path between them is fine. That is the
+scenario where "peer to peer" earns its keep: a boat, a workshop, a failed uplink, a deliberately
+air-gapped network. It is also the common weaker case — a home or office LAN where the internet is
+merely flaky, and peers that could talk directly fail to resolve because resolution goes out first.
+
+iroh 1.0.3 ships **no** mDNS or local-swarm lookup (that existed in 0.x and is not present here), so
+mcpmesh cannot simply switch one on. What it can do is stop the resolver set being closed:
+`iroh::address_lookup::AddressLookup` is a public, pluggable trait, so an implementation can live
+outside this crate.
+
+```rust
+use mcpmesh_node::iroh::address_lookup::{AddressLookup, EndpointData};
+
+#[derive(Debug)]
+struct MyMdns;
+
+impl AddressLookup for MyMdns {
+    fn publish(&self, _data: &EndpointData) { /* announce on the LAN */ }
+    // `resolve` defaults to None; implement it to answer queries.
+}
+
+node.add_address_lookup(MyMdns)?;
+```
+
+- **Additive, never authoritative.** Your lookup is consulted alongside whatever the node already
+  has; adding one cannot remove relay-based resolution.
+- **Resolution authorizes nothing.** A peer found this way faces the trust gate exactly as one found
+  any other way — resolution answers *where*, never *who may*. A resolver cannot widen who your node
+  admits, which is why this is safe to hand to an embedder at all.
+- **Takes effect for dials from now on.** A dial already in flight is not re-resolved.
+
+**An in-tree mDNS implementation behind `[network].local_discovery` is still open** (#68). This is
+the seam that unblocks writing one outside; it is not the discovery itself.
