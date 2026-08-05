@@ -103,20 +103,31 @@ pub fn run_join(
     .encode();
 
     // Pin the org root (+ user id/key path) through the daemon (single-writer; no roster yet).
-    with_daemon(async |mut client| {
-        client
-            .org_join(
-                &invite.org_id,
-                &invite.org_root_pk,
-                &requested_user_id,
-                &user_key_path.to_string_lossy(),
-            )
+    // #93b: the daemon reports whether its roster TRANSPORT is running. A daemon that booted in
+    // pairing mode has now pinned the org root but bound no gossip/blob ALPNs, so presence stays
+    // empty and blobs hard-close until it restarts — carried out so the porcelain can say so.
+    let restart_required = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let restart_flag = restart_required.clone();
+    let (join_org_id, join_root_pk, join_user_id, join_key_path) = (
+        invite.org_id.clone(),
+        invite.org_root_pk.clone(),
+        requested_user_id.clone(),
+        user_key_path.to_string_lossy().into_owned(),
+    );
+    let join_url = invite.roster_url.clone();
+    with_daemon(async move |mut client| {
+        let joined = client
+            .org_join(&join_org_id, &join_root_pk, &join_user_id, &join_key_path)
             .await?;
+        restart_flag.store(
+            joined.restart_required,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         // If the invite carried a roster URL, pin it to config `[roster].url` so the joiner's poll
         // loop fetches its FIRST roster on the next daemon start (the joiner has no other way to
         // obtain one before it holds a roster). Same daemon connection, immediately after the
         // org-root pin.
-        if let Some(url) = &invite.roster_url {
+        if let Some(url) = &join_url {
             client.set_roster_url(url).await?;
         }
         Ok(())
@@ -132,11 +143,21 @@ pub fn run_join(
                 "join_code": join,
                 "join_code_fingerprint": code_fp,
                 "org_root_fingerprint": fingerprint,
+                "restart_required": restart_required.load(std::sync::atomic::Ordering::Relaxed),
             })
         );
         return Ok(());
     }
     println!("Joined org '{}' as '{requested_user_id}'.", invite.org_id);
+    // #93b: stated BEFORE the approval instructions, because it changes what the user should do
+    // next. Without it the join looked wholly successful and the missing presence/file sharing
+    // surfaced later as an unexplained absence.
+    if restart_required.load(std::sync::atomic::Ordering::Relaxed) {
+        println!(
+            "  → Restart the daemon before this fully takes effect: this one started in pairing \
+             mode, so presence and file sharing stay off until it does. The join itself is saved."
+        );
+    }
     println!("Org root fingerprint: {fingerprint}");
     println!(
         "  → Confirm this matches what the operator reads back, out-of-band, before they approve you."

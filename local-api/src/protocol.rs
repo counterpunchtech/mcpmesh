@@ -295,6 +295,17 @@ pub struct RosterStatus {
     pub serial: u64,
     pub state: String, // "pending" | "approved" | "degraded" | "stopped"
     pub org_root_fingerprint: String, // short-word form
+    /// The org's DECLARED group namespace, in roster document order (#93). `api_minor >= 46`.
+    ///
+    /// The set an `allow` entry may name — a roster is refused if any user carries a group outside
+    /// it — so this is what a UI offers when assigning membership. Without it an embedder in roster
+    /// mode had managed group membership it could not enumerate, and the only way to learn the
+    /// groups was to hand-parse the daemon-owned `roster.json`.
+    ///
+    /// Display/authoring input, never an authorization answer: naming a group grants nothing.
+    /// Additive — a payload from an older daemon reads as an empty list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
 }
 
 /// One reachable roster peer device as reported by `status` (the advisory presence read).
@@ -304,6 +315,21 @@ pub struct RosterStatus {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PresencePeer {
     pub user_id: String,
+    /// The person's human display name from the roster (#93). `api_minor >= 46`.
+    ///
+    /// `user_id` is an authorization handle; this is what a UI puts next to a face. The roster
+    /// carried it all along and the control seam dropped it, so an embedder had a presence list it
+    /// could only label with an opaque id. Display-only — never an authz input.
+    ///
+    /// Additive: absent from an older daemon's payload, and empty when the roster's own field is.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub display_name: String,
+    /// The groups this person belongs to (#93). `api_minor >= 46`.
+    ///
+    /// The same strings an `allow` entry names, so a UI can show why someone is admitted without
+    /// re-deriving it. Advisory display data: the gate reads the roster, never this. Additive.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
     pub device_label: String,
     pub role: String, // "primary" | "mirror" (roster vocabulary)
     /// Whether the device has a live presence heartbeat (advisory — absence never blocks a dial).
@@ -1086,6 +1112,17 @@ pub enum Request {
     /// pins the org root on FIRST install (`b64u:`); omit it
     /// once pinned (config carries it). Tag `"roster_install"`.
     RosterInstall(RosterInstallParams),
+    /// Read the installed roster's MEMBERSHIP: the declared groups, and every person with their
+    /// display name, groups, and devices (#93). Parameterless. Tag `"roster_members"`.
+    ///
+    /// The read half of roster mode. `status` reports that a roster exists (`RosterStatus`) and who
+    /// is currently online (`PresencePeer`); neither answered "who is in this org" — a person with
+    /// no live device appeared nowhere at all, so an embedder could not draw a member list, and
+    /// the only route to one was hand-parsing the daemon-owned `roster.json`.
+    ///
+    /// ADVISORY and display-oriented, like `status`: the gate reads the roster document, never
+    /// this. Empty in a pure-pairing daemon or before the first roster is installed.
+    RosterMembers,
     /// Pin the org root on a JOINER — WITHOUT a roster (the joiner has none yet; its poll loop
     /// fetches the first one). Records `[identity]` org_id / org_root_pk / user_id / user_key.
     /// `user_key` is a LOCAL path
@@ -1188,6 +1225,28 @@ pub enum Request {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrgJoinResult {
     pub org_id: String,
+    /// `true` when the org root was pinned but this node's ROSTER TRANSPORT is not running, so the
+    /// join is only half in effect until the daemon restarts (#93). `api_minor >= 46`.
+    ///
+    /// Roster mode is decided at BOOT: it fixes the ALPN set bound on the endpoint and whether
+    /// gossip, presence and app-blobs are constructed at all. The roster GATE hot-swaps live. So a
+    /// node that booted in pairing mode and then joins an org reaches a state where MCP sessions to
+    /// org members work as soon as a roster arrives, while `status.presence` stays permanently
+    /// empty and every blob verb hard-closes with `blobs not enabled` — succeeding partially, with
+    /// no error anywhere, which a caller previously had no way to detect.
+    ///
+    /// **What to do with it:** if `true`, tell the user the join succeeded and the node must
+    /// restart before presence and file sharing work. Do not treat it as a failure — nothing was
+    /// left half-written; the pin is durable and the restart is sufficient.
+    ///
+    /// `false` when the transport is already composed (the node booted with an org root pinned), or
+    /// on a re-join of an org this node is already in.
+    ///
+    /// Same shape as [`SetRelaysResult::restart_required`] (#53), for the same reason. Additive:
+    /// absent from an older daemon's payload and reads as `false` — which was that daemon's
+    /// implicit, and wrong, answer.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub restart_required: bool,
 }
 
 /// Result of a [`Request::RosterInstall`] request (the manual install path): the installed roster's
@@ -1203,6 +1262,61 @@ pub struct RosterInstallResult {
     /// How many live sessions were severed, for the porcelain's confirmation line.
     #[serde(default)]
     pub severed: u32,
+}
+
+/// Result of [`Request::RosterMembers`]: the org's membership as an embedder renders it (#93).
+///
+/// Distinct from `status.presence` in what it enumerates: that lists reachable DEVICES and omits a
+/// person entirely when none of their devices is up. This lists every person the roster carries,
+/// online or not — a member list, not a presence list — with `online` per device so a UI can draw
+/// both from one read.
+///
+/// ADVISORY. Every field here is display or authoring input; nothing in it is an authorization
+/// answer. The gate reads the signed roster.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RosterMembersResult {
+    /// The org's declared group namespace, in document order — the set an `allow` entry may name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
+    /// Every person in the roster, ordered by `user_id` for a stable display.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub users: Vec<RosterMember>,
+}
+
+/// One person in a [`RosterMembersResult`] (#93).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RosterMember {
+    /// The stable authorization handle — what an `allow` entry names.
+    pub user_id: String,
+    /// The human name, for display. Empty if the roster's own field is.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub display_name: String,
+    /// The groups this person belongs to, each declared in [`RosterMembersResult::groups`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
+    /// Their ACTIVE devices — revoked ones are absent, exactly as the gate sees it. Ordered
+    /// primary-before-mirror, then by label.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<RosterMemberDevice>,
+}
+
+/// One device of a [`RosterMember`] (#93).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RosterMemberDevice {
+    /// The device's human label.
+    pub label: String,
+    /// `"primary"` | `"mirror"` — the advisory dial-ordering hint, never a security property.
+    pub role: String,
+    /// The device's stable `eid:` principal — the SAME vocabulary [`PeerInfo::principal`] carries,
+    /// and what a per-device `allow` entry names.
+    ///
+    /// Included where `PresencePeer` deliberately omits it, because this surface exists to be
+    /// ACTED on: an embedder granting or revoking one device of a person needs the handle to name
+    /// it, and the alternative is a nickname that does not exist in roster mode.
+    pub principal: String,
+    /// Whether the device has a live presence heartbeat. Advisory — absence never blocks a dial,
+    /// and never removes a dial candidate.
+    pub online: bool,
 }
 
 /// Result of [`Request::BlobPublish`]: the copyable `mcpmesh/blob/1` ticket + the blob's blake3 hash.
@@ -3007,9 +3121,27 @@ mod tests {
         // OrgJoinResult echoes the pinned org id (surface-clean; the fingerprint is porcelain-side).
         let res = OrgJoinResult {
             org_id: "acme".into(),
+            restart_required: true,
         };
         let v = serde_json::to_value(&res).unwrap();
         assert_eq!(v["org_id"], "acme");
+        assert_eq!(
+            v["restart_required"], true,
+            "#93: a half-live join must reach the wire — the caller cannot detect it any other way"
+        );
+        // Additive: an older daemon omits it, and absent reads as `false` — which was that
+        // daemon's implicit answer. Pinned so the default cannot silently flip to `true` and start
+        // telling every caller to restart.
+        let legacy: OrgJoinResult =
+            serde_json::from_value(serde_json::json!({"org_id": "acme"})).unwrap();
+        assert!(!legacy.restart_required);
+        // …and the false case must not bloat the payload.
+        let quiet = serde_json::to_value(OrgJoinResult {
+            org_id: "acme".into(),
+            restart_required: false,
+        })
+        .unwrap();
+        assert!(quiet.get("restart_required").is_none());
         assert_eq!(serde_json::from_value::<OrgJoinResult>(v).unwrap(), res);
     }
 
@@ -3216,10 +3348,13 @@ mod tests {
                 serial: 42,
                 state: "approved".into(),
                 org_root_fingerprint: "tango-fig-cabbage-anchor".into(),
+                groups: vec!["eng".into(), "ops".into()],
             }),
             presence: vec![
                 PresencePeer {
                     user_id: "alice".into(),
+                    display_name: "Alice Example".into(),
+                    groups: vec!["eng".into()],
                     device_label: "laptop".into(),
                     role: "primary".into(),
                     online: true,
@@ -3227,6 +3362,8 @@ mod tests {
                 },
                 PresencePeer {
                     user_id: "alice".into(),
+                    display_name: "Alice Example".into(),
+                    groups: vec!["eng".into()],
                     device_label: "desktop".into(),
                     role: "mirror".into(),
                     online: false,

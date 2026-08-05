@@ -764,6 +764,18 @@ pub(crate) async fn handle_request(req: &Value, state: &DaemonState) -> Value {
         // (a local file the same-uid daemon reads) and an OPTIONAL `org_root_pk`
         // that pins the org root on first install. `install_roster` validates (rules 1–6),
         // persists, hot-swaps the gate, and severs revoked sessions.
+        // #93: the READ half of roster mode — the declared groups plus every person the installed
+        // roster carries, online or not. Parameterless and read-only; `status` answers who is
+        // REACHABLE, which is a different question and omits anyone whose devices are all down.
+        Some("roster_members") => respond(
+            id,
+            "roster_members",
+            async {
+                let mesh = state.mesh_required()?;
+                Ok(crate::daemon::roster_members(mesh))
+            }
+            .await,
+        ),
         Some("roster_install") => respond(
             id,
             "roster_install",

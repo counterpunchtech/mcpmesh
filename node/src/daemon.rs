@@ -132,7 +132,7 @@ pub(crate) use roster_install::{
     install_roster, org_join, set_app_metadata, set_nickname, set_roster_url,
 };
 pub(crate) use status::{
-    known_service_names, peer_infos, presence_peers, roster_status, service_infos,
+    known_service_names, peer_infos, presence_peers, roster_members, roster_status, service_infos,
 };
 
 /// The lockstep stack version (workspace version) reported in `Hello`/`status`.
@@ -750,6 +750,28 @@ impl MeshState {
             .read()
             .expect("app_metadata lock not poisoned")
             .clone()
+    }
+
+    /// Is the roster TRANSPORT actually composed on this process (#93b)?
+    ///
+    /// `roster_mode` is a boot-time snapshot of "an org root is pinned", and it decides two things
+    /// nothing can change afterwards: the ALPN set bound on the endpoint, and whether gossip,
+    /// presence and app-blobs are constructed at all. The roster GATE, by contrast, hot-swaps live.
+    ///
+    /// So a node that booted in PAIRING mode and then ran `org_join` is half-live: MCP sessions to
+    /// org members start working the moment a roster arrives, while presence stays permanently
+    /// empty and blobs hard-close with `blobs not enabled`. Partial success with no error is the
+    /// worst failure shape available, and an embedder had no way to detect it — which is what
+    /// `OrgJoinResult::restart_required` now answers.
+    ///
+    /// **Derived from the composed transport, not from `roster_mode`.** They differ in a case that
+    /// matters: `compose_roster_transport` also returns nothing when roster mode is on but no
+    /// `org_id` is known (it warns and disables gossip). The ALPNs are bound in that case and
+    /// presence still does not work, so `roster_mode` would report "live" for a node that is not.
+    /// Asking the transport itself cannot drift from what was actually built. `blobs` is composed
+    /// in the same branch as `gossip`, so one answers for both.
+    pub(crate) fn roster_transport_live(&self) -> bool {
+        self.gossip.is_some()
     }
 
     /// Who currently gets a reachability pong (#89). Read on every `mcpmesh/ping/1` accept.

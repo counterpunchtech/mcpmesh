@@ -398,6 +398,22 @@ impl ControlClient {
         .await
     }
 
+    /// Read the installed roster's MEMBERSHIP (#93): the declared groups, and every person with
+    /// their display name, groups, and devices.
+    ///
+    /// Distinct from [`status`](Self::status)'s `presence`, which enumerates reachable DEVICES and
+    /// omits a person entirely when none of theirs is up. This is the member list — everyone the
+    /// roster carries, with `online` per device, so one read serves both questions.
+    ///
+    /// Advisory: display and authoring input, never an authorization answer. Empty in a
+    /// pure-pairing daemon and before the first roster is installed. `api_minor >= 46`.
+    pub async fn roster_members(
+        &mut self,
+    ) -> Result<crate::protocol::RosterMembersResult, ClientError> {
+        self.request_typed(Request::RosterMembers, "roster_members result")
+            .await
+    }
+
     /// Pin the org root on a JOINER (no roster yet). `user_key` is a LOCAL path — the key never
     /// crosses the API. Returns the pinned org id.
     pub async fn org_join(

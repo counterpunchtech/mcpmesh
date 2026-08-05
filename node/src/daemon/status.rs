@@ -66,6 +66,9 @@ pub(crate) fn roster_status(mesh: &Arc<MeshState>, cfg: Option<&Config>) -> Opti
                 serial: view.serial(),
                 state: state.to_string(),
                 org_root_fingerprint,
+                // #93: the declared group namespace, so an embedder can enumerate the groups an
+                // `allow` entry may name without hand-parsing the daemon-owned roster.json.
+                groups: view.groups().to_vec(),
             })
         }
         None => {
@@ -78,6 +81,9 @@ pub(crate) fn roster_status(mesh: &Arc<MeshState>, cfg: Option<&Config>) -> Opti
                 serial: 0,
                 state: "pending".to_string(),
                 org_root_fingerprint,
+                // Pending = pinned root, no roster yet. There is no group namespace to report:
+                // groups are DECLARED by the roster document, and this node has none.
+                groups: Vec::new(),
             })
         }
     }
@@ -110,6 +116,11 @@ pub(crate) fn presence_peers(mesh: &Arc<MeshState>) -> Vec<PresencePeer> {
         .devices()
         .map(|(eid, d)| PresencePeer {
             user_id: d.user_id.clone(),
+            // #93: the roster carried both of these all along and this projection dropped them,
+            // leaving an embedder a presence list it could label only with an opaque `user_id`.
+            // Display data, exactly like `device_label` beside them — never an authz input.
+            display_name: d.display_name.clone(),
+            groups: d.groups.clone(),
             device_label: d.label.clone(),
             role: d.role.clone(),
             online: active.contains_key(eid),
@@ -230,6 +241,71 @@ pub(crate) fn peer_infos(store: &PeerStore) -> Vec<PeerInfo> {
             principal: Some(mcpmesh_net::EndpointId::from_bytes(e.endpoint_id).principal()),
         })
         .collect()
+}
+
+/// The `roster_members` read (#93): the org's declared groups + every person the installed roster
+/// carries, with their devices and each device's live presence.
+///
+/// **Why this is not `status.presence`.** That projection enumerates DEVICES and answers "who is
+/// reachable right now" — a person whose devices are all offline appears nowhere in it. An embedder
+/// drawing a member list needs the opposite question ("who is in this org"), and had no way to ask
+/// it: the roster is daemon-owned, so the only route was hand-parsing `<root>/config/roster.json`.
+/// This answers the membership question and carries `online` per device, so one read serves both.
+///
+/// Reads the SAME validated view the gate resolves against, so a revoked device is absent here
+/// exactly as it is unauthorized there — a member list that showed a revoked device as merely
+/// offline would be worse than none.
+///
+/// ADVISORY: every field is display or authoring input. Empty in a pure-pairing daemon, and before
+/// the first roster is installed.
+pub(crate) fn roster_members(mesh: &Arc<MeshState>) -> mcpmesh_local_api::RosterMembersResult {
+    let Some(view) = mesh.roster.view() else {
+        return mcpmesh_local_api::RosterMembersResult::default();
+    };
+    let now = epoch_now_i64();
+    let active: std::collections::HashMap<[u8; 32], crate::roster::presence::PresenceEntry> =
+        mesh.presence_table.active(now).into_iter().collect();
+
+    // Group the view's flat device map by owner. The view is device-keyed because that is what the
+    // gate resolves; the person is the unit an embedder renders.
+    let mut by_user: std::collections::BTreeMap<String, mcpmesh_local_api::RosterMember> =
+        std::collections::BTreeMap::new();
+    for (eid, d) in view.devices() {
+        let member =
+            by_user
+                .entry(d.user_id.clone())
+                .or_insert_with(|| mcpmesh_local_api::RosterMember {
+                    user_id: d.user_id.clone(),
+                    display_name: d.display_name.clone(),
+                    groups: d.groups.clone(),
+                    devices: Vec::new(),
+                });
+        member.devices.push(mcpmesh_local_api::RosterMemberDevice {
+            label: d.label.clone(),
+            role: d.role.clone(),
+            // The handle a per-device `allow` entry names — the same `eid:` vocabulary
+            // `PeerInfo::principal` carries. Included here, unlike on `PresencePeer`, because this
+            // surface exists to be acted on: granting or revoking ONE device of a person needs a
+            // way to name it, and roster mode has no nicknames.
+            principal: mcpmesh_net::EndpointId::from_bytes(*eid).principal(),
+            online: active.contains_key(eid),
+        });
+    }
+    // Stable display order, matching `presence_peers`: primary before mirror, then label. The
+    // view's device map is unordered, so without this the list reshuffles between reads.
+    for m in by_user.values_mut() {
+        m.devices.sort_by(|a, b| {
+            dial::dial_role_rank(&a.role)
+                .cmp(&dial::dial_role_rank(&b.role))
+                .then_with(|| a.label.cmp(&b.label))
+        });
+    }
+    mcpmesh_local_api::RosterMembersResult {
+        groups: view.groups().to_vec(),
+        // BTreeMap → ordered by `user_id`, which is the stable key. Sorting by `display_name`
+        // would reorder the list when someone is renamed.
+        users: by_user.into_values().collect(),
+    }
 }
 
 #[cfg(test)]
@@ -400,5 +476,191 @@ mod tests {
         assert_eq!(status.recent_pairings.len(), 8);
         assert_eq!(status.recent_pairings[0].sas_code, "code-9");
         assert_eq!(status.recent_pairings[0].paired_at_epoch, 9);
+    }
+}
+
+#[cfg(test)]
+mod roster_members_tests {
+    use super::roster_members;
+    use crate::daemon::testutil::hermetic_mesh;
+    use mcpmesh_trust::roster::validate::load_installed;
+    use mcpmesh_trust::roster::{Roster, RosterDevice, RosterUser, encode_b64u, sign::mint_signed};
+
+    /// Build + install a two-person roster: alice has two devices (one revoked), bob has one and no
+    /// live device at all. Bob is the case `status.presence` cannot express.
+    fn install_sample(mesh: &std::sync::Arc<crate::daemon::MeshState>) {
+        let root = mcpmesh_trust::ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let r = mint_signed(
+            &root,
+            Roster {
+                format: "mcpmesh-roster/1".into(),
+                org_id: "acme".into(),
+                serial: 5,
+                issued_at: "2000-01-01T00:00:00Z".into(),
+                expires_at: "2999-01-01T00:00:00Z".into(),
+                groups: vec!["ops".into(), "eng".into()],
+                users: vec![
+                    RosterUser {
+                        user_id: "alice".into(),
+                        display_name: "Alice Example".into(),
+                        user_pk: encode_b64u(&[1u8; 32]),
+                        groups: vec!["eng".into()],
+                        devices: vec![
+                            RosterDevice {
+                                endpoint_id: encode_b64u(&[0xA1; 32]),
+                                label: "laptop".into(),
+                                role: "primary".into(),
+                            },
+                            RosterDevice {
+                                endpoint_id: encode_b64u(&[0xA2; 32]),
+                                label: "old-phone".into(),
+                                role: "mirror".into(),
+                            },
+                        ],
+                    },
+                    RosterUser {
+                        user_id: "bob".into(),
+                        display_name: "Bob Example".into(),
+                        user_pk: encode_b64u(&[2u8; 32]),
+                        groups: vec!["ops".into(), "eng".into()],
+                        devices: vec![RosterDevice {
+                            endpoint_id: encode_b64u(&[0xB1; 32]),
+                            label: "desktop".into(),
+                            role: "primary".into(),
+                        }],
+                    },
+                ],
+                // alice's `old-phone` is revoked — it must not appear as a member device at all.
+                revoked_endpoints: vec![encode_b64u(&[0xA2; 32])],
+                sig: String::new(),
+            },
+        );
+        mesh.roster
+            .install(load_installed(&r, &root.verifying_key()).unwrap());
+    }
+
+    /// #93(a): the membership read an embedder could not perform.
+    ///
+    /// The roster holds `display_name`, `groups`, and per-user devices; none of it crossed the
+    /// control seam, so the only route to a member list was hand-parsing the daemon-owned
+    /// `roster.json`. This asserts each field that was missing, and — the load-bearing part — that
+    /// **bob appears at all**: he has no live device, so `status.presence` cannot show him, which
+    /// is precisely why a presence list is not a member list.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_membership_read_carries_names_groups_and_offline_people() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+        std::fs::write(&cfg, "").unwrap();
+        let mesh = hermetic_mesh(cfg).await;
+        install_sample(&mesh);
+
+        let got = roster_members(&mesh);
+
+        assert_eq!(
+            got.groups,
+            vec!["ops".to_string(), "eng".to_string()],
+            "the DECLARED group namespace must be reported in document order — it is the set an \
+             `allow` entry may name, and a UI has nothing else to offer from"
+        );
+        assert_eq!(
+            got.users
+                .iter()
+                .map(|u| u.user_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alice", "bob"],
+            "every person in the roster must appear, ordered by the stable user_id — bob has NO \
+             live device, which is exactly the case status.presence cannot express"
+        );
+
+        let alice = &got.users[0];
+        assert_eq!(
+            alice.display_name, "Alice Example",
+            "the human name must cross the seam"
+        );
+        assert_eq!(alice.groups, vec!["eng".to_string()]);
+        assert_eq!(
+            alice
+                .devices
+                .iter()
+                .map(|d| d.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["laptop"],
+            "a REVOKED device must be absent, not merely offline — the member list must agree \
+             with what the gate would authorize"
+        );
+        assert_eq!(
+            alice.devices[0].principal,
+            mcpmesh_net::EndpointId::from_bytes([0xA1; 32]).principal(),
+            "each device carries the eid: handle a per-device allow entry names — roster mode has \
+             no nicknames, so without it one device cannot be addressed"
+        );
+        assert!(
+            !alice.devices[0].online,
+            "nothing has sent a heartbeat in this hermetic mesh"
+        );
+
+        let bob = &got.users[1];
+        assert_eq!(bob.display_name, "Bob Example");
+        assert_eq!(
+            bob.groups,
+            vec!["ops".to_string(), "eng".to_string()],
+            "multi-group membership must survive verbatim"
+        );
+        assert_eq!(bob.devices.len(), 1);
+    }
+
+    /// A pure-pairing daemon has no roster, and must answer an EMPTY membership rather than
+    /// erroring — an embedder polls one control surface whichever mode it is in.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_daemon_with_no_roster_reports_empty_membership() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+        std::fs::write(&cfg, "").unwrap();
+        let mesh = hermetic_mesh(cfg).await;
+
+        let got = roster_members(&mesh);
+        assert!(got.users.is_empty() && got.groups.is_empty());
+    }
+
+    /// #93(a), the other half: the same two fields on the PRESENCE projection, which is the
+    /// surface an embedder already polls.
+    ///
+    /// Separate from the membership read on purpose — `presence_peers` builds its rows
+    /// independently, so a fix to one says nothing about the other. Dropping either `.clone()` in
+    /// that projection leaves the membership test above green.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn presence_rows_carry_the_display_name_and_groups_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+        std::fs::write(&cfg, "").unwrap();
+        let mesh = hermetic_mesh(cfg).await;
+        install_sample(&mesh);
+
+        let peers = super::presence_peers(&mesh);
+        let alice = peers
+            .iter()
+            .find(|p| p.user_id == "alice")
+            .expect("alice's active device is projected");
+        assert_eq!(alice.display_name, "Alice Example");
+        assert_eq!(alice.groups, vec!["eng".to_string()]);
+        assert_eq!(
+            alice.device_label, "laptop",
+            "the pre-existing fields must survive"
+        );
+    }
+
+    /// #93(a): `status.roster` must carry the declared groups, so a UI can populate a group picker
+    /// from the same read that tells it a roster exists.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn roster_status_carries_the_declared_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+        std::fs::write(&cfg, "").unwrap();
+        let mesh = hermetic_mesh(cfg).await;
+        install_sample(&mesh);
+
+        let st = super::roster_status(&mesh, None).expect("a roster is installed");
+        assert_eq!(st.groups, vec!["ops".to_string(), "eng".to_string()]);
+        assert_eq!(st.serial, 5, "the pre-existing fields must survive");
     }
 }
