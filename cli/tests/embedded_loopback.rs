@@ -456,7 +456,11 @@ async fn revoking_a_peer_severs_its_live_custom_protocol_connection() {
             &self,
             conn: mcpmesh_node::iroh::endpoint::Connection,
         ) -> Result<(), mcpmesh_node::iroh::protocol::AcceptError> {
-            self.open.notify_waiters();
+            // `notify_one`, NOT `notify_waiters`: the latter wakes only waiters ALREADY registered,
+            // so if the handler wins the race to this line the signal is dropped and the test
+            // hangs. `notify_one` stores a permit, so a later `notified()` returns immediately.
+            // Caught by CI — it passed locally on scheduling luck.
+            self.open.notify_one();
             conn.closed().await;
             Ok(())
         }
