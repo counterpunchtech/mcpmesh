@@ -77,6 +77,8 @@ pub mod daemon;
 /// Node-level conditions that are observable but have no API to observe them through (#134) —
 /// currently the relay's duplicate-endpoint-id report, which iroh 1.0.3 only `warn!`s.
 pub mod diag;
+/// Peer address resolution that needs no external infrastructure (#68).
+pub mod discovery;
 #[doc(hidden)]
 pub mod ipc;
 #[doc(hidden)]

@@ -82,6 +82,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # The blob AC/gate tests hash fixture bytes and drive raw iroh-blobs requests at the gate.
 blake3 = "1"
 iroh-blobs = { workspace = true }
+socket2 = "0.6"
+data-encoding = "2"
 
 # Debian packaging (spec §16 M4). `cargo-deb` reads this declarative table — no debian/{control,rules}
 # shell. Build with `cargo install cargo-deb && cargo deb -p mcpmesh` (a runbook step; cargo-deb is NOT a

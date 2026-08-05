@@ -84,6 +84,7 @@ bytes = { workspace = true }
 n0-future = { workspace = true }
 # Custom-discovery pkarr relay URLs (spec §10.3): iroh's Pkarr builders take `url::Url`.
 url = { workspace = true }
+iroh-mdns-address-lookup = "0.4"
 
 [dev-dependencies]
 tempfile.workspace = true

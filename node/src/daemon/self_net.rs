@@ -30,6 +30,8 @@ pub(crate) fn project(
     identity_conflict_epoch: Option<i64>,
     // #89: `"paired"` | `"granted"` | `"off"`. `None` only from a projection with no mesh.
     presence_mode: Option<String>,
+    // #68: `"off"` | `"on"` | `"resolve"`. `None` only from a projection with no mesh.
+    local_discovery: Option<String>,
 ) -> SelfNetwork {
     let relays: Vec<RelayInfo> = relays
         .into_iter()
@@ -45,6 +47,7 @@ pub(crate) fn project(
         last_change_epoch,
         identity_conflict_epoch,
         presence_mode,
+        local_discovery,
     }
 }
 
@@ -78,6 +81,7 @@ pub(crate) fn read_current(mesh: &MeshState, last_change_epoch: Option<i64>) -> 
         // #89: report the LIVE mode, not the on-disk config — an operator must be able to confirm
         // the knob took effect, and boot is the only thing that installs it.
         Some(mesh.presence_mode().as_str().to_string()),
+        Some(mesh.local_discovery().to_string()),
     )
 }
 
@@ -99,7 +103,7 @@ pub fn spawn_self_net_watch(mesh: Arc<MeshState>) -> tokio::task::JoinHandle<()>
         let mut watcher = mesh.endpoint.home_relay_status();
         // The offline-empty baseline (see above). Compared WITHOUT `direct_addrs` or the
         // stamp — see `signature`.
-        let mut previous = project(std::iter::empty(), Vec::new(), None, None, None);
+        let mut previous = project(std::iter::empty(), Vec::new(), None, None, None, None);
         loop {
             let current = read_current(&mesh, None);
             if signature(&current) != signature(&previous) {
@@ -169,6 +173,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(net.online);
         assert_eq!(net.home_relay.as_deref(), Some("https://b.example:443"));
@@ -180,6 +185,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(!net.online, "a known-but-disconnected relay is not online");
         assert_eq!(net.home_relay, None);
@@ -187,6 +193,7 @@ mod tests {
         let net = project(
             std::iter::empty::<(String, bool)>(),
             Vec::new(),
+            None,
             None,
             None,
             None,
@@ -255,6 +262,7 @@ mod tests {
             None,
             None,
             Some(crate::daemon::PresenceMode::Off.as_str().to_string()),
+            None,
         );
         assert_eq!(
             net.presence_mode.as_deref(),
@@ -290,6 +298,7 @@ mod tests {
                 vec!["10.0.0.1:1".into()],
                 None,
                 conflict,
+                None,
                 None,
             )
         };
@@ -327,10 +336,12 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let addr_churn = project(
             [("https://a.example:443".to_string(), true)],
             vec!["10.0.0.2:2".into()],
+            None,
             None,
             None,
             None,
@@ -343,6 +354,7 @@ mod tests {
         let relay_down = project(
             [("https://a.example:443".to_string(), false)],
             vec!["10.0.0.1:1".into()],
+            None,
             None,
             None,
             None,
@@ -366,6 +378,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let secondary_down = project(
             [
@@ -373,6 +386,7 @@ mod tests {
                 ("https://b.example:443".to_string(), false),
             ],
             vec!["10.0.0.1:1".into()],
+            None,
             None,
             None,
             None,

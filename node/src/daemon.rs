@@ -222,6 +222,12 @@ pub struct MeshState {
     /// presence with it in the same action, which is the property an embedder's per-peer sharing
     /// switch needs.
     pub(crate) presence_mode: std::sync::RwLock<crate::daemon::PresenceMode>,
+    /// `[network].local_discovery` (#68), as spelled in config, resolved at boot.
+    ///
+    /// Stored as the SPELLING rather than the parsed pair, because its only consumer is
+    /// `status.self_network` reading it back to the operator — and a read-back in a different
+    /// vocabulary from the one they wrote cannot confirm their setting took.
+    pub(crate) local_discovery: std::sync::OnceLock<String>,
     pub(crate) config_path: PathBuf,
     /// The relay posture (mode + custom URL set) currently APPLIED to the live endpoint — the
     /// runtime truth the `set_relays` verb (#53) diffs against. Seeded at boot from `[network]`
@@ -596,6 +602,7 @@ impl MeshState {
             // hermetic-mesh call sites across the integration tests, and every one of them wants
             // the default.
             presence_mode: std::sync::RwLock::new(crate::daemon::PresenceMode::default()),
+            local_discovery: std::sync::OnceLock::new(),
             config_path,
             applied_relays: std::sync::Mutex::new(RelayPosture::default()),
             roster,
@@ -995,6 +1002,17 @@ impl MeshState {
     /// in the same branch as `gossip`, so one answers for both.
     pub(crate) fn roster_transport_live(&self) -> bool {
         self.gossip.is_some()
+    }
+
+    /// This node's `[network].local_discovery` spelling (#68), for `status.self_network`.
+    /// Defaults to `"off"` — the config default, and the answer for a mesh boot never touched.
+    pub fn local_discovery(&self) -> &str {
+        self.local_discovery.get().map_or("off", String::as_str)
+    }
+
+    /// Install the boot-resolved `[network].local_discovery` spelling (#68).
+    pub fn set_local_discovery(&self, mode: String) {
+        let _ = self.local_discovery.set(mode);
     }
 
     /// Who currently gets a reachability pong (#89). Read on every `mcpmesh/ping/1` accept.

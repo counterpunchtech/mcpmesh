@@ -537,6 +537,7 @@ Do not build on either — they may change or disappear without an `api_version`
               "blobs_gc": {"interval_secs": 3600, "runs": 12, "last_run_epoch": 1754300000,
                            "last_protected": 41, "aborted": 0}},
   "self_network": {"online": true, "home_relay": "https://relay.example:443",
+                   "presence_mode": "paired", "local_discovery": "off",
                    "relays": [{"url": "https://relay.example:443", "connected": true}],
                    "direct_addrs": ["192.168.1.20:53420"], "last_change_epoch": 1753842000}
 }
@@ -561,6 +562,16 @@ of `online`, the home relay, any relay's connection state, **or a new identity-c
 observation** also pushes a `self_network` frame on `subscribe` (and the subscribe snapshot carries
 the block), so an embedder learns "you just went unreachable" without polling — the signal
 `set_relays` (#53) never had.
+
+`self_network.local_discovery` (`api_minor >= 50`, #68) is this node's `[network].local_discovery`:
+`"off"` (default) | `"on"` | `"resolve"`. It answers two operator questions the control API could
+not answer before — "why can these two machines on one LAN not find each other" (`"off"`), and
+**"is this node announcing itself to the network it is on"** (`"on"` multicasts its endpoint id and
+its LAN, public-WAN and IPv6 addresses to every device on the link; `"resolve"` never publishes the
+identity, but still emits a service query about once a second, so it is quieter rather than silent). A product backing a
+privacy switch needs the second. See `[network]` in `docs/config.md` for what is actually sent and
+why the default is off. Discovery is not authorization: a peer found this way faces the same trust
+gate as one found any other way.
 
 `storage` (`api_minor >= 27`, #88) is this node's own on-disk footprint — counts, never content:
 the summed monthly audit files, the `state.redb` trust store, and the app-blob store directory
