@@ -174,6 +174,7 @@ mod tests {
             reachability: vec![],
             self_nickname: String::new(),
             storage: None,
+            revoked: Vec::new(),
             self_network: None,
         };
         let v = status_json("fp-words", &hello, &status);

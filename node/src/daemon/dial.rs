@@ -44,6 +44,27 @@ use crate::allowlist::PeerEntry;
 /// locally. The (blocking) redb read runs on `spawn_blocking` (never redb IO on a runtime worker).
 ///
 /// [`PeerEntry`]: crate::allowlist::PeerEntry
+/// Refuse to DIAL a revoked endpoint (#85 ask 4).
+///
+/// Revocation was inbound-only in the first cut: the gate refused a revoked device's connections,
+/// but every outbound path — `open_session`, `peer_services`, `peer_diagnostics`, blob sources —
+/// still read `PeerStore` directly and happily connected to the machine the operator had just
+/// declared stolen, handing it the request. The 0.45.0 gate proved it.
+///
+/// That made the weaker verb stronger: `peer_remove` DELETES the row, so it blocked the dial;
+/// `peer_revoke`, the compromise claim, did not. Backwards, and in the direction that leaks data to
+/// whoever holds the device.
+///
+/// Fails CLOSED on a read error, like every other revocation read (`PeerStore::is_revoked`).
+fn refuse_if_revoked(mesh: &Arc<MeshState>, id: &[u8; 32], peer: &str) -> Result<()> {
+    anyhow::ensure!(
+        !mesh.store.is_revoked(id),
+        "{peer} is REVOKED on this node — dialling it would hand the request to a device you \
+         declared compromised. Use `mcpmesh revoke undo` if that was a mistake"
+    );
+    Ok(())
+}
+
 pub async fn dial_service(
     mesh: &Arc<MeshState>,
     peer: &str,
@@ -54,6 +75,12 @@ pub async fn dial_service(
     // ambiguity (nicknames are not unique), no person→device race: it targets one device
     // precisely, which is the whole point of dialing the verified caller back. Resolved FIRST.
     if let Some(hex) = peer.strip_prefix("eid:") {
+        // #85 ask 4: an explicit device dial is the most direct way to reach a revoked machine.
+        if let Ok(bytes) = data_encoding::HEXLOWER.decode(hex.as_bytes())
+            && let Ok(id) = <[u8; 32]>::try_from(bytes.as_slice())
+        {
+            refuse_if_revoked(mesh, &id, peer)?;
+        }
         return dial_by_eid(mesh, hex, service).await;
     }
 
@@ -109,6 +136,7 @@ pub async fn dial_service(
         return Ok(watch_session(mesh, transport, conn));
     }
     let entry = single.with_context(|| format!("peer '{peer}' is not in the allowlist"))?;
+    refuse_if_revoked(mesh, &entry.endpoint_id, peer)?;
     let endpoint_id = iroh::EndpointId::from_bytes(&entry.endpoint_id)
         .map_err(|e| anyhow::anyhow!("stored endpoint id for '{peer}' is invalid: {e}"))?;
     let addr = stored_dial_addr(entry.last_addr.as_deref(), endpoint_id);
@@ -471,6 +499,17 @@ async fn hinted_addrs(
     mesh: &Arc<MeshState>,
     candidates: Vec<[u8; 32]>,
 ) -> Result<Vec<iroh::EndpointAddr>> {
+    // #85 ask 4: drop revoked devices from the race. Filtering here covers BOTH racing paths (the
+    // roster person→device race and the multi-device `user_id` race) at one seam — a person with
+    // three devices, one of them stolen, must still be reachable on the other two.
+    let candidates: Vec<[u8; 32]> = candidates
+        .into_iter()
+        .filter(|id| !mesh.store.is_revoked(id))
+        .collect();
+    anyhow::ensure!(
+        !candidates.is_empty(),
+        "every device of that peer is REVOKED on this node"
+    );
     let store = mesh.store.clone();
     crate::util::blocking("join dial-candidate hints", move || {
         let mut out = Vec::with_capacity(candidates.len());

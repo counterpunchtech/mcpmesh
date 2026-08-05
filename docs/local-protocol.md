@@ -171,6 +171,10 @@ Methods split into two groups by audience:
 | `peer_endorse` | `{subject, subject_user_id?}` — **produce** an endorsement of a peer for someone else to redeem (#65, `api_minor >= 42`). Signs with your user key; it changes nothing about your own trust in the subject. Hand both result fields to the recipient. | `{endorsed_by, evidence}` |
 | `peer_introduce` | `{subject, endorsed_by, evidence, subject_user_id?, subject_binding?, nickname}` — install a peer from a **signed endorsement** by someone you are already paired with (#65, `api_minor >= 42`). Onboards a small group in O(N) instead of O(N²) two-human ceremonies. **It installs IDENTITY, not authorization**: service access stays principal-keyed in config (#38) and an explicit, separate act. `endorsed_by` must be the `user_id` of a peer you are **currently paired** with, so the chain terminates at a ceremony you performed yourself — unpairing them revokes their power to introduce, even though the signature stays cryptographically valid, and an **introduced peer cannot introduce others**. `subject_user_id` requires `subject_binding` (the subject's OWN device→user binding): a `user_id` is authorization-bearing and public, so an endorser alone must not be able to attach one. Refused for: an unpaired endorser, a signature naming a different subject, your own endpoint id, a peer you are **already paired with** (it would replace a SAS-proven row with a weaker one), or a nickname you already use for a different peer. Recorded as a `trust` audit event naming the endorser. | `{}` |
 | `peer_remove` | `{nickname}` | `{}` (ack) |
+| `peer_revoke` | `{peer, reason?}` — a nickname, `eid:`, `b64u:`, or (in roster mode) a roster **group name**, which revokes every device in it — mark this device **dead on this node** (#85 ask 4, `api_minor >= 51`). Blocks the **outbound** direction too: this node will not dial a revoked endpoint, so `open_session`, `peer_services` and `peer_diagnostics` all refuse it. A revoked device is also refused on the otherwise gate-exempt pair ALPN, so it cannot burn an invite or re-append itself to an allow list. **Not `peer_remove`**: removal is routine and re-pairable, revocation is a compromise claim that **outlives the pair row**, so it cannot be undone by a fresh pairing. Live sessions are **severed immediately** (#54), not left to end on their own. A `b64u:` revokes every device you know of that person's. A name matching nothing is an **error**, never an empty success. | `{revoked: [eid], severed}` |
+| `peer_unrevoke` | `{peer}` — lift a local revocation. Idempotent. Restores the peer only because revocation never deleted its pair row. Accepts a bare `eid:` too, so a revoke-then-unpair cannot leave a revocation permanently unliftable. | `{unrevoked: [eid]}` |
+| `device_revoke` | `{endpoint, reason?}` — sign a **portable** revocation of one of **your own** devices with your user key. The direction local revocation cannot express: your peers cannot discover your laptop was stolen. Also applies it here. Requires a user key. | `{token, endpoint, user_id}` |
+| `device_revocation_import` | `{token}` — apply a peer's signed revocation. Honoured **only** from a `user_id` you already pair with, and **only** for a device you already know is theirs. An endpoint you have never seen is **refused**, not recorded — see the note below. A replayed older token is a no-op. | `{endpoint, user_id, applied, severed}` |
 | `peer_rename` | `{to, user_id?, nickname?}` — rename a person by `user_id`, else a provisional contact by `nickname` | `{}` (ack) |
 | `set_nickname` | `{nickname}` — rename **this node** live (#37, `api_minor >= 2`): validated (trimmed non-empty, no `/`), persisted to `[identity].nickname` under the daemon's own config lock (no lost-update window against a concurrent grant/registration), and effective for FUTURE invites/presentations immediately — no restart. Display-only: peers keep the nickname they stored at pairing time until a re-invite | `{}` (ack) |
 | `service_allow_grant` | `{service, principal}` — grant a stable principal (`b64u:`/`eid:`) access to ONE service's allow WITHOUT (re)pairing (#44), under the daemon's config lock + hot-reload. The per-peer "sharing on" toggle. Works on EPHEMERAL registrations too, mutating their in-memory allow (#55, `api_minor >= 11`). Idempotent; a name in neither the config nor the ephemeral registry → `-32040`. **When the edit lands only in the ephemeral overlay (nothing changes on disk), the registry is updated in place rather than rebuilt from `config.toml` — so the verb no longer picks up unrelated hand-edits to the config file as a side effect (#94). Use `register_service` or a daemon restart to apply config edits.** | `{}` (ack) |
@@ -572,6 +576,34 @@ identity, but still emits a service query about once a second, so it is quieter 
 privacy switch needs the second. See `[network]` in `docs/config.md` for what is actually sent and
 why the default is off. Discovery is not authorization: a peer found this way faces the same trust
 gate as one found any other way.
+
+`revoked` (`api_minor >= 51`, #85 ask 4) lists the endpoints this node currently refuses, and is
+**omitted when empty** — which it is on almost every node. Each row carries the `eid:` principal,
+when this node applied it, the surviving local `nickname` if there is one, and a `source`:
+
+- `"local"` — *your* decision about someone else's device.
+- `"signed"` — a statement the device's **owner** issued about their own, with the verified
+  `signer_user_id`. Only this one is evidence that the person themselves declared the device dead.
+
+Present because a revocation is otherwise invisible: a peer that has been cut off simply stops
+working, and neither side can distinguish that from a network fault.
+
+**A revocation can only name a device you already know.** `device_revocation_import` refuses an
+endpoint this node has no row for, even with a perfect signature. That costs something real — a peer
+who pairs with the stolen device *after* receiving the token has to import it again once the row
+exists — and the alternative was worse: endpoint ids are public, so accepting unknown endpoints let
+any peer you had paired with permanently kill an arbitrary *future* contact, with the only remedy an
+operator running `revoke undo` on a principal they never revoked. Ownership of an endpoint you hold
+no row for cannot be verified, and a binding carried in the token would not help — the signer could
+bind any endpoint to themselves.
+
+**A local `peer_revoke` never overwrites a signed one.** The owner's statement is stronger evidence
+than your own note, and clearing its `issued_at` would re-arm the replay an older token could win.
+
+**Distribution of a signed revocation is out of band.** Pairing mode has no gossip, so getting a
+`mcpmesh-revoke:` token to your peers is the same problem as getting them an invite line, with the
+same answer — you send it to them. Until each peer imports it, whoever holds the revoked device
+still authenticates as its owner *to them*. Nothing here pretends otherwise.
 
 `storage` (`api_minor >= 27`, #88) is this node's own on-disk footprint — counts, never content:
 the summed monthly audit files, the `state.redb` trust store, and the app-blob store directory

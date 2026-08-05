@@ -466,6 +466,64 @@ impl ControlClient {
         .await
     }
 
+    /// Refuse a peer's device on this node (#85 ask 4). Immediate: live sessions are severed.
+    pub async fn peer_revoke(
+        &mut self,
+        peer: impl Into<String>,
+        reason: Option<String>,
+    ) -> Result<crate::protocol::PeerRevokeResult, ClientError> {
+        self.request_typed(
+            Request::PeerRevoke(crate::protocol::PeerRevokeParams {
+                peer: peer.into(),
+                reason,
+            }),
+            "peer_revoke result",
+        )
+        .await
+    }
+
+    /// Lift a local revocation (#85 ask 4). Idempotent.
+    pub async fn peer_unrevoke(
+        &mut self,
+        peer: impl Into<String>,
+    ) -> Result<crate::protocol::PeerUnrevokeResult, ClientError> {
+        self.request_typed(
+            Request::PeerUnrevoke(crate::protocol::PeerUnrevokeParams { peer: peer.into() }),
+            "peer_unrevoke result",
+        )
+        .await
+    }
+
+    /// Sign a portable revocation of one of THIS person's own devices (#85 ask 4).
+    pub async fn device_revoke(
+        &mut self,
+        endpoint: impl Into<String>,
+        reason: Option<String>,
+    ) -> Result<crate::protocol::DeviceRevokeResult, ClientError> {
+        self.request_typed(
+            Request::DeviceRevoke(crate::protocol::DeviceRevokeParams {
+                endpoint: endpoint.into(),
+                reason,
+            }),
+            "device_revoke result",
+        )
+        .await
+    }
+
+    /// Apply a peer's signed device revocation (#85 ask 4).
+    pub async fn device_revocation_import(
+        &mut self,
+        token: impl Into<String>,
+    ) -> Result<crate::protocol::DeviceRevocationImportResult, ClientError> {
+        self.request_typed(
+            Request::DeviceRevocationImport(crate::protocol::DeviceRevocationImportParams {
+                token: token.into(),
+            }),
+            "device_revocation_import result",
+        )
+        .await
+    }
+
     /// EXPORT this node's user key as a RECOVERY PHRASE (#85 ask 2).
     ///
     /// **The phrase is the private key**, in a form a person can write down. Anyone who reads it
@@ -966,6 +1024,7 @@ mod tests {
             reachability: vec![],
             self_nickname: String::new(),
             storage: None,
+            revoked: Vec::new(),
             self_network: None,
         };
         write_frame(

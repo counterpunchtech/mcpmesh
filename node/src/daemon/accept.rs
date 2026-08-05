@@ -174,6 +174,32 @@ pub fn spawn_accept_loop(mesh: Arc<MeshState>, services: Arc<Services>) -> JoinH
                             conn.close(0u32.into(), b"pair rate limited");
                             return;
                         }
+                        // #85 ask 4: the pair ALPN is GATE-EXEMPT by design — its authentication is
+                        // the invite secret, not the allowlist — which is exactly why revocation
+                        // has to be checked here explicitly.
+                        //
+                        // The gate already refuses a revoked device on every other ALPN, so it
+                        // could never actually USE a re-pairing. But without this it could still
+                        // complete one: burn an invite use, overwrite its own `PeerEntry`, and —
+                        // through the grant hook — get its principal appended to `[services.*].allow`
+                        // in config.toml, with a SAS and "paired" reported on both sides. An
+                        // operator watching that would reasonably conclude the revocation had not
+                        // taken. Refusing here keeps the two halves telling the same story.
+                        //
+                        // Same close reason as no-live-invite: a revoked device learning WHY it was
+                        // refused is a disclosure with no upside.
+                        let remote_id = mcpmesh_net::EndpointId::from(conn.remote_id());
+                        if mesh.gate.is_revoked(&remote_id) {
+                            tracing::warn!(
+                                peer = %remote_id.principal(),
+                                "refused a pair attempt from a REVOKED endpoint"
+                            );
+                            conn.close(
+                                0u32.into(),
+                                crate::pairing::rendezvous::NO_LIVE_INVITE_CLOSE,
+                            );
+                            return;
+                        }
                         // The real inviter-side rendezvous, run against the narrow context the
                         // mesh composes: store + invites + the grant hook, so a successful pair
                         // can also GRANT service access (config-append + reload) without the

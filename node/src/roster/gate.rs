@@ -195,8 +195,12 @@ impl TrustGate for ComposedGate {
     }
 
     fn resolve(&self, endpoint: &EndpointId) -> Option<PeerIdentity> {
-        // (1) revocation wins, all ALPNs.
-        if self.roster.is_revoked(endpoint) {
+        // (1) revocation wins, all ALPNs — from EITHER source (#85 ask 4). The pairing revocation
+        // list is not a roster concept, so asking only `self.roster` here would silently drop it on
+        // any node that installed a roster: a device its owner declared stolen would be refused in
+        // pairing mode and admitted the moment the operator joined an org. `pairs.resolve` below
+        // also checks, but only for endpoints that reach it — a rostered endpoint returns at (2).
+        if self.roster.is_revoked(endpoint) || self.pairs.is_revoked(endpoint) {
             return None;
         }
         // (2) roster masks the pair entry.
@@ -214,7 +218,8 @@ impl TrustGate for ComposedGate {
     /// state (fail-closed). This is what closes the TOCTOU race: a connection registering after a
     /// revoking install sees `true` here and self-closes.
     fn is_revoked(&self, endpoint: &EndpointId) -> bool {
-        self.roster.is_revoked(endpoint)
+        // EITHER source (#85 ask 4) — see `resolve`'s rule 1.
+        self.roster.is_revoked(endpoint) || self.pairs.is_revoked(endpoint)
     }
 
     /// The register-time recheck: sever iff the endpoint is REVOKED (revocation wins, all
@@ -234,7 +239,8 @@ impl TrustGate for ComposedGate {
     /// (severing purely-paired peers, `roster_user == None`, whose authorization is independent of the
     /// org roster) while delivering nothing for roster peers (already denied at `resolve`).
     fn should_sever_now(&self, endpoint: &EndpointId, roster_user: Option<&str>) -> bool {
-        self.roster.is_revoked(endpoint)
+        self.pairs.is_revoked(endpoint)
+            || self.roster.is_revoked(endpoint)
             || (roster_user.is_some()
                 && self
                     .roster
@@ -609,5 +615,65 @@ mod tests {
             },
         );
         load_installed(&r, &root.verifying_key()).unwrap()
+    }
+
+    /// #85 ask 4: the COMPOSED gate must honour a PAIRING revocation, not only the roster's.
+    ///
+    /// The available mistake, and the one the design flagged before it was written: `ComposedGate`
+    /// delegated all three revocation methods to `self.roster` alone. Left that way, a device its
+    /// owner declared stolen is refused in pairing mode and **admitted the moment the operator
+    /// joins an org** — the composition silently drops the newer list.
+    #[test]
+    fn the_composed_gate_honours_a_pairing_revocation_as_well_as_the_rosters() {
+        use crate::allowlist::{PeerEntry, PeerStore, RevokedEntry};
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(PeerStore::open(&dir.path().join("p.redb")).unwrap());
+        let eid = [21u8; 32];
+        store
+            .add(PeerEntry {
+                endpoint_id: eid,
+                nickname: "bob-laptop".into(),
+                services: vec!["notes".into()],
+                paired_at: None,
+                user_id: Some("b64u:BOB".into()),
+                last_addr: None,
+            })
+            .unwrap();
+        let pairs = std::sync::Arc::new(crate::allowlist::AllowlistGate::new(store.clone()));
+        // An EMPTY roster — the point is that the roster knows nothing about this endpoint, so
+        // every refusal below has to come from the pairing list.
+        let roster = std::sync::Arc::new(RosterGate::empty());
+        let composed = ComposedGate::new(roster, pairs);
+        let id: EndpointId = eid.into();
+
+        assert!(
+            composed.resolve(&id).is_some(),
+            "precondition: the paired peer resolves through the composition first"
+        );
+
+        store
+            .revoke(RevokedEntry {
+                endpoint_id: eid,
+                revoked_at: 1,
+                reason: None,
+                source: "signed".into(),
+                signer_user_id: Some("b64u:BOB".into()),
+                issued_at: Some(1),
+            })
+            .unwrap();
+
+        assert!(
+            composed.resolve(&id).is_none(),
+            "a pairing revocation must refuse through the COMPOSED gate — this is the one a \
+             roster-mode node actually uses"
+        );
+        assert!(
+            composed.is_revoked(&id),
+            "…including the check-register recheck, or a connection racing the revoke survives it"
+        );
+        assert!(
+            composed.should_sever_now(&id, None),
+            "…and the live-session sever, which is what makes revocation immediate (#54)"
+        );
     }
 }

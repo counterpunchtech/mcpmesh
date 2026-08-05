@@ -449,3 +449,139 @@ async fn the_unpair_path_swaps_the_registry_before_it_severs() {
     .await
     .expect("unpair swap-before-sever test timed out");
 }
+
+/// #85 ask 4: `peer_revoke` severs the live connection AND refuses the next dial.
+///
+/// The severance half is #54's contract, and it matters more here than for a service revoke: the
+/// endpoint being cut is one somebody has physically taken. A revocation that waited for the peer
+/// to disconnect would be unbounded — MCP sessions are long-lived by design, so "eventually" can
+/// mean days on the machine you are trying to lock out.
+///
+/// The refusal half is what distinguishes revocation from `peer_remove`: the pair row is still
+/// there, untouched, and the peer is still refused. Without that assertion this test would pass on
+/// an implementation that simply deleted the row.
+#[tokio::test]
+async fn peer_revoke_severs_the_live_connection_and_refuses_the_next_dial() {
+    timeout(Duration::from_secs(60), async {
+        let (mesh, addr, _registry, peers, dir) = paired_mesh(&["alice"]).await;
+        let alice = &peers[0];
+        let state = mcpmesh::control::DaemonState::with_mesh("test", mesh.clone());
+
+        let conn = dial(&alice.endpoint, addr.clone()).await;
+        let mut session = open_session(&conn, "echo").await;
+        assert!(
+            session_served(session.as_mut()).await,
+            "precondition: served before the revoke — otherwise the sever below proves nothing"
+        );
+
+        let out = mcpmesh::daemon::peer_revoke(
+            &state,
+            mcpmesh_local_api::PeerRevokeParams {
+                peer: alice.principal.clone(),
+                reason: Some("laptop stolen".into()),
+            },
+        )
+        .await
+        .expect("revoke succeeds");
+        assert_eq!(out.revoked, vec![alice.principal.clone()]);
+        assert_eq!(
+            out.severed, 1,
+            "the result must REPORT the severance, not merely perform it — an embedder showing a \
+             user 'device cut off' needs the count"
+        );
+
+        timeout(Duration::from_secs(5), conn.closed())
+            .await
+            .expect("a revoke must SEVER the live connection, not leave it running");
+
+        // The peer is STILL refused on a fresh connection, even though its pair row is intact.
+        // (That the row survived is not asserted directly — the store is not exposed here — but
+        // the unrevoke below restores service, which is only possible if the row was never
+        // deleted. That is the stronger statement anyway: it is about behaviour, not storage.)
+        let redial = dial(&alice.endpoint, addr.clone()).await;
+        let refused = timeout(Duration::from_secs(10), async {
+            let mut s = open_session(&redial, "echo").await;
+            session_served(s.as_mut()).await
+        })
+        .await;
+        assert!(
+            !matches!(refused, Ok(true)),
+            "a revoked peer must be refused on a FRESH connection too, even though its pair row is \
+             intact: {refused:?}"
+        );
+
+        // …and lifting it restores service, which is the whole reason the row survived.
+        mcpmesh::daemon::peer_unrevoke(
+            &state,
+            mcpmesh_local_api::PeerUnrevokeParams {
+                peer: alice.principal.clone(),
+            },
+        )
+        .await
+        .expect("unrevoke succeeds");
+        let back = dial(&alice.endpoint, addr).await;
+        let mut s = open_session(&back, "echo").await;
+        assert!(
+            session_served(s.as_mut()).await,
+            "unrevoking must restore the peer — the pair row was never touched"
+        );
+        drop(dir);
+    })
+    .await
+    .expect("peer revoke sever test timed out");
+}
+
+/// Revoking one person must not disturb anybody else. Over-severing is a self-inflicted outage, and
+/// on this path it would cut a peer the operator never named while telling them it worked.
+#[tokio::test]
+async fn peer_revoke_does_not_sever_an_unrelated_peer() {
+    timeout(Duration::from_secs(60), async {
+        let (mesh, addr, _registry, peers, _dir) = paired_mesh(&["alice", "bob"]).await;
+        let (alice, bob) = (&peers[0], &peers[1]);
+        let state = mcpmesh::control::DaemonState::with_mesh("test", mesh.clone());
+
+        let bob_conn = dial(&bob.endpoint, addr).await;
+        let mut bob_session = open_session(&bob_conn, "echo").await;
+        assert!(
+            session_served(bob_session.as_mut()).await,
+            "bob served first"
+        );
+
+        mcpmesh::daemon::peer_revoke(
+            &state,
+            mcpmesh_local_api::PeerRevokeParams {
+                peer: alice.principal.clone(),
+                reason: None,
+            },
+        )
+        .await
+        .expect("revoke alice");
+
+        assert!(
+            timeout(Duration::from_secs(2), bob_conn.closed())
+                .await
+                .is_err(),
+            "bob's connection must survive alice's revocation"
+        );
+        // Round-trip on the ALREADY-OPEN session, exactly as `revoke_does_not_sever_an_unrelated_peer`
+        // does: `session_served` is a one-shot that finishes the stream it checks, so calling it
+        // twice would report a dead session whether or not the sever was over-broad — a test that
+        // fails for its own reasons proves nothing about the code.
+        let bob_session = bob_session.as_mut().expect("bob's session opened");
+        bob_session
+            .send_value(tools_call_frame("still-alive"))
+            .await
+            .expect("bob's session is still live");
+        let reply = timeout(Duration::from_secs(5), bob_session.recv_value())
+            .await
+            .expect("bob's kept session must answer promptly")
+            .expect("bob transport ok")
+            .expect("bob reply frame");
+        assert_eq!(
+            reply["result"]["content"][0]["text"], "still-alive",
+            "revoking alice must NOT sever bob's live session: {reply}"
+        );
+    })
+    .await
+    .expect("unrelated peer test timed out");
+}

@@ -402,6 +402,13 @@ pub struct StatusResult {
     /// Additive: default + skip-if-none so an older payload round-trips.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage: Option<StorageInfo>,
+    /// Endpoints this node currently REFUSES (#85 ask 4, `api_minor >= 51`), local or signed.
+    ///
+    /// Present because a revocation is otherwise invisible: a peer that has been cut off simply
+    /// stops working, and neither side can tell that from a network fault. Empty on the
+    /// overwhelming majority of nodes, so it is elided rather than serialized as `[]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revoked: Vec<RevokedEndpoint>,
     /// THIS node's own reachability posture (#90) — see [`SelfNetwork`]. Computed live per
     /// call; `None` in mesh-less control-only mode. Additive: default + skip-if-none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -505,6 +512,30 @@ pub struct RelayInfo {
     /// Sanitized (scheme + host + port), like `home_relay`.
     pub url: String,
     pub connected: bool,
+}
+
+/// One entry of `status.revoked` (#85 ask 4).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RevokedEndpoint {
+    /// The `eid:` device principal that is refused.
+    pub principal: String,
+    /// When THIS node applied it, epoch seconds.
+    pub revoked_at_epoch: u64,
+    /// `"local"` — this operator's own decision about someone else's device — or `"signed"`, a
+    /// statement the device's OWNER issued about their own. Two different claims, and an operator
+    /// reading this list needs to tell them apart: only the second is evidence that the person
+    /// themselves declared the device dead.
+    pub source: String,
+    /// For `"signed"`: the verified `b64u:` that signed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer_user_id: Option<String>,
+    /// Free-text operator note, never interpreted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The local nickname this endpoint still has a pair row under, if any. Revocation does not
+    /// delete the row, so this is usually present — and it is what makes the list readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nickname: Option<String>,
 }
 
 /// The `status.storage` block (#88): bytes actually on disk, by subsystem. Counts, never
@@ -701,6 +732,94 @@ pub struct PairParams {
     /// `mcpmesh_node::pairing::is_enrollment_line`. `api_minor >= 45`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub allow_self_enroll: bool,
+}
+
+/// Params of [`Request::PeerRevoke`] (#85 ask 4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerRevokeParams {
+    /// A nickname, an `eid:` device principal, or a `b64u:` user_id. A `b64u:` revokes EVERY
+    /// endpoint this node associates with that person.
+    pub peer: String,
+    /// Free-text operator note, stored and shown in `status`. Never interpreted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Result of [`Request::PeerRevoke`].
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PeerRevokeResult {
+    /// The `eid:` principals now revoked. Empty means the name resolved to no endpoint — an ERROR
+    /// is returned instead in that case, so an empty list here never reads as success.
+    pub revoked: Vec<String>,
+    /// Live connections severed by this call. `0` is normal (the peer may be offline) and is NOT a
+    /// failure — but a non-zero count is the evidence that revocation was immediate rather than
+    /// deferred to the peer's next disconnect.
+    pub severed: usize,
+}
+
+/// Params of [`Request::PeerUnrevoke`] (#85 ask 4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerUnrevokeParams {
+    /// Nickname, `eid:`, or `b64u:` — the same vocabulary as `peer_revoke`.
+    pub peer: String,
+}
+
+/// Result of [`Request::PeerUnrevoke`].
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PeerUnrevokeResult {
+    /// The `eid:` principals whose revocation was lifted. Empty = none were revoked (idempotent).
+    pub unrevoked: Vec<String>,
+}
+
+/// Params of [`Request::DeviceRevoke`] (#85 ask 4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceRevokeParams {
+    /// The `eid:` principal of the device being revoked — one of THIS person's own.
+    ///
+    /// Explicit rather than "this node", because the device you are revoking is usually the one you
+    /// no longer have: you issue the token from your replacement machine, naming the lost one.
+    pub endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Result of [`Request::DeviceRevoke`]: the portable token, and what it says.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct DeviceRevokeResult {
+    /// The signed statement, `mcpmesh-revoke:<base64url>`. Hand this to your peers.
+    ///
+    /// Not a secret — it authorizes nothing and grants nothing; it only asks that an endpoint be
+    /// treated as dead, and only peers who already trust the signer will act on it.
+    pub token: String,
+    /// The `eid:` it revokes, echoed so a caller can confirm they named the device they meant.
+    pub endpoint: String,
+    /// The signing `b64u:` user_id — the identity your peers already pinned.
+    pub user_id: String,
+}
+
+/// Params of [`Request::DeviceRevocationImport`] (#85 ask 4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceRevocationImportParams {
+    /// A `mcpmesh-revoke:` token from a peer.
+    pub token: String,
+}
+
+/// Result of [`Request::DeviceRevocationImport`].
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct DeviceRevocationImportResult {
+    /// The `eid:` now revoked.
+    pub endpoint: String,
+    /// The `b64u:` that signed it — verified, not claimed.
+    pub user_id: String,
+    /// `false` when an equal-or-newer revocation for this endpoint was already held: the import is
+    /// idempotent, and a replayed OLDER token must not overwrite a newer one.
+    pub applied: bool,
+    /// Live connections severed. See `PeerRevokeResult::severed`.
+    pub severed: usize,
 }
 
 /// Params of [`Request::PeerRemove`]: the nickname to unpair.
@@ -1166,6 +1285,50 @@ pub enum Request {
     /// pairing rendezvous uses, so a rename can't inherit another peer's access. Tag `"peer_rename"`;
     /// host-privileged like the other pair ops.
     PeerRename(PeerRenameParams),
+    /// REVOKE an endpoint locally: "I no longer trust this device" (#85 ask 4). Tag
+    /// `"peer_revoke"`.
+    ///
+    /// **Not the same act as [`PeerRemove`](Self::PeerRemove), deliberately.** Removal is routine —
+    /// we are not working together any more — and re-pairing afterwards is normal. Revocation is a
+    /// claim about COMPROMISE, and it outlives the pair row: a revoked endpoint is refused whether
+    /// or not it is in the allowlist, so it cannot be undone by a fresh pairing. Making them one
+    /// verb would either make removal irreversible or make revocation weak.
+    ///
+    /// Takes effect IMMEDIATELY, like `service_allow_revoke` (#54): live sessions are severed
+    /// rather than left to end on their own, which for long-lived MCP sessions is unbounded.
+    ///
+    /// A `b64u:` principal revokes EVERY endpoint this node associates with that person — the "not
+    /// on any of their devices" case, which an operator will otherwise get wrong doing it device by
+    /// device.
+    ///
+    /// Reversible with [`PeerUnrevoke`](Self::PeerUnrevoke): this list is LOCAL and not
+    /// authoritative for anyone else, so an operator mistake has to be fixable. Both directions are
+    /// audited.
+    PeerRevoke(PeerRevokeParams),
+    /// Lift a local revocation (#85 ask 4). Tag `"peer_unrevoke"`. Idempotent.
+    ///
+    /// Restores the peer only if its pair row still exists — revocation never deleted it. A
+    /// revocation applied from a SIGNED statement can be lifted too: the signature proved who asked,
+    /// not that this node must obey forever.
+    PeerUnrevoke(PeerUnrevokeParams),
+    /// Sign a revocation of one of THIS node's own endpoints with THIS node's user key (#85 ask 4),
+    /// producing a portable token. Tag `"device_revoke"`.
+    ///
+    /// The direction that matters, and the one local revocation cannot express: my laptop was
+    /// stolen, and my peers cannot discover that by themselves. I have to tell them, and they have
+    /// to be able to verify it was me.
+    ///
+    /// Requires a user key — a node with none has no authority to speak for its person.
+    /// **Distribution is out of band**: pairing mode has no gossip, so getting the token to your
+    /// peers is the same problem as getting them an invite line, and has the same answer.
+    DeviceRevoke(DeviceRevokeParams),
+    /// Apply a signed device revocation from a peer (#85 ask 4). Tag `"device_revocation_import"`.
+    ///
+    /// Refused unless this node ALREADY trusts the signing `user_id` (holds a paired entry carrying
+    /// it) **and** the revoked endpoint is one this node associates with that same person, or is
+    /// entirely unknown to it. That bound is what keeps this from being an "mark any endpoint dead"
+    /// primitive: a peer may kill their OWN devices in your node, and nothing else.
+    DeviceRevocationImport(DeviceRevocationImportParams),
     /// RESERVED / INTERNAL (`docs/local-protocol.md` "Reserved / internal methods"): install a
     /// peer directly from a raw `endpoint_id` — the trust-population stand-in for pairing behind
     /// `mcpmesh internal peer add`. A deliberate, documented exception to the surface discipline
@@ -2430,7 +2593,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   thirty have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.50";
+pub const API_VERSION: &str = "1.51";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -2516,7 +2679,18 @@ pub const API_VERSION: &str = "1.50";
 /// refusals — expired line, no live invite, inviter unreachable, id mismatch, name conflict, and
 /// the deliberately-opaque refusal. `ERR_NICKNAME_TAKEN` had been the only coded pairing failure,
 /// so every other one arrived as `-32000` and an embedder could either forward our prose to end
-/// users or substring-match it (#159); to 50 with [`SelfNetwork::local_discovery`] — LOCAL (mDNS)
+/// users or substring-match it (#159); to 51 with the PAIRING-MODE REVOCATION verbs —
+/// `peer_revoke` / `peer_unrevoke` / `device_revoke` / `device_revocation_import`, plus
+/// [`StatusResult::revoked`] (#85 ask 4). `revoked_endpoints` was roster-only, so in pairing mode
+/// the only remedy for a stolen device was every peer independently running `peer_remove`, with
+/// nothing telling them they should — until the last one did, whoever held the disk authenticated
+/// as its owner and every message they sent was cryptographically indistinguishable. Two
+/// directions, deliberately not one verb: `peer_revoke` is MY local decision about YOUR device;
+/// `device_revoke` signs a portable statement about MY OWN, which is the half my peers cannot
+/// discover for themselves. An import is honoured only from a `user_id` this node already pairs
+/// with, and only for that person's OWN devices — a signature proves who asked, not that the
+/// endpoint was ever theirs. Revocation is IMMEDIATE (live sessions severed, #54) and outlives the
+/// pair row, so it cannot be undone by re-pairing. Guard on `>= 51`; to 50 with [`SelfNetwork::local_discovery`] — LOCAL (mDNS)
 /// peer discovery, off unless `[network].local_discovery` asks for it (#68). Peer resolution
 /// otherwise needs external infrastructure, so two machines on one LAN with no uplink could not
 /// find each other though the path between them was fine. Three modes: `"off"` (default), `"on"`
@@ -2640,7 +2814,7 @@ pub const API_VERSION: &str = "1.50";
 /// its REAL content is a meaning change to `reachable` — the field exists so the new meaning is
 /// observable at all. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 50;
+pub const API_MINOR: u32 = 51;
 
 #[cfg(test)]
 mod tests {
@@ -3694,6 +3868,7 @@ mod tests {
             reachability: vec![],
             self_nickname: String::new(),
             storage: None,
+            revoked: Vec::new(),
             self_network: None,
         };
         let v = serde_json::to_value(&s).unwrap();
@@ -3767,6 +3942,7 @@ mod tests {
             reachability: vec![],
             self_nickname: String::new(),
             storage: None,
+            revoked: Vec::new(),
             self_network: None,
         };
         let v = serde_json::to_value(&s).unwrap();
@@ -3806,6 +3982,7 @@ mod tests {
             reachability: vec![],
             self_nickname: String::new(),
             storage: None,
+            revoked: Vec::new(),
             self_network: None,
         };
         let v = serde_json::to_value(&s).unwrap();

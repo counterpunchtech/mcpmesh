@@ -63,9 +63,10 @@ pub use boot::serve_forever;
 pub use dial::{dial_service, pipe_session, race_dial};
 pub use handlers::{
     BlobWithdrawn, Cancelled, NoSuchBlob, NoSuchBlobScope, NoSuchService, endorse_peer,
-    grant_service_access, grant_service_allow, introduce_peer, remove_peer, rename_peer,
-    revoke_service_access, revoke_service_allow,
+    grant_service_access, grant_service_allow, introduce_peer, peer_revoke, peer_unrevoke,
+    remove_peer, rename_peer, revoke_service_access, revoke_service_allow,
 };
+pub(crate) use handlers::{device_revocation_import, device_revoke};
 pub(crate) use reach::caller_admitted_services;
 /// The services this identity is admitted to, as the accept path computes them (#100). Test seam:
 /// it lets a test assert that the reported set matches what a session would actually be granted.
