@@ -142,7 +142,7 @@ pub(crate) async fn converge_roster_bytes(
     let pk = crate::roster::parse_org_root_pk(
         &mesh_config_org_root_pk(mesh)?.context("no pinned org root; cannot accept roster")?,
     )?;
-    let tmp = write_temp_roster(bytes)?;
+    let tmp = write_temp_roster(&roster_staging_dir(mesh), bytes)?;
     let rstore = RosterStore::new(installed_roster_path(mesh));
     let now = epoch_now_i64();
     // `tmp` moves into the closure: its guard removes the temp file when the install returns
@@ -327,6 +327,15 @@ pub(crate) fn mesh_config_org_root_pk(mesh: &MeshState) -> Result<Option<String>
 /// read that resolves the trust anchor (`mesh_config_org_root_pk`) already uses the same per-node
 /// `config_path`, so the anchor and the roster file always co-locate. **DECLARED** as the one
 /// deviation from the plan's literal `paths::default_roster_path()` in `distribute.rs`.
+/// Where a roster is STAGED before the install judges it — the installed roster's own directory,
+/// derived from `config_path` exactly as [`installed_roster_path`] derives `roster.json`.
+pub(crate) fn roster_staging_dir(mesh: &MeshState) -> PathBuf {
+    mesh.config_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 pub(crate) fn installed_roster_path(mesh: &MeshState) -> PathBuf {
     mesh.config_path
         .parent()
@@ -411,8 +420,16 @@ pub(crate) async fn reconcile_user_id_from_roster(mesh: &MeshState) {
 /// this bridges the two. The returned [`TempPathGuard`] removes the temp file on drop — the caller
 /// holds it across the install. A per-call-unique name ([`unique_temp_path`]: pid + seq — never
 /// a fixed temp name); the file is only ever READ by `install_from_file`.
-pub(crate) fn write_temp_roster(bytes: &[u8]) -> Result<TempPathGuard> {
-    let tmp = TempPathGuard::new(unique_temp_path(&std::env::temp_dir(), "mcpmesh-roster-in"));
+///
+/// Staged BESIDE the installed roster (`mesh.config_path`'s directory), not in the system temp
+/// dir. It is per-node state — same argument as [`installed_roster_path`] — so it belongs under the
+/// node's own root, where a `--profile` root or an embedded node keeps it separate. The shared temp
+/// dir also made it impossible to tell one node's in-flight staging file from another's, which is
+/// the difference between "this node leaked a temp" and "some other process is mid-install".
+pub(crate) fn write_temp_roster(dir: &Path, bytes: &[u8]) -> Result<TempPathGuard> {
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("create roster staging dir {}", dir.display()))?;
+    let tmp = TempPathGuard::new(unique_temp_path(dir, "mcpmesh-roster-in"));
     let mut f = File::create(tmp.path())
         .with_context(|| format!("create temp roster {}", tmp.path().display()))?;
     f.write_all(bytes).context("write temp roster")?;

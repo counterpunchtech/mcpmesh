@@ -1136,6 +1136,17 @@ pub enum Request {
     /// think it did stays an out-of-band human step, and `join_code_fingerprint` in the result is
     /// what the two humans compare.
     OrgApprove(OrgApproveParams),
+    /// INSPECT a join code without approving it (#66): who it claims to be, and the fingerprint the
+    /// two humans compare. Read-only — nothing is signed, installed, or persisted.
+    /// Tag `"org_join_code"`.
+    ///
+    /// This is what makes an "approve this person" button correct rather than merely possible. The
+    /// fingerprint has to be shown and confirmed out-of-band BEFORE the approval, because a
+    /// substituted code is caught there or not at all — and reading it off `OrgApprove`'s result
+    /// is too late, the member is already in the signed roster. The CLI always had this (it
+    /// decoded the code locally); an embedder could not, since the join-code format lives in
+    /// `mcpmesh-node` and not on this seam.
+    OrgJoinCode(OrgJoinCodeParams),
     /// REVOKE from the roster: remove a person, one device, or a person's user key, then bump,
     /// re-sign, and install — which severs the cut devices' live sessions (#66).
     /// Tag `"org_revoke"`.
@@ -1346,6 +1357,38 @@ pub struct OrgApproveResult {
     /// approval.** Nothing else binds the person to the `user_pk` in the code, so a substituted
     /// code is caught here or not at all. Returned rather than checked, because only the human can
     /// check it.
+    pub join_code_fingerprint: String,
+}
+
+/// Params of [`Request::OrgJoinCode`] (#66).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrgJoinCodeParams {
+    /// The `mcpmesh-join:` code to inspect.
+    pub join_code: String,
+}
+
+/// Result of [`Request::OrgJoinCode`] (#66): what a join code claims, plus the fingerprint that
+/// decides whether to believe it.
+///
+/// The claims are ATTACKER-CONTROLLED — they come out of a code someone handed you. `display_name`
+/// and `requested_user_id` are what the sender asked for, not facts. What is verified is the
+/// device→user-key binding (a bad one is refused rather than reported), and what is *checkable* is
+/// `join_code_fingerprint`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrgJoinCodeResult {
+    /// The human name the code carries. Sender-chosen — render it, do not trust it.
+    pub display_name: String,
+    /// The `user_id` the sender is asking for. Sender-chosen, and it is what every `allow` entry
+    /// would name, so it is worth an operator's attention before approving.
+    pub requested_user_id: String,
+    /// The label of the device being enrolled. Sender-chosen.
+    pub device_label: String,
+    /// The fingerprint in short words — the enrollment analogue of the pairing SAS.
+    ///
+    /// **Show this and have the operator confirm it out-of-band before calling
+    /// [`Request::OrgApprove`].** Nothing in a join code binds it to a person; a substituted code
+    /// carries a different `user_pk` and so diverges here. This is the entire check.
     pub join_code_fingerprint: String,
 }
 

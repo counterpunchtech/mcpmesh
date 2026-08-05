@@ -22,9 +22,9 @@ use mcpmesh_local_api::{
     API_NAME, API_VERSION, AuditListParams, AuditPruneParams, BlobFetchCancelParams,
     BlobFetchParams, BlobGrantParams, BlobPublishParams, BlobRepublishParams, BlobRevokeParams,
     BlobUnpublishParams, Hello, InviteParams, OpenSessionParams, OrgApproveParams, OrgCreateParams,
-    OrgJoinParams, OrgRevokeParams, PairParams, PeerServicesParams, RosterInstallParams,
-    ServiceAllowParams, SetAppMetadataParams, SetNicknameParams, SetRelaysParams,
-    SetRosterUrlParams, StatusResult, UnregisterServiceParams, method_of,
+    OrgJoinCodeParams, OrgJoinParams, OrgRevokeParams, PairParams, PeerServicesParams,
+    RosterInstallParams, ServiceAllowParams, SetAppMetadataParams, SetNicknameParams,
+    SetRelaysParams, SetRosterUrlParams, StatusResult, UnregisterServiceParams, method_of,
 };
 use mcpmesh_net::framing::{FrameReader, Inbound, write_frame};
 use serde_json::{Value, json};
@@ -793,6 +793,16 @@ pub(crate) async fn handle_request(req: &Value, state: &DaemonState) -> Value {
             "org_approve",
             with_params(&params, |p: OrgApproveParams| {
                 crate::daemon::org_approve(state, p.join_code, p.groups, p.user_id)
+            })
+            .await,
+        ),
+        // Read-only: decode + verify a join code and return the fingerprint the operator confirms
+        // OUT-OF-BAND before approving. Nothing is signed, installed, or persisted.
+        Some("org_join_code") => respond(
+            id,
+            "org_join_code",
+            with_params(&params, |p: OrgJoinCodeParams| {
+                crate::daemon::org_join_code(state, p.join_code)
             })
             .await,
         ),

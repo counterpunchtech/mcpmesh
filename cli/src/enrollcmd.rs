@@ -231,26 +231,31 @@ pub fn run_org_approve(
     // strictly worse position to put an operator in, and the roster would already carry the
     // attacker's device.
     //
-    // Decoding the code to derive display words duplicates no authorization: the daemon still
-    // verifies the binding authoritatively and refuses a forged code whatever this prints.
+    // Routed through the `org_join_code` VERB, not a local decode. Same reason the rest of this
+    // function moved: the daemon owns the decode+verify+fingerprint path, and computing the
+    // confirmation words a second way here would let the code an operator confirms drift from the
+    // code the approval acts on.
+    //
+    // It also means the binding is VERIFIED before these words print, so a forged code fails here
+    // instead of being announced as a person awaiting approval.
     if !json {
-        let jc = roster::enroll::JoinCode::decode(&join_code)?;
-        let user_pk = mcpmesh_trust::roster::decode_endpoint_id(&jc.user_pk)
-            .context("join code has an invalid user_pk")?;
-        let device_id = mcpmesh_trust::roster::decode_endpoint_id(&jc.device_endpoint_id)
-            .context("join code has an invalid device endpoint")?;
-        let code_fp = pairing::sas::join_code_fingerprint(&user_pk, &device_id);
+        let seen = with_daemon({
+            let join_code = join_code.clone();
+            async move |mut client| Ok(client.org_join_code(&join_code).await?)
+        })?;
         println!(
-            "Approving join code {code_fp} for '{}' as user '{}', groups [{}].",
-            jc.display_name,
+            "Approving join code {} for '{}' as user '{}', groups [{}].",
+            seen.join_code_fingerprint,
+            seen.display_name,
             user_id
                 .clone()
-                .unwrap_or_else(|| jc.requested_user_id.clone()),
+                .unwrap_or_else(|| seen.requested_user_id.clone()),
             groups.join(", ")
         );
         println!(
-            "  → Verify {code_fp} matches what the joiner read back to you out-of-band; if it \
-             doesn't, stop now and ask them for a fresh join code."
+            "  → Verify {} matches what the joiner read back to you out-of-band; if it doesn't, \
+             stop now and ask them for a fresh join code.",
+            seen.join_code_fingerprint
         );
     }
     let out = with_daemon({
@@ -309,7 +314,13 @@ pub fn run_org_revoke(target: String, user_key: bool, json: bool) -> anyhow::Res
             out.target
         ),
         "device" => format!("Revoked device '{}'", out.target),
-        _ => format!("Revoked person '{}' (all devices)", out.target),
+        "person" => format!("Revoked person '{}' (all devices)", out.target),
+        // A mode this porcelain does not know — a newer daemon. Report it VERBATIM rather than
+        // falling through to the person wording: that is the most destructive sentence of the
+        // three, and printing it for an unknown mode would tell an operator something worse
+        // happened than did (or something milder, if the new mode is worse). Neither is safe to
+        // guess about a revocation.
+        other => format!("Revoked '{}' (mode: {other})", out.target),
     };
     println!(
         "{action} (org '{}', serial {}). Severed {} live session{}.",

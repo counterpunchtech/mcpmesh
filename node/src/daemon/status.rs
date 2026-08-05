@@ -266,11 +266,31 @@ pub(crate) fn roster_members(mesh: &Arc<MeshState>) -> mcpmesh_local_api::Roster
     let active: std::collections::HashMap<[u8; 32], crate::roster::presence::PresenceEntry> =
         mesh.presence_table.active(now).into_iter().collect();
 
-    // Group the view's flat device map by owner. The view is device-keyed because that is what the
-    // gate resolves; the person is the unit an embedder renders.
-    let mut by_user: std::collections::BTreeMap<String, mcpmesh_local_api::RosterMember> =
-        std::collections::BTreeMap::new();
+    // Seed from the roster's USERS, not from the device map. That map is keyed by endpoint because
+    // that is what the gate resolves, so a person whose devices are all revoked does not appear in
+    // it at all — and revoking someone's only device is an ordinary operation that leaves their
+    // user entry in the signed roster. Deriving members from devices made "revoked their last
+    // device" indistinguishable from "removed from the org", which is the opposite of what a member
+    // list is for.
+    let mut by_user: std::collections::BTreeMap<String, mcpmesh_local_api::RosterMember> = view
+        .users()
+        .iter()
+        .map(|u| {
+            (
+                u.user_id.clone(),
+                mcpmesh_local_api::RosterMember {
+                    user_id: u.user_id.clone(),
+                    display_name: u.display_name.clone(),
+                    groups: u.groups.clone(),
+                    devices: Vec::new(),
+                },
+            )
+        })
+        .collect();
     for (eid, d) in view.devices() {
+        // `or_insert_with` rather than a bare lookup: every device's owner is in `users` by
+        // construction (both are read from one document), but a lookup that could silently DROP a
+        // device is not worth the assumption.
         let member =
             by_user
                 .entry(d.user_id.clone())
@@ -506,6 +526,16 @@ mod roster_members_tests {
                         user_pk: encode_b64u(&[1u8; 32]),
                         groups: vec!["eng".into()],
                         devices: vec![
+                            // Deliberately listed MIRROR-first and with a label that sorts before
+                            // the primary's, so the projection's sort is observable: document
+                            // order, label order and role order all disagree here. With one device
+                            // each (the first version of this fixture) the sort was a no-op and
+                            // deleting it entirely left the suite green.
+                            RosterDevice {
+                                endpoint_id: encode_b64u(&[0xA3; 32]),
+                                label: "aaa-tablet".into(),
+                                role: "mirror".into(),
+                            },
                             RosterDevice {
                                 endpoint_id: encode_b64u(&[0xA1; 32]),
                                 label: "laptop".into(),
@@ -529,9 +559,29 @@ mod roster_members_tests {
                             role: "primary".into(),
                         }],
                     },
+                    // A member whose ONLY device is revoked — the ordinary outcome of
+                    // `org_revoke <user>/<device>` on someone's last machine. Their user entry
+                    // stays in the signed roster, so a member list that omits them reports
+                    // "removed from the org" for someone who was not.
+                    //
+                    // `user_id` sorts AFTER bob but `display_name` sorts FIRST, so this also pins
+                    // that the list is ordered by the stable id rather than by the name a rename
+                    // could reshuffle.
+                    RosterUser {
+                        user_id: "zoe".into(),
+                        display_name: "Aaron Deviceless".into(),
+                        user_pk: encode_b64u(&[3u8; 32]),
+                        groups: vec!["ops".into()],
+                        devices: vec![RosterDevice {
+                            endpoint_id: encode_b64u(&[0xC1; 32]),
+                            label: "retired".into(),
+                            role: "primary".into(),
+                        }],
+                    },
                 ],
                 // alice's `old-phone` is revoked — it must not appear as a member device at all.
-                revoked_endpoints: vec![encode_b64u(&[0xA2; 32])],
+                // zoe's ONLY device is revoked, which must not remove zoe.
+                revoked_endpoints: vec![encode_b64u(&[0xA2; 32]), encode_b64u(&[0xC1; 32])],
                 sig: String::new(),
             },
         );
@@ -567,9 +617,26 @@ mod roster_members_tests {
                 .iter()
                 .map(|u| u.user_id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["alice", "bob"],
-            "every person in the roster must appear, ordered by the stable user_id — bob has NO \
-             live device, which is exactly the case status.presence cannot express"
+            vec!["alice", "bob", "zoe"],
+            "every person in the roster must appear, ordered by the stable USER_ID. Three things \
+             ride on this list. bob has no live device, which status.presence cannot express. \
+             zoe's ONLY device is revoked — the ordinary result of `org_revoke <user>/<device>` on \
+             someone's last machine, which leaves their user entry in the signed roster; deriving \
+             members from the device map dropped zoe entirely, reporting 'removed from the org' \
+             for someone who was not. And zoe sorts LAST by user_id but FIRST by display_name, so \
+             this pins the ordering key against a rename reshuffling the list"
+        );
+        let zoe = &got.users[2];
+        assert_eq!(zoe.display_name, "Aaron Deviceless");
+        assert!(
+            zoe.devices.is_empty(),
+            "…and they appear with NO devices, which is the honest report: the entry exists, the \
+             hardware is revoked"
+        );
+        assert_eq!(
+            zoe.groups,
+            vec!["ops".to_string()],
+            "group membership survives the revocation of every device"
         );
 
         let alice = &got.users[0];
@@ -584,8 +651,11 @@ mod roster_members_tests {
                 .iter()
                 .map(|d| d.label.as_str())
                 .collect::<Vec<_>>(),
-            vec!["laptop"],
-            "a REVOKED device must be absent, not merely offline — the member list must agree \
+            vec!["laptop", "aaa-tablet"],
+            "TWO properties. (1) The order is primary-before-mirror — NOT document order (the \
+             tablet is listed first) and NOT label order (`aaa-tablet` sorts first \
+             alphabetically), so deleting the sort or sorting by label alone both fail here. \
+             (2) a REVOKED device must be absent, not merely offline — the member list must agree \
              with what the gate would authorize"
         );
         assert_eq!(

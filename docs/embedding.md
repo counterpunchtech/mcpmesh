@@ -148,10 +148,14 @@ let mut ctl = node.control().await?;
 // reads back out-of-band, and the only thing anchoring their trust in the org.
 let org = ctl.org_create("acme", Some(365 * 86_400), None).await?;
 
-// A joiner sends you their join code. Verify the FINGERPRINT with them out of band:
-// nothing in the code binds it to a person, so a substituted code is caught here or never.
+// A joiner sends you their join code. INSPECT it first — this verifies the binding and
+// returns the fingerprint, without approving anything.
+let seen = ctl.org_join_code(&join_code).await?;
+show(&seen.display_name, &seen.requested_user_id, &seen.join_code_fingerprint);
+
+// Nothing in a join code binds it to a person, so a substituted one is caught by the two
+// humans comparing that fingerprint out-of-band — before this call, not after.
 let approved = ctl.org_approve(&join_code, vec!["eng".into()], None).await?;
-show(&approved.join_code_fingerprint);
 
 // Three readings; `mode` tells you which one you got.
 ctl.org_revoke("alice", false).await?;          // person departs — devices revoked
@@ -170,6 +174,14 @@ for user in &members.users {
 
 Three things worth knowing:
 
+- **Inspect before you approve.** `org_join_code` exists so an approve button can show who is
+  asking and, crucially, the fingerprint to confirm — *before* the member lands in the signed
+  roster. The same words come back on the approval result, but by then declining means revoking.
+  The claims (`display_name`, `requested_user_id`, `device_label`) are chosen by the sender: render
+  them, do not trust them. The binding is verified either way, so a forged code is refused.
+- **A `user_id` may not contain `/`.** It would collide with the `<user_id>/<device>` revoke
+  grammar, and the id defaults to one the person being approved chose — so `org_approve` refuses
+  it. Pass an explicit `user_id` to override.
 - **`roster_members` is not `status.presence`.** That one lists reachable *devices* and omits a
   person entirely when none of theirs is up. This is the member list — everyone the roster carries,
   with `online` per device, so one read draws both. It reads the same validated view the trust gate

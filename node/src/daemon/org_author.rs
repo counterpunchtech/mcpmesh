@@ -93,7 +93,10 @@ async fn install_authored(
 ) -> Result<mcpmesh_local_api::RosterInstallResult> {
     let bytes = serde_json::to_vec(roster).context("serialize the authored roster")?;
     // The guard must outlive the install call, so it is bound here rather than in a helper.
-    let staged = super::roster_install::write_temp_roster(&bytes)?;
+    let staged = super::roster_install::write_temp_roster(
+        &super::roster_install::roster_staging_dir(state.mesh_required()?),
+        &bytes,
+    )?;
     let path = staged.path().to_string_lossy().into_owned();
     let out = super::roster_install::install_roster(state, path, org_root_pk).await;
     drop(staged);
@@ -120,6 +123,17 @@ pub(crate) async fn org_create(
         !name.contains('/'),
         "org_create: the org name must not contain '/'"
     );
+    // EVERY cheap check runs BEFORE the key is minted. `load_or_generate` PERSISTS a new key, and
+    // the one-time guard then refuses the retry — so a validation failure after that point leaves
+    // the node holding a root it cannot use and an error message ("one-time per node") that
+    // actively discourages the only fix. Ordering is the whole mitigation: nothing below this line
+    // can fail on caller input.
+    let expires_secs = expires_secs.unwrap_or(DEFAULT_EXPIRES_SECS);
+    anyhow::ensure!(
+        expires_secs > 0,
+        "org_create: expires_secs must be positive"
+    );
+
     let key_path = org_root_key_path(mesh);
     let (root, created) = blocking("org_create root key", {
         let key_path = key_path.clone();
@@ -133,11 +147,6 @@ pub(crate) async fn org_create(
         key_path.display()
     );
 
-    let expires_secs = expires_secs.unwrap_or(DEFAULT_EXPIRES_SECS);
-    anyhow::ensure!(
-        expires_secs > 0,
-        "org_create: expires_secs must be positive"
-    );
     let now = epoch_now_i64();
     let roster = mint_signed(
         root.signing_key(),
@@ -147,8 +156,18 @@ pub(crate) async fn org_create(
     let installed = install_authored(state, &roster, Some(org_root_pk.clone())).await?;
     // Pin the roster URL through the same single-writer path the `set_roster_url` verb uses, so an
     // operator's poll loop keeps the hosted document current.
-    if let Some(url) = &roster_url {
-        super::roster_install::set_roster_url(state, url.clone()).await?;
+    //
+    // BEST-EFFORT, deliberately. The org now EXISTS — root minted, roster installed, anchor pinned
+    // — and `org_create` is one-time per node, so returning `Err` here would report failure for
+    // something that fully succeeded and then refuse the retry. The URL is a convenience the
+    // operator can set afterwards with `set_roster_url`; the org is not.
+    if let Some(url) = &roster_url
+        && let Err(e) = super::roster_install::set_roster_url(state, url.clone()).await
+    {
+        tracing::warn!(
+            %e,
+            "org created, but pinning the roster URL failed — set it with set_roster_url"
+        );
     }
     Ok(OrgCreateResult {
         org_id: installed.org_id,
@@ -180,20 +199,34 @@ pub(crate) async fn org_approve(
     user_id: Option<String>,
 ) -> Result<OrgApproveResult> {
     let mesh = state.mesh_required()?;
-    // No added context: the decode error is already the user-facing sentence.
-    let jc = JoinCode::decode(&join_code)?;
-    let user_pk = decode_endpoint_id(&jc.user_pk).context("join code has an invalid user_pk")?;
-    let device_id = decode_endpoint_id(&jc.device_endpoint_id)
-        .context("join code has an invalid device endpoint")?;
-    let sig = decode_b64u(&jc.binding_sig).context("join code has an invalid signature")?;
-    verify_device_binding(&user_pk, &device_id, &sig).map_err(|_| {
-        anyhow::anyhow!("join code device binding failed — the code is forged or corrupt")
-    })?;
+    // #66: serialize the whole authoring read-modify-write — see `MeshState::org_author_lock`.
+    // Taken BEFORE the decode so two approvals queue rather than both reading the same serial.
+    let _authoring = mesh.org_author_lock.lock().await;
+    // ONE decode+verify+fingerprint path, shared with `org_join_code`. The operator confirms the
+    // fingerprint THAT verb returned; if this computed its own from a second implementation, the
+    // two could drift and the code confirmed would not be the code approved.
+    let (jc, _user_pk, _device_id, code_fp) = inspect_join_code(&join_code)?;
 
     let (root, mut roster) = load_operator_roster(mesh)?;
     let uid = user_id.unwrap_or_else(|| jc.requested_user_id.clone());
     anyhow::ensure!(!uid.trim().is_empty(), "org_approve: the user_id is empty");
-    let code_fp = pairing::sas::join_code_fingerprint(&user_pk, &device_id);
+    // A `/` in a user_id HIJACKS the revoke grammar, and the id defaults to a value the person
+    // being approved chose. Approving `alice/laptop` as a user_id means a later
+    // `org_revoke("alice/laptop")` parses as "alice's laptop device" — so an operator trying to
+    // remove the hostile entry instead cuts the real Alice's laptop and leaves the hostile user in
+    // the roster, with `mode: "device"` reported and a confirmation sentence that reads correct for
+    // both intents.
+    //
+    // Refused HERE rather than made unambiguous in `org_revoke`, because the ambiguity is in the
+    // namespace: `user_id` and `<user_id>/<label>` cannot both be free-form and stay parseable.
+    // Device labels may still contain `/` — with no `/` in any user_id, `split_once` at the FIRST
+    // `/` always yields the right person.
+    anyhow::ensure!(
+        !uid.contains('/'),
+        "org_approve: a user_id must not contain '/' (it would collide with the \
+         '<user_id>/<device>' revoke grammar); pass an explicit user_id to override the one the \
+         join code requested"
+    );
 
     roster.serial += 1;
     mutate::upsert_member(
@@ -218,6 +251,52 @@ pub(crate) async fn org_approve(
     })
 }
 
+/// The decoded, binding-VERIFIED parts of a join code, shared by [`org_join_code`] and
+/// [`org_approve`] so the fingerprint an operator confirms and the one the approval acts on are
+/// computed from the same bytes by the same code.
+fn inspect_join_code(join_code: &str) -> Result<(JoinCode, [u8; 32], [u8; 32], String)> {
+    // No added context: the decode error is already the user-facing sentence.
+    let jc = JoinCode::decode(join_code)?;
+    let user_pk = decode_endpoint_id(&jc.user_pk).context("join code has an invalid user_pk")?;
+    let device_id = decode_endpoint_id(&jc.device_endpoint_id)
+        .context("join code has an invalid device endpoint")?;
+    let sig = decode_b64u(&jc.binding_sig).context("join code has an invalid signature")?;
+    verify_device_binding(&user_pk, &device_id, &sig).map_err(|_| {
+        anyhow::anyhow!("join code device binding failed — the code is forged or corrupt")
+    })?;
+    let fingerprint = pairing::sas::join_code_fingerprint(&user_pk, &device_id);
+    Ok((jc, user_pk, device_id, fingerprint))
+}
+
+/// `org_join_code`: INSPECT a join code — what it claims, and the fingerprint that decides whether
+/// to believe it. Read-only; nothing is signed, installed, or persisted.
+///
+/// This is what makes an embedder's "approve this person" button CORRECT rather than merely
+/// possible. The fingerprint must be confirmed out-of-band BEFORE the approval — a substituted code
+/// is caught there or not at all — and reading it off `org_approve`'s result is too late, since the
+/// member is already in the signed roster by then. The CLI always could do this locally; an
+/// embedder could not, because the join-code format lives here and not on the control seam.
+///
+/// The binding is still verified, so a forged code is REFUSED rather than described.
+pub(crate) async fn org_join_code(
+    state: &DaemonState,
+    join_code: String,
+) -> Result<mcpmesh_local_api::OrgJoinCodeResult> {
+    // A mesh is required for consistency with the approval this precedes: an inspection that
+    // worked on a control-only daemon would have different preconditions than the verb it exists
+    // to guard.
+    let _ = state.mesh_required()?;
+    let (jc, _user_pk, _device_id, fingerprint) = inspect_join_code(&join_code)?;
+    Ok(mcpmesh_local_api::OrgJoinCodeResult {
+        // Sender-chosen claims, echoed for display and never trusted. What is verified is the
+        // binding; what is checkable is the fingerprint.
+        display_name: jc.display_name,
+        requested_user_id: jc.requested_user_id,
+        device_label: jc.device_label,
+        join_code_fingerprint: fingerprint,
+    })
+}
+
 /// `org_revoke`: mutate the installed roster per the target grammar, bump, re-sign, install — which
 /// SEVERS the cut devices' live sessions (#54), not merely refuses their next one.
 ///
@@ -231,7 +310,16 @@ pub(crate) async fn org_revoke(
     user_key: bool,
 ) -> Result<OrgRevokeResult> {
     let mesh = state.mesh_required()?;
+    let _authoring = mesh.org_author_lock.lock().await;
     anyhow::ensure!(!target.trim().is_empty(), "org_revoke: the target is empty");
+    // `user_key` is a rotation of the PERSON's key, so a device-shaped target is contradictory
+    // rather than merely unmatched. Refused by name instead of falling through to a
+    // `no such person 'alice/laptop'`, which reads like the person is missing.
+    anyhow::ensure!(
+        !(user_key && target.contains('/')),
+        "org_revoke: user_key rotates a PERSON's key, so the target must be a user_id, not \
+         '<user_id>/<device>'"
+    );
     let (root, mut roster) = load_operator_roster(mesh)?;
     roster.serial += 1;
     let mode = if user_key {
@@ -465,6 +553,158 @@ mod tests {
             msg.contains("device binding failed"),
             "the forged binding must be the failure — not 'not an org operator', which would mean \
              the check runs after the roster load: {msg}"
+        );
+    }
+
+    /// #66: a `/` in a user_id HIJACKS the revoke grammar — proven, then closed.
+    ///
+    /// The id defaults to a value the person being APPROVED chose. Approving `alice/laptop` as a
+    /// user_id means a later `org_revoke("alice/laptop")` parses as "alice's laptop device": the
+    /// operator trying to remove the hostile entry instead cuts the real Alice's laptop and leaves
+    /// the hostile user in the roster, with `mode: "device"` and a confirmation sentence that reads
+    /// correct for both intents.
+    ///
+    /// Refused at approval, where the namespace is decided. Removing the guard makes the second
+    /// approval below succeed, which is the whole exploit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_user_id_containing_a_slash_cannot_hijack_the_revoke_grammar() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = operator_state(dir.path()).await;
+        org_create(&state, "acme".into(), None, None).await.unwrap();
+
+        let alice = SigningKey::from_bytes(&[9u8; 32]);
+        let alice_pk = alice.verifying_key().to_bytes();
+        org_approve(
+            &state,
+            join_code_signed_by(&alice, &alice_pk, &[0xA1; 32]),
+            vec![],
+            None,
+        )
+        .await
+        .expect("the real alice is approved");
+
+        // Mallory asks to be called `alice/laptop`.
+        let mallory = SigningKey::from_bytes(&[7u8; 32]);
+        let mallory_pk = mallory.verifying_key().to_bytes();
+        let hostile = JoinCode {
+            display_name: "Mallory".into(),
+            requested_user_id: "alice/laptop".into(),
+            user_pk: encode_b64u(&mallory_pk),
+            device_endpoint_id: encode_b64u(&[0xB1; 32]),
+            device_label: "phone".into(),
+            binding_sig: encode_b64u(&mcpmesh_trust::roster::sign::sign_device_binding(
+                &mallory,
+                &[0xB1; 32],
+            )),
+        }
+        .encode();
+
+        let err = org_approve(&state, hostile.clone(), vec![], None)
+            .await
+            .expect_err("a user_id carrying '/' must be refused");
+        assert!(
+            format!("{err:#}").contains("must not contain '/'"),
+            "refused for the RIGHT reason — the grammar collision, not some incidental failure: \
+             {err:#}"
+        );
+
+        // …and the operator's override is the documented way through, so the person can still be
+        // approved under a name that does not collide.
+        org_approve(&state, hostile, vec![], Some("mallory".into()))
+            .await
+            .expect("an explicit, non-colliding user_id is accepted");
+
+        // The revoke grammar is now unambiguous: alice's laptop is alice's laptop.
+        let out = org_revoke(&state, "alice/laptop".into(), false)
+            .await
+            .unwrap();
+        assert_eq!(out.mode, "device");
+        let mesh = state.mesh_required().unwrap();
+        let members = crate::daemon::roster_members(mesh);
+        assert!(
+            members.users.iter().any(|u| u.user_id == "mallory"),
+            "revoking alice's laptop must not have touched the other member"
+        );
+    }
+
+    /// #66: `user_key` rotates a PERSON's key, so a device-shaped target is contradictory.
+    ///
+    /// Refused by name rather than falling through to `no such person 'alice/laptop'`, which reads
+    /// like the person is missing when the real problem is the caller combined two grammars.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rotation_refuses_a_device_shaped_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = operator_state(dir.path()).await;
+        org_create(&state, "acme".into(), None, None).await.unwrap();
+        let alice = SigningKey::from_bytes(&[9u8; 32]);
+        org_approve(
+            &state,
+            join_code_signed_by(&alice, &alice.verifying_key().to_bytes(), &[42u8; 32]),
+            vec![],
+            None,
+        )
+        .await
+        .unwrap();
+
+        let err = org_revoke(&state, "alice/laptop".into(), true)
+            .await
+            .expect_err("a rotation with a device target must be refused");
+        assert!(
+            format!("{err:#}").contains("must be a user_id"),
+            "the refusal must name the grammar mistake: {err:#}"
+        );
+    }
+
+    /// #66: an embedder can INSPECT a join code before approving it — the read that makes an
+    /// "approve this person" button correct rather than merely possible.
+    ///
+    /// The fingerprint has to be confirmed out-of-band BEFORE the approval; a substituted code is
+    /// caught there or not at all. Reading it off `org_approve`'s result is too late — the member is
+    /// already in the signed roster. The CLI always had this (it decodes locally); an embedder did
+    /// not, because the join-code format lives in this crate and not on the control seam.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_join_code_can_be_inspected_before_it_is_approved() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = operator_state(dir.path()).await;
+        org_create(&state, "acme".into(), None, None).await.unwrap();
+
+        let alice = SigningKey::from_bytes(&[9u8; 32]);
+        let code = join_code_signed_by(&alice, &alice.verifying_key().to_bytes(), &[42u8; 32]);
+
+        let seen = org_join_code(&state, code.clone())
+            .await
+            .expect("a well-formed code inspects");
+        assert_eq!(seen.display_name, "Alice");
+        assert_eq!(seen.requested_user_id, "alice");
+        assert_eq!(seen.device_label, "laptop");
+        assert!(!seen.join_code_fingerprint.is_empty());
+
+        // Read-only: nothing was installed, so the roster is untouched and the member absent.
+        let mesh = state.mesh_required().unwrap();
+        assert_eq!(
+            mesh.roster.view().unwrap().serial(),
+            1,
+            "inspection must not bump the serial"
+        );
+        assert!(crate::daemon::roster_members(mesh).users.is_empty());
+
+        // THE property: the fingerprint the operator confirms is the one the approval acts on.
+        // Two implementations could drift, and then the code confirmed is not the code approved.
+        let approved = org_approve(&state, code, vec![], None).await.unwrap();
+        assert_eq!(
+            approved.join_code_fingerprint, seen.join_code_fingerprint,
+            "the inspected and approved fingerprints must be identical — otherwise the operator's \
+             out-of-band check certifies a different code than the one that lands"
+        );
+
+        // A forged binding is REFUSED by the inspection, not described — an approve UI must not be
+        // able to render a forged code as if it were a person awaiting approval.
+        let mallory = SigningKey::from_bytes(&[7u8; 32]);
+        let forged = join_code_signed_by(&mallory, &alice.verifying_key().to_bytes(), &[43u8; 32]);
+        let err = org_join_code(&state, forged).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("device binding failed"),
+            "{err:#}"
         );
     }
 

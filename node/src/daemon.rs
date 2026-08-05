@@ -129,7 +129,7 @@ pub(crate) use handlers::{
     redeem, register_service, service_allow_grant, service_allow_revoke, set_relays,
     unregister_service,
 };
-pub(crate) use org_author::{org_approve, org_create, org_revoke};
+pub(crate) use org_author::{org_approve, org_create, org_join_code, org_revoke};
 pub(crate) use roster_install::{
     install_roster, org_join, set_app_metadata, set_nickname, set_roster_url,
 };
@@ -396,6 +396,22 @@ pub struct MeshState {
     ///
     /// std `Mutex`, held only for the insert/remove and never across an await.
     pub(crate) probes_inflight: std::sync::Mutex<std::collections::HashSet<[u8; 32]>>,
+    /// Serializes an org AUTHORING verb's whole read-modify-write (#66).
+    ///
+    /// `org_approve`/`org_revoke` read `roster.json`, mutate, bump the serial, re-sign, and only
+    /// then install — and `install_roster` takes `reload_lock` for the install alone. Since #172 the
+    /// control API dispatches a connection's requests CONCURRENTLY, so two approvals can both read
+    /// serial N and both build N+1. There is no lost update (the second is refused by the
+    /// `serial > installed` rollback check), but the loser fails with a roster-validation sentence
+    /// about serial monotonicity, which is an opaque and misleading answer for an "approve this
+    /// person" button. Holding this across the whole RMW makes the second approval simply queue and
+    /// then succeed at N+2.
+    ///
+    /// A SEPARATE lock rather than widening `reload_lock`: `install_roster` takes that one itself,
+    /// and tokio's `Mutex` is not reentrant, so reusing it here would deadlock. Ordering is
+    /// authoring → `reload_lock` and never the reverse — nothing acquires this while holding
+    /// `reload_lock` — so the graph stays acyclic.
+    pub(crate) org_author_lock: tokio::sync::Mutex<()>,
     /// EPHEMERAL service registrations (#36): in-memory only, never written to config, torn down
     /// when the registering control connection closes. Keyed by service name → its backend spec +
     /// allow list. Overlaid onto the config-built registry on every hot-reload
@@ -544,6 +560,7 @@ impl MeshState {
             self_net_change: std::sync::Mutex::new(None),
             probe_seq: std::sync::atomic::AtomicU64::new(0),
             probes_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            org_author_lock: tokio::sync::Mutex::new(()),
             ephemeral_services: std::sync::Mutex::new(std::collections::HashMap::new()),
             fetches: std::sync::Mutex::new(std::collections::HashMap::new()),
         })

@@ -466,6 +466,31 @@ impl ControlClient {
         .await
     }
 
+    /// INSPECT a join code without approving it (#66): what it claims, and the fingerprint that
+    /// decides whether to believe it. Read-only — nothing is signed or installed.
+    ///
+    /// **Call this before [`org_approve`](Self::org_approve), show
+    /// `join_code_fingerprint`, and have the operator confirm it out-of-band.** Nothing in a join
+    /// code binds it to a person; a substituted one carries a different key and diverges here. The
+    /// fingerprint on the approval RESULT is the same words, but by then the member is in the
+    /// signed roster — too late to decline.
+    ///
+    /// The claims (`display_name`, `requested_user_id`, `device_label`) are chosen by the sender.
+    /// Render them; do not trust them. A forged binding is refused rather than described.
+    /// `api_minor >= 46`.
+    pub async fn org_join_code(
+        &mut self,
+        join_code: &str,
+    ) -> Result<crate::protocol::OrgJoinCodeResult, ClientError> {
+        self.request_typed(
+            Request::OrgJoinCode(crate::protocol::OrgJoinCodeParams {
+                join_code: join_code.to_string(),
+            }),
+            "org_join_code result",
+        )
+        .await
+    }
+
     /// REVOKE from the roster (#66) — and sever the cut devices' live sessions, immediately.
     ///
     /// Three readings, and picking the wrong one is destructive, so the result reports which
