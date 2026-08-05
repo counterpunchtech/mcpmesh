@@ -414,6 +414,80 @@ impl ControlClient {
             .await
     }
 
+    /// AUTHOR an org (#66): mint this node's org root key, sign an empty roster, install it (which
+    /// pins the root), and return the copyable invite plus the root's fingerprint.
+    ///
+    /// **One-time per node** — a second call is refused rather than replacing the key, which would
+    /// orphan every roster already signed with it.
+    ///
+    /// Show `org_root_fingerprint` to the operator: it is what every joiner reads back
+    /// out-of-band, and it is the only thing anchoring their trust in the org. `api_minor >= 46`.
+    pub async fn org_create(
+        &mut self,
+        name: &str,
+        expires_secs: Option<i64>,
+        roster_url: Option<String>,
+    ) -> Result<crate::protocol::OrgCreateResult, ClientError> {
+        self.request_typed(
+            Request::OrgCreate(crate::protocol::OrgCreateParams {
+                name: name.to_string(),
+                expires_secs,
+                roster_url,
+            }),
+            "org_create result",
+        )
+        .await
+    }
+
+    /// APPROVE a join code into the roster (#66): verify its device→user-key binding, add the
+    /// member with `groups`, re-sign, install.
+    ///
+    /// **The result's `join_code_fingerprint` is not decoration.** Nothing in a join code binds it
+    /// to a human, so a substituted code is caught by the two people comparing that fingerprint
+    /// out-of-band, or it is not caught at all. Show it and have the operator confirm it.
+    ///
+    /// Each group must already be declared in the roster; an undeclared one is refused. `user_id`
+    /// overrides the id the joiner requested — worth using, since that id is chosen by the person
+    /// being approved and is what every `allow` entry will name. `api_minor >= 46`.
+    pub async fn org_approve(
+        &mut self,
+        join_code: &str,
+        groups: Vec<String>,
+        user_id: Option<String>,
+    ) -> Result<crate::protocol::OrgApproveResult, ClientError> {
+        self.request_typed(
+            Request::OrgApprove(crate::protocol::OrgApproveParams {
+                join_code: join_code.to_string(),
+                groups,
+                user_id,
+            }),
+            "org_approve result",
+        )
+        .await
+    }
+
+    /// REVOKE from the roster (#66) — and sever the cut devices' live sessions, immediately.
+    ///
+    /// Three readings, and picking the wrong one is destructive, so the result reports which
+    /// `mode` was applied: `"<user_id>/<label>"` cuts ONE device; a bare `user_id` removes the
+    /// person and revokes ALL their devices; `user_key = true` is a key ROTATION — the person is
+    /// removed but their devices stay un-revoked so the same hardware re-enrolls under a fresh
+    /// user key. `api_minor >= 46`.
+    pub async fn org_revoke(
+        &mut self,
+        target: &str,
+        user_key: bool,
+    ) -> Result<crate::protocol::OrgRevokeResult, ClientError> {
+        self.request_typed(
+            Request::OrgRevoke(crate::protocol::OrgRevokeParams {
+                target: target.to_string(),
+                user_key,
+            }),
+            "org_revoke result",
+        )
+        .await
+    }
+
     /// Pin the org root on a JOINER (no roster yet). `user_key` is a LOCAL path — the key never
     /// crosses the API. Returns the pinned org id.
     pub async fn org_join(

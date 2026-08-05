@@ -21,10 +21,10 @@ use mcpmesh_local_api::transport::{LocalListener, LocalStream};
 use mcpmesh_local_api::{
     API_NAME, API_VERSION, AuditListParams, AuditPruneParams, BlobFetchCancelParams,
     BlobFetchParams, BlobGrantParams, BlobPublishParams, BlobRepublishParams, BlobRevokeParams,
-    BlobUnpublishParams, Hello, InviteParams, OpenSessionParams, OrgJoinParams, PairParams,
-    PeerServicesParams, RosterInstallParams, ServiceAllowParams, SetAppMetadataParams,
-    SetNicknameParams, SetRelaysParams, SetRosterUrlParams, StatusResult, UnregisterServiceParams,
-    method_of,
+    BlobUnpublishParams, Hello, InviteParams, OpenSessionParams, OrgApproveParams, OrgCreateParams,
+    OrgJoinParams, OrgRevokeParams, PairParams, PeerServicesParams, RosterInstallParams,
+    ServiceAllowParams, SetAppMetadataParams, SetNicknameParams, SetRelaysParams,
+    SetRosterUrlParams, StatusResult, UnregisterServiceParams, method_of,
 };
 use mcpmesh_net::framing::{FrameReader, Inbound, write_frame};
 use serde_json::{Value, json};
@@ -774,6 +774,34 @@ pub(crate) async fn handle_request(req: &Value, state: &DaemonState) -> Value {
                 let mesh = state.mesh_required()?;
                 Ok(crate::daemon::roster_members(mesh))
             }
+            .await,
+        ),
+        // #66: the AUTHORING verbs. Roster mode's operator side used to be CLI-only, so an
+        // embedded node could consume a roster and never author one — no "approve this person"
+        // button without shelling out to a second binary. The porcelain now calls these too, so
+        // both front doors run ONE implementation.
+        Some("org_create") => respond(
+            id,
+            "org_create",
+            with_params(&params, |p: OrgCreateParams| {
+                crate::daemon::org_create(state, p.name, p.expires_secs, p.roster_url)
+            })
+            .await,
+        ),
+        Some("org_approve") => respond(
+            id,
+            "org_approve",
+            with_params(&params, |p: OrgApproveParams| {
+                crate::daemon::org_approve(state, p.join_code, p.groups, p.user_id)
+            })
+            .await,
+        ),
+        Some("org_revoke") => respond(
+            id,
+            "org_revoke",
+            with_params(&params, |p: OrgRevokeParams| {
+                crate::daemon::org_revoke(state, p.target, p.user_key)
+            })
             .await,
         ),
         Some("roster_install") => respond(

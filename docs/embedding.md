@@ -132,3 +132,57 @@ a stored payload without one.
 
 Signatures survive restarts and process exits — the device key lives under the node's root
 directory, so a mailbox full of payloads signed by long-gone processes stays attributable.
+
+## Roster mode from an embedded node (`api_minor >= 46`, #66/#93)
+
+Roster mode gives you managed group membership signed by an org root, instead of per-peer pairing.
+Both halves of it are now on the control API, so an app can run the whole thing — including an
+"approve this person" button — without shipping the `mcpmesh` binary alongside itself.
+
+**Authoring** (the operator's node):
+
+```rust
+let mut ctl = node.control().await?;
+
+// One-time per node. Show org_root_fingerprint to your operator — it is what every joiner
+// reads back out-of-band, and the only thing anchoring their trust in the org.
+let org = ctl.org_create("acme", Some(365 * 86_400), None).await?;
+
+// A joiner sends you their join code. Verify the FINGERPRINT with them out of band:
+// nothing in the code binds it to a person, so a substituted code is caught here or never.
+let approved = ctl.org_approve(&join_code, vec!["eng".into()], None).await?;
+show(&approved.join_code_fingerprint);
+
+// Three readings; `mode` tells you which one you got.
+ctl.org_revoke("alice", false).await?;          // person departs — devices revoked
+ctl.org_revoke("alice/laptop", false).await?;   // one device
+ctl.org_revoke("alice", true).await?;           // key ROTATION — devices stay usable
+```
+
+**Reading** (any member's node):
+
+```rust
+let members = ctl.roster_members().await?;
+for user in &members.users {
+    println!("{} ({}) in [{}]", user.display_name, user.user_id, user.groups.join(", "));
+}
+```
+
+Three things worth knowing:
+
+- **`roster_members` is not `status.presence`.** That one lists reachable *devices* and omits a
+  person entirely when none of theirs is up. This is the member list — everyone the roster carries,
+  with `online` per device, so one read draws both. It reads the same validated view the trust gate
+  resolves against, so a **revoked device is absent**, not shown as merely offline.
+- **`org_join` may need a restart.** Roster mode is decided at boot: it fixes the ALPNs bound on the
+  endpoint and whether gossip, presence and app-blobs are constructed at all. A node that started in
+  pairing mode and then joins an org reaches a state where sessions to org members work while
+  presence stays permanently empty. `OrgJoinResult::restart_required` says so — surface it, don't
+  treat it as a failure. The pin is durable; the restart is all that is missing.
+- **The 90-day roster expiry is an operator default, and a sharp edge for a small group.** Past it
+  the roster degrades and the group stops working — which for a handful of laptops can arrive days
+  after one was closed for a long weekend. Pass a long `expires_secs` to `org_create` deliberately.
+
+Not yet available: **org root rotation** (#93c). An operator machine that dies takes the org with it
+once the roster expires, so back up `<root>/config/org-root.key` alongside `roster.json` — copying
+both to a second operator machine works today.

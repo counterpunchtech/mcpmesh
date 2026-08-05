@@ -27,6 +27,7 @@ pub(crate) mod config_write;
 mod dial;
 mod dial_hint;
 mod handlers;
+mod org_author;
 mod path_watch;
 pub(crate) mod reach;
 mod roster_install;
@@ -128,6 +129,7 @@ pub(crate) use handlers::{
     redeem, register_service, service_allow_grant, service_allow_revoke, set_relays,
     unregister_service,
 };
+pub(crate) use org_author::{org_approve, org_create, org_revoke};
 pub(crate) use roster_install::{
     install_roster, org_join, set_app_metadata, set_nickname, set_roster_url,
 };
