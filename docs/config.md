@@ -221,6 +221,46 @@ serve. All four are safe to hand-edit; the durations use the format above.
 | `poll_interval` | `"1h"` | How often the daemon re-polls `url` to confirm the installed roster is current. |
 | `max_staleness` | `"24h"` | How long the node may go without confirming the roster current before it degrades (same warning-then-stop ladder as expiry). Under an adversary withholding updates, staleness is bounded by `max_staleness + grace_period`. |
 
+## `[blobs]`
+
+Reclaiming disk from the app-blob store (#80).
+
+| Key | Default | Meaning |
+|---|---|---|
+| `gc_interval` | *(unset — no collection)* | How often to sweep `<data_dir>/blobs/`, e.g. `"1h"`. Minimum `60s`. Absent means the store grows monotonically, which is the behaviour of every release up to 0.42.0. |
+
+`blob_unpublish` and `blob_revoke` withdraw *access*; neither reclaims a byte. This is the knob that
+does, so an embedder that has told a user "this file is deleted" can deliver that.
+
+**What a sweep deletes: every blob no scope names.** That is the reclaim you asked for, and it also
+covers a case worth knowing before you turn this on:
+
+> A blob this node **fetched** and never republished is in no scope, so it is reclaimed. The fetch
+> already wrote the caller's `dest_path` and the store copy is a cache — but it means
+> **`blob_republish` of a hash fetched more than one interval ago fails**, and this node stops being
+> an alternate source for it (`blob_fetch --from`).
+
+Pick the interval against how long you want to stay a source for things you fetched, not just
+against disk.
+
+**A bad value leaves collection OFF.** Unlike `[roster]`'s durations — where a typo falls back to
+the default, because a typo must never disable a safety property — an unparseable `gc_interval`, or
+one below `60s`, turns collection off and logs a warning. A knob that deletes bytes must not start
+deleting them because a fallback guessed an interval. A below-minimum value is refused rather than
+raised to the minimum, so `status` can never report an interval the node is not on.
+
+**Watch `status.storage.blobs_gc.runs`.** Two properties come from iroh-blobs and cannot be worked
+around here:
+
+- The collector **sleeps a full interval before its first run**. A node with `gc_interval = "24h"`
+  reclaims nothing for its first 24 hours, and there is no way to request a sweep on demand.
+- It **stops collecting for the life of the process after its first sweep error** — a log line, and
+  otherwise silent. `runs` failing to advance across several intervals is the only signal. Restart
+  the daemon to resume.
+
+`status.storage.blobs_gc` is absent entirely when collection is not configured, and present with
+`runs: 0` when it is configured and has not swept yet.
+
 ## `[services.<name>]`
 
 One table per served MCP server — written by `mcpmesh serve`, grown by pairings. The table name is
@@ -273,6 +313,30 @@ learns the limit by receiving `-32053`, not by querying it.
 bounded by (services that peer is granted) × (their limits) — both operator-chosen, neither
 peer-influenced. That is a real weakening, and it is the minimum one that delivers the isolation:
 also consulting a shared bucket would restore the old ceiling and restore the starvation with it.
+
+#### Sizing it against MCP 2026-07-28 (#188)
+
+**One logical tool call can now cost several requests, and each is charged.**
+[SEP-2322 Multi Round-Trip Requests][mrtr] replaces the server-initiated `elicitation/create`,
+`sampling/createMessage` and `roots/list` — which previously held a stream open — with: the server
+returns `resultType: "input_required"`, and the client **retries the original call** with its
+answers in `inputResponses`.
+
+That retry is metered as a **fresh request**. So a tool that needs one round of user input costs
+**two** requests against this bucket, and two rounds cost three.
+
+This is a decision, not an accident, and it is worth stating why: there is no correlation id at the
+mesh layer, and inventing one would mean parsing MCP request/response semantics inside the
+transport — which mcpmesh deliberately does not do (it pumps; it does not interpret). A
+continuation is also still a round trip, still a backend invocation, and still the unit this limit
+exists to bound.
+
+**The practical consequence:** a budget tuned against 2025-11-25 traffic is effectively **2–3×
+tighter** for exactly the interactive tools MRTR exists to enable, and the failure surfaces
+*mid-interaction* — after the user has already been asked a question. If you serve tools that
+elicit input, size for the round trips, not the tool calls.
+
+[mrtr]: https://blog.modelcontextprotocol.io/posts/2026-07-28/
 
 ## A complete example
 

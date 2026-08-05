@@ -428,7 +428,8 @@ enum BlobCmd {
     ///
     /// Run it from a SECOND terminal: the fetching command holds its own control connection for the
     /// transfer's duration, so the cancel necessarily arrives on a different one. The fetch exits
-    /// non-zero with a "cancelled" error; partial chunks stay in the store (#80).
+    /// non-zero with a "cancelled" error; partial chunks stay in the store, and are reclaimed
+    /// only if this node configured `[blobs].gc_interval` (#80).
     Cancel {
         /// The blob's hash, as printed by `blob fetch`/`blob list` or carried on transfer frames.
         hash: String,

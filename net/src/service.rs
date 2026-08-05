@@ -45,6 +45,88 @@ pub fn strip_reserved_meta(frame: &mut Value) {
 /// not a request any server would unwrap.
 const MAX_BATCH_DEPTH: usize = 8;
 
+/// The MCP 2026-07-28 key a client writes its own software name/version into.
+const CLIENT_INFO_KEY: &str = "io.modelcontextprotocol/clientInfo";
+
+/// Remove a `clientInfo` that names itself in mcpmesh's PRINCIPAL grammar (#189).
+///
+/// With the `initialize` handshake gone in MCP 2026-07-28, client identity moves into per-request
+/// `_meta` as `io.modelcontextprotocol/clientInfo`. mcpmesh injects the transport-authenticated
+/// caller into the SAME object as `mcpmesh/peer`. So a backend now sees two identity-shaped keys
+/// side by side with opposite trust properties:
+///
+/// | key | written by | trustworthy |
+/// |---|---|---|
+/// | `mcpmesh/peer` | mcpmesh, from the authenticated endpoint | yes |
+/// | `io.modelcontextprotocol/clientInfo` | the caller | **no** |
+///
+/// **mcpmesh does not populate, filter or validate `clientInfo` in general.** It is legitimate
+/// protocol data describing the client SOFTWARE, not the principal; overwriting it would destroy
+/// information a backend wants and make mcpmesh the only transport that lies about which MCP client
+/// is connected. A backend that reads `clientInfo.name` as an identity has an authorization bug no
+/// transport filtering can fix, because that field is caller-controlled BY DESIGN. That is a
+/// contract to document, and `docs/local-protocol.md` documents it.
+///
+/// The one exception is here. A `name` written in **our** grammar — `eid:…` or `b64u:…` — is never
+/// client software naming itself; it is only ever an attempt to look authoritative beside the key
+/// that is. That is #164's shape exactly (a caller writing in the reserved grammar) and it gets
+/// #164's treatment: removal, on every frame, descending batches.
+///
+/// **Called from BOTH places `strip_reserved_meta` is**, and for the same reason: [`select_service`]
+/// on the session's first frame, the backend pump on every later one. The pump alone would miss
+/// frame 1 — `serve` hands the selected `initialize` straight to the backend — which is #164 in
+/// mirror image, and worse here, because under 2026-07-28 `clientInfo` rides EVERY request rather
+/// than only the handshake.
+///
+/// Deliberately narrow. Nicknames are NOT checked: "bob" is a plausible name for client software,
+/// the nickname space is unbounded and per-node, and a check there would be leaky and
+/// false-positive-prone at once. A non-string `name`, an absent `name`, a non-object `clientInfo`,
+/// and every other name pass through verbatim.
+///
+/// The WHOLE entry goes, not just `name`: an object whose name is a forgery has nothing worth
+/// preserving, and a `clientInfo` missing its required field is worse for a strict backend than no
+/// `clientInfo` at all.
+///
+/// Returns whether anything was removed, so the caller can log ONCE per session. A `warn!` per
+/// offending frame is an unbounded, caller-driven log-growth vector — the same class as the audit
+/// DoS this project has already fixed once.
+#[must_use]
+pub fn strip_impersonating_client_info(frame: &mut Value) -> bool {
+    strip_impersonating_client_info_to_depth(frame, 0)
+}
+
+/// Principal prefixes reserved to mcpmesh. A `clientInfo.name` in either is a forgery attempt.
+const PRINCIPAL_PREFIXES: [&str; 2] = ["eid:", "b64u:"];
+
+fn strip_impersonating_client_info_to_depth(frame: &mut Value, depth: usize) -> bool {
+    if let Some(batch) = frame.as_array_mut() {
+        if depth >= MAX_BATCH_DEPTH {
+            return false;
+        }
+        // NOT short-circuiting: every element must be sanitized even once one has already matched.
+        let mut hit = false;
+        for element in batch {
+            hit |= strip_impersonating_client_info_to_depth(element, depth + 1);
+        }
+        return hit;
+    }
+    let Some(meta) = frame
+        .pointer_mut("/params/_meta")
+        .and_then(Value::as_object_mut)
+    else {
+        return false;
+    };
+    let impersonating = meta
+        .get(CLIENT_INFO_KEY)
+        .and_then(|ci| ci.get("name"))
+        .and_then(Value::as_str)
+        .is_some_and(|n| PRINCIPAL_PREFIXES.iter().any(|p| n.starts_with(p)));
+    if impersonating {
+        meta.remove(CLIENT_INFO_KEY);
+    }
+    impersonating
+}
+
 fn strip_reserved_meta_to_depth(frame: &mut Value, depth: usize) {
     if let Some(batch) = frame.as_array_mut() {
         if depth < MAX_BATCH_DEPTH {
@@ -73,6 +155,24 @@ pub fn select_service(init: &mut Value, caller_allowed: &[String]) -> ServiceDec
     // Strip ALL reserved keys, always — before any decision is acted on.
     strip_reserved_meta(init);
 
+    // #189 on the SESSION'S FIRST FRAME. The backend pump covers every LATER frame, but the first
+    // one never reaches it: `serve` hands the already-selected `initialize` to the backend, which
+    // injects `mcpmesh/peer` itself. Wiring the removal only into the pump would leave frame 1
+    // untouched — the exact shape of #164, in mirror image, and a worse one here: under MCP
+    // 2026-07-28 `clientInfo` rides EVERY request, so frame 1 is the likeliest place to see it,
+    // not the least.
+    //
+    // Warned inline rather than returned. `select_service` runs once per session, so this is
+    // bounded by session count — the same "once per session" the pump achieves with a flag, with
+    // no signal to thread through `ServiceDecision` and no second place for the rule to drift to.
+    if strip_impersonating_client_info(init) {
+        tracing::warn!(
+            "caller's `io.modelcontextprotocol/clientInfo` named itself in mcpmesh's principal \
+             grammar (eid:/b64u:) on the session's first frame; the whole entry was removed. \
+             `mcpmesh/peer` is the only authenticated identity in that object."
+        );
+    }
+
     if malformed {
         return ServiceDecision::Refuse;
     }
@@ -92,6 +192,158 @@ mod tests {
     fn init_with_meta(meta: serde_json::Value) -> serde_json::Value {
         json!({"jsonrpc":"2.0","id":1,"method":"initialize",
                "params":{"protocolVersion":"2025-11-25","_meta": meta,"capabilities":{}}})
+    }
+
+    const CI: &str = "io.modelcontextprotocol/clientInfo";
+
+    fn frame_with_client_info(ci: serde_json::Value) -> serde_json::Value {
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+               "params":{"_meta":{CI: ci, "other/key":"kept"}}})
+    }
+
+    /// #189 on the session's FIRST frame — the one the pump never sees.
+    ///
+    /// `serve` hands the selected `initialize` straight to the backend, which injects
+    /// `mcpmesh/peer` itself; only LATER frames go through the pump's sanitizer. A `clientInfo`
+    /// check wired only into the pump would therefore miss frame 1 — #164 in mirror image, and
+    /// worse here, because under MCP 2026-07-28 `clientInfo` rides every request and frame 1 is
+    /// where a handshake-shaped one appears.
+    #[test]
+    fn the_first_frame_is_covered_too() {
+        let mut init = init_with_meta(json!({
+            "mcpmesh/service": "notes",
+            CI: {"name": "eid:forged", "version": "1"},
+        }));
+        assert_eq!(
+            select_service(&mut init, &["notes".into()]),
+            ServiceDecision::Selected("notes".into()),
+            "the selection itself is unaffected"
+        );
+        assert!(
+            init["params"]["_meta"].get(CI).is_none(),
+            "an impersonating clientInfo must not reach the backend on frame 1: {init}"
+        );
+
+        // A legitimate one survives selection untouched.
+        let ci = json!({"name": "Claude Code", "version": "2.0"});
+        let mut ok = init_with_meta(json!({"mcpmesh/service": "notes", CI: ci.clone()}));
+        let _ = select_service(&mut ok, &["notes".into()]);
+        assert_eq!(ok["params"]["_meta"][CI], ci);
+    }
+
+    /// #189: a `clientInfo` naming itself in mcpmesh's PRINCIPAL grammar is removed.
+    ///
+    /// Under MCP 2026-07-28 this key sits in the same `_meta` object as the authenticated
+    /// `mcpmesh/peer`. A caller writing `eid:`/`b64u:` there is not naming its software; it is
+    /// dressing up as the key that is trustworthy.
+    #[test]
+    fn a_client_info_wearing_our_principal_grammar_is_removed() {
+        for name in [
+            "eid:abcdef",
+            "b64u:AAAA",
+            // No separator required beyond the prefix — a bare prefix still reads as a principal.
+            "eid:",
+        ] {
+            let mut f = frame_with_client_info(json!({"name": name, "version": "1.0"}));
+            assert!(
+                strip_impersonating_client_info(&mut f),
+                "{name} must be reported as impersonating, so the pump can warn once"
+            );
+            assert!(
+                f["params"]["_meta"].get(CI).is_none(),
+                "the WHOLE entry goes — a clientInfo missing its required `name` is worse for a \
+                 strict backend than none: {f}"
+            );
+            assert_eq!(
+                f["params"]["_meta"]["other/key"], "kept",
+                "nothing else in _meta is touched"
+            );
+        }
+    }
+
+    /// …and everything else passes through VERBATIM. The narrowness is the design: `clientInfo` is
+    /// legitimate protocol data describing client SOFTWARE, and mcpmesh pumps rather than
+    /// interprets.
+    #[test]
+    fn an_ordinary_client_info_is_never_touched() {
+        for ci in [
+            json!({"name": "Claude Code", "version": "2.0"}),
+            // A nickname-shaped name: deliberately NOT checked. "bob" is plausible software
+            // naming, and the nickname space is unbounded and per-node.
+            json!({"name": "bob"}),
+            // Prefix-ish but not ours.
+            json!({"name": "eidetic-client"}),
+            json!({"name": "identity:bob"}),
+            // Non-string / absent `name`, and a non-object clientInfo.
+            json!({"name": 42}),
+            json!({"name": {"eid": "nested"}}),
+            json!({"version": "1.0"}),
+            json!("not-an-object"),
+            json!(["eid:array"]),
+            json!(null),
+        ] {
+            let mut f = frame_with_client_info(ci.clone());
+            assert!(
+                !strip_impersonating_client_info(&mut f),
+                "{ci} must not be reported as impersonating"
+            );
+            assert_eq!(
+                f["params"]["_meta"][CI], ci,
+                "{ci} must pass through verbatim"
+            );
+        }
+
+        // No `_meta`, no `params`, a non-object `_meta`, and a scalar frame: no panic, no change.
+        for mut f in [
+            json!({"method":"ping","params":{}}),
+            json!({"method":"ping"}),
+            json!({"method":"ping","params":{"_meta":["not","an","object"]}}),
+            json!("scalar"),
+        ] {
+            let before = f.clone();
+            assert!(!strip_impersonating_client_info(&mut f));
+            assert_eq!(f, before);
+        }
+    }
+
+    /// A JSON-RPC batch is descended into — the #164 hole, on this rule.
+    ///
+    /// A caller that could wrap the forged frame in `[ ... ]` and slip past would have the exact
+    /// bypass #164 was, so the batch case is pinned rather than assumed.
+    #[test]
+    fn a_batch_wrapped_impersonation_is_removed_in_every_element() {
+        // The LAST element is deliberately legitimate: with an impersonator last, `hit |= …`
+        // degraded to `hit = …` still returns true and the accumulator bug goes unseen.
+        let mut batch = json!([
+            frame_with_client_info(json!({"name": "eid:one"})),
+            frame_with_client_info(json!({"name": "Claude Code"})),
+            frame_with_client_info(json!({"name": "b64u:three"})),
+            frame_with_client_info(json!({"name": "Some Client"})),
+        ]);
+        assert!(
+            strip_impersonating_client_info(&mut batch),
+            "a hit anywhere in the batch must be reported, not just one in the last element"
+        );
+        assert!(batch[0]["params"]["_meta"].get(CI).is_none());
+        assert_eq!(
+            batch[1]["params"]["_meta"][CI]["name"], "Claude Code",
+            "a legitimate sibling in the same batch is untouched"
+        );
+        assert!(
+            batch[2]["params"]["_meta"].get(CI).is_none(),
+            "the scan must not stop at the first hit — element 3 is after element 1"
+        );
+        assert_eq!(
+            batch[3]["params"]["_meta"][CI]["name"], "Some Client",
+            "…and a legitimate element AFTER a hit survives"
+        );
+
+        // Past the depth bound, nothing is descended — same contract as `strip_reserved_meta`.
+        let mut deep = frame_with_client_info(json!({"name": "eid:deep"}));
+        for _ in 0..(MAX_BATCH_DEPTH + 1) {
+            deep = json!([deep]);
+        }
+        assert!(!strip_impersonating_client_info(&mut deep));
     }
 
     #[test]

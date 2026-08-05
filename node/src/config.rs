@@ -17,6 +17,8 @@ pub struct Config {
     /// Roster-mode `[roster]` tunables: the degraded-expiry grace window, the roster URL +
     /// poll interval, and the freshness bound — one `RosterState` machine consumes them all.
     pub roster: RosterCfg,
+    /// `[blobs]` tunables. Today: the app-blob garbage-collection interval (#80).
+    pub blobs: BlobsCfg,
     /// `[services.<name>]` registry — each entry is a served MCP server plus its allow
     /// list. Peers do NOT live in config; they live in the daemon's state store, so
     /// there is no `[peers]` table here.
@@ -334,6 +336,67 @@ impl RosterCfg {
     }
 }
 
+/// The shortest `[blobs].gc_interval` that is honoured. Below this, collection stays OFF.
+///
+/// A sweep walks every blob in the store and deletes what the scope table does not name; running
+/// it every few seconds is all cost and no benefit, and `"1s"` is far more likely to be a mistake
+/// than an intent.
+pub const MIN_GC_INTERVAL_SECS: i64 = 60;
+
+/// The `[blobs]` table.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct BlobsCfg {
+    /// How often to garbage-collect the app-blob store (#80), e.g. `"1h"`. **Absent means no
+    /// collection at all** — `<data_dir>/blobs/` grows monotonically, which is the behavior of
+    /// every release up to 0.42.0.
+    ///
+    /// Opt-in because a sweep deletes bytes the node holds but no scope names, which includes
+    /// every blob this node has FETCHED and not republished. Those are reclaimable — the fetch
+    /// already wrote the caller's `dest_path` and the store copy is a cache — but it means a
+    /// `blob_republish` of a hash fetched more than one interval ago fails. Silent background
+    /// deletion is the wrong default for a local-first tool, and that interaction makes it wrong
+    /// twice.
+    pub gc_interval: Option<String>,
+}
+
+impl BlobsCfg {
+    /// The GC interval in SECONDS, or `None` for "do not collect".
+    ///
+    /// **Deliberately NOT total, unlike every other duration accessor here.**
+    /// [`RosterCfg::grace_seconds`] and friends fall back to their default on a typo because a typo
+    /// must never disable a safety property. This one runs the other way: a value that fell back to
+    /// *some* interval would let `gc_interval = "1hh"` start deleting data the operator never
+    /// authorized. So an unparseable value — or one below [`MIN_GC_INTERVAL_SECS`] — leaves
+    /// collection OFF and warns.
+    ///
+    /// A below-floor value is refused rather than clamped UP: a clamped value reads back through
+    /// `status.storage.blobs_gc.interval_secs` as honoured, and is not.
+    pub fn gc_interval_seconds(&self) -> Option<u64> {
+        let raw = self.gc_interval.as_deref()?;
+        match parse_duration(raw) {
+            Ok(secs) if secs >= MIN_GC_INTERVAL_SECS => Some(secs as u64),
+            Ok(secs) => {
+                tracing::warn!(
+                    value = raw,
+                    secs,
+                    min = MIN_GC_INTERVAL_SECS,
+                    "[blobs].gc_interval is below the minimum; blob garbage collection is OFF"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!(
+                    value = raw,
+                    %e,
+                    "[blobs].gc_interval is unparseable; blob garbage collection is OFF"
+                );
+                None
+            }
+        }
+    }
+}
+
 /// Parse a duration string to SECONDS: a `d`/`h`/`m`/`s` suffix (days/hours/minutes/seconds) or a
 /// bare number (seconds). Trim + suffix-strip + checked multiply; rejects a
 /// negative/overflowing/garbage value as `Err` (the caller supplies the
@@ -570,5 +633,60 @@ mod tests {
         // Absent → None (pure-pairing / operator-only node).
         let bare: Config = toml::from_str("[identity]\n").unwrap();
         assert!(bare.identity.user_id.is_none() && bare.identity.user_key.is_none());
+    }
+
+    /// #80: `[blobs].gc_interval` must FAIL SAFE. A knob that deletes bytes gets the opposite
+    /// convention from every other duration here.
+    ///
+    /// `grace_period`/`poll_interval`/`max_staleness` fall back to their default on a typo, because
+    /// a typo must never disable a safety property. Here a fallback to *some* interval would let
+    /// `"1hh"` start deleting data the operator never authorized, so the fallback is OFF.
+    #[test]
+    fn a_bad_gc_interval_leaves_collection_off_rather_than_guessing_one() {
+        let off: Config = toml::from_str("[identity]\n").unwrap();
+        assert_eq!(
+            off.blobs.gc_interval_seconds(),
+            None,
+            "absent means no collection at all — the behavior of every release up to 0.42.0"
+        );
+
+        let on: Config = toml::from_str("[blobs]\ngc_interval = \"2h\"\n").unwrap();
+        assert_eq!(on.blobs.gc_interval_seconds(), Some(7200));
+
+        for bad in ["1hh", "", "soon", "-1", "0.5h"] {
+            let c: Config = toml::from_str(&format!("[blobs]\ngc_interval = \"{bad}\"\n")).unwrap();
+            assert_eq!(
+                c.blobs.gc_interval_seconds(),
+                None,
+                "an unparseable interval ({bad:?}) must leave collection OFF, never fall back to \
+                 a default that deletes data"
+            );
+        }
+    }
+
+    /// Below the floor is REFUSED, not clamped up.
+    ///
+    /// A clamped value reads back through `status.storage.blobs_gc.interval_secs` as honoured and
+    /// is not. The boundary is pinned from both sides so a `>` / `>=` slip is visible.
+    #[test]
+    fn a_sub_minimum_gc_interval_is_refused_rather_than_clamped() {
+        let at: Config = toml::from_str(&format!(
+            "[blobs]\ngc_interval = \"{MIN_GC_INTERVAL_SECS}s\"\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            at.blobs.gc_interval_seconds(),
+            Some(MIN_GC_INTERVAL_SECS as u64),
+            "exactly the floor is honoured"
+        );
+        for under in [MIN_GC_INTERVAL_SECS - 1, 1, 0] {
+            let c: Config =
+                toml::from_str(&format!("[blobs]\ngc_interval = \"{under}s\"\n")).unwrap();
+            assert_eq!(
+                c.blobs.gc_interval_seconds(),
+                None,
+                "{under}s is below the floor and must leave collection OFF, not be raised to it"
+            );
+        }
     }
 }

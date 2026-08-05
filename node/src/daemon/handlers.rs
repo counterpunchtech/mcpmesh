@@ -124,9 +124,10 @@ pub(crate) async fn blob_revoke(
 /// Handle a `blob_unpublish` control request (#62): remove a hash from ONE scope.
 ///
 /// Takes effect IMMEDIATELY for authorization — the scope gate requires the hash to be listed in
-/// some scope — but does NOT delete bytes: the local store keeps them and there is no reclaim verb
-/// (`iroh_blobs` exposes no on-demand GC; see the issue). A hash published into several scopes stays
-/// reachable through the others.
+/// some scope — but does NOT delete bytes synchronously. The local store keeps them until a
+/// background sweep reclaims them, and only a node that set `[blobs].gc_interval` runs one (#80);
+/// there is still no reclaim VERB, because `iroh_blobs` exposes no on-demand GC. A hash published
+/// into several scopes stays reachable through the others — and stays LIVE for the sweep.
 pub(crate) async fn blob_unpublish(state: &DaemonState, scope: String, hash: String) -> Result<()> {
     let mesh = state.mesh_required()?;
     let provider = mesh.app_blobs().await.context(
@@ -396,6 +397,13 @@ pub(crate) async fn blob_fetch(
             .fetch_from(&ticket, &alternates)
             .await
             .context("fetch blob")?;
+        // #80: pin the fetched blob across the EXPORT. It is in the store and in no scope — the
+        // fetch creates no tag — so on a collecting node a sweep between the transfer completing
+        // and the export finishing would reclaim it, and the caller would get a `NotFound` after a
+        // fully successful transfer. Held only for the export; afterwards the blob is deliberately
+        // reclaimable, since the caller's `dest_path` is the durable copy and the store's is a
+        // cache (see `[blobs]` in docs/config.md).
+        let _pin = provider.pin(hash).await;
         // STREAM to disk (#82). The previous `read_bytes` + `fs::write` held the entire blob in
         // memory before a byte landed, so peak RSS was blob-sized and a large fetch OOM-killed the
         // node rather than merely being slow. `export` writes incrementally and reports the size,

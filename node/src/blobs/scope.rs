@@ -75,8 +75,8 @@ pub struct Scope {
     pub grants: BTreeSet<String>,
     /// Hashes deliberately WITHDRAWN from this scope (#107).
     ///
-    /// `blob_unpublish` removes reachability but not bytes (#80: no reclaim), so the blob stays
-    /// complete in the local store forever and `blob_republish` would re-add it to this scope —
+    /// `blob_unpublish` removes reachability but not bytes, so until a sweep runs the blob stays
+    /// complete in the local store and `blob_republish` would re-add it to this scope —
     /// whose grants unpublish never touched — restoring access with no grant call and no warning.
     /// A lock cannot close that: exclusion is in lock-ACQUISITION order, not request-arrival order,
     /// so an unpublish that acquires first is still erased by a republish acquiring second.
@@ -155,9 +155,13 @@ impl BlobScopes {
     /// changed.
     ///
     /// This is the AUTHORIZATION boundary: [`allows`](Self::allows) requires the hash to be in some
-    /// scope, so a subsequent GET for it is refused. It does NOT delete bytes — the store keeps them and
-    /// there is no reclaim verb (#80). A hash published into several scopes stays reachable through
-    /// the others, and a transfer already streaming is not interrupted.
+    /// scope, so a subsequent GET for it is refused. It does NOT delete bytes SYNCHRONOUSLY — the
+    /// store keeps them, and only a background sweep reclaims them, on a node that configured one
+    /// (`[blobs].gc_interval`, #80). On a node that did not, they stay forever. The tombstone
+    /// outlives the bytes either way, so a republish is refused before AND after a sweep — only the
+    /// error changes, from `BlobWithdrawn` to `NoSuchBlob`. A hash published into several scopes
+    /// stays reachable through the others (and stays LIVE for the sweep), and a transfer already
+    /// streaming is not interrupted.
     pub fn unpublish_hash(&mut self, scope: &str, hash_hex: &str) -> bool {
         self.scopes.get_mut(scope).is_some_and(|sc| {
             // Record the withdrawal even when the hash was not currently listed: the operator has
@@ -230,6 +234,25 @@ impl BlobScopes {
             total,
             truncated,
         })
+    }
+
+    /// Every hash NAMED by some scope — the liveness root for blob garbage collection (#80).
+    ///
+    /// mcpmesh creates no persistent tags (`publish_path`'s `TempTag` is dropped as it returns), so
+    /// a blob absent from this set is referenced by nothing mcpmesh knows about and the sweep may
+    /// reclaim it.
+    ///
+    /// **`withdrawn` is deliberately excluded.** `unpublish` moves a hash out of `hashes` and
+    /// records a tombstone; the tombstone lives in the sidecar, not the store, so it outlives the
+    /// bytes and keeps refusing a republish after a sweep — the refusal merely changes from
+    /// `BlobWithdrawn` to `NoSuchBlob`. Reclaiming withdrawn bytes is the entire point of #80: an
+    /// embedder that told a user "this file is deleted" could not deliver that.
+    ///
+    /// Duplicates across scopes are the caller's to collapse — the consumer is a `HashSet`.
+    pub fn live_hashes(&self) -> impl Iterator<Item = &str> {
+        self.scopes
+            .values()
+            .flat_map(|sc| sc.hashes.iter().map(String::as_str))
     }
 
     /// Was this hash deliberately withdrawn from this scope (#107)?
@@ -453,6 +476,35 @@ impl ScopeStore {
         self.inner.read().expect("scope lock not poisoned").clone()
     }
 
+    /// TEST-ONLY: poison `inner`, so [`live_hashes`](Self::live_hashes) fails the way it fails in
+    /// production — a thread that panicked mid-mutation. The only way to exercise the GC callback's
+    /// `Abort` arm, which is the guard against sweeping against an EMPTY liveness root and deleting
+    /// every blob on the node.
+    #[cfg(test)]
+    pub(crate) fn poison_for_test(&self) {
+        let inner = &self.inner;
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = inner.write().expect("not yet poisoned");
+            panic!("poison the scope lock");
+        }));
+    }
+
+    /// The blob-GC liveness root: every hash named by some scope (#80).
+    ///
+    /// **Fallible on purpose, and the only reachable failure is a POISONED lock** — which means
+    /// another thread panicked part-way through a mutation, so the table may be mid-update. Every
+    /// other accessor here `expect`s past that, which is right for a control verb that would be
+    /// returning an error anyway. It is wrong here: this answers a background sweep whose fallback
+    /// on "no answer" is to delete every blob in the store. The caller maps `Err` to
+    /// `ProtectOutcome::Abort`, which skips the run and keeps the schedule.
+    pub fn live_hashes(&self) -> Result<std::collections::HashSet<String>> {
+        let g = self
+            .inner
+            .read()
+            .map_err(|_| anyhow::anyhow!("blob scope lock is poisoned"))?;
+        Ok(g.live_hashes().map(str::to_string).collect())
+    }
+
     /// Publish a hash into a scope + persist (single-writer). The write lock is dropped before the
     /// fs write so a slow fsync never blocks a concurrent authz read.
     pub fn publish_hash(&self, scope: &str, hash_hex: &str) -> Result<()> {
@@ -617,6 +669,111 @@ impl ScopeStore {
         }
         txn.commit()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod gc_root_tests {
+    use super::*;
+
+    /// #80: the liveness root is the union across scopes, and a WITHDRAWN hash is not in it.
+    ///
+    /// The second half is the whole feature. `blob_unpublish` records a tombstone and drops the
+    /// hash from `hashes`; if `live_hashes` protected withdrawn entries, the bytes an operator
+    /// deliberately withdrew would be the one thing collection could never reclaim — exactly the
+    /// promise #80 exists to make deliverable.
+    #[test]
+    fn the_liveness_root_unions_scopes_and_excludes_withdrawn() {
+        let mut t = BlobScopes::default();
+        t.publish_hash("room", "aa");
+        t.publish_hash("room", "bb");
+        // Distinct scope, and a hash SHARED with `room` — so a root that took only one scope, or
+        // that double-counted, is visible.
+        t.publish_hash("other", "cc");
+        t.publish_hash("other", "aa");
+
+        let root: std::collections::HashSet<&str> = t.live_hashes().collect();
+        assert_eq!(
+            root,
+            ["aa", "bb", "cc"].into_iter().collect(),
+            "every hash named by any scope is live"
+        );
+
+        // Withdraw `bb` from the only scope holding it.
+        assert!(t.unpublish_hash("room", "bb"));
+        assert!(
+            t.is_withdrawn("room", "bb"),
+            "precondition: the tombstone exists"
+        );
+        let root: std::collections::HashSet<&str> = t.live_hashes().collect();
+        assert!(
+            !root.contains("bb"),
+            "a withdrawn hash must be RECLAIMABLE — protecting it makes #80 undeliverable: {root:?}"
+        );
+        assert!(
+            root.contains("aa") && root.contains("cc"),
+            "…and withdrawing one hash must not unprotect the rest: {root:?}"
+        );
+
+        // `aa` is still live through `other` after being withdrawn from `room` — a hash in several
+        // scopes is protected by any one of them.
+        assert!(t.unpublish_hash("room", "aa"));
+        let root: std::collections::HashSet<&str> = t.live_hashes().collect();
+        assert!(
+            root.contains("aa"),
+            "a hash withdrawn from ONE scope is still live through another: {root:?}"
+        );
+
+        assert_eq!(
+            BlobScopes::default().live_hashes().count(),
+            0,
+            "an empty table protects nothing"
+        );
+    }
+
+    /// The store-level accessor answers the same set, as owned strings for the sweep's `HashSet`.
+    #[test]
+    fn the_store_reports_the_same_root() {
+        let s = ScopeStore::new(PathBuf::from("/nonexistent/scopes.json"));
+        s.publish_hash("room", "aa").unwrap();
+        s.publish_hash("room", "bb").unwrap();
+        let root = s.live_hashes().expect("an unpoisoned store answers");
+        assert_eq!(
+            root,
+            ["aa".to_string(), "bb".to_string()].into_iter().collect()
+        );
+    }
+
+    /// A POISONED scope lock must be an ERROR, not an empty root.
+    ///
+    /// This is the only reachable failure, and it is the one that matters: the caller maps `Err` to
+    /// `ProtectOutcome::Abort`, which skips the sweep. An accessor that `expect`ed — like every
+    /// sibling here — would panic inside a background timer task; one that returned an empty set
+    /// would hand the sweep an empty liveness root and delete every blob on the node.
+    #[test]
+    fn a_poisoned_scope_lock_is_an_error_and_not_an_empty_root() {
+        let s = ScopeStore::new(PathBuf::from("/nonexistent/scopes.json"));
+        s.publish_hash("room", "aa").unwrap();
+        assert_eq!(
+            s.live_hashes().unwrap().len(),
+            1,
+            "precondition: the root is non-empty before the lock is poisoned"
+        );
+
+        // Poison `inner` by panicking while holding its WRITE guard.
+        let inner = &s.inner;
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = inner.write().expect("not yet poisoned");
+            panic!("poison the scope lock");
+        }));
+
+        let e = s
+            .live_hashes()
+            .expect_err("a poisoned lock must not answer a liveness root");
+        assert!(
+            format!("{e:#}").contains("poisoned"),
+            "the error must name the cause, so an operator reading the abort log knows why: {e:#}"
+        );
     }
 }
 

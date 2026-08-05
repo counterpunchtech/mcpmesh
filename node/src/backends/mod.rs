@@ -48,11 +48,17 @@ pub(crate) const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 /// MCP lifecycle permits before `initialize`, and which rmcp answers — and sent its real
 /// `initialize` as frame 2, which reached the backend verbatim with a forged `mcpmesh/peer`.
 ///
-/// Two steps, because each alone leaves a hole:
+/// Three steps, because each alone leaves a hole:
 ///
 /// 1. **Strip** every caller-supplied `mcpmesh/*` key. Unconditional, both backends.
 ///    `mcpmesh/service` is the key `select_service` acts on, so this is authorization-relevant.
-/// 2. **Inject** the authoritative peer into whichever frame is actually the handshake. Stripping
+/// 2. **Remove an impersonating `io.modelcontextprotocol/clientInfo`** (#189) — one whose `name` is
+///    written in mcpmesh's own `eid:`/`b64u:` principal grammar. Under MCP 2026-07-28 that key
+///    lands in the same `_meta` object as the authenticated `mcpmesh/peer`; see
+///    [`strip_impersonating_client_info`](mcpmesh_net::service::strip_impersonating_client_info)
+///    for why the rest of `clientInfo` is left strictly alone. Returned rather than logged here, so
+///    the pump can warn ONCE per session instead of once per caller-controlled frame.
+/// 3. **Inject** the authoritative peer into whichever frame is actually the handshake. Stripping
 ///    alone would leave the backend's real `initialize` carrying no identity at all —
 ///    unattributable, which is the second harm the issue names.
 ///
@@ -62,10 +68,18 @@ pub(crate) const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 ///
 /// Non-object `params`/`_meta` are REPLACED, never indexed into — `Value`'s `IndexMut` panics on a
 /// non-object base, and a caller controls this shape.
-fn sanitize_caller_frame(frame: &mut Value, peer_meta: Option<&Value>) {
+/// Returns whether an impersonating `clientInfo` was removed (#189) — the caller warns once.
+#[must_use]
+fn sanitize_caller_frame(frame: &mut Value, peer_meta: Option<&Value>) -> bool {
     mcpmesh_net::service::strip_reserved_meta(frame);
-    let Some(peer) = peer_meta else { return };
-    inject_peer(frame, peer, 0);
+    // Runs for BOTH backends, including `run` — a spawned server reads `_meta` too even though its
+    // identity arrives by env var, so skipping the removal there would leave the impersonation
+    // reachable on exactly one backend.
+    let impersonating = mcpmesh_net::service::strip_impersonating_client_info(frame);
+    if let Some(peer) = peer_meta {
+        inject_peer(frame, peer, 0);
+    }
+    impersonating
 }
 
 /// Attribute whichever frame is really the handshake, descending a JSON-RPC batch.
@@ -165,13 +179,27 @@ where
     // Direction A: mesh transport → local server. Owns `&mut transport` (recv) and
     // `server_write`; ends on transport EOF/error or the server's input closing.
     let to_server = async {
+        // #189: warn on the FIRST impersonating `clientInfo` of the session and never again. The
+        // offending field is caller-controlled and arrives per frame, so a log line per occurrence
+        // is an unbounded growth vector the caller drives — the audit-DoS class again. One line
+        // names the session; a second adds nothing.
+        let mut warned_client_info = false;
         loop {
             match transport.recv_value().await {
                 Ok(Some(mut frame)) => {
                     // #164: strip reserved keys and re-attribute a later handshake, BEFORE the
                     // rate gate, the audit hook, or the forward — `select_service`'s same "before
                     // anything acts on the frame" discipline.
-                    sanitize_caller_frame(&mut frame, peer_meta.as_ref());
+                    if sanitize_caller_frame(&mut frame, peer_meta.as_ref())
+                        && !std::mem::replace(&mut warned_client_info, true)
+                    {
+                        tracing::warn!(
+                            "caller sent an `io.modelcontextprotocol/clientInfo` naming itself in \
+                             mcpmesh's principal grammar (eid:/b64u:); the whole entry was removed \
+                             before the backend saw it. `mcpmesh/peer` is the only authenticated \
+                             identity in that object. Logged once per session."
+                        );
+                    }
                     // Per-identity rate limit: consult BEFORE forwarding a
                     // proxied REQUEST/notification (a method-bearing frame). FAIL-SAFE over-limit —
                     // DROP the request (never forward, never queue), reply -32053{retry_after_ms}
@@ -404,7 +432,7 @@ mod tests {
             "mcpmesh/service": "not-yours",
             "app/keep": "yes"
         }}});
-        sanitize_caller_frame(&mut frame, None);
+        let _ = sanitize_caller_frame(&mut frame, None);
 
         assert!(
             frame["params"]["_meta"].get("mcpmesh/peer").is_none(),
@@ -429,7 +457,7 @@ mod tests {
         // attribute a `tools/call` as though it were a handshake.
         let mut call = json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
                               "params":{"_meta":{"mcpmesh/peer":{"name":"attacker"}}}});
-        sanitize_caller_frame(&mut call, Some(&peer));
+        let _ = sanitize_caller_frame(&mut call, Some(&peer));
         assert!(
             call["params"]["_meta"].get("mcpmesh/peer").is_none(),
             "a forged peer on a non-initialize frame is stripped and NOT replaced: {call}"
@@ -439,8 +467,68 @@ mod tests {
         let mut init = json!({"jsonrpc":"2.0","id":2,"method":"initialize",
                               "params":{"_meta":{"mcpmesh/peer":
                                   {"name":"attacker","groups":["admin"],"user_id":"root"}}}});
-        sanitize_caller_frame(&mut init, Some(&peer));
+        let _ = sanitize_caller_frame(&mut init, Some(&peer));
         assert_eq!(init["params"]["_meta"]["mcpmesh/peer"], peer, "{init}");
+    }
+
+    /// #189 at the SEAM: the removal runs on every caller frame, both backends, and the
+    /// authoritative injection is unaffected by it.
+    ///
+    /// The non-first-frame case is the point. #164 was a rule that held on frame 1 only, and a
+    /// caller reached the backend by spending frame 1 on a `ping`. A `clientInfo` check wired only
+    /// into `select_service` would have exactly that hole — and unlike `mcpmesh/peer` this key
+    /// legitimately appears on EVERY request under MCP 2026-07-28, so frame 1 is the LEAST likely
+    /// place to see it.
+    #[test]
+    fn an_impersonating_client_info_is_removed_on_every_frame_and_both_backends() {
+        const CI: &str = "io.modelcontextprotocol/clientInfo";
+        let peer = json!({"eid":"eid:aa","name":"bob","user_id":null,"groups":[]});
+
+        // A LATER frame — a `tools/call`, not the handshake.
+        let mut later = json!({"jsonrpc":"2.0","id":7,"method":"tools/call",
+            "params":{"_meta":{CI:{"name":"eid:forged","version":"9"}}}});
+        assert!(
+            sanitize_caller_frame(&mut later, Some(&peer)),
+            "the seam must report the removal so the pump can warn once per session"
+        );
+        assert!(
+            later["params"]["_meta"].get(CI).is_none(),
+            "a non-handshake frame must be cleaned too — #164's hole was exactly this: {later}"
+        );
+
+        // The `run` backend (`peer_meta: None`) conveys identity by env var and gets no `_meta`
+        // injection — but it still READS `_meta`, so skipping the removal there would leave the
+        // impersonation reachable on exactly one backend.
+        let mut run_frame = json!({"jsonrpc":"2.0","id":8,"method":"tools/call",
+            "params":{"_meta":{CI:{"name":"b64u:forged"}}}});
+        assert!(sanitize_caller_frame(&mut run_frame, None));
+        assert!(
+            run_frame["params"]["_meta"].get(CI).is_none(),
+            "{run_frame}"
+        );
+
+        // The two rules are independent: an impersonating clientInfo on the handshake is removed
+        // AND the authoritative peer is still injected. A legitimate one survives beside it.
+        let mut init = json!({"jsonrpc":"2.0","id":9,"method":"initialize",
+            "params":{"_meta":{CI:{"name":"eid:forged"},"mcpmesh/peer":{"name":"also forged"}}}});
+        assert!(sanitize_caller_frame(&mut init, Some(&peer)));
+        assert!(init["params"]["_meta"].get(CI).is_none());
+        assert_eq!(
+            init["params"]["_meta"]["mcpmesh/peer"], peer,
+            "the authenticated identity is still injected: {init}"
+        );
+
+        let mut ok = json!({"jsonrpc":"2.0","id":10,"method":"initialize",
+            "params":{"_meta":{CI:{"name":"Claude Code","version":"2.0"}}}});
+        assert!(
+            !sanitize_caller_frame(&mut ok, Some(&peer)),
+            "an ordinary clientInfo is not an impersonation"
+        );
+        assert_eq!(
+            ok["params"]["_meta"][CI]["name"], "Claude Code",
+            "…and it reaches the backend beside `mcpmesh/peer`, verbatim: {ok}"
+        );
+        assert_eq!(ok["params"]["_meta"]["mcpmesh/peer"], peer);
     }
 
     /// #164: a caller controls these shapes, and `Value`'s `IndexMut` PANICS on a non-object base.
@@ -455,7 +543,7 @@ mod tests {
             json!({"jsonrpc":"2.0","id":4,"method":"initialize","params":{"_meta":42}}),
             json!({"jsonrpc":"2.0","id":5,"method":"initialize","params":{"_meta":["a"]}}),
         ] {
-            sanitize_caller_frame(&mut frame, Some(&peer));
+            let _ = sanitize_caller_frame(&mut frame, Some(&peer));
             assert_eq!(
                 frame["params"]["_meta"]["mcpmesh/peer"], peer,
                 "an odd-shaped initialize must still end up attributed: {frame}"
@@ -466,7 +554,7 @@ mod tests {
         // through untouched rather than coerced into an object that invents an `initialize`.
         for original in [json!("a bare string frame"), json!(null), json!(7)] {
             let mut frame = original.clone();
-            sanitize_caller_frame(&mut frame, Some(&peer));
+            let _ = sanitize_caller_frame(&mut frame, Some(&peer));
             assert_eq!(
                 frame, original,
                 "a scalar frame is not an initialize and must pass through unchanged"
@@ -489,7 +577,7 @@ mod tests {
             {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"_meta": forged}},
             {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"_meta": forged}},
         ]);
-        sanitize_caller_frame(&mut batch, Some(&peer));
+        let _ = sanitize_caller_frame(&mut batch, Some(&peer));
 
         assert_eq!(
             batch[0]["params"]["_meta"]["mcpmesh/peer"], peer,
@@ -512,19 +600,19 @@ mod tests {
         // without limit. It must still not PANIC, and the outer levels are handled.
         let mut deep = json!([[[[[[[[[[{"jsonrpc":"2.0","method":"initialize",
                                         "params":{"_meta":{"mcpmesh/peer":{"name":"x"}}}}]]]]]]]]]]);
-        sanitize_caller_frame(&mut deep, Some(&peer));
+        let _ = sanitize_caller_frame(&mut deep, Some(&peer));
 
         // And with no identity, a batch is still stripped.
         let mut b2 = json!([{"jsonrpc":"2.0","id":1,"method":"initialize",
                              "params":{"_meta":{"mcpmesh/peer":{"name":"attacker"}}}}]);
-        sanitize_caller_frame(&mut b2, None);
+        let _ = sanitize_caller_frame(&mut b2, None);
         assert!(
             b2[0]["params"]["_meta"].get("mcpmesh/peer").is_none(),
             "a run backend's batch is stripped too: {b2}"
         );
         // And with no identity, an odd shape must not panic either.
         for mut frame in [json!(null), json!("s"), json!({"params": 7})] {
-            sanitize_caller_frame(&mut frame, None);
+            let _ = sanitize_caller_frame(&mut frame, None);
         }
     }
 

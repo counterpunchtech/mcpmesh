@@ -116,3 +116,120 @@ async fn a_second_node_on_the_same_root_is_refused() {
     );
     first.shutdown().await;
 }
+
+/// #80 THROUGH BOOT: `[blobs].gc_interval` in a real config reaches a real store, and a restart on
+/// the same root still works.
+///
+/// Both halves were gaps the 0.43.0 gate found, and each was invisible on a fully green suite:
+///
+/// - **The wiring.** Every other GC test calls `AppBlobs::load(.., Some(interval))` or
+///   `mesh.set_blobs_gc(..)` directly, so severing `boot.rs`'s two lines made #80 a complete no-op
+///   in the shipped daemon with 375 lib tests, `audit_verbs` and `start` all still passing. A
+///   tested helper nobody calls.
+/// - **The release.** `run_gc` runs on the blob store's own runtime and holds a `Store` clone,
+///   while the store's actor loop ends only when the last sender drops — a cycle dropping the
+///   `FsStore` cannot break. A collecting node therefore held `blobs.db`, its runtime and its
+///   worker threads for the life of the PROCESS, and this restart hung forever. Proved by probe:
+///   identical path, `gc: None` reopened, `gc: Some(..)` did not.
+///
+/// `NodeBuilder` shares `boot_node` with `serve_forever`, so this pins the standalone daemon too.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_configured_gc_interval_reaches_the_store_and_still_frees_the_root() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("config")).unwrap();
+    // Deliberately the FLOOR, not something comfortably above it: a boot that silently refused a
+    // boundary value would look identical to one that never read the key.
+    std::fs::write(
+        root.path().join("config/config.toml"),
+        "[blobs]\ngc_interval = \"60s\"\n",
+    )
+    .unwrap();
+
+    let node = NodeBuilder::new(root.path()).start().await.expect("start");
+    let mut control = node.control().await.expect("control");
+    let gc = control
+        .status()
+        .await
+        .expect("status")
+        .storage
+        .expect("storage block")
+        .blobs_gc
+        .expect("a configured gc_interval must reach the store and be reported");
+    assert_eq!(
+        gc.interval_secs, 60,
+        "the reported interval must be the one the store is actually on"
+    );
+    assert_eq!(
+        gc.runs, 0,
+        "the collector sleeps a full interval before its first run — 0 here is correct, and is why \
+         `Some` with runs: 0 has to be distinguishable from absent"
+    );
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), node.shutdown())
+        .await
+        .expect("shutdown must complete promptly on a collecting node");
+    let restarted = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        NodeBuilder::new(root.path()).start(),
+    )
+    .await
+    .expect("restart must not hang — a collecting node must release its blob store")
+    .expect("restart must succeed");
+    restarted.shutdown().await;
+}
+
+/// The control: with NO `gc_interval`, boot must report no collector at all.
+///
+/// Without this, the test above passes on a boot that turns collection on unconditionally — which
+/// would make `status.storage.blobs_gc` claim a collector on every node, destroying the one
+/// distinction the block exists to carry.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_gc_interval_means_no_collector_reported() {
+    let root = tempfile::tempdir().unwrap();
+    let node = NodeBuilder::new(root.path()).start().await.expect("start");
+    let mut control = node.control().await.expect("control");
+    assert!(
+        control
+            .status()
+            .await
+            .expect("status")
+            .storage
+            .expect("storage block")
+            .blobs_gc
+            .is_none(),
+        "an unconfigured node must report NO collector — the default, and every release <= 0.42.0"
+    );
+    node.shutdown().await;
+}
+
+/// A BAD `gc_interval` must leave collection off rather than guessing an interval — through boot,
+/// not just through the config accessor.
+///
+/// The accessor is unit-tested, but a boot that ignored its `None` and installed a default would
+/// start deleting data an operator never authorized, on the strength of a typo.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unparseable_gc_interval_boots_with_collection_off() {
+    for bad in ["1hh", "30s"] {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("config")).unwrap();
+        std::fs::write(
+            root.path().join("config/config.toml"),
+            format!("[blobs]\ngc_interval = \"{bad}\"\n"),
+        )
+        .unwrap();
+        let node = NodeBuilder::new(root.path()).start().await.expect("start");
+        let mut control = node.control().await.expect("control");
+        assert!(
+            control
+                .status()
+                .await
+                .expect("status")
+                .storage
+                .expect("storage block")
+                .blobs_gc
+                .is_none(),
+            "{bad:?} must leave collection OFF — a knob that deletes bytes must not start on a typo"
+        );
+        node.shutdown().await;
+    }
+}
