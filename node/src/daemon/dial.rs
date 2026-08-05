@@ -227,6 +227,53 @@ pub(crate) async fn protocol_candidates(
     Ok(out)
 }
 
+/// Resolve alternate blob SOURCES to dialable addresses (#83).
+///
+/// Each entry is a stable principal or a paired nickname — the same vocabulary `open_session`
+/// takes — expanded through [`protocol_candidates`], so naming a PERSON offers every device of
+/// theirs rather than one. Each address carries the stored dial hint, exactly as a service dial
+/// does, so an alternate this node has not contacted since boot is still reachable on a hermetic
+/// LAN.
+///
+/// A name that resolves to NOBODY is an error rather than a silent skip: a caller that typed a
+/// nickname wrong would otherwise watch the fetch fail on the offline publisher and never learn
+/// that its fallback list was empty all along.
+///
+/// Order is preserved and duplicates are dropped — including a device that two named people share,
+/// which would otherwise be dialled twice for one timeout each.
+pub(crate) async fn blob_source_addrs(
+    mesh: &Arc<MeshState>,
+    from: &[String],
+) -> anyhow::Result<Vec<iroh::EndpointAddr>> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for name in from {
+        let candidates = protocol_candidates(mesh, name).await?;
+        anyhow::ensure!(
+            !candidates.is_empty(),
+            "no blob source '{name}' — it must be a paired peer, a roster member, or an \
+             `eid:`/`b64u:` principal"
+        );
+        for eid in candidates {
+            if !seen.insert(eid) {
+                continue;
+            }
+            let Ok(id) = iroh::EndpointId::from_bytes(&eid) else {
+                continue;
+            };
+            let store = mesh.store.clone();
+            let entry =
+                crate::util::blocking("join blob source resolve", move || store.resolve(&eid))
+                    .await??;
+            out.push(stored_dial_addr(
+                entry.and_then(|e| e.last_addr).as_deref(),
+                id,
+            ));
+        }
+    }
+    Ok(out)
+}
+
 pub(crate) fn stored_dial_addr(
     last_addr: Option<&str>,
     endpoint_id: iroh::EndpointId,

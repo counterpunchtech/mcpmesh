@@ -1008,6 +1008,28 @@ pub struct BlobRepublishParams {
 pub struct BlobFetchParams {
     pub ticket: String,
     pub dest_path: String,
+    /// ADDITIONAL sources to try if the ticket's publisher does not answer (#83).
+    /// `api_minor >= 47`.
+    ///
+    /// Content addressing makes every recipient a potential source, and without this the control
+    /// API made that unusable: a ticket names ONE address, so a file shared with a room became
+    /// unfetchable the moment the sender closed their laptop — even though other people in the room
+    /// already held the identical, verified bytes.
+    ///
+    /// Each entry is a stable principal (`eid:` device, `b64u:` user_id) or a paired nickname —
+    /// the same vocabulary `open_session` takes. They are tried **in order, after** the ticket's own
+    /// address, so the publisher stays the first choice and a live one costs nothing. An offline
+    /// publisher costs one dial timeout before the first alternate is tried.
+    ///
+    /// **An alternate only works if it can serve you.** The bytes are BLAKE3-verified against the
+    /// ticket's hash whoever supplies them, so a hostile alternate cannot substitute content — but
+    /// it must have republished the hash into a scope that grants you, or it answers with a
+    /// permission refusal and the fetch moves on.
+    ///
+    /// Additive: absent from an older caller's payload and read as empty, which is the
+    /// single-source behaviour.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub from: Vec<String>,
 }
 
 /// Params of [`Request::BlobFetchCancel`] (#172): stop every in-flight [`Request::BlobFetch`] of
@@ -2262,7 +2284,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   thirty have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.46";
+pub const API_VERSION: &str = "1.47";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -2348,7 +2370,17 @@ pub const API_VERSION: &str = "1.46";
 /// refusals — expired line, no live invite, inviter unreachable, id mismatch, name conflict, and
 /// the deliberately-opaque refusal. `ERR_NICKNAME_TAKEN` had been the only coded pairing failure,
 /// so every other one arrived as `-32000` and an embedder could either forward our prose to end
-/// users or substring-match it (#159); to 46 with the roster-mode embedding surface (#66, #93):
+/// users or substring-match it (#159); to 47 with `BlobFetchParams::from` — ADDITIONAL sources a
+/// fetch falls back to when the ticket's publisher does not answer (#83). Content addressing makes
+/// every recipient a potential source, and a one-address ticket made that unusable: a file shared
+/// with a room became unfetchable the moment the sender closed their laptop, though others in the
+/// room already held the identical verified bytes. Additive and absent-tolerant — an older caller's
+/// payload reads as empty, which is the single-source behaviour — so guard on `>= 47` only before
+/// SENDING the field (`deny_unknown_fields` rejects the whole request below it). The bytes stay
+/// BLAKE3-verified against the ticket's hash whoever serves them, so an alternate can refuse but
+/// never substitute; it must have republished the hash into a scope granting the caller
+/// (`blob_republish`, `api_minor >= 18`). What did NOT land: multi-source PARALLEL fetch — sources
+/// are tried in order, so an offline publisher costs one dial timeout; to 46 with the roster-mode embedding surface (#66, #93):
 /// the `org_create` / `org_approve` / `org_revoke` AUTHORING verbs, the `roster_members` read,
 /// `PresencePeer::display_name` + `groups`, `RosterStatus::groups`, and
 /// `OrgJoinResult::restart_required`. Two gaps close together. Authoring existed only as CLI
@@ -2431,7 +2463,7 @@ pub const API_VERSION: &str = "1.46";
 /// its REAL content is a meaning change to `reachable` — the field exists so the new meaning is
 /// observable at all. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 46;
+pub const API_MINOR: u32 = 47;
 
 #[cfg(test)]
 mod tests {
@@ -3656,16 +3688,37 @@ mod tests {
             Some("blob_list")
         );
 
-        // BlobFetch → { method, params: { ticket, dest_path } }.
+        // BlobFetch → { method, params: { ticket, dest_path, from? } }.
         let r = Request::BlobFetch(BlobFetchParams {
             ticket: "blobAAA".into(),
             dest_path: "/tmp/out.bin".into(),
+            from: vec!["eid:aa".into(), "b64u:bb".into()],
         });
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["method"], "blob_fetch");
         assert_eq!(v["params"]["ticket"], "blobAAA");
         assert_eq!(v["params"]["dest_path"], "/tmp/out.bin");
+        assert_eq!(
+            v["params"]["from"][0], "eid:aa",
+            "#83: the alternate sources must reach the wire IN ORDER — the publisher is tried \
+             first and these follow, so a reordering changes which source answers"
+        );
+        assert_eq!(v["params"]["from"][1], "b64u:bb");
         assert_eq!(serde_json::from_value::<Request>(v).unwrap(), r);
+        // Additive: an older caller omits it, and absent reads as EMPTY — the single-source
+        // behaviour. A default that invented sources would dial peers the caller never named.
+        let legacy: BlobFetchParams =
+            serde_json::from_value(serde_json::json!({"ticket": "x", "dest_path": "/tmp/y"}))
+                .unwrap();
+        assert!(legacy.from.is_empty());
+        // …and an empty list must not bloat the payload.
+        let quiet = serde_json::to_value(Request::BlobFetch(BlobFetchParams {
+            ticket: "x".into(),
+            dest_path: "/tmp/y".into(),
+            from: vec![],
+        }))
+        .unwrap();
+        assert!(quiet["params"].get("from").is_none());
 
         // BlobPublishResult carries the ticket + hash (blob-reference vocabulary).
         let res = BlobPublishResult {

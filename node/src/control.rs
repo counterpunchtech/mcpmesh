@@ -992,7 +992,7 @@ pub(crate) async fn handle_request(req: &Value, state: &DaemonState) -> Value {
             id,
             "blob_fetch",
             with_params(&params, |p: BlobFetchParams| {
-                crate::daemon::blob_fetch(state, p.ticket, p.dest_path)
+                crate::daemon::blob_fetch(state, p.ticket, p.dest_path, p.from)
             })
             .await,
         ),

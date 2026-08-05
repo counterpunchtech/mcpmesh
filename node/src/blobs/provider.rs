@@ -647,12 +647,77 @@ impl AppBlobs {
     /// Returns the verified hash. A provider that refuses this
     /// caller (accept-time 401 or request-time Permission) surfaces here as an `Err`.
     pub async fn fetch(&self, ticket_str: &str) -> Result<Hash> {
+        self.fetch_from(ticket_str, &[]).await
+    }
+
+    /// [`fetch`](Self::fetch), with ADDITIONAL sources to try when the publisher does not answer
+    /// (#83).
+    ///
+    /// Content addressing makes every recipient a potential source, and the single-address ticket
+    /// made that unusable: a file shared with a room became unfetchable the moment the sender
+    /// closed their laptop, even though other people in the room already held the identical
+    /// verified bytes.
+    ///
+    /// **Order: the ticket's own address first, then `alternates` in the caller's order.** The
+    /// publisher is the authoritative source and a live one costs nothing; an offline one costs one
+    /// dial timeout before the first alternate is tried. Every attempt is bounded, so an
+    /// unreachable source costs a timeout rather than the caller's future.
+    ///
+    /// **Substitution is impossible whoever answers.** `store.remote().fetch(conn, hash)` verifies
+    /// the BLAKE3 hash from the ticket against the bytes as they stream, so an alternate can serve
+    /// the blob or fail — it cannot serve a different one. What an alternate CAN do is refuse: it
+    /// serves only hashes it has republished into a scope granting us, so an ungranted alternate
+    /// answers a permission error and the fetch moves on to the next.
+    ///
+    /// Errors carry the LAST failure with every source's count, rather than only the publisher's —
+    /// "dial failed" for a blob nobody could serve is a misleading thing to hand a user.
+    pub async fn fetch_from(
+        &self,
+        ticket_str: &str,
+        alternates: &[iroh::EndpointAddr],
+    ) -> Result<Hash> {
         let ticket: BlobTicket = ticket_str.parse().context("parse blob ticket")?;
-        let conn = self
-            .endpoint
-            .connect(ticket.addr().clone(), APP_BLOB_ALPN)
+        // The publisher first, then the caller's alternates. `dedup`-style filtering is the
+        // caller's job (`dial::blob_source_addrs` does it) — here an id repeated is simply retried.
+        let mut sources: Vec<iroh::EndpointAddr> = Vec::with_capacity(1 + alternates.len());
+        sources.push(ticket.addr().clone());
+        sources.extend(alternates.iter().cloned());
+        let total = sources.len();
+
+        let mut conn = None;
+        let mut last: Option<anyhow::Error> = None;
+        for (i, addr) in sources.into_iter().enumerate() {
+            match tokio::time::timeout(
+                crate::daemon::dial::DIAL_TIMEOUT,
+                self.endpoint.connect(addr, APP_BLOB_ALPN),
+            )
             .await
-            .context("dial app-blob provider")?;
+            {
+                Ok(Ok(c)) => {
+                    if i > 0 {
+                        tracing::info!(
+                            source = i,
+                            of = total,
+                            "app-blob fetch fell back to an alternate source"
+                        );
+                    }
+                    conn = Some(c);
+                    break;
+                }
+                Ok(Err(e)) => last = Some(anyhow::Error::new(e)),
+                Err(_) => last = Some(anyhow::anyhow!("dial timed out")),
+            }
+        }
+        let conn = match conn {
+            Some(c) => c,
+            None => {
+                let e = last.unwrap_or_else(|| anyhow::anyhow!("no source to dial"));
+                return Err(e.context(format!(
+                    "dial app-blob provider (tried {total} source{})",
+                    if total == 1 { "" } else { "s" }
+                )));
+            }
+        };
         // #82 ask 2: consume the progress stream instead of dropping it on the floor. Same
         // coalescing rule as the serving side — `GetProgressItem::Progress` arrives per chunk, so
         // an uncoalesced fetch would flood the ring exactly as an uncoalesced serve would.

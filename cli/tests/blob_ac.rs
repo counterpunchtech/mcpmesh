@@ -692,3 +692,102 @@ async fn a_withdrawn_blob_stays_refused_over_the_wire_after_a_republish_attempt(
     .await
     .expect("withdrawn-over-the-wire test timed out");
 }
+
+/// #83 ask 2: a fetch survives the publisher going offline, by falling back to a RECIPIENT that
+/// republished the blob.
+///
+/// The scenario the issue describes is ordinary, not exotic: someone posts a file to a room and
+/// closes their laptop. Content addressing makes every recipient a potential source, and the
+/// single-address ticket made that unusable — the only address anyone held pointed at the sleeping
+/// publisher.
+///
+/// Three real endpoints, one hard shutdown, and the assertions that matter:
+///
+/// 1. With the publisher DOWN and no alternates, the fetch fails. Without this the test could pass
+///    on a fetch that never needed a fallback at all.
+/// 2. With the same dead publisher and a live alternate, it succeeds — and the bytes BLAKE3-verify
+///    against the ORIGINAL source, so the fallback served the same blob rather than merely
+///    something.
+#[tokio::test]
+async fn a_fetch_falls_back_to_a_recipient_when_the_publisher_is_gone() {
+    timeout(Duration::from_secs(180), async {
+        let root = SigningKey::from_bytes(&[23u8; 32]);
+        let pub_ep = provider_endpoint().await;
+        let relay_ep = provider_endpoint().await; // the recipient that will re-serve
+        let caller_ep = caller_endpoint().await;
+        let (relay_id, caller_id) = (*relay_ep.id().as_bytes(), *caller_ep.id().as_bytes());
+
+        // The publisher admits both the recipient and the final caller.
+        let pub_roster = Arc::new(RosterGate::empty());
+        let pub_view = mint_view(&root, 1, &[(relay_id, "bob"), (caller_id, "alice")], &[]);
+        let (pub_mesh, pub_dir) = serving_provider(pub_ep.clone(), pub_roster, pub_view).await;
+
+        // The recipient serves too, and admits the caller.
+        let relay_roster = Arc::new(RosterGate::empty());
+        let relay_view = mint_view(&root, 1, &[(caller_id, "alice")], &[]);
+        let (relay_mesh, _relay_dir) =
+            serving_provider(relay_ep.clone(), relay_roster, relay_view).await;
+
+        seed_addr(&relay_ep, &pub_ep);
+        seed_addr(&caller_ep, &pub_ep);
+        seed_addr(&caller_ep, &relay_ep);
+
+        // Publish a blob and grant both readers.
+        let src = pub_dir.path().join("shared.bin");
+        let payload: Vec<u8> = (0..64_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&src, &payload).unwrap();
+        let source_hash = blake3::hash(&payload);
+        let publisher = pub_mesh.app_blobs().await.unwrap();
+        let (ticket, hash_hex) = publisher.publish_scope("room", &src).await.unwrap();
+        publisher.grant("room", "alice").unwrap();
+        publisher.grant("room", "bob").unwrap();
+
+        // The recipient fetches it while the publisher is still up, then REPUBLISHES it into a
+        // scope of its own that grants the caller. That republish is what makes it a source —
+        // #83 ask 1, already shipped; ask 2 is being able to USE it.
+        let relay_blobs = relay_mesh.app_blobs().await.unwrap();
+        relay_blobs
+            .fetch(&ticket)
+            .await
+            .expect("the recipient fetches from the publisher");
+        // Grant first: the scope is created by the grant, and the recipient chooses a scope IT
+        // controls rather than inheriting the publisher's grant list — republishing grants nobody
+        // (#83), which is why this line is separate and deliberate.
+        relay_blobs.grant("room", "alice").unwrap();
+        relay_blobs
+            .republish("room", &hash_hex)
+            .await
+            .expect("the recipient re-serves what it holds");
+
+        // The publisher goes away — the closed laptop.
+        pub_ep.close().await;
+        drop(pub_mesh);
+
+        // (1) No alternates: the fetch must FAIL. Otherwise assertion (2) proves nothing about
+        // fallback — it could be succeeding against a publisher that never actually went down.
+        let cdir = tempfile::tempdir().unwrap();
+        let caller = AppBlobs::open_fetcher(cdir.path().join("c"), caller_ep.clone())
+            .await
+            .unwrap();
+        assert!(
+            caller.fetch(&ticket).await.is_err(),
+            "with the publisher down and no alternate, the fetch must fail — this is the state \
+             #83 describes, and the control for the assertion below"
+        );
+
+        // (2) The same dead ticket, with the recipient named as a source.
+        let hash = caller
+            .fetch_from(&ticket, &[relay_ep.addr()])
+            .await
+            .expect("the fetch must fall back to the recipient that republished the blob");
+        let got = caller.read_bytes(hash).await.unwrap();
+        assert_eq!(
+            blake3::hash(&got),
+            source_hash,
+            "and the fallback must serve the SAME blob — the bytes are BLAKE3-verified against \
+             the ticket's hash whoever supplies them, so a source can fail but never substitute"
+        );
+    })
+    .await
+    .expect("blob source fallback test timed out");
+}
