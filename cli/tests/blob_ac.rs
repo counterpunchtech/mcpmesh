@@ -775,11 +775,29 @@ async fn a_fetch_falls_back_to_a_recipient_when_the_publisher_is_gone() {
              #83 describes, and the control for the assertion below"
         );
 
-        // (2) The same dead ticket, with the recipient named as a source.
+        // (2) The same dead ticket, with the recipient named as a source — and, AHEAD of it, a
+        // source that is perfectly dialable and simply cannot serve this blob.
+        //
+        // That ordering is the test. The first version of `fetch_from` broke out of its loop the
+        // moment a dial SUCCEEDED, so an online-but-ungranted peer ended the whole fetch with the
+        // live alternate sitting untried — and that is the ORDINARY case for the room this feature
+        // exists for, where some recipients republished and some did not. Review found it by
+        // running it. Putting the useless source first means a fetch that only falls back on
+        // unreachable dials fails here.
+        let useless_ep = provider_endpoint().await;
+        let useless_roster = Arc::new(RosterGate::empty());
+        let useless_view = mint_view(&root, 1, &[(caller_id, "alice")], &[]);
+        let (_useless_mesh, _useless_dir) =
+            serving_provider(useless_ep.clone(), useless_roster, useless_view).await;
+        seed_addr(&caller_ep, &useless_ep);
+
         let hash = caller
-            .fetch_from(&ticket, &[relay_ep.addr()])
+            .fetch_from(&ticket, &[useless_ep.addr(), relay_ep.addr()])
             .await
-            .expect("the fetch must fall back to the recipient that republished the blob");
+            .expect(
+                "the fetch must pass OVER a dialable source that cannot serve the blob and fall \
+                 back to the recipient that republished it",
+            );
         let got = caller.read_bytes(hash).await.unwrap();
         assert_eq!(
             blake3::hash(&got),

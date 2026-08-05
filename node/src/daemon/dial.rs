@@ -245,6 +245,16 @@ pub(crate) async fn blob_source_addrs(
     mesh: &Arc<MeshState>,
     from: &[String],
 ) -> anyhow::Result<Vec<iroh::EndpointAddr>> {
+    // Bounded before any work: each name costs a store scan and each candidate a dial timeout, so
+    // an unbounded list is an unbounded wait on a request holding one of the connection's in-flight
+    // slots. Refused rather than truncated — silently dropping the tail would make a fetch fail
+    // while the source that had the blob sat unused.
+    anyhow::ensure!(
+        from.len() <= mcpmesh_local_api::MAX_BLOB_SOURCES,
+        "too many blob sources: {} (the cap is {})",
+        from.len(),
+        mcpmesh_local_api::MAX_BLOB_SOURCES
+    );
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for name in from {
@@ -561,6 +571,117 @@ fn inject_service(mut frame: Value, service: &str) -> Value {
         .expect("meta set to object above")
         .insert("mcpmesh/service".into(), Value::String(service.to_string()));
     frame
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::blob_source_addrs;
+    use crate::daemon::testutil::hermetic_mesh;
+
+    async fn mesh_with_peers(
+        dir: &std::path::Path,
+        peers: &[(&str, [u8; 32], Option<&str>)],
+    ) -> std::sync::Arc<crate::daemon::MeshState> {
+        let cfg = dir.join("config.toml");
+        std::fs::write(&cfg, "").unwrap();
+        let mesh = hermetic_mesh(cfg).await;
+        for (nick, eid, user) in peers {
+            mesh.store
+                .add(crate::allowlist::PeerEntry {
+                    endpoint_id: *eid,
+                    nickname: (*nick).into(),
+                    services: vec![],
+                    paired_at: None,
+                    user_id: user.map(|u| u.to_string()),
+                    last_addr: None,
+                })
+                .unwrap();
+        }
+        mesh
+    }
+
+    fn eid_of(seed: u8) -> [u8; 32] {
+        *iroh::SecretKey::from_bytes(&[seed; 32]).public().as_bytes()
+    }
+
+    /// #83: every property `blob_source_addrs`' doc claims, pinned.
+    ///
+    /// It had NO coverage in the first cut — nothing called it outside the handler, and the
+    /// acceptance test passed literal addresses, bypassing resolution entirely. Review found that
+    /// `Ok(vec![])`, a deleted typo guard and a deleted dedup all survived.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blob_sources_resolve_dedupe_and_refuse_a_typo() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (eid_of(41), eid_of(42));
+        let mesh = mesh_with_peers(
+            dir.path(),
+            &[("alice", a, Some("b64u:alice-key")), ("bob", b, None)],
+        )
+        .await;
+
+        // A nickname resolves.
+        let out = blob_source_addrs(&mesh, &["alice".into()]).await.unwrap();
+        assert_eq!(out.len(), 1, "a paired nickname must resolve to its device");
+        assert_eq!(*out[0].id.as_bytes(), a);
+
+        // A `b64u:` user_id resolves to that person's device — the doc and the `--from` help both
+        // promise this, and it goes through a different store lookup than the nickname.
+        let out = blob_source_addrs(&mesh, &["b64u:alice-key".into()])
+            .await
+            .unwrap();
+        assert_eq!(*out[0].id.as_bytes(), a, "a b64u: user_id must resolve");
+
+        // An `eid:` principal resolves without any store entry at all.
+        let stranger = eid_of(43);
+        let out = blob_source_addrs(
+            &mesh,
+            &[format!("eid:{}", data_encoding::HEXLOWER.encode(&stranger))],
+        )
+        .await
+        .unwrap();
+        assert_eq!(*out[0].id.as_bytes(), stranger);
+
+        // ORDER is preserved — sources are tried in it, so a reordering changes which one answers.
+        let out = blob_source_addrs(&mesh, &["bob".into(), "alice".into()])
+            .await
+            .unwrap();
+        assert_eq!(
+            out.iter().map(|x| *x.id.as_bytes()).collect::<Vec<_>>(),
+            vec![b, a],
+            "the caller's order must survive resolution"
+        );
+
+        // DEDUPED across names: the same device reached two ways is dialled once, not twice for
+        // one timeout each.
+        let out = blob_source_addrs(&mesh, &["alice".into(), "b64u:alice-key".into()])
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 1, "one device named twice must be dialled once");
+
+        // A name that resolves to NOBODY is an error, not an empty contribution. Otherwise the
+        // caller watches the fetch fail on the offline publisher and never learns its fallback
+        // list was empty all along.
+        let err = blob_source_addrs(&mesh, &["nobody".into()])
+            .await
+            .expect_err("an unresolvable source must be refused");
+        assert!(
+            format!("{err:#}").contains("no blob source 'nobody'"),
+            "{err:#}"
+        );
+
+        // …and the fan-out is CAPPED rather than truncated: dropping the tail would make a fetch
+        // fail while the source that had the blob sat unused.
+        let many: Vec<String> = (0..mcpmesh_local_api::MAX_BLOB_SOURCES + 1)
+            .map(|_| "alice".to_string())
+            .collect();
+        let err = blob_source_addrs(&mesh, &many)
+            .await
+            .expect_err("over the cap must be refused");
+        assert!(
+            format!("{err:#}").contains("too many blob sources"),
+            "{err:#}"
+        );
+    }
 }
 
 #[cfg(test)]

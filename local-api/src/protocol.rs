@@ -1024,13 +1024,29 @@ pub struct BlobFetchParams {
     /// **An alternate only works if it can serve you.** The bytes are BLAKE3-verified against the
     /// ticket's hash whoever supplies them, so a hostile alternate cannot substitute content — but
     /// it must have republished the hash into a scope that grants you, or it answers with a
-    /// permission refusal and the fetch moves on.
+    /// permission refusal and the fetch moves on. Every failure mode falls through, not only an
+    /// unreachable dial: a refusal, a missing hash, a mid-stream reset, and a stalled transfer all
+    /// move to the next source.
     ///
     /// Additive: absent from an older caller's payload and read as empty, which is the
     /// single-source behaviour.
+    /// Capped at [`MAX_BLOB_SOURCES`]; more is an error rather than a silent truncation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub from: Vec<String>,
 }
+
+/// The ceiling on [`BlobFetchParams::from`] (#83).
+///
+/// Sources are tried SEQUENTIALLY and each costs up to a dial timeout, so an unbounded list is an
+/// unbounded wait on a request that holds one of the connection's [`MAX_INFLIGHT`] slots — and
+/// naming a PERSON expands to every device of theirs, so the list a caller writes is not the number
+/// of dials it buys. Comfortably above "everyone in a room", far below anything that turns a fetch
+/// into an hour.
+///
+/// Exceeding it is an ERROR, not a truncation: silently dropping the tail would make a fetch fail
+/// while the source that had the blob sat unused, which is exactly what this feature exists to
+/// prevent.
+pub const MAX_BLOB_SOURCES: usize = 32;
 
 /// Params of [`Request::BlobFetchCancel`] (#172): stop every in-flight [`Request::BlobFetch`] of
 /// this blob.
