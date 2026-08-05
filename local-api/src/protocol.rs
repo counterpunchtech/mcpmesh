@@ -1189,6 +1189,16 @@ pub enum Request {
     /// re-sign, and install — which severs the cut devices' live sessions (#66).
     /// Tag `"org_revoke"`.
     OrgRevoke(OrgRevokeParams),
+    /// EXPORT this node's user key as a recovery phrase (#85 ask 2). Parameterless.
+    /// Tag `"user_key_export"`.
+    ///
+    /// **The phrase IS the private key**, in a form a human can write down. Anyone who reads it can
+    /// present this identity. It is deliberately not logged, not audited, and not echoed anywhere
+    /// but this response.
+    UserKeyExport,
+    /// IMPORT a user key from a recovery phrase (#85 ask 2), so a person's `b64u:` survives the
+    /// hardware. Tag `"user_key_import"`.
+    UserKeyImport(UserKeyImportParams),
     /// Pin the org root on a JOINER — WITHOUT a roster (the joiner has none yet; its poll loop
     /// fetches the first one). Records `[identity]` org_id / org_root_pk / user_id / user_key.
     /// `user_key` is a LOCAL path
@@ -1396,6 +1406,46 @@ pub struct OrgApproveResult {
     /// code is caught here or not at all. Returned rather than checked, because only the human can
     /// check it.
     pub join_code_fingerprint: String,
+}
+
+/// Params of [`Request::UserKeyImport`] (#85 ask 2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserKeyImportParams {
+    /// The recovery phrase, as written down. Whitespace and case are forgiven; a wrong word, the
+    /// wrong count, or a failed checksum are refused by position rather than guessed at.
+    pub recovery_phrase: String,
+    /// Replace an EXISTING user key. Defaults to `false`, and the refusal is the point: importing
+    /// over a live key discards the identity this node currently presents, which is irreversible
+    /// without that key's own phrase.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replace: bool,
+}
+
+/// Result of [`Request::UserKeyExport`] (#85 ask 2).
+///
+/// **`recovery_phrase` is the private key.** Show it to the person who owns it, once, and do not
+/// persist it anywhere your application would not persist the key file itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserKeyExportResult {
+    /// 33 words. Write them down in order.
+    pub recovery_phrase: String,
+    /// The `b64u:` identity this phrase restores — safe to display and to record, unlike the
+    /// phrase. Compare it after an import to confirm the right identity came back.
+    pub user_id: String,
+}
+
+/// Result of [`Request::UserKeyImport`] (#85 ask 2).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserKeyImportResult {
+    /// The `b64u:` identity now in effect. **Compare it against the one you are recovering** — the
+    /// phrase's checksum catches most transcription errors, but a `user_id` that does not match is
+    /// the definitive answer, and the only one that distinguishes "restored the wrong key" from
+    /// "peers have not seen me yet".
+    pub user_id: String,
+    /// `true` when this replaced a user key that already existed (`replace` was set).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replaced: bool,
 }
 
 /// Params of [`Request::OrgJoinCode`] (#66).
@@ -2300,7 +2350,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   thirty have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.47";
+pub const API_VERSION: &str = "1.48";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -2386,7 +2436,16 @@ pub const API_VERSION: &str = "1.47";
 /// refusals — expired line, no live invite, inviter unreachable, id mismatch, name conflict, and
 /// the deliberately-opaque refusal. `ERR_NICKNAME_TAKEN` had been the only coded pairing failure,
 /// so every other one arrived as `-32000` and an embedder could either forward our prose to end
-/// users or substring-match it (#159); to 47 with `BlobFetchParams::from` — ADDITIONAL sources a
+/// users or substring-match it (#159); to 48 with `user_key_export` / `user_key_import` — a
+/// RECOVERY PHRASE for the user key, so a person's `b64u:` survives the hardware (#85 ask 2). It
+/// lived in one file on one machine with no export, import or escrow verb anywhere, so replacing a
+/// laptop destroyed the identity peers pin, kb audiences key on, and a roster names — recovery was
+/// an in-person SAS ceremony with everyone you had ever paired with. **The export response carries
+/// a PRIVATE KEY**: it is deliberately absent from the audit log, from `status`, and from every
+/// other surface. Import refuses to overwrite an existing key unless asked, because doing so
+/// discards a live identity irreversibly. What it does NOT do: get a device admitted. Peers
+/// authorize per DEVICE, and a restored user key puts this endpoint in nobody's allowlist — that is
+/// #85 ask 3, unshipped, and the reason a recovered person still pairs. Guard on `>= 48`; to 47 with `BlobFetchParams::from` — ADDITIONAL sources a
 /// fetch falls back to when the ticket's publisher does not answer (#83). Content addressing makes
 /// every recipient a potential source, and a one-address ticket made that unusable: a file shared
 /// with a room became unfetchable the moment the sender closed their laptop, though others in the
@@ -2479,7 +2538,7 @@ pub const API_VERSION: &str = "1.47";
 /// its REAL content is a meaning change to `reachable` — the field exists so the new meaning is
 /// observable at all. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 47;
+pub const API_MINOR: u32 = 48;
 
 #[cfg(test)]
 mod tests {

@@ -12,9 +12,11 @@
 //! outstanding invites. The rendezvous handler mints into and redeems out of it.
 //!
 //! [`PeerEntry`]: crate::allowlist::PeerEntry
+pub mod persist;
 /// On-disk persistence for outstanding invites (#87b) — see the module doc for why a bearer
 /// secret is written to disk at all, and why it is not the redb trust store.
-pub mod persist;
+/// The user-key RECOVERY PHRASE (#85 ask 2) — the artifact that survives the hardware.
+pub mod recovery;
 pub mod rendezvous;
 pub mod sas;
 

@@ -466,6 +466,50 @@ impl ControlClient {
         .await
     }
 
+    /// EXPORT this node's user key as a RECOVERY PHRASE (#85 ask 2).
+    ///
+    /// **The phrase is the private key**, in a form a person can write down. Anyone who reads it
+    /// can present this identity. Show it once, to the person who owns it, and do not persist it
+    /// anywhere you would not persist the key file. It is deliberately not logged or audited by the
+    /// daemon; this response is the only place it exists.
+    ///
+    /// `user_id` is safe to display and record — compare it after an import to confirm the right
+    /// identity came back. `api_minor >= 48`.
+    pub async fn user_key_export(
+        &mut self,
+    ) -> Result<crate::protocol::UserKeyExportResult, ClientError> {
+        self.request_typed(Request::UserKeyExport, "user_key_export result")
+            .await
+    }
+
+    /// IMPORT a user key from a recovery phrase (#85 ask 2), so a person's `b64u:` survives the
+    /// hardware.
+    ///
+    /// Refuses to overwrite an existing key unless `replace` is set: importing over a live key
+    /// discards the identity this node presents, irreversibly without that key's own phrase.
+    ///
+    /// **Check the returned `user_id` against the one you are recovering.** The phrase's checksum
+    /// catches most transcription errors, but the `user_id` is the definitive answer, and the only
+    /// thing that distinguishes "restored the wrong key" from "my peers have not seen me yet".
+    ///
+    /// It does NOT get this device admitted by anyone: peers authorize per DEVICE, and a restored
+    /// user key does not put this endpoint in anybody's allowlist. That is #85 ask 3, not shipped.
+    /// `api_minor >= 48`.
+    pub async fn user_key_import(
+        &mut self,
+        recovery_phrase: &str,
+        replace: bool,
+    ) -> Result<crate::protocol::UserKeyImportResult, ClientError> {
+        self.request_typed(
+            Request::UserKeyImport(crate::protocol::UserKeyImportParams {
+                recovery_phrase: recovery_phrase.to_string(),
+                replace,
+            }),
+            "user_key_import result",
+        )
+        .await
+    }
+
     /// INSPECT a join code without approving it (#66): what it claims, and the fingerprint that
     /// decides whether to believe it. Read-only — nothing is signed or installed.
     ///

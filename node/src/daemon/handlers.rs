@@ -2401,6 +2401,124 @@ where
     pipe_session(transport, service, control_reader, control_writer).await
 }
 
+/// Handle a `user_key_export` control request (#85 ask 2): render this node's user key as a
+/// recovery phrase.
+///
+/// **The phrase IS the private key.** Deliberately not audited and not logged — the audit log is a
+/// durable, operator-readable file, and putting a private key in it would make the compliance
+/// surface the largest copy of the secret. `status` does not carry it either; it exists only in
+/// this response.
+///
+/// Errors when this node has no user key: there is nothing to export, and minting one here would
+/// hand back a phrase for an identity nobody has ever seen.
+pub(crate) async fn user_key_export(
+    state: &DaemonState,
+) -> Result<mcpmesh_local_api::UserKeyExportResult> {
+    let mesh = state.mesh_required()?;
+    let path = mesh
+        .user_key_path
+        .get()
+        .cloned()
+        .context("this node has no user key path resolved")?;
+    anyhow::ensure!(
+        path.exists(),
+        "this node has no user key to export ({})",
+        path.display()
+    );
+    let (key, created) = blocking("join user key export", {
+        let path = path.clone();
+        move || mcpmesh_trust::UserKey::load_or_generate(&path)
+    })
+    .await?
+    .map_err(|e| anyhow::anyhow!("user key error at {}: {e}", path.display()))?;
+    // `load_or_generate` MINTS when absent. The `exists` check above makes that unreachable, and
+    // this refuses rather than trusting the check to have raced correctly: a phrase for a key that
+    // did not exist a moment ago is a phrase for an identity nobody has.
+    anyhow::ensure!(
+        !created,
+        "refusing to export a user key that was just minted — there was nothing to recover"
+    );
+    Ok(mcpmesh_local_api::UserKeyExportResult {
+        recovery_phrase: crate::pairing::recovery::encode(&key.signing_key().to_bytes()),
+        user_id: mcpmesh_trust::binding::user_id(&key),
+    })
+}
+
+/// Handle a `user_key_import` control request (#85 ask 2): restore a user key from a recovery
+/// phrase, so a person's `b64u:` survives the hardware.
+///
+/// **Refuses to overwrite an existing key unless `replace` is set.** Importing over a live key
+/// discards the identity this node presents, irreversibly without that key's own phrase — and the
+/// person doing it is, by construction, someone who has just been handling recovery phrases.
+///
+/// The new binding is installed LIVE, through the same path #86 uses for an adopted enrollment
+/// binding, so the identity this node presents at pairing changes immediately rather than at the
+/// next restart. A restart-required answer would leave the node presenting the OLD identity while
+/// its operator believed the recovery had taken.
+///
+/// What it does NOT do: get this device admitted by anyone. Peers authorize per DEVICE, and a
+/// restored user key does not put this endpoint in anybody's allowlist. That is #85 ask 3.
+pub(crate) async fn user_key_import(
+    state: &DaemonState,
+    recovery_phrase: String,
+    replace: bool,
+) -> Result<mcpmesh_local_api::UserKeyImportResult> {
+    let mesh = state.mesh_required()?;
+    // Decoded FIRST, before anything is touched: a mistyped phrase must not have moved a key file.
+    let bytes = crate::pairing::recovery::decode(&recovery_phrase)?;
+    let path = mesh
+        .user_key_path
+        .get()
+        .cloned()
+        .context("this node has no user key path resolved")?;
+    let existed = path.exists();
+    anyhow::ensure!(
+        !existed || replace,
+        "this node already has a user key ({}); importing over it discards the identity it \
+         currently presents, which cannot be undone without that key's own recovery phrase. Pass \
+         replace to do it anyway",
+        path.display()
+    );
+
+    let key = mcpmesh_trust::ed25519_dalek::SigningKey::from_bytes(&bytes);
+    let write_key = key.clone();
+    let write_path = path.clone();
+    blocking("join user key import", move || {
+        if write_path.exists() {
+            // `write_signing_key` refuses an existing target by design, so the explicit replace
+            // removes it first. Ordered so a failed write cannot leave the node with NO key: the
+            // remove and the write are adjacent, and a crash between them is recoverable with the
+            // same phrase the caller just supplied.
+            std::fs::remove_file(&write_path)?;
+        }
+        mcpmesh_trust::keys::write_signing_key(&write_path, &write_key)
+            .map_err(|e| anyhow::anyhow!("write user key at {}: {e}", write_path.display()))
+    })
+    .await??;
+
+    // LIVE, via #86's adopted-binding path: the identity this node presents changes now.
+    let user_key = mcpmesh_trust::UserKey::from_signing_key(key);
+    let (user_pk, sig) = mcpmesh_trust::binding::present(&user_key, mesh.endpoint.id().as_bytes());
+    mesh.set_self_binding_live(Some(crate::pairing::rendezvous::SelfBinding {
+        user_pk,
+        sig,
+    }));
+    let user_id = mcpmesh_trust::binding::user_id(&user_key);
+    // Trust event: an identity change is exactly the kind of thing an operator reads a log to find.
+    // The user_id only — never the phrase, never the key.
+    mesh.audit().record(crate::audit::AuditRecord::trust(
+        crate::audit::now_ts(),
+        "user_key_import".into(),
+        Some(user_id.clone()),
+        None,
+    ));
+    tracing::info!(%user_id, replaced = existed, "user key imported from a recovery phrase");
+    Ok(mcpmesh_local_api::UserKeyImportResult {
+        user_id,
+        replaced: existed,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

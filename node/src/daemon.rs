@@ -127,7 +127,7 @@ pub(crate) use handlers::{
     add_peer, blob_fetch, blob_fetch_cancel, blob_grant, blob_list, blob_publish, blob_republish,
     blob_revoke, blob_unpublish, mint_invite, open_session, peer_diagnostics, peer_services,
     redeem, register_service, service_allow_grant, service_allow_revoke, set_relays,
-    unregister_service,
+    unregister_service, user_key_export, user_key_import,
 };
 pub(crate) use org_author::{org_approve, org_create, org_join_code, org_revoke};
 pub(crate) use roster_install::{

@@ -739,3 +739,138 @@ async fn an_embedder_can_supply_its_own_peer_resolver() {
     b.shutdown().await;
     a.shutdown().await;
 }
+
+/// #85 ask 2: a person's `b64u:` identity survives the hardware.
+///
+/// It lived in one file on one machine with no export, import, or escrow verb anywhere. Replacing
+/// a laptop destroyed it — the new machine mints a fresh user key, presents a new `b64u:`, and is a
+/// stranger even to peers that had pinned the old one. The reporter's framing: the equivalent event
+/// in a centralized product is a password reset.
+///
+/// Driven through two SEPARATE node roots, which is the whole claim — a phrase written down on one
+/// machine restores the identity on a different one:
+///
+/// 1. Node a exports a phrase. Node b, a fresh root, has its OWN different identity.
+/// 2. b imports a's phrase and now presents a's `user_id`.
+/// 3. The change is LIVE — b's pairing identity is the restored one immediately, not after a
+///    restart, which is what a peer would actually see.
+/// 4. A second import is REFUSED without `replace`, because it would discard a live identity.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_recovery_phrase_restores_an_identity_on_new_hardware() {
+    let (a_root, b_root) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = NodeBuilder::new(a_root.path())
+        .config(hermetic())
+        .start()
+        .await
+        .expect("node a starts");
+    let b = NodeBuilder::new(b_root.path())
+        .config(hermetic())
+        .start()
+        .await
+        .expect("node b starts");
+
+    let mut a_ctl = a.control().await.expect("a control");
+    let exported = a_ctl
+        .user_key_export()
+        .await
+        .expect("a exports its identity");
+    assert_eq!(
+        exported.recovery_phrase.split_whitespace().count(),
+        33,
+        "a phrase is one word per key byte plus a checksum"
+    );
+    assert!(
+        exported.user_id.starts_with("b64u:"),
+        "the exported id is the stable b64u: identity peers pin: {}",
+        exported.user_id
+    );
+
+    // b starts life as somebody else. Without this the restore below could be a no-op.
+    let mut b_ctl = b.control().await.expect("b control");
+    let b_before = b_ctl
+        .user_key_export()
+        .await
+        .expect("b has its own identity")
+        .user_id;
+    assert_ne!(
+        b_before, exported.user_id,
+        "precondition: two fresh roots are two different people"
+    );
+
+    // Restoring onto a node that already has a key must be REFUSED — it would discard the identity
+    // that node currently presents, irreversibly without that key's own phrase.
+    let refused = b_ctl
+        .user_key_import(&exported.recovery_phrase, false)
+        .await
+        .expect_err("importing over a live key must be refused");
+    assert!(
+        format!("{refused}").contains("already has a user key"),
+        "and refused for THAT reason, not some incidental failure: {refused}"
+    );
+
+    // With the explicit replace, the identity moves.
+    let restored = b_ctl
+        .user_key_import(&exported.recovery_phrase, true)
+        .await
+        .expect("an explicit replace restores the identity");
+    assert_eq!(
+        restored.user_id, exported.user_id,
+        "THE claim: the same person, on different hardware"
+    );
+    assert!(restored.replaced, "and it reports that it replaced one");
+
+    // LIVE, not at the next restart — and asserted through what a PEER actually sees, not by
+    // re-reading the file. Re-exporting only proves the key landed on disk; the binding a node
+    // PRESENTS at pairing is separate state, and a node that kept presenting the OLD identity while
+    // its operator believed the recovery had taken would go on to pair and have the peer store the
+    // wrong person. That is the failure worth pinning, and re-export cannot see it: with the live
+    // install deleted, the re-export assertion still passed.
+    let c_root = tempfile::tempdir().unwrap();
+    let c = NodeBuilder::new(c_root.path())
+        .config(hermetic())
+        .start()
+        .await
+        .expect("node c starts");
+    b_ctl
+        .register_service(
+            "notes",
+            BackendSpec::Run {
+                cmd: vec![STUB.into()],
+                env: Default::default(),
+                cwd: None,
+            },
+            vec![],
+        )
+        .await
+        .expect("register notes");
+    let invite = b_ctl.invite(vec!["notes".into()]).await.expect("invite");
+    let mut c_ctl = c.control().await.expect("c control");
+    let paired = timeout(Duration::from_secs(30), c_ctl.pair(&invite.invite_line))
+        .await
+        .expect("pair within 30s")
+        .expect("pair");
+    assert_eq!(
+        paired.peer_user_id.as_deref(),
+        Some(exported.user_id.as_str()),
+        "a peer pairing with b RIGHT NOW must see the RESTORED identity — this is what recovery \
+         is for, and it is live state the on-disk key does not prove"
+    );
+    c.shutdown().await;
+
+    // A mistyped phrase is refused rather than restoring a different identity — the case that
+    // otherwise looks exactly like every peer having forgotten you.
+    let mut words: Vec<&str> = exported.recovery_phrase.split_whitespace().collect();
+    words.swap(0, 1);
+    let typo = b_ctl.user_key_import(&words.join(" "), true).await;
+    // A swap of two identical words is a no-op, so accept either outcome — but if it DID decode,
+    // it must have decoded to the same identity, never a different one.
+    if let Ok(r) = typo {
+        assert_eq!(
+            r.user_id, exported.user_id,
+            "a phrase must never restore an identity other than the one it encodes"
+        );
+    }
+
+    b.shutdown().await;
+    a.shutdown().await;
+}

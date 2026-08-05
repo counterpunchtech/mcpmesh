@@ -24,7 +24,8 @@ use mcpmesh_local_api::{
     BlobUnpublishParams, Hello, InviteParams, OpenSessionParams, OrgApproveParams, OrgCreateParams,
     OrgJoinCodeParams, OrgJoinParams, OrgRevokeParams, PairParams, PeerServicesParams,
     RosterInstallParams, ServiceAllowParams, SetAppMetadataParams, SetNicknameParams,
-    SetRelaysParams, SetRosterUrlParams, StatusResult, UnregisterServiceParams, method_of,
+    SetRelaysParams, SetRosterUrlParams, StatusResult, UnregisterServiceParams,
+    UserKeyImportParams, method_of,
 };
 use mcpmesh_net::framing::{FrameReader, Inbound, write_frame};
 use serde_json::{Value, json};
@@ -798,6 +799,21 @@ pub(crate) async fn handle_request(req: &Value, state: &DaemonState) -> Value {
         ),
         // Read-only: decode + verify a join code and return the fingerprint the operator confirms
         // OUT-OF-BAND before approving. Nothing is signed, installed, or persisted.
+        // #85 ask 2: the recovery phrase. The response carries a PRIVATE KEY — never audited,
+        // never logged, and it exists nowhere else on this surface.
+        Some("user_key_export") => respond(
+            id,
+            "user_key_export",
+            crate::daemon::user_key_export(state).await,
+        ),
+        Some("user_key_import") => respond(
+            id,
+            "user_key_import",
+            with_params(&params, |p: UserKeyImportParams| {
+                crate::daemon::user_key_import(state, p.recovery_phrase, p.replace)
+            })
+            .await,
+        ),
         Some("org_join_code") => respond(
             id,
             "org_join_code",

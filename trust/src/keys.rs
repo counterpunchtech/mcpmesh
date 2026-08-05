@@ -86,6 +86,44 @@ fn mint_signing_key_at(path: &Path) -> Result<SigningKey, KeyError> {
     result.map(|_| key)
 }
 
+/// Write SPECIFIC key bytes to `path` with the same discipline `load_or_generate` mints under:
+/// 0600, a per-call-unique temp, `create_new` so nothing is clobbered by a race (#85 ask 2).
+///
+/// Used by the recovery import. Separate from the mint path because the caller supplies the key —
+/// and separate from a plain `atomic_write` because a key file's MODE is load-bearing: a
+/// world-readable user key is an identity anyone on the box can present, and `doctor` reports
+/// exactly that.
+///
+/// Refuses when `path` already exists. Overwriting is the caller's decision to make explicitly,
+/// because it discards an identity irreversibly.
+pub fn write_signing_key(path: &Path, key: &SigningKey) -> Result<(), KeyError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), seq));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let result = (|| -> Result<(), KeyError> {
+        let mut f = opts.open(&tmp)?;
+        use std::io::Write;
+        f.write_all(&key.to_bytes())?;
+        f.sync_all()?;
+        // `hard_link` rather than `rename`: it FAILS if the target exists, so a concurrent writer
+        // cannot be clobbered. The same choice `load_or_generate` makes, for the same reason.
+        std::fs::hard_link(&tmp, path)?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    result
+}
+
 pub struct DeviceKey(SigningKey);
 
 impl DeviceKey {
@@ -175,6 +213,12 @@ impl UserKey {
     /// The user PUBLIC key bytes — carried in the join code (`user_pk` b64u) + the roster.
     pub fn public_bytes(&self) -> [u8; 32] {
         self.0.verifying_key().to_bytes()
+    }
+
+    /// Wrap a key the caller already holds — the recovery import (#85 ask 2), which decodes it
+    /// from a phrase rather than reading a file.
+    pub fn from_signing_key(key: SigningKey) -> Self {
+        Self(key)
     }
 }
 
