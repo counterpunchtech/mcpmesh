@@ -128,6 +128,7 @@ pub(crate) async fn serving_provider(
         // #82: the mesh's transfer ring, exactly as `boot` wires it — so a test can observe the
         // frames a real served transfer produces.
         Some(mesh.blob_bcast_for_test().clone()),
+        None,
     )
     .await
     .unwrap();
@@ -516,6 +517,7 @@ async fn a_pairing_mode_daemon_serves_app_blobs() {
             provider_ep.clone(),
             mcpmesh::audit::AuditSink::disabled(),
             mcpmesh::limits::MeshLimiters::unlimited(),
+            None,
             None,
         )
         .await

@@ -490,6 +490,14 @@ async fn boot_node(
     // Gating construction on an org root key kept content-addressed transfer out of the mode the
     // quickstart teaches, for no authorization reason.
     {
+        // #80: OFF unless `[blobs].gc_interval` is set, parseable, and at or above the floor.
+        // `gc_interval_seconds` warns and returns None on the other two, which is the safe
+        // direction for a knob that deletes bytes — see its doc for why it inverts this tree's
+        // usual "a typo falls back to the default" convention.
+        //
+        // Computed ONCE: it is the single place that decides, and calling it twice would emit the
+        // warning twice for one typo.
+        let gc_secs = cfg.blobs.gc_interval_seconds();
         let scopes_path = paths.blob_scopes_path.clone();
         match blocking("join app-blob scopes load", move || {
             crate::blobs::scope::ScopeStore::open(scopes_path)
@@ -510,6 +518,7 @@ async fn boot_node(
                     // #82 ask 2: the mesh's transfer ring, so served-side progress reaches every
                     // `subscribe` consumer.
                     Some(mesh.blob_bcast.clone()),
+                    gc_secs.map(std::time::Duration::from_secs),
                 )
                 .await
                 {
@@ -521,6 +530,13 @@ async fn boot_node(
                         // #88: record the on-disk store dir alongside the provider, so
                         // `status.storage.blobs_bytes` walks the dir that actually holds bytes.
                         mesh.set_blobs_dir(paths.blobs_dir.clone());
+                        // #80: only when collection is actually RUNNING — the same `gc_secs` the
+                        // store was built with, so `status` can never claim an interval the store
+                        // is not on. An unset cell is what makes `status.storage.blobs_gc` read
+                        // `None` rather than "configured, zero runs".
+                        if let Some(secs) = gc_secs {
+                            mesh.set_blobs_gc(secs, provider.gc_stats());
+                        }
                         mesh.set_app_blobs(provider).await
                     }
                     Err(e) => tracing::warn!(%e, "app-blob provider disabled (build failed)"),

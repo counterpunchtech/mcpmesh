@@ -256,10 +256,12 @@ Methods split into two groups by audience:
 > freezing at its last `Progress`. `bytes_done` on that frame is `0`: the real count died with the
 > transfer, and a stale one would be worse than none.
 >
-> **What cancellation does NOT clean up.** A partially fetched blob's chunks stay in the store.
-> They are not listed by `blob_list` (which lists published scopes, not raw store contents) and
-> there is no reclaim path yet (#80), so an abandoned fetch — cancelled *or* failed — leaves bytes
-> on disk that nothing surfaces or frees.
+> **What cancellation does NOT clean up.** A partially fetched blob's chunks stay in the store, and
+> are not listed by `blob_list` (which lists published scopes, not raw store contents). They are
+> reclaimed only by a garbage-collection sweep, which runs only on a node that set
+> `[blobs].gc_interval` (#80, `api_minor >= 49`) — and never immediately, since the collector is
+> periodic. On a node with no interval configured, which is the default, an abandoned fetch —
+> cancelled *or* failed — leaves bytes on disk that nothing surfaces or frees.
 >
 > **Progress IS reported, from `api_minor >= 41`** (#82): subscribe on a *separate* control
 > connection and read `StreamFrame::BlobTransfer` — it arrives on both the serving and the fetching
@@ -281,13 +283,25 @@ Methods split into two groups by audience:
 > - **Other scopes still serve it.** If the same hash is published into another scope that grants
 >   the caller, it remains fetchable there — unpublish is per-scope, never a global delete.
 >
-> So if you have promised a user that a file is *deleted*, this verb does not deliver that promise.
+> So on its own, this verb does not deliver a promise that a file is *deleted*.
 >
-> There is currently **no reclaim**: `<data_dir>/blobs/` grows monotonically. `iroh-blobs` exposes
-> no on-demand sweep (its `delete` is crate-private and it directs users to garbage collection,
-> which it only supports as a periodic background policy configured at store construction), so a
-> reclaim path needs its own design. Tracked in
-> [#80](https://github.com/counterpunchtech/mcpmesh/issues/80).
+> **Reclaim is a separate, opt-in thing** (`api_minor >= 49`, #80). Set `[blobs].gc_interval` and a
+> background sweep deletes every blob no scope names — including one you unpublished. Until then
+> `<data_dir>/blobs/` grows monotonically, which is the default and the behaviour of every release
+> up to 0.42.0.
+>
+> Two properties to size against, both inherited from `iroh-blobs`, which supports only a periodic
+> background policy configured at store construction (its `delete` is crate-private and there is no
+> on-demand sweep to expose):
+>
+> - **It is not immediate.** The collector sleeps a full interval before its first run, so
+>   "deleted" means "deleted within an interval", and there is no verb to ask for a sweep now.
+> - **It stops silently after one sweep error.** Watch `status.storage.blobs_gc.runs`; a counter
+>   that stops advancing is the only signal. See `[blobs]` in `docs/config.md`.
+>
+> A withdrawal outlives the bytes either way: the tombstone is in the scope sidecar, not the store,
+> so `blob_republish` stays refused after a sweep — the error changes from `-32042` (withdrawn) to
+> `-32041` (we no longer hold it), because the completeness check now fails first.
 
 Paths and files (`roster_install.path`, `org_join.user_key`, `blob_publish.path`,
 `blob_fetch.dest_path`) are passed **as local paths, not bytes** — the same-uid daemon reads/writes
@@ -519,7 +533,9 @@ Do not build on either — they may change or disappear without an `api_version`
   "recent_pairings": [{"peer_nickname":"bob","sas_code":"tango-fig-cabbage","paired_at_epoch":1751760000}],
   "reachability": [{"name":"bob","reachable":true,"rtt_ms":42,"age_secs":3,"meta":"v=1.2.3","principal":"eid:…"}],
   "self_nickname": "workbench",
-  "storage": {"audit_bytes": 18234, "redb_bytes": 1069056, "blobs_bytes": 0},
+  "storage": {"audit_bytes": 18234, "redb_bytes": 1069056, "blobs_bytes": 0,
+              "blobs_gc": {"interval_secs": 3600, "runs": 12, "last_run_epoch": 1754300000,
+                           "last_protected": 41, "aborted": 0}},
   "self_network": {"online": true, "home_relay": "https://relay.example:443",
                    "relays": [{"url": "https://relay.example:443", "connected": true}],
                    "direct_addrs": ["192.168.1.20:53420"], "last_change_epoch": 1753842000}
@@ -552,6 +568,21 @@ the summed monthly audit files, the `state.redb` trust store, and the app-blob s
 the audit log's write rate is driven by inbound peer traffic and it shares a filesystem with the
 trust store and device key. Bound the audit half with `audit_prune` or
 `[limits].audit_retain_months` (see `docs/config.md`). Absent in mesh-less control-only mode.
+
+`storage.blobs_gc` (`api_minor >= 49`, #80) reports app-blob garbage collection, and is **absent
+entirely when collection is not configured** — which is the default. Present with `runs: 0` means
+configured but not yet swept, a real and common state: the collector sleeps a full interval before
+its first run, so a node on `gc_interval = "24h"` reports `runs: 0` for its first day.
+
+**Watch `runs`.** iroh-blobs ends collection for the life of the process on its first sweep error,
+with only a log line — so a `runs` that stops advancing across several intervals is the only signal
+that reclaim has silently stopped. `aborted` counts runs mcpmesh skipped because it could not read
+the liveness root; those swept nothing (the intended fail-safe), but a climbing `aborted` also means
+nothing is being reclaimed.
+
+There is deliberately **no `bytes_reclaimed`**: iroh-blobs calls back only *before* a sweep, so any
+such number would be a guess. Read reclaim off `blobs_bytes` over time — that one is measured.
+See `[blobs]` in `docs/config.md` for what a sweep deletes and why it is opt-in.
 
 `reachability` is **advisory** — an on-demand liveness read of your paired peers, populated by a
 probe cache the daemon refreshes lazily. It is empty until the first probe completes. A `status`
@@ -710,6 +741,32 @@ peer going away; an unsolicited frame neither extends nor shortens it.
 > handshake this session shape is built around. The push property must be re-established explicitly
 > under that rework — it is exactly the kind of property that disappears unnoticed when the
 > surrounding shape changes, which is why it is written down here first.
+
+#### Which of these shapes survive MCP 2026-07-28 (#188)
+
+The transport contract above is unchanged — a push is still a push, still FIFO, still unmetered. What
+changes is **which MCP interactions are supposed to use it**, and this section was largely motivated
+by the ones that are going away. Read the [2026-07-28 release post][mcp20260728] alongside it.
+
+| Shape | Status under 2026-07-28 |
+|---|---|
+| Server→client **notifications** (progress, resource updates, "something happened") | **Unchanged.** This is the shape the contract is for, and the one to build on. |
+| `subscriptions/listen` (SEP-2663, Tasks) | **New consumer** of exactly this long-lived-stream shape. |
+| Server→client **requests**: `sampling/createMessage`, `elicitation/create`, `roots/list` | **Replaced** by [SEP-2322 Multi Round-Trip Requests][mcp20260728]: the server returns `resultType: "input_required"` and the client **retries the original call** with `inputResponses`. It no longer asks over the push channel. |
+| `roots`, `sampling`, `logging` as core capabilities | **Removed from core** by SEP-2577. Deprecated, functional for at least 12 months — so **until roughly 2027-07-28**. |
+
+**The incentive gradient changes, and it is worth naming before someone builds on it.** A push is
+free while a proxied request is charged (above), and under MRTR a server can no longer *ask* over the
+push channel — it must return `input_required` and be re-called, which **is** charged, and charged as
+a fresh request (see [`rate_limit_per_min` sizing](config.md#sizing-it-against-mcp-2026-07-28-188)).
+So pushing becomes the only free, non-round-tripping channel a served backend has.
+
+That is not a defect today, and nothing here refuses it. But a chat overlay built on notifications
+*because they are free* inherits the guarantee below — notification delivery is not guaranteed under
+load and the loss is undetectable from the sending side — which is a poor foundation for a channel
+carrying user-visible messages.
+
+[mcp20260728]: https://blog.modelcontextprotocol.io/posts/2026-07-28/
 
 `peer` may be a **local nickname** or the peer's **stable `b64u:` user_id** — the same
 self-sovereign identity attested *inbound* on `_meta["mcpmesh/peer"].user_id` (see [the identity
@@ -1229,6 +1286,39 @@ The strip covers `params._meta`, including inside a JSON-RPC batch. It does not 
 `_meta` sibling of `params`, nor `result._meta` on a client→server response — neither is a seam a
 backend reads identity from.
 
+#### `clientInfo` is in the same object, and is NOT an identity (#189)
+
+MCP 2026-07-28 removes the `initialize` handshake and moves client identity into per-request `_meta`:
+
+```json
+"_meta": {
+  "mcpmesh/peer":                        {"name": "alice", "user_id": "b64u:…", "groups": ["team-eng"]},
+  "io.modelcontextprotocol/clientInfo":  {"name": "…", "version": "…"}
+}
+```
+
+Two identity-shaped keys, side by side, with **opposite** trust properties:
+
+| Key | Written by | Trustworthy |
+|---|---|---|
+| `mcpmesh/peer` | mcpmesh, from the TLS-authenticated endpoint | **Yes** — stripped-then-injected on every frame |
+| `io.modelcontextprotocol/clientInfo` | the caller | **No** — self-asserted, passes through untouched |
+
+**Never authorize on `clientInfo`.** MCP defines it as the client *software's* self-description, so
+its contents are caller-controlled by design; a backend reading `clientInfo.name` as "who is calling"
+has an authorization hole. `mcpmesh/peer` is the only authenticated claim in that object.
+
+mcpmesh does not populate, rewrite or validate `clientInfo` — overwriting it would destroy
+information you may legitimately want (which AI client is this?) and make mcpmesh the only transport
+that lies about it.
+
+**The one exception**, so you are not surprised by a missing key: a `clientInfo` whose `name` is
+written in mcpmesh's *own* principal grammar — it starts with `eid:` or `b64u:` — has the **whole
+entry removed** before your backend sees it. That is never software naming itself; it is a caller
+dressing up as the key that is authoritative, the same shape as the forged `mcpmesh/peer` above.
+Nicknames are deliberately **not** checked (`"bob"` is a plausible product name, and the nickname
+space is unbounded), and every other `clientInfo` reaches you verbatim.
+
 ### Using it well
 
 - **Authorize on `user_id`, not the nickname.** The nickname is *your* local label; the `user_id` is
@@ -1261,7 +1351,7 @@ Reference: [`cli/src/backends/spawn.rs`](../cli/src/backends/spawn.rs) (`run`),
 | `-32047` | `pair` — **the address-swap defense fired**: the machine that answered is not the endpoint the invite names (#159). **Do not render this as "try again"** — get the invite again through a channel you trust. |
 | `-32048` | `pair` — the invite asks to be called a name this node already uses for a different peer (#159). The redeemer-side mirror of `-32043`. Ask for an invite suggesting a different name. |
 | `-32049` | `pair` — the inviter refused and the cause is **deliberately withheld** (#159). Ask for a fresh invite. |
-| `-32050` | the request was **cancelled on purpose** before it finished — today, a `blob_fetch` that `blob_fetch_cancel` tripped (#172, `api_minor >= 44`). Not a failure: the caller asked for it. Partial chunks stay in the store (#80). |
+| `-32050` | the request was **cancelled on purpose** before it finished — today, a `blob_fetch` that `blob_fetch_cancel` tripped (#172, `api_minor >= 44`). Not a failure: the caller asked for it. Partial chunks stay in the store, and are reclaimed only if this node configured `[blobs].gc_interval` (#80). |
 | `-32051` | this control connection already has 32 requests in flight, so this one was refused without being started (#172, `api_minor >= 44`). **Retryable** — retry after any response lands, or use a second connection. |
 | `-32052` | `pair` — the line is a SELF-ENROLLMENT (`mcpmesh-enroll:`) and you did not set `allow_self_enroll` (#178, `api_minor >= 45`). Decided from the line, **before any dial**: nothing was contacted and the invite is untouched, so the same line works on a retry. Remedy: if the person meant to add another of their own devices, offer that explicitly and retry with `allow_self_enroll: true`; otherwise they pasted the wrong link. |
 | `-32000` | operation failed — `message` carries the detail. One common instance: the daemon is in control-only mode with no mesh (e.g. `invite`/`pair` before a mesh exists) |

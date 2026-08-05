@@ -10,6 +10,8 @@ use iroh_blobs::provider::events::{
     ThrottleMode,
 };
 use iroh_blobs::store::fs::FsStore;
+use iroh_blobs::store::fs::options::Options as FsStoreOptions;
+use iroh_blobs::store::{GcConfig, ProtectOutcome};
 use iroh_blobs::ticket::BlobTicket;
 use iroh_blobs::{BlobFormat, BlobsProtocol, Hash};
 use mcpmesh_net::TrustGate;
@@ -285,6 +287,35 @@ pub struct AppBlobs {
     /// TEST-ONLY: pause between `publish_scope`'s import and its scope insert (#104).
     #[cfg(test)]
     publish_delay: std::sync::Mutex<Option<std::time::Duration>>,
+    /// What the background GC has done (#80). Always present; all zeros when GC is not configured,
+    /// which `status` distinguishes by reading the configured interval rather than these counters.
+    gc_stats: Arc<BlobGcStats>,
+}
+
+/// What a running blob GC has actually done (#80), for `status.storage.blobs_gc`.
+///
+/// Atomics rather than a lock: written from the protect callback on a background timer, read from
+/// the synchronous `status` builder. Nothing here needs to be consistent across fields.
+///
+/// **There is no `bytes_reclaimed`, and that is not an oversight.** `run_gc`'s only callback fires
+/// BEFORE the sweep and there is no after-callback, so any byte count printed here would be a
+/// guess. `status.storage.blobs_bytes` already walks the store directory; an operator reads reclaim
+/// off that, over time, which is measured rather than asserted.
+#[derive(Debug, Default)]
+pub struct BlobGcStats {
+    /// Runs STARTED — entries to the protect callback, not finished sweeps (we are not told about
+    /// those).
+    ///
+    /// THE load-bearing field: `run_gc` `break`s its loop on the first `gc_run_once` error rather
+    /// than continuing, so one failed sweep silently ends collection for the life of the process. A
+    /// counter that stops advancing is the only signal an operator gets.
+    pub runs: std::sync::atomic::AtomicU64,
+    /// Unix seconds of the most recent run start; 0 before the first.
+    pub last_run_epoch: std::sync::atomic::AtomicI64,
+    /// Hashes protected on the most recent run.
+    pub last_protected: std::sync::atomic::AtomicU64,
+    /// Runs ABORTED because the liveness root could not be read — each one swept nothing.
+    pub aborted: std::sync::atomic::AtomicU64,
 }
 
 /// How long ONE source gets to complete the transfer before the fetch moves on (#83).
@@ -296,19 +327,148 @@ pub struct AppBlobs {
 /// an unbounded wait, which is not on offer.
 const SOURCE_TRANSFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// Build the `GcConfig` handed to `FsStore::load_with_opts` (#80).
+///
+/// `iroh_blobs`'s `gc_mark` roots the live set in the store's tags and temp tags, then unions
+/// whatever this callback adds. mcpmesh creates **no persistent tags** — `publish_path`'s `TempTag`
+/// is dropped as it returns — so without this callback the root would be empty and the first sweep
+/// would delete every blob on the node. The scope table IS the root.
+///
+/// Three properties of upstream's `run_gc`, read out of its source rather than assumed, that an
+/// operator has to know and that shape everything here:
+///
+/// 1. **It sleeps before its first run** (`loop { live.clear(); sleep(interval); … }`). A node with
+///    `gc_interval = "24h"` reclaims nothing until it has been up 24 hours. There is no boot sweep
+///    and no way to request one — see the `load_with_opts` comment for why we cannot add one.
+/// 2. **One error ends collection for the process.** `if let Err(e) = gc_run_once(..) { error!(); break }`
+///    — `break`, not `continue`. Hence [`BlobGcStats::runs`], whose stalling is the only signal.
+/// 3. **`ProtectOutcome::Abort` skips ONE run and keeps the schedule** (`continue`). That is the
+///    fail-safe, and it is why [`ScopeStore::live_hashes`] is fallible: a run that cannot read the
+///    root must sweep nothing rather than sweep against an empty one.
+///
+/// **Lifetime.** `run_gc` is spawned onto the store's own dedicated runtime, which the fs actor
+/// owns, and it holds a `Store` clone — while the actor's loop ends only when every `commands_tx`
+/// sender drops. That is a cycle dropping the `FsStore` cannot break, so the collector would run
+/// until the process exited. [`AppBlobs::shutdown`] closes the store explicitly, which ends the
+/// actor and with it the GC task; see there, because that release turned out to matter with or
+/// without a collector.
+fn gc_config(
+    interval: std::time::Duration,
+    scopes: Arc<ScopeStore>,
+    stats: Arc<BlobGcStats>,
+) -> GcConfig {
+    use std::sync::atomic::Ordering;
+    GcConfig {
+        interval,
+        add_protected: Some(Arc::new(move |live: &mut HashSet<Hash>| {
+            let scopes = scopes.clone();
+            let stats = stats.clone();
+            Box::pin(async move {
+                stats.runs.fetch_add(1, Ordering::Relaxed);
+                stats
+                    .last_run_epoch
+                    .store(crate::util::epoch_now_i64(), Ordering::Relaxed);
+                let hashes = match scopes.live_hashes() {
+                    Ok(h) => h,
+                    Err(e) => {
+                        stats.aborted.fetch_add(1, Ordering::Relaxed);
+                        tracing::error!(
+                            %e,
+                            "blob gc: cannot read the scope table; skipping this run rather than \
+                             sweeping against an empty liveness root"
+                        );
+                        return ProtectOutcome::Abort;
+                    }
+                };
+                let mut protected = 0u64;
+                for hex in &hashes {
+                    // A hash the scope table holds but that will not parse cannot protect anything,
+                    // and it must NOT abort the run: one junk row would disable collection forever
+                    // while looking configured. Warn and carry on — the sweep then reclaims that
+                    // blob, which is correct, since an unparseable entry authorizes nobody either
+                    // (`allows` compares against canonical hex).
+                    match crate::blobs::parse_blob_hash(hex) {
+                        Ok(h) => {
+                            live.insert(h);
+                            protected += 1;
+                        }
+                        Err(e) => tracing::warn!(
+                            hash = %hex,
+                            %e,
+                            "blob gc: scope table holds an unparseable hash; it protects nothing"
+                        ),
+                    }
+                }
+                stats.last_protected.store(protected, Ordering::Relaxed);
+                tracing::info!(protected, "blob gc: sweeping");
+                ProtectOutcome::Continue
+            })
+        })),
+    }
+}
+
 impl AppBlobs {
-    /// End the request-time gate loop, releasing the `TrustGate` (and with it the redb handle).
-    /// Idempotent; a fetcher has no loop and is a no-op.
+    /// Protect `hash` from a garbage-collection sweep for as long as the returned tag is held
+    /// (#80).
+    ///
+    /// The seam for "this blob is in the store, is in no scope, and something still needs it" — a
+    /// just-fetched blob between the transfer and the export, for instance. A blob in a scope needs
+    /// no pin: the scope table is the durable liveness root.
+    ///
+    /// `None` when the store cannot mint one, and that is deliberately not an error: the caller is
+    /// mid-operation, and failing it because the GC bookkeeping hiccuped would be worse than the
+    /// window a pin closes. On a node with no `gc_interval` there is nothing to protect against at
+    /// all.
+    pub async fn pin(&self, hash: Hash) -> Option<iroh_blobs::api::TempTag> {
+        self.store.tags().temp_tag(hash).await.ok()
+    }
+
+    /// What the background GC has done (#80). All zeros when GC is not configured.
+    pub fn gc_stats(&self) -> Arc<BlobGcStats> {
+        self.gc_stats.clone()
+    }
+
+    /// End the request-time gate loop, releasing the `TrustGate` (and with it the redb handle), and
+    /// CLOSE the blob store, releasing `blobs.db`. Idempotent; a fetcher has no gate loop and skips
+    /// that half.
     ///
     /// The `await` after `abort` is deliberate but NOT load-bearing for the current test: dropping
     /// the provider already closes the event channel, and abort-without-await passes today. It is
     /// here so the release is deterministic rather than dependent on when the runtime reaps the
     /// task — the racy version is the kind that fails under load, not in CI.
+    ///
+    /// **Closing the store is load-bearing, and NOT only for a collecting one.** Without this call,
+    /// dropping the provider left the fs actor running and `blobs.db` locked. Two measurements,
+    /// both taken by removing this call and reopening the same directory:
+    ///
+    /// - After a real `publish_scope`: `gc: Some(..)` hangs, `gc: None` reopens.
+    /// - On a store nothing had written: **both** hang, under a current-thread and a multi-thread
+    ///   runtime alike.
+    ///
+    /// So the leak is not created by #80 — it predates it, and whether it bites without a collector
+    /// depends on what the store was doing. GC makes it deterministic, because `run_gc` holds a
+    /// `Store` clone on the store's own runtime and the actor's loop ends only when the last sender
+    /// drops: a cycle dropping the `FsStore` cannot break.
+    ///
+    /// Recorded as measured rather than as reported — the 0.43.0 gate called this GC-introduced and
+    /// GC-specific, and the second measurement above says otherwise. The fix is the same either
+    /// way; the scope of what it fixes is not.
+    ///
+    /// Done for EVERY provider regardless — `shutdown` means "release this node's resources", and a
+    /// release that depends on a config knob is the kind that is right in CI and wrong in
+    /// production.
+    ///
+    /// After this the provider is finished — every store call fails. That already matched how
+    /// `shutdown` was used (boot's teardown, and the root-release tests).
     pub async fn shutdown(&self) {
         let handle = self.gate_loop.lock().await.take();
         if let Some(h) = handle {
             h.abort();
             let _ = h.await;
+        }
+        // Best-effort: a store already gone is exactly the idempotent second call.
+        if let Err(e) = self.store.shutdown().await {
+            tracing::debug!(%e, "blob store shutdown (already closed?)");
         }
     }
 }
@@ -331,6 +491,10 @@ impl AppBlobs {
         tokio::fs::create_dir_all(&blobs_dir)
             .await
             .with_context(|| format!("create blobs dir {}", blobs_dir.display()))?;
+        // NEVER configure GC here (#80). A fetcher's `ScopeStore::new` is an empty table that is
+        // never persisted and never mutated, so a protect callback reading it would protect NOTHING
+        // and the very first sweep would delete every blob this fetcher holds. GC belongs only on
+        // `load`, whose scope table is the real one.
         let store = FsStore::load(&blobs_dir)
             .await
             .with_context(|| format!("load blob store {}", blobs_dir.display()))?;
@@ -338,6 +502,7 @@ impl AppBlobs {
             store,
             endpoint,
             transfers,
+            gc_stats: Arc::new(BlobGcStats::default()),
             events: None,
             relay_wait: std::sync::atomic::AtomicBool::new(false),
             hash_membership: tokio::sync::Mutex::new(()),
@@ -354,6 +519,7 @@ impl AppBlobs {
     /// Spawns the drain loop ONCE, wired to the trust `gate` (resolve endpoint → identity) and
     /// `scopes` (the authz table). `FsStore::load` is async/fallible;
     /// the dir is created first.
+    #[allow(clippy::too_many_arguments)] // every one is a distinct collaborator this provider owns
     pub async fn load(
         blobs_dir: PathBuf,
         scopes: Arc<ScopeStore>,
@@ -364,13 +530,60 @@ impl AppBlobs {
         // #82 ask 2: the ring coalesced transfer progress rides. `None` for fixtures that build a
         // provider without a mesh — the gate loop then does no progress work at all.
         transfers: Option<tokio::sync::broadcast::Sender<crate::daemon::BlobTransfer>>,
+        // #80: how often to garbage-collect the store, or `None` for "never" — the behavior of
+        // every release up to 0.42.0 and still the default. See `spawn_gc_config`.
+        gc: Option<std::time::Duration>,
     ) -> Result<Arc<Self>> {
         tokio::fs::create_dir_all(&blobs_dir)
             .await
             .with_context(|| format!("create blobs dir {}", blobs_dir.display()))?;
-        let store = FsStore::load(&blobs_dir)
-            .await
-            .with_context(|| format!("load blob store {}", blobs_dir.display()))?;
+        let gc_stats = Arc::new(BlobGcStats::default());
+        let store = match gc {
+            // #80: `FsStore::load_with_opts` is the ONLY door to collection in iroh-blobs 0.103.0 —
+            // `gc_run_once` is `pub` inside a PRIVATE module (`store/mod.rs:11`) and `Blobs::delete`
+            // is `pub(crate)`, so there is no on-demand sweep to call and no way to add one later
+            // without an upstream change. Configured at construction or not at all.
+            Some(interval) => {
+                let opts = FsStoreOptions {
+                    gc: Some(gc_config(interval, scopes.clone(), gc_stats.clone())),
+                    ..FsStoreOptions::new(&blobs_dir)
+                };
+                // `FsStore::load` derives `db_path = root/blobs.db` and `Options::new(root)`; the
+                // low-level entry point takes both separately, so the derivation has to be
+                // repeated EXACTLY or the two paths diverge and the store opens somewhere else.
+                let store = FsStore::load_with_opts(blobs_dir.join("blobs.db"), opts)
+                    .await
+                    .with_context(|| format!("load blob store with gc {}", blobs_dir.display()))?;
+                // Clear the AUTO-TAGS every release up to 0.42.0 wrote (#80).
+                //
+                // `add_path().await` runs `with_tag()`, which persists a tag per imported blob, and
+                // `gc_mark` roots the live set in tags. So on an existing store every blob ever
+                // published is permanently rooted and the first sweep would reclaim NOTHING while
+                // logging a run every interval — the feature would look configured and do nothing.
+                //
+                // Safe because mcpmesh reads tags NOWHERE: the scope table is the sole authority on
+                // what is live, and `add_protected` feeds it in on every run. This deletes a
+                // redundant root, not data. Once, at construction, before the provider serves.
+                //
+                // Best-effort: a store that cannot clear its tags is one whose sweeps will protect
+                // too much, which is the safe direction. Do not fail the boot over it.
+                match store.tags().delete_all().await {
+                    Ok(n) if n > 0 => tracing::info!(
+                        tags = n,
+                        "blob gc: cleared pre-0.43.0 auto-tags; the scope table is the liveness root"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(
+                        %e,
+                        "blob gc: could not clear auto-tags; sweeps will over-protect"
+                    ),
+                }
+                store
+            }
+            None => FsStore::load(&blobs_dir)
+                .await
+                .with_context(|| format!("load blob store {}", blobs_dir.display()))?,
+        };
         // The request-time scope gate: `APP_BLOB_EVENT_MASK` intercepts connect + single-blob GET,
         // and pins every non-GET request type to deny-by-default (Disabled/Intercept — see the
         // const's SECURITY note). Since `get: InterceptLog` also routes
@@ -388,6 +601,7 @@ impl AppBlobs {
             store,
             endpoint,
             transfers,
+            gc_stats,
             events: Some(events),
             scopes,
             gate_loop: tokio::sync::Mutex::new(Some(gate_loop)),
@@ -428,23 +642,53 @@ impl AppBlobs {
         });
     }
 
-    /// Add a LOCAL file to the store (the large-blob idiom — `add_path`) and return
-    /// `(ticket_string, blake3_hex)` WITHOUT touching any scope (used for the ungated round-trip).
-    pub async fn publish_path(&self, path: &Path) -> Result<(String, String)> {
+    /// Import a LOCAL file and mint its ticket, returning the `TempTag` that protects it.
+    ///
+    /// **`.temp_tag()`, deliberately NOT `.await` on `add_path` (#80).** Awaiting `AddProgress`
+    /// runs `with_tag()`, which writes a PERSISTENT auto-tag — and `gc_mark` roots the live set in
+    /// the store's tags. So every blob mcpmesh ever added was permanently rooted, and a garbage
+    /// collector configured over it would have been a guaranteed no-op that still logged a sweep
+    /// every interval. (#80's own research asserts the opposite — "mcpmesh creates no persistent
+    /// tags" — which is what `publish_path`'s temp tag WOULD have given us had it not been awaited
+    /// into a permanent one. Caught by the acceptance test failing to reclaim anything.)
+    ///
+    /// The temp tag is the caller's to hold: it protects the blob from a sweep that lands between
+    /// the import and whatever makes the blob durably live. Dropping it makes the blob eligible
+    /// immediately.
+    async fn import_path(&self, path: &Path) -> Result<(iroh_blobs::api::TempTag, String, String)> {
         let tag = self
             .store
             .blobs()
             .add_path(path)
+            .temp_tag()
             .await
             .with_context(|| format!("add blob from {}", path.display()))?;
-        let ticket = self.ticket_for(tag.hash).await;
-        Ok((ticket.to_string(), tag.hash.to_hex().to_string()))
+        let hash = tag.hash();
+        let ticket = self.ticket_for(hash).await;
+        Ok((tag, ticket.to_string(), hash.to_hex().to_string()))
+    }
+
+    /// Add a LOCAL file to the store (the large-blob idiom — `add_path`) and return
+    /// `(ticket_string, blake3_hex)` WITHOUT touching any scope (used for the ungated round-trip).
+    ///
+    /// Touching no scope means naming no liveness root, so on a node with `[blobs].gc_interval` set
+    /// the blob is reclaimable from the moment this returns — the temp tag drops here. That is the
+    /// intended reading of "published to a ticket but shared with nobody"; `publish_scope` is the
+    /// verb that makes a blob durably live.
+    pub async fn publish_path(&self, path: &Path) -> Result<(String, String)> {
+        let (_temp, ticket, hash_hex) = self.import_path(path).await?;
+        Ok((ticket, hash_hex))
     }
 
     /// Publish a LOCAL file INTO a scope: add it to the store AND record its hash in the
     /// named scope (single-writer via `ScopeStore`). Returns `(ticket_string, blake3_hex)`.
     pub async fn publish_scope(&self, scope: &str, path: &Path) -> Result<(String, String)> {
-        let (ticket, hash_hex) = self.publish_path(path).await?;
+        // #80: hold the import's temp tag across the scope insert. Between the import and the
+        // insert the blob is named by nothing, so a sweep landing in that window would delete a
+        // file the operator is in the middle of publishing — and `publish_delay` below makes that
+        // window arbitrarily wide on purpose. The temp tag protects it until the scope does; it is
+        // dropped as this returns, by which point the scope table is the root.
+        let (_temp, ticket, hash_hex) = self.import_path(path).await?;
         // #104: membership mutations are serialized as a family, so an import that finishes while
         // an unpublish is in flight cannot interleave with it either.
         let _membership = self.hash_membership.lock().await;
@@ -513,6 +757,22 @@ impl AppBlobs {
         // `blob_publish` is safe only because it stores `tag.hash.to_hex()`.
         let hash = crate::blobs::parse_blob_hash(hash_hex)?;
         let canonical = hash.to_hex().to_string();
+        // #80: pin the blob BEFORE the completeness check and hold the pin until the scope insert
+        // lands. This is a read-check-write over bytes the scope table does not yet name, so on a
+        // collecting node a sweep can land inside it — and the consequence here is worse than on
+        // the publish path, which loses a file: republish would still return Ok with a ticket and
+        // write the hash into the scope, leaving a PERMANENT entry advertising bytes the node
+        // cannot serve. That is precisely what the completeness check exists to prevent ("a hang at
+        // every fetcher"), and the entry then roots itself in `live_hashes` forever.
+        //
+        // Ordering matters: pin, THEN check. Checking first would leave the same window, only
+        // narrower. A pin on a hash the store does not hold is harmless — the check below still
+        // refuses.
+        //
+        // Best-effort: a store that cannot mint a temp tag is one where the check below is about to
+        // fail anyway, and refusing a republish because the GC bookkeeping hiccuped would be worse
+        // than the narrow window it closes.
+        let _pin = self.store.tags().temp_tag(hash).await.ok();
         if !self.store.blobs().has(hash).await.unwrap_or(false) {
             anyhow::bail!(crate::daemon::NoSuchBlob(canonical));
         }
@@ -602,7 +862,8 @@ impl AppBlobs {
     ///
     /// This is the AUTHORIZATION half and takes effect at once for NEW requests: the scope gate
     /// requires the hash to be listed in some scope, so a subsequent GET is refused at the request
-    /// hook. The BYTES remain in the store — there is no reclaim (#80) — so do not describe this to
+    /// hook. The BYTES remain in the store until a background sweep reclaims them, and only a node
+    /// that set `[blobs].gc_interval` runs one (#80) — so do not describe this to
     /// a user as deletion. A transfer already streaming is not interrupted.
     pub async fn unpublish(&self, scope: &str, hash_hex: &str) -> Result<bool> {
         // NORMALIZE FIRST (#107 review). Since #107 this call WRITES a persistent key into the
@@ -1834,6 +2095,7 @@ mod tests {
                 crate::audit::AuditSink::disabled(),
                 crate::limits::MeshLimiters::unlimited(),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1908,6 +2170,7 @@ mod tests {
                 b_ep.clone(),
                 crate::audit::AuditSink::disabled(),
                 crate::limits::MeshLimiters::unlimited(),
+                None,
                 None,
             )
             .await
@@ -2351,6 +2614,7 @@ mod tests {
                 crate::audit::AuditSink::disabled(),
                 crate::limits::MeshLimiters::unlimited(),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -2433,6 +2697,7 @@ mod tests {
                 provider_ep.clone(),
                 crate::audit::AuditSink::disabled(),
                 crate::limits::MeshLimiters::unlimited(),
+                None,
                 None,
             )
             .await
@@ -2517,6 +2782,7 @@ mod tests {
                 sink,
                 crate::limits::MeshLimiters::unlimited(),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -2558,5 +2824,569 @@ mod tests {
         })
         .await
         .expect("blob_fetch audit test timed out");
+    }
+
+    /// `shutdown` must RELEASE the blob store, so the same directory can be opened again.
+    ///
+    /// A leak that predates #80 and was found while gating it: dropping the provider never closed
+    /// the fs actor, so `blobs.db` stayed locked for the life of the process. Removing the fix
+    /// makes the `gc: Some(..)` arm here hang; a variant of this test that publishes nothing makes
+    /// **both** arms hang, so the release was unreliable without a collector too and merely
+    /// deterministic with one.
+    ///
+    /// **Both arms are kept for that reason.** Running only `Some` would encode the narrower story
+    /// the gate reported and leave the older half untested.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_releases_the_blob_store_with_and_without_a_collector() {
+        for gc in [None, Some(std::time::Duration::from_secs(60))] {
+            let dir = tempfile::tempdir().unwrap();
+            let blobs_dir = dir.path().join("blobs");
+            {
+                let provider = AppBlobs::load(
+                    blobs_dir.clone(),
+                    Arc::new(ScopeStore::new(dir.path().join("scopes.json"))),
+                    Arc::new(StaticGate::new(std::collections::HashMap::new())),
+                    ep().await,
+                    crate::audit::AuditSink::disabled(),
+                    crate::limits::MeshLimiters::unlimited(),
+                    None,
+                    gc,
+                )
+                .await
+                .unwrap();
+                // Do real work first: an empty store could plausibly release for reasons a used
+                // one would not.
+                let src = dir.path().join("f.bin");
+                std::fs::write(&src, b"some bytes").unwrap();
+                provider.publish_scope("room", &src).await.unwrap();
+                provider.shutdown().await;
+            }
+            // The proof is a REOPEN, not an absence of panics: the lock is held by a task, so
+            // nothing observable happens until someone else wants the directory.
+            tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                AppBlobs::open_fetcher(blobs_dir.clone(), ep().await),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "reopening the store after shutdown hung (gc = {gc:?}); the fs actor was \
+                        never closed, so blobs.db stayed locked for the life of the process"
+                )
+            })
+            .expect("reopen must succeed");
+        }
+    }
+
+    /// #80: a sweep landing inside `republish`'s check-then-insert must not leave the scope
+    /// advertising bytes the node no longer has.
+    ///
+    /// `publish_scope` got a temp tag held across its insert; `republish` has the identical window
+    /// — `has()` → `is_withdrawn` → `publish_hash` — and its failure is worse. A publish that loses
+    /// its blob fails. A republish returned `Ok` WITH A TICKET and wrote the hash into the scope,
+    /// so `blob_list` showed the file as shared, every fetcher hung or errored, and the phantom
+    /// entry then rooted itself in `live_hashes` forever — permanent, self-protecting, and exactly
+    /// what the completeness check exists to prevent ("a hang at every fetcher").
+    ///
+    /// `set_republish_delay` widens the window past several sweeps, so this is deterministic rather
+    /// than a race the test hopes to lose.
+    #[tokio::test]
+    async fn a_sweep_during_a_republish_leaves_no_phantom_scope_entry() {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let dir = tempfile::tempdir().unwrap();
+            let scopes = Arc::new(ScopeStore::new(dir.path().join("scopes.json")));
+            let provider = AppBlobs::load(
+                dir.path().join("blobs"),
+                scopes.clone(),
+                Arc::new(StaticGate::new(std::collections::HashMap::new())),
+                ep().await,
+                crate::audit::AuditSink::disabled(),
+                crate::limits::MeshLimiters::unlimited(),
+                None,
+                Some(std::time::Duration::from_secs(2)),
+            )
+            .await
+            .unwrap();
+
+            // A scope must exist for republish to target. Give it its own live blob, so the sweeps
+            // that run during the window are real ones with a non-empty root.
+            let other = dir.path().join("other.bin");
+            std::fs::write(&other, b"an unrelated published blob").unwrap();
+            provider.publish_scope("room", &other).await.unwrap();
+
+            // The target: in the store, in NO scope — a fetched-and-not-republished blob, which is
+            // the state `blob_republish` exists to act on, and the state nothing protects.
+            //
+            // Created LAST and republished IMMEDIATELY, on purpose. An earlier version set this up
+            // first and slept before republishing, so a sweep reclaimed the target during SETUP and
+            // `republish` bailed on the completeness check without ever entering the window it was
+            // meant to exercise — a test that would have passed whatever the code did. The only
+            // unprotected gap left is the microseconds between `publish_path` dropping its temp tag
+            // and `republish` taking its pin; the 5s delay below guarantees a sweep inside the
+            // window that actually matters.
+            use std::sync::atomic::Ordering;
+            let stats = provider.gc_stats();
+            let src = dir.path().join("held.bin");
+            std::fs::write(&src, b"held but unshared").unwrap();
+            let (_t, hex) = provider.publish_path(&src).await.unwrap();
+            let hash = crate::blobs::parse_blob_hash(&hex).unwrap();
+
+            let before = stats.runs.load(Ordering::Relaxed);
+            provider.set_republish_delay(std::time::Duration::from_secs(5));
+            let res = provider.republish("room", &hex).await;
+
+            assert!(
+                stats.runs.load(Ordering::Relaxed) > before,
+                "precondition: at least one sweep ran INSIDE the republish window ({before} -> {})",
+                stats.runs.load(Ordering::Relaxed)
+            );
+            // Whatever the verb answers, the two states it may leave must AGREE. A refusal that
+            // touched no scope is fine; a success whose bytes are gone is the defect.
+            let listed = scopes
+                .snapshot()
+                .scopes
+                .get("room")
+                .is_some_and(|sc| sc.hashes.contains(&hex));
+            let held = provider.store.blobs().has(hash).await.unwrap();
+            assert!(
+                !listed || held,
+                "the scope must never advertise a hash the store no longer holds — republish said \
+                 {res:?}, scope lists it = {listed}, store holds it = {held}"
+            );
+            assert!(
+                res.is_ok() && held,
+                "and the pin should make the republish SUCCEED across the sweep rather than merely \
+                 fail consistently: {res:?}"
+            );
+        })
+        .await
+        .expect("timed out");
+    }
+
+    /// #80: one unparseable hash in the scope table must not disable collection.
+    ///
+    /// The protect callback warns and carries on rather than aborting. Aborting would let a single
+    /// junk row — reachable from a hand-edited sidecar or a pre-#62 one — stop reclaim forever
+    /// while `status` still reported a configured collector. The comment claiming that was
+    /// undefended until this test.
+    #[tokio::test]
+    async fn a_junk_hash_in_the_scope_table_does_not_disable_collection() {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let dir = tempfile::tempdir().unwrap();
+            let scopes = Arc::new(ScopeStore::new(dir.path().join("scopes.json")));
+            // Straight into the table, as a hand-edited sidecar would be: not a blake3 hex.
+            scopes.publish_hash("room", "not-a-hash").unwrap();
+            let provider = AppBlobs::load(
+                dir.path().join("blobs"),
+                scopes,
+                Arc::new(StaticGate::new(std::collections::HashMap::new())),
+                ep().await,
+                crate::audit::AuditSink::disabled(),
+                crate::limits::MeshLimiters::unlimited(),
+                None,
+                Some(std::time::Duration::from_secs(1)),
+            )
+            .await
+            .unwrap();
+
+            let kept_src = dir.path().join("kept.bin");
+            std::fs::write(&kept_src, b"a real published blob").unwrap();
+            let (_t, kept_hex) = provider.publish_scope("room", &kept_src).await.unwrap();
+            let kept = crate::blobs::parse_blob_hash(&kept_hex).unwrap();
+            let swept_src = dir.path().join("swept.bin");
+            std::fs::write(&swept_src, b"named by nothing").unwrap();
+            let (_t, swept_hex) = provider.publish_path(&swept_src).await.unwrap();
+            let swept = crate::blobs::parse_blob_hash(&swept_hex).unwrap();
+
+            let mut gone = false;
+            for _ in 0..100 {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                if !provider.store.blobs().has(swept).await.unwrap() {
+                    gone = true;
+                    break;
+                }
+            }
+            use std::sync::atomic::Ordering;
+            let stats = provider.gc_stats();
+            assert!(
+                gone,
+                "collection must keep running past a junk row — aborting on one would stop reclaim \
+                 forever while status still showed a configured collector (aborted = {})",
+                stats.aborted.load(Ordering::Relaxed)
+            );
+            assert_eq!(
+                stats.aborted.load(Ordering::Relaxed),
+                0,
+                "a junk row is not a failure to READ the root, so it must not count as an abort"
+            );
+            assert_eq!(
+                stats.last_protected.load(Ordering::Relaxed),
+                1,
+                "the junk row protects nothing, and the real one still does"
+            );
+            assert!(
+                provider.store.blobs().has(kept).await.unwrap(),
+                "…and the real published blob survives"
+            );
+        })
+        .await
+        .expect("timed out");
+    }
+
+    /// #80 FAIL-SAFE: a run that cannot read the liveness root must sweep NOTHING.
+    ///
+    /// The protect callback runs BEFORE the sweep and its only job is to hand over the live set. If
+    /// it returned `Continue` after failing to build one, iroh would sweep against an **empty**
+    /// root and delete every blob on the node — every published file, every scope's contents, on a
+    /// background timer, with the operator's only warning a log line. `ProtectOutcome::Abort` skips
+    /// the run and keeps the schedule.
+    ///
+    /// The failure is provoked the way it happens in production: a poisoned scope lock, i.e. a
+    /// thread that panicked part-way through a mutation.
+    #[tokio::test]
+    async fn a_run_that_cannot_read_the_scope_table_sweeps_nothing() {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let dir = tempfile::tempdir().unwrap();
+            let scopes = Arc::new(ScopeStore::new(dir.path().join("scopes.json")));
+            let gate: Arc<dyn mcpmesh_net::TrustGate> =
+                Arc::new(StaticGate::new(std::collections::HashMap::new()));
+            let provider = AppBlobs::load(
+                dir.path().join("blobs"),
+                scopes.clone(),
+                gate,
+                ep().await,
+                crate::audit::AuditSink::disabled(),
+                crate::limits::MeshLimiters::unlimited(),
+                None,
+                Some(std::time::Duration::from_secs(1)),
+            )
+            .await
+            .unwrap();
+
+            let src = dir.path().join("published.bin");
+            std::fs::write(&src, b"a published blob a scope names").unwrap();
+            let (_t, hex) = provider.publish_scope("room", &src).await.unwrap();
+            let hash = crate::blobs::parse_blob_hash(&hex).unwrap();
+
+            scopes.poison_for_test();
+            assert!(
+                scopes.live_hashes().is_err(),
+                "precondition: the root really is unreadable now"
+            );
+
+            use std::sync::atomic::Ordering;
+            let stats = provider.gc_stats();
+            let mut aborted = false;
+            for _ in 0..100 {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                if stats.aborted.load(Ordering::Relaxed) >= 2 {
+                    aborted = true;
+                    break;
+                }
+            }
+            assert!(
+                aborted,
+                "an unreadable root must ABORT the run and keep the schedule — one abort then \
+                 silence would mean collection had stopped, not that it was failing safe"
+            );
+            assert!(
+                provider.store.blobs().has(hash).await.unwrap(),
+                "a run that could not build the live set must delete NOTHING; sweeping against an \
+                 empty root would take every blob on the node"
+            );
+        })
+        .await
+        .expect("timed out");
+    }
+
+    /// #80 END TO END, through a real `FsStore` on a real timer: a blob NAMED by a scope survives a
+    /// sweep and a blob the store merely holds does not.
+    ///
+    /// **Both halves are load-bearing.** "The unreferenced blob is gone" alone passes on a
+    /// collector that deletes everything — which is precisely the failure mode an empty liveness
+    /// root produces, and the reason `live_hashes` is fallible at all. "The published blob survives"
+    /// alone passes on a collector that never runs.
+    ///
+    /// The unscoped blob stands in for the ordinary case this feature exists for: a blob this node
+    /// FETCHED and never republished, or one an operator withdrew with `blob_unpublish` — bytes no
+    /// scope names, which before 0.43.0 stayed on disk for the life of the node.
+    #[tokio::test]
+    async fn a_sweep_reclaims_what_no_scope_names_and_keeps_what_one_does() {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let dir = tempfile::tempdir().unwrap();
+            let scopes = Arc::new(ScopeStore::new(dir.path().join("scopes.json")));
+            let gate: Arc<dyn mcpmesh_net::TrustGate> =
+                Arc::new(StaticGate::new(std::collections::HashMap::new()));
+            let provider = AppBlobs::load(
+                dir.path().join("blobs"),
+                scopes,
+                gate,
+                ep().await,
+                crate::audit::AuditSink::disabled(),
+                crate::limits::MeshLimiters::unlimited(),
+                None,
+                // Far below the `[blobs].gc_interval` floor on purpose: the floor is an OPERATOR
+                // policy in config, not a property of the store, so a test may ask for a fast one.
+                Some(std::time::Duration::from_secs(1)),
+            )
+            .await
+            .unwrap();
+
+            // KEPT: published into a scope, so the scope table names it.
+            let kept_src = dir.path().join("kept.bin");
+            std::fs::write(&kept_src, b"a blob some scope names").unwrap();
+            let (_t, kept_hex) = provider.publish_scope("room", &kept_src).await.unwrap();
+            let kept = crate::blobs::parse_blob_hash(&kept_hex).unwrap();
+
+            // SWEPT: in the store, in no scope. `publish_path` deliberately touches no scope.
+            let swept_src = dir.path().join("swept.bin");
+            std::fs::write(&swept_src, b"a blob no scope names").unwrap();
+            let (_t, swept_hex) = provider.publish_path(&swept_src).await.unwrap();
+            let swept = crate::blobs::parse_blob_hash(&swept_hex).unwrap();
+            assert_ne!(kept, swept, "precondition: two distinct blobs");
+
+            let has = async |h| provider.store.blobs().has(h).await.unwrap();
+            assert!(
+                has(kept).await && has(swept).await,
+                "precondition: the store holds both before any sweep"
+            );
+
+            // The collector SLEEPS before its first run, so nothing is reclaimable immediately.
+            // Poll rather than sleeping a fixed multiple: a bounded, sleeping wait, not a spin.
+            let mut swept_gone = false;
+            for _ in 0..100 {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                if !has(swept).await {
+                    swept_gone = true;
+                    break;
+                }
+            }
+            assert!(
+                swept_gone,
+                "a blob no scope names must be reclaimed once the collector runs"
+            );
+            assert!(
+                has(kept).await,
+                "…and a blob a scope DOES name must survive — without this half the test passes on \
+                 a collector that deletes everything, which is exactly what an empty liveness root \
+                 produces"
+            );
+
+            let stats = provider.gc_stats();
+            use std::sync::atomic::Ordering;
+            assert!(
+                stats.runs.load(Ordering::Relaxed) >= 1,
+                "the run counter is the only signal an operator gets that collection is alive"
+            );
+            assert_eq!(
+                stats.aborted.load(Ordering::Relaxed),
+                0,
+                "a healthy run must not report as aborted"
+            );
+            assert_eq!(
+                stats.last_protected.load(Ordering::Relaxed),
+                1,
+                "exactly the one scoped hash was protected"
+            );
+            assert!(
+                stats.last_run_epoch.load(Ordering::Relaxed) > 0,
+                "a run that happened must carry a timestamp"
+            );
+        })
+        .await
+        .expect("timed out");
+    }
+
+    /// With NO gc configured — the default, and every release up to 0.42.0 — an unreferenced blob
+    /// stays put and the counters stay at zero.
+    ///
+    /// This is the control for the test above: without it, "swept is gone" could be reporting a
+    /// store that drops unreferenced blobs on its own, with the `GcConfig` doing nothing.
+    #[tokio::test]
+    async fn without_a_configured_interval_nothing_is_reclaimed() {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let dir = tempfile::tempdir().unwrap();
+            let scopes = Arc::new(ScopeStore::new(dir.path().join("scopes.json")));
+            let gate: Arc<dyn mcpmesh_net::TrustGate> =
+                Arc::new(StaticGate::new(std::collections::HashMap::new()));
+            let provider = AppBlobs::load(
+                dir.path().join("blobs"),
+                scopes,
+                gate,
+                ep().await,
+                crate::audit::AuditSink::disabled(),
+                crate::limits::MeshLimiters::unlimited(),
+                None,
+                None, // no collection
+            )
+            .await
+            .unwrap();
+
+            let src = dir.path().join("orphan.bin");
+            std::fs::write(&src, b"nobody names this").unwrap();
+            let (_t, hex) = provider.publish_path(&src).await.unwrap();
+            let hash = crate::blobs::parse_blob_hash(&hex).unwrap();
+
+            // Comfortably longer than the 1s interval the configured test above relies on.
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            assert!(
+                provider.store.blobs().has(hash).await.unwrap(),
+                "an unconfigured node must never reclaim — that is the documented default"
+            );
+            use std::sync::atomic::Ordering;
+            assert_eq!(
+                provider.gc_stats().runs.load(Ordering::Relaxed),
+                0,
+                "no collector means no runs"
+            );
+        })
+        .await
+        .expect("timed out");
+    }
+
+    /// How many tags the store holds — the GC root #80 has to clear.
+    async fn tag_count(store: &FsStore) -> usize {
+        use n0_future::StreamExt;
+        let mut n = 0;
+        let mut s = std::pin::pin!(store.tags().list().await.unwrap());
+        while let Some(t) = s.next().await {
+            t.unwrap();
+            n += 1;
+        }
+        n
+    }
+
+    /// #80: a store written by an EARLIER release must become collectable.
+    ///
+    /// Up to 0.42.0 every import awaited `add_path`, which runs `with_tag()` and persists an
+    /// auto-tag per blob — and `gc_mark` roots the live set in tags. So on any existing store the
+    /// first sweep would have reclaimed NOTHING while logging a run every interval: configured,
+    /// and silently doing nothing. This pins the one-time clear that fixes it.
+    ///
+    /// The pre-0.43.0 store is CONSTRUCTED, not simulated: the awaited `add_path` below is
+    /// byte-for-byte what `publish_path` used to do.
+    #[tokio::test]
+    async fn a_pre_0_43_store_full_of_auto_tags_becomes_collectable() {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let dir = tempfile::tempdir().unwrap();
+            let blobs_dir = dir.path().join("blobs");
+            let src = dir.path().join("legacy.bin");
+            std::fs::write(&src, b"imported by an older release").unwrap();
+
+            // A store as 0.42.0 left it: one blob, one PERSISTENT auto-tag, no scope naming it.
+            let hash = {
+                let old = AppBlobs::open_fetcher(blobs_dir.clone(), ep().await)
+                    .await
+                    .unwrap();
+                let tag = old.store.blobs().add_path(&src).await.unwrap();
+                assert_eq!(
+                    tag_count(&old.store).await,
+                    1,
+                    "precondition: the old import path leaves a persistent tag"
+                );
+                old.store.shutdown().await.unwrap();
+                tag.hash
+            };
+
+            // Reopen with collection on.
+            let scopes = Arc::new(ScopeStore::new(dir.path().join("scopes.json")));
+            let gate: Arc<dyn mcpmesh_net::TrustGate> =
+                Arc::new(StaticGate::new(std::collections::HashMap::new()));
+            let provider = AppBlobs::load(
+                blobs_dir,
+                scopes,
+                gate,
+                ep().await,
+                crate::audit::AuditSink::disabled(),
+                crate::limits::MeshLimiters::unlimited(),
+                None,
+                Some(std::time::Duration::from_secs(1)),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                tag_count(&provider.store).await,
+                0,
+                "the legacy auto-tags must be cleared, or every sweep protects everything"
+            );
+
+            let mut gone = false;
+            for _ in 0..100 {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                if !provider.store.blobs().has(hash).await.unwrap() {
+                    gone = true;
+                    break;
+                }
+            }
+            assert!(
+                gone,
+                "a blob left by an older release, named by no scope, must be reclaimable"
+            );
+        })
+        .await
+        .expect("timed out");
+    }
+
+    /// #80: a sweep landing MID-PUBLISH must not delete the file being published.
+    ///
+    /// `publish_scope` imports and then inserts into the scope; between those the blob is named by
+    /// nothing, so the scope table cannot protect it. The import's temp tag has to, and is held
+    /// across the insert for exactly that reason.
+    ///
+    /// `publish_delay` widens the window to several sweep intervals, so this is deterministic
+    /// rather than a race the test hopes to lose.
+    #[tokio::test]
+    async fn a_sweep_during_a_publish_does_not_eat_the_blob_being_published() {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let dir = tempfile::tempdir().unwrap();
+            let scopes = Arc::new(ScopeStore::new(dir.path().join("scopes.json")));
+            let gate: Arc<dyn mcpmesh_net::TrustGate> =
+                Arc::new(StaticGate::new(std::collections::HashMap::new()));
+            let provider = AppBlobs::load(
+                dir.path().join("blobs"),
+                scopes,
+                gate,
+                ep().await,
+                crate::audit::AuditSink::disabled(),
+                crate::limits::MeshLimiters::unlimited(),
+                None,
+                Some(std::time::Duration::from_secs(1)),
+            )
+            .await
+            .unwrap();
+            // The scope must already exist and hold an UNRELATED live hash, so the sweeps that run
+            // during the window are real sweeps with a real (non-empty) root — not runs that
+            // happen to protect nothing and delete nothing.
+            let other = dir.path().join("other.bin");
+            std::fs::write(&other, b"an unrelated published blob").unwrap();
+            provider.publish_scope("room", &other).await.unwrap();
+
+            // Wait out one interval so at least one sweep has already run before we start.
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            provider.set_publish_delay(std::time::Duration::from_secs(4));
+
+            let src = dir.path().join("slow.bin");
+            std::fs::write(&src, b"published across several sweeps").unwrap();
+            let (_t, hex) = provider
+                .publish_scope("room", &src)
+                .await
+                .expect("the publish itself must succeed");
+            let hash = crate::blobs::parse_blob_hash(&hex).unwrap();
+
+            assert!(
+                provider
+                    .gc_stats()
+                    .runs
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    >= 2,
+                "precondition: sweeps really did run across the publish window"
+            );
+            assert!(
+                provider.store.blobs().has(hash).await.unwrap(),
+                "the blob must survive a sweep that lands between its import and its scope insert"
+            );
+        })
+        .await
+        .expect("timed out");
     }
 }

@@ -508,6 +508,41 @@ pub struct StorageInfo {
     pub redb_bytes: u64,
     /// Total size under the app-blob store directory; 0 when no blob store exists.
     pub blobs_bytes: u64,
+    /// Blob garbage collection (#80), or `None` when it is not configured — which is the default
+    /// and the behavior of every release up to 0.42.0.
+    ///
+    /// `None` means "not collecting", NOT "collecting and idle": a configured collector reports
+    /// `Some` with `runs: 0` until its first sweep.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blobs_gc: Option<BlobsGcInfo>,
+}
+
+/// The `status.storage.blobs_gc` block (#80): what the background app-blob collector has done.
+///
+/// **There is deliberately no `bytes_reclaimed`.** iroh-blobs calls back only BEFORE a sweep, never
+/// after, so any byte count here would be a guess. `blobs_bytes` is measured by walking the store
+/// directory; an operator reads reclaim off that, over time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobsGcInfo {
+    /// The interval the store is actually running on, in seconds.
+    pub interval_secs: u64,
+    /// Runs STARTED. iroh-blobs offers no completion callback, so this counts sweeps begun.
+    ///
+    /// **Watch this number.** Upstream's collector `break`s its loop on the first sweep error
+    /// rather than continuing, so one failure silently ends collection until the daemon restarts. A
+    /// `runs` that stops advancing across several intervals is the only signal that happened.
+    ///
+    /// Also: the collector SLEEPS before its first run, so a node with a 24h interval reports
+    /// `runs: 0` for its first 24 hours. That is not a fault.
+    pub runs: u64,
+    /// Unix seconds at the start of the most recent run; `None` before the first.
+    pub last_run_epoch: Option<i64>,
+    /// Hashes protected on the most recent run — the size of the liveness root the scope table
+    /// produced.
+    pub last_protected: u64,
+    /// Runs ABORTED because the liveness root could not be read. Each one swept nothing, which is
+    /// the intended fail-safe; a number that climbs means collection is not happening.
+    pub aborted: u64,
 }
 
 /// Params of [`Request::RegisterService`]: the `[services.*]` entry to write/update.
@@ -977,8 +1012,12 @@ pub struct BlobRevokeParams {
 /// Params of [`Request::BlobUnpublish`] (#62): the scope and the blake3 hex to remove from it.
 ///
 /// Removes REACHABILITY, not bytes. The scope gate requires a hash to be listed in some scope, so
-/// this takes effect immediately for authorization — but the bytes stay in the local store, and
-/// there is no reclaim verb yet. Do not surface this to a user as deletion.
+/// this takes effect immediately for authorization — but the bytes stay in the local store until a
+/// GARBAGE-COLLECTION sweep reclaims them, and only a node that set `[blobs].gc_interval` runs one
+/// (#80, `api_minor >= 49`). There is no reclaim VERB — collection is periodic and configured at
+/// store construction, so "deleted" means "deleted within an interval" at best. On a node with no
+/// interval configured — the default — the bytes stay forever. Do not surface this to a user as
+/// deletion unless you know the node collects.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BlobUnpublishParams {
@@ -2378,7 +2417,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   thirty have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.48";
+pub const API_VERSION: &str = "1.49";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -2464,7 +2503,18 @@ pub const API_VERSION: &str = "1.48";
 /// refusals — expired line, no live invite, inviter unreachable, id mismatch, name conflict, and
 /// the deliberately-opaque refusal. `ERR_NICKNAME_TAKEN` had been the only coded pairing failure,
 /// so every other one arrived as `-32000` and an embedder could either forward our prose to end
-/// users or substring-match it (#159); to 48 with `user_key_export` / `user_key_import` — a
+/// users or substring-match it (#159); to 49 with [`StorageInfo::blobs_gc`] — app-blob GARBAGE
+/// COLLECTION, off unless `[blobs].gc_interval` is set (#80). `blob_unpublish` and `blob_revoke`
+/// closed the AUTHORIZATION half at 15; neither reclaimed a byte, so `<data_dir>/blobs/` grew
+/// monotonically for the life of the node and an embedder that had told a user "this file is
+/// deleted" could not deliver that. Opt-in, because a sweep also reclaims blobs this node FETCHED
+/// and never republished — reclaimable in themselves (the fetch already wrote the caller's
+/// `dest_path`) but it means `blob_republish` of a hash fetched more than one interval ago fails.
+/// `blobs_gc` is `None` when collection is not configured, `Some` with `runs: 0` when it is
+/// configured and has not swept yet — a distinction worth reading, because the collector sleeps a
+/// full interval before its first run. WATCH `runs`: iroh-blobs ends collection for the process on
+/// its first sweep error, so a counter that stops advancing is the only signal. Guard on `>= 49`;
+/// to 48 with `user_key_export` / `user_key_import` — a
 /// RECOVERY PHRASE for the user key, so a person's `b64u:` survives the hardware (#85 ask 2). It
 /// lived in one file on one machine with no export, import or escrow verb anywhere, so replacing a
 /// laptop destroyed the identity peers pin, kb audiences key on, and a roster names — recovery was
@@ -2566,7 +2616,7 @@ pub const API_VERSION: &str = "1.48";
 /// its REAL content is a meaning change to `reachable` — the field exists so the new meaning is
 /// observable at all. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 48;
+pub const API_MINOR: u32 = 49;
 
 #[cfg(test)]
 mod tests {

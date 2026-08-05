@@ -302,6 +302,11 @@ pub struct MeshState {
     /// The on-disk app-blob store directory (#88), set once at boot when one exists — read by
     /// `status.storage.blobs_bytes`. Same set-once discipline as `audit`/`limits`.
     pub(crate) blobs_dir: std::sync::OnceLock<PathBuf>,
+    /// The configured blob-GC interval and its counters (#80), set once at boot alongside
+    /// `blobs_dir` — and ONLY when collection is actually configured, so `status` can tell "not
+    /// collecting" from "collecting, has not run yet". Read synchronously by
+    /// `status.storage.blobs_gc`; the `app_blobs` mutex could not be taken from there.
+    pub(crate) blobs_gc: std::sync::OnceLock<(u64, Arc<crate::blobs::provider::BlobGcStats>)>,
     /// Self-network transition ring (#90) — `subscribe`'s third tap, fed by
     /// [`spawn_self_net_watch`](self_net::spawn_self_net_watch). A SEPARATE ring from
     /// `reach_bcast` for the same reason that one is separate from audit: the frames have
@@ -609,6 +614,7 @@ impl MeshState {
             app_metadata: Arc::new(std::sync::RwLock::new(String::new())),
             app_blobs: tokio::sync::Mutex::new(None),
             blobs_dir: std::sync::OnceLock::new(),
+            blobs_gc: std::sync::OnceLock::new(),
             audit: std::sync::OnceLock::new(),
             limits: std::sync::OnceLock::new(),
             roster_addr_book: std::sync::OnceLock::new(),
@@ -1066,6 +1072,17 @@ impl MeshState {
     /// The recorded blob-store directory, if this node has one.
     pub(crate) fn blobs_dir(&self) -> Option<&Path> {
         self.blobs_dir.get().map(PathBuf::as_path)
+    }
+
+    /// Record that blob GC is RUNNING, at `interval_secs`, with these counters (#80). Called at
+    /// boot only when collection was actually configured — an unset cell is what makes
+    /// `status.storage.blobs_gc` read `None` rather than "configured, zero runs".
+    pub fn set_blobs_gc(
+        &self,
+        interval_secs: u64,
+        stats: Arc<crate::blobs::provider::BlobGcStats>,
+    ) {
+        let _ = self.blobs_gc.set((interval_secs, stats));
     }
 
     /// The audit sink, or the disabled no-op sink if none was installed (control-only test daemon).

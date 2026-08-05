@@ -324,6 +324,73 @@ async fn audit_list_filters_and_pages_with_an_honest_total() {
     .expect("audit_list test timed out");
 }
 
+/// #80: `status.storage.blobs_gc` distinguishes "not collecting" from "collecting, no sweep yet",
+/// and reports the counters live.
+///
+/// The absent case is the load-bearing one. `None` is the default and the behaviour of every
+/// release up to 0.42.0; if it defaulted to a zeroed block instead, an operator reading `runs: 0`
+/// could not tell a node that is not collecting from one whose collector has died — and a dead
+/// collector reporting `runs: 0` forever is exactly the failure this block exists to make visible.
+#[tokio::test(flavor = "multi_thread")]
+async fn status_blobs_gc_is_absent_until_collection_is_configured() {
+    timeout(Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+        let audit_dir = dir.path().join("audit");
+        std::fs::create_dir_all(&audit_dir).unwrap();
+        let (mut client, control, mesh) =
+            control_over_audit_dir(dir.path(), audit_dir.clone()).await;
+
+        let status: StatusResult =
+            serde_json::from_value(client.request(Request::Status).await.expect("status"))
+                .expect("StatusResult deserializes");
+        assert!(
+            status.storage.expect("storage block").blobs_gc.is_none(),
+            "an unconfigured node reports NO gc block — not a zeroed one"
+        );
+
+        // Now as boot wires it when `[blobs].gc_interval` is set and honoured.
+        use std::sync::atomic::Ordering;
+        let stats = std::sync::Arc::new(mcpmesh::blobs::provider::BlobGcStats::default());
+        mesh.set_blobs_gc(3600, stats.clone());
+
+        let status: StatusResult =
+            serde_json::from_value(client.request(Request::Status).await.expect("status 2"))
+                .expect("StatusResult deserializes");
+        let gc = status
+            .storage
+            .expect("storage")
+            .blobs_gc
+            .expect("a configured collector reports a block");
+        assert_eq!(gc.interval_secs, 3600);
+        assert_eq!(gc.runs, 0, "configured, and it has not swept yet");
+        assert_eq!(
+            gc.last_run_epoch, None,
+            "0 is the never-ran sentinel, not a 1970 timestamp"
+        );
+
+        // A sweep happens.
+        stats.runs.fetch_add(1, Ordering::Relaxed);
+        stats.last_run_epoch.store(1_754_300_000, Ordering::Relaxed);
+        stats.last_protected.store(41, Ordering::Relaxed);
+        stats.aborted.fetch_add(2, Ordering::Relaxed);
+
+        let status: StatusResult =
+            serde_json::from_value(client.request(Request::Status).await.expect("status 3"))
+                .expect("StatusResult deserializes");
+        let gc = status.storage.expect("storage").blobs_gc.expect("block");
+        assert_eq!(
+            (gc.runs, gc.last_run_epoch, gc.last_protected, gc.aborted),
+            (1, Some(1_754_300_000), 41, 2),
+            "every counter is a LIVE read — a cached block would report the boot-time zeros, and \
+             `runs` failing to advance is the only signal an operator gets that collection died"
+        );
+
+        control.abort();
+    })
+    .await
+    .expect("status blobs_gc test timed out");
+}
+
 /// `status.storage` reports the bytes actually on disk: audit = the summed month files, redb =
 /// the state store, blobs present (0 with no blob store). Mutating the audit dir must move the
 /// number — the field is a live read, not a cached boot-time value.

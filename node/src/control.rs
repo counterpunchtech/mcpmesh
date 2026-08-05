@@ -1346,10 +1346,26 @@ pub(crate) fn status_result(state: &DaemonState) -> Result<StatusResult> {
             .blobs_dir()
             .map(crate::util::dir_size_bytes)
             .unwrap_or(0);
+        // #80: `Some` only when collection is actually running — an unset cell means the operator
+        // did not configure it (or configured it unparseably, which leaves it off), and that is a
+        // different answer from "running, no sweep yet".
+        let blobs_gc = mesh.blobs_gc.get().map(|(interval_secs, stats)| {
+            use std::sync::atomic::Ordering;
+            let last = stats.last_run_epoch.load(Ordering::Relaxed);
+            mcpmesh_local_api::BlobsGcInfo {
+                interval_secs: *interval_secs,
+                runs: stats.runs.load(Ordering::Relaxed),
+                // 0 is the never-ran sentinel, not a 1970 timestamp.
+                last_run_epoch: (last != 0).then_some(last),
+                last_protected: stats.last_protected.load(Ordering::Relaxed),
+                aborted: stats.aborted.load(Ordering::Relaxed),
+            }
+        });
         mcpmesh_local_api::StorageInfo {
             audit_bytes,
             redb_bytes,
             blobs_bytes,
+            blobs_gc,
         }
     });
     // #90: THIS node's own reachability posture — live point reads off the endpoint's stable
