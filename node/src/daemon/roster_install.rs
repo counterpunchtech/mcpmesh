@@ -113,6 +113,63 @@ pub fn install_roster_view_and_sever(
     severed
 }
 
+/// Persist an adopted successor org root (#93 ask c), audibly.
+///
+/// Called from EVERY install path — the manual one and the gossip/URL convergence one — because a
+/// node that was offline across a rotation catches up through the second, so re-anchoring only in
+/// the first would fix the case that needs it least. Extracted rather than duplicated for exactly
+/// that reason.
+///
+/// Durable: a rotation held only in memory reverts on restart and re-strands the node, which is the
+/// failure this feature exists to remove. Written through the same surgical RMW writer, under the
+/// `reload_lock` the caller already holds — a nested lock on the non-reentrant tokio mutex would
+/// deadlock.
+///
+/// An org's trust anchor moving is the highest-consequence event in roster mode and it happens with
+/// NO operator action on this node, so it is audited and logged at `warn!`.
+async fn adopt_successor_root(
+    mesh: &MeshState,
+    anchor: &mcpmesh_trust::roster::validate::AnchorChange,
+    org_id: &str,
+) -> anyhow::Result<()> {
+    let Some(new_pk) = anchor.adopted_root_pk.clone() else {
+        return Ok(());
+    };
+    let config_path = mesh.config_path.clone();
+    let (pk_w, oid_w) = (new_pk.clone(), org_id.to_string());
+    blocking("join org-root rotation config write", move || {
+        write_identity_pin(&config_path, &pk_w, &oid_w)
+    })
+    .await??;
+    let _ = new_pk;
+    audit_successor_adoption(mesh, anchor, org_id);
+    Ok(())
+}
+
+/// The audit record + warning for an adopted successor, split from the WRITE so the manual install
+/// path can settle pin precedence against an explicit caller pk itself and still report exactly
+/// once.
+fn audit_successor_adoption(
+    mesh: &MeshState,
+    anchor: &mcpmesh_trust::roster::validate::AnchorChange,
+    org_id: &str,
+) {
+    let Some(new_pk) = anchor.adopted_root_pk.as_deref() else {
+        return;
+    };
+    mesh.audit().record(crate::audit::AuditRecord::trust(
+        crate::audit::now_ts(),
+        "org_root_rotated".into(),
+        Some(org_id.to_string()),
+        Some(new_pk.to_string()),
+    ));
+    tracing::warn!(
+        org_id = %org_id,
+        new_root = %new_pk,
+        "ORG ROOT ROTATED — this node re-anchored to the successor named by the previous root"
+    );
+}
+
 /// Converge fetched roster BYTES through the SINGLE install path — the shared convergence tail of
 /// BOTH automatic distribution channels (the gossip announce and the URL poll), surfaced to
 /// `roster::distribute` as `DistributionHost::install_roster_bytes`: serialized under
@@ -147,10 +204,13 @@ pub(crate) async fn converge_roster_bytes(
     let now = epoch_now_i64();
     // `tmp` moves into the closure: its guard removes the temp file when the install returns
     // (success and failure alike).
-    let view = blocking("join roster install", move || {
+    let (view, anchor) = blocking("join roster install", move || {
         rstore.install_from_file(tmp.path(), &pk, now)
     })
     .await??;
+    // #93 ask c: the convergence path is how a node that was OFFLINE across a rotation catches up,
+    // so it needs the re-anchor at least as much as the manual one.
+    adopt_successor_root(mesh, &anchor, view.org_id()).await?;
     mesh.confirm_roster_current(now).await;
     let severed = install_roster_view_and_sever(mesh, view);
     reconcile_user_id_from_roster(mesh).await;
@@ -260,17 +320,29 @@ pub(crate) async fn install_roster(
     let file = PathBuf::from(path);
     // Read + validate + persist on a blocking thread (fs + verify); returns the resolvable view.
     // A FAILED validation returns Err BEFORE the write, so the on-disk roster is left untouched.
-    let view = blocking("join roster install", move || {
+    let (view, anchor) = blocking("join roster install", move || {
         rstore.install_from_file(&file, &pk, now)
     })
     .await??;
     let (org_id, serial) = (view.org_id().to_string(), view.serial());
+    // Audit + log the adoption; the PIN is written by the block below, which also settles the
+    // precedence against an explicit caller pk.
+    audit_successor_adoption(mesh, &anchor, &org_id);
     // Pin the trust anchor + org_id to config now that the roster validated — only when an explicit
     // pk was provided (a first install or an operator re-pin). Call the lock-free `write_identity_pin`
     // DIRECTLY under the `reload_lock` we ALREADY hold — a nested `reload_lock.lock()` on the
     // non-reentrant tokio Mutex would deadlock. Same order as before: pin AFTER validation, using the
     // validated org_id; a subsequent install that reused the already-pinned value does not rewrite it.
-    if org_root_pk.is_some() {
+    // An ADOPTED successor wins over the caller's explicit pk (#93 ask c gate).
+    //
+    // The caller's pk is by construction the OLD anchor — it is what they had to supply to make the
+    // roster verify at all. Pinning it after adoption silently reverted the re-anchor while the
+    // `org_root_rotated` audit record and warning had already fired: "reads as durable, then
+    // silently reverts", the exact failure `AnchorChange`'s own doc cites #107 for. Reachable by
+    // the by-hand distribution the CLI recommends, and by any joiner holding only the `org_create`
+    // invite.
+    let pk_str = anchor.adopted_root_pk.clone().unwrap_or(pk_str);
+    if org_root_pk.is_some() || anchor.adopted_root_pk.is_some() {
         let config_path = mesh.config_path.clone();
         let (pk_w, oid_w) = (pk_str.clone(), org_id.clone());
         blocking("join org-root pin config write", move || {

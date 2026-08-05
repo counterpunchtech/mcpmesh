@@ -171,6 +171,7 @@ Methods split into two groups by audience:
 | `peer_endorse` | `{subject, subject_user_id?}` — **produce** an endorsement of a peer for someone else to redeem (#65, `api_minor >= 42`). Signs with your user key; it changes nothing about your own trust in the subject. Hand both result fields to the recipient. | `{endorsed_by, evidence}` |
 | `peer_introduce` | `{subject, endorsed_by, evidence, subject_user_id?, subject_binding?, nickname}` — install a peer from a **signed endorsement** by someone you are already paired with (#65, `api_minor >= 42`). Onboards a small group in O(N) instead of O(N²) two-human ceremonies. **It installs IDENTITY, not authorization**: service access stays principal-keyed in config (#38) and an explicit, separate act. `endorsed_by` must be the `user_id` of a peer you are **currently paired** with, so the chain terminates at a ceremony you performed yourself — unpairing them revokes their power to introduce, even though the signature stays cryptographically valid, and an **introduced peer cannot introduce others**. `subject_user_id` requires `subject_binding` (the subject's OWN device→user binding): a `user_id` is authorization-bearing and public, so an endorser alone must not be able to attach one. Refused for: an unpaired endorser, a signature naming a different subject, your own endpoint id, a peer you are **already paired with** (it would replace a SAS-proven row with a weaker one), or a nickname you already use for a different peer. Recorded as a `trust` audit event naming the endorser. | `{}` |
 | `peer_remove` | `{nickname}` | `{}` (ack) |
+| `org_rotate` | `{new_key_path?}` — **rotate the org root** (#93 ask c, `api_minor >= 53`). Publishes a roster signed by the SUCCESSOR and cross-signed by the current root, so members re-anchor as they receive it — including members that were offline when you ran it, because the bridge rides every later roster. A member **two** rotations behind needs a fresh `org_join`. **Not escrow**: a LOST root cannot sign a bridge. | `{org_id, serial, new_root_pk, old_root_fingerprint, new_root_fingerprint}` |
 | `attest_offer` | `{}` — mint a `mcpmesh-attest:` line telling another **device of you** where to dial (#85 ask 3, `api_minor >= 52`). Carries nothing secret: the node's id and address, both of which an invite line already carries in the clear. It exists because a machine restored from a recovery phrase holds no rows and so cannot find anyone. Refused unless `[identity].admit_attested_devices` is on — an offer this node would not honour is worse than none. | `{offer}` |
 | `peer_revoke` | `{peer, reason?}` — a nickname, `eid:`, `b64u:`, or (in roster mode) a roster **group name**, which revokes every device in it — mark this device **dead on this node** (#85 ask 4, `api_minor >= 51`). Blocks the **outbound** direction too: this node will not dial a revoked endpoint, so `open_session`, `peer_services` and `peer_diagnostics` all refuse it. A revoked device is also refused on the otherwise gate-exempt pair ALPN, so it cannot burn an invite or re-append itself to an allow list. **Not `peer_remove`**: removal is routine and re-pairable, revocation is a compromise claim that **outlives the pair row**, so it cannot be undone by a fresh pairing. Live sessions are **severed immediately** (#54), not left to end on their own. A `b64u:` revokes every device you know of that person's. A name matching nothing is an **error**, never an empty success. | `{revoked: [eid], severed}` |
 | `peer_unrevoke` | `{peer}` — lift a local revocation. Idempotent. Restores the peer only because revocation never deleted its pair row. Accepts a bare `eid:` too, so a revoke-then-unpair cannot leave a revocation permanently unliftable. | `{unrevoked: [eid]}` |
@@ -1626,3 +1627,55 @@ This document describes the surface; the code defines it.
 
 The `mcpmesh-local-api` crate is [published to crates.io](https://crates.io/crates/mcpmesh-local-api):
 Rust clients can depend on it directly (`client` feature) rather than reimplementing the wire format.
+
+### Org root rotation (#93 ask c)
+
+The org's trust anchor is one pinned key. Until 0.47.0 nothing could move it: an operator laptop
+that died took the org with it 90 days later, when the roster expired — and the delay is what made
+that hard to diagnose. Recovery was a fresh ceremony with every member.
+
+```
+mcpmesh org rotate                 # publishes the bridge; members adopt it as they receive it
+mcpmesh org rotate --new-key <p>   # …reusing a successor key you staged elsewhere
+```
+
+A roster gains two optional fields, `successor_root_pk` and `successor_sig` — the successor, and the
+**current** root's signature over `domain ∥ org_id ∥ successor_pk`. A member still pinned to the
+current root verifies that cross-signature with the key it already has, adopts the successor, and
+only then verifies the roster body with it.
+
+**The bridge rides every subsequent roster**, not only the one that introduces it. That is what
+makes rotation survivable rather than merely possible: a member offline for a single publication
+would otherwise find every later roster unverifiable and be stranded exactly as before. Being
+offline for one publication is a laptop closed for a week.
+
+Four properties, each of which is a way to get this wrong:
+
+- **A successor is only ever adopted on a statement signed by the key it replaces.** Someone who can
+  serve you a roster cannot introduce their own root.
+- **A roster that verifies against your pinned root directly is never re-anchored**, even if it
+  carries a successor pair — otherwise an ordinary roster could silently move your anchor.
+- **`org_id` is inside the cross-signature**, so a rotation for one org cannot be replayed into
+  another that shares an operator.
+- **Rollback protection is untouched.** Adopting a successor does not reset the installed serial, so
+  a replayed older roster — including one predating a revocation — is still refused.
+
+Adoption rewrites `[identity].org_root_pk` durably and is **audited** (`org_root_rotated`): the
+anchor moves with no operator action on the receiving node, which is exactly the kind of event a log
+should carry.
+
+**Every member must be on 0.47.0 or newer before you rotate.** A rotated roster declares
+`mcpmesh-roster/2`, and the roster schema is a closed field set — an older binary refuses it. Because
+the bridge rides *every* subsequent roster, an older member does not merely miss the rotation: it
+stops accepting membership changes entirely, and degrades when its installed roster expires. The
+format bump is what makes that refusal legible (`unexpected roster format` rather than `unknown
+field`), and its poll loop now says so at `warn!` — but the only fix is to upgrade that member, or
+re-`org_join` it.
+
+An org that has never rotated keeps producing `mcpmesh-roster/1`, byte-identically, so nothing
+changes for anyone who does not use this.
+
+**Limits, stated rather than discovered.** A member **two** rotations behind cannot chain — chaining
+would mean carrying a history — and needs a fresh `org_join`. And this is **not escrow**: if the
+current root key is *lost* there is nothing to sign a bridge with. Copying `org-root.key` to a
+second operator machine already works and remains the answer for that.

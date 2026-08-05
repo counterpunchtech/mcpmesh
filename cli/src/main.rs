@@ -264,6 +264,22 @@ enum OrgCmd {
         #[arg(long)]
         roster_url: Option<String>,
     },
+    /// Rotate the org root key, so a compromised or aging anchor can be replaced.
+    ///
+    /// Publishes a roster signed by the NEW key and cross-signed by the current one. Members adopt
+    /// the new anchor as they receive it — including members that were offline when you ran this,
+    /// because the bridge rides every later roster.
+    ///
+    /// A member two rotations behind needs a fresh `join`. And this is NOT recovery for a LOST key:
+    /// with nothing to cross-sign, there is no bridge. Copy `org-root.key` to a second operator
+    /// machine for that.
+    Rotate {
+        /// Where to read or write the successor key. Defaults to `<config>/org_root_next.key`.
+        ///
+        /// Reused if it exists, so you can prepare the key on a machine that is not this one.
+        #[arg(long)]
+        new_key: Option<String>,
+    },
     /// Approve a joiner: add the person + device to the roster and re-sign.
     ///
     /// Verifies the join code's device binding, grants the named groups, and
@@ -729,6 +745,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     roster_url,
                 },
         }) => enrollcmd::run_org_create(name, expires, roster_url, cli.json),
+        Some(Cmd::Org {
+            command: OrgCmd::Rotate { new_key },
+        }) => enrollcmd::run_org_rotate(new_key, cli.json),
         Some(Cmd::Org {
             command:
                 OrgCmd::Approve {

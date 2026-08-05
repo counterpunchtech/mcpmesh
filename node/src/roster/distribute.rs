@@ -330,7 +330,22 @@ pub fn spawn_poll_loop<H: DistributionHost>(
         let period = std::time::Duration::from_secs(interval_secs.max(1) as u64);
         loop {
             if let Err(e) = poll_roster_url_once(&mesh, &url).await {
-                tracing::debug!(%e, "roster URL poll failed; will retry next interval");
+                // A SIGNATURE or FORMAT failure is not a transient poll error and must not be
+                // logged as one (#93 ask c gate): those are the two shapes a node stuck behind an
+                // org-root rotation sees, and it will retry against a document it can never verify
+                // until the roster expires — which is precisely the "90 days later, nobody connects
+                // cause to effect" failure #93 opens with. Say so, once per poll, at `warn!`.
+                let msg = format!("{e:#}");
+                if msg.contains("signature") || msg.contains("roster format") {
+                    tracing::warn!(
+                        %e,
+                        "roster poll REJECTED the served roster — if your org rotated its root \
+                         while this node was off, or this node is behind two rotations, re-run \
+                         `mcpmesh join` with a current org invite. Retrying will not help"
+                    );
+                } else {
+                    tracing::debug!(%e, "roster URL poll failed; will retry next interval");
+                }
             }
             tokio::time::sleep(period).await;
         }

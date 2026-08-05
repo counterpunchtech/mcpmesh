@@ -7,7 +7,9 @@ use std::collections::{HashMap, HashSet};
 use ed25519_dalek::VerifyingKey;
 
 use super::sign::verify;
-use super::{ROSTER_FORMAT, Roster, RosterError, SKEW_SECS, decode_endpoint_id};
+use super::{
+    ROSTER_FORMAT, ROSTER_FORMAT_ROTATION, Roster, RosterError, SKEW_SECS, decode_endpoint_id,
+};
 
 /// A validated, resolvable roster — the lookup maps a `RosterGate` holds (built once at
 /// install/load). Net-free: `resolve` returns `(user_id, groups)`; the cli maps that to a
@@ -243,46 +245,139 @@ fn parse_rfc3339(s: &str) -> Result<i64, RosterError> {
         .map_err(|e| RosterError::BadTimestamp(format!("{s:?}: {e}")))
 }
 
-/// Full validation for INSTALLING a new roster (rules 1–6, all MUST). On success
-/// returns the resolvable [`RosterView`]. `installed_serial` is the current installed serial (0
-/// if none); `now_epoch` is wall-clock seconds (a parameter — the caller supplies `epoch_now`).
-pub fn validate_for_install(
+/// What a successful install did to this node's trust anchor (#93 ask c).
+///
+/// Returned alongside the view so the caller can PERSIST an adopted successor. A rotation that
+/// lived only in memory would revert on restart and re-strand the node — the "reads as durable,
+/// then silently reverts" failure #107's withdrawal tombstone was designed against.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AnchorChange {
+    /// The successor the caller must now pin, `b64u:`. `None` when the roster verified directly.
+    pub adopted_root_pk: Option<String>,
+}
+
+/// Resolve which key verifies this roster's BODY, adopting a cross-signed successor if the pinned
+/// anchor no longer signs directly (#93 ask c).
+///
+/// Order is the security of the whole feature:
+///
+/// 1. The pinned root is tried FIRST. A roster that verifies against it is never re-anchored, even
+///    if it carries a successor pair — otherwise an ordinary roster could silently move a node's
+///    anchor, which is the mechanism an attacker would want.
+/// 2. Only on failure is the successor considered, and only when `successor_sig` verifies **with
+///    the pinned root** over `domain ∥ org_id ∥ successor_pk`. An attacker who can serve a roster
+///    still cannot introduce their own root: they would need the current root's signature over it.
+/// 3. `org_id` is inside that signature, so a rotation statement for one org cannot be replayed
+///    into another that happens to share an operator.
+///
+/// One rotation of slack, deliberately: a node two rotations behind cannot chain, because chaining
+/// would mean carrying a history. An operator whose machine was off across two rotations hands it
+/// an `org_join`.
+fn resolve_verifier(
+    roster: &Roster,
+    pinned: &VerifyingKey,
+) -> Result<(VerifyingKey, AnchorChange), RosterError> {
+    if verify(roster, pinned).is_ok() {
+        return Ok((*pinned, AnchorChange::default()));
+    }
+    let (Some(succ_pk_b64u), Some(succ_sig_b64u)) = (
+        roster.successor_root_pk.as_deref(),
+        roster.successor_sig.as_deref(),
+    ) else {
+        // No bridge on offer: the original failure stands, reported as the signature error it is.
+        return Err(RosterError::BadSignature);
+    };
+    let succ_pk: [u8; 32] = crate::roster::decode_b64u(succ_pk_b64u)?
+        .as_slice()
+        .try_into()
+        .map_err(|_| RosterError::BadSignature)?;
+    let succ_sig = crate::roster::decode_b64u(succ_sig_b64u)?;
+    let pinned_bytes = pinned.to_bytes();
+    crate::roster::sign::verify_org_rotation(&pinned_bytes, &roster.org_id, &succ_pk, &succ_sig)?;
+    let succ = VerifyingKey::from_bytes(&succ_pk).map_err(|_| RosterError::BadSignature)?;
+    // The body must ALSO verify under the adopted key — the cross-signature says who may sign, not
+    // that this document is signed.
+    verify(roster, &succ)?;
+    Ok((
+        succ,
+        AnchorChange {
+            adopted_root_pk: Some(succ_pk_b64u.to_string()),
+        },
+    ))
+}
+
+/// [`validate_for_install`], additionally reporting an adopted successor (#93 ask c).
+pub fn validate_for_install_with_anchor(
     roster: &Roster,
     root_pk: &VerifyingKey,
     installed_serial: u64,
     now_epoch: i64,
-) -> Result<RosterView, RosterError> {
-    // Rule 6 / format: reject any non-`mcpmesh-roster/1` document up front.
-    if roster.format != ROSTER_FORMAT {
+) -> Result<(RosterView, AnchorChange), RosterError> {
+    // `/2` is the ROTATION format (#93 ask c). Accepted here and refused by every pre-0.47.0
+    // binary with a legible "unexpected roster format" rather than "unknown field".
+    if roster.format != ROSTER_FORMAT && roster.format != ROSTER_FORMAT_ROTATION {
         return Err(RosterError::BadFormat(roster.format.clone()));
     }
-    // Rule 1: signature.
-    verify(roster, root_pk)?;
-    // Rule 2: strictly-increasing serial (rollback protection).
+    // A `/2` document MUST carry the pair it exists to declare, and a `/1` document must NOT — the
+    // format is a promise about the field set, so letting either drift would make the version
+    // meaningless and reintroduce the ambiguity `deny_unknown_fields` exists to remove.
+    let has_rotation = roster.successor_root_pk.is_some() || roster.successor_sig.is_some();
+    if has_rotation != (roster.format == ROSTER_FORMAT_ROTATION) {
+        return Err(RosterError::BadFormat(roster.format.clone()));
+    }
+    let (_verifier, anchor) = resolve_verifier(roster, root_pk)?;
+    // Rule 2: strictly-increasing serial. Adopting a successor does NOT reset it — rollback
+    // protection is orthogonal to which key signs, and resetting would make a rotation a way to
+    // replay an old membership list.
     if roster.serial <= installed_serial {
         return Err(RosterError::StaleSerial {
             got: roster.serial,
             installed: installed_serial,
         });
     }
-    // Rule 3: validity window with ±skew (BOTH bounds).
     let issued = parse_rfc3339(&roster.issued_at)?;
     let expires = parse_rfc3339(&roster.expires_at)?;
     if now_epoch < issued - SKEW_SECS || now_epoch > expires + SKEW_SECS {
         return Err(RosterError::OutOfValidity);
     }
-    // Rules 4 + 5 + build the view.
-    build_view(roster, expires)
+    Ok((build_view(roster, expires)?, anchor))
+}
+
+/// Full validation for INSTALLING a new roster (rules 1–6, all MUST). On success
+/// returns the resolvable [`RosterView`]. `installed_serial` is the current installed serial (0
+/// if none); `now_epoch` is wall-clock seconds (a parameter — the caller supplies `epoch_now`).
+///
+/// [`validate_for_install_with_anchor`], discarding the anchor change.
+///
+/// **Kept as a thin delegate, not a second implementation.** It was left as its own copy in
+/// 0.47.0's first cut and immediately became a trap: it had no production caller, understood no
+/// rotation, and would refuse a rotated roster — so an embedder reaching for the obvious name got a
+/// bridge-blind validator with nothing saying so. Delegating means it cannot drift.
+///
+/// Prefer [`validate_for_install_with_anchor`]: discarding the [`AnchorChange`] means a successor
+/// is adopted for THIS document and then forgotten, so the next boot re-adopts it. Correct, but it
+/// never re-pins.
+pub fn validate_for_install(
+    roster: &Roster,
+    root_pk: &VerifyingKey,
+    installed_serial: u64,
+    now_epoch: i64,
+) -> Result<RosterView, RosterError> {
+    validate_for_install_with_anchor(roster, root_pk, installed_serial, now_epoch).map(|(v, _)| v)
 }
 
 /// Re-verify + rebuild the view for LOADING an already-installed roster at startup. Verifies the
 /// signature (rule 1) and structural rules (4, 5), but NOT expiry/serial — a legitimately-expired
 /// installed roster loads into degraded mode (the install-vs-load distinction).
 pub fn load_installed(roster: &Roster, root_pk: &VerifyingKey) -> Result<RosterView, RosterError> {
-    if roster.format != ROSTER_FORMAT {
+    if roster.format != ROSTER_FORMAT && roster.format != ROSTER_FORMAT_ROTATION {
         return Err(RosterError::BadFormat(roster.format.clone()));
     }
-    verify(roster, root_pk)?;
+    // #93 ask c: honour the rotation bridge here too. A node that adopted a successor writes the
+    // new anchor to config, so on the next boot this normally verifies directly — but if that write
+    // failed, or the roster on disk is newer than the pinned key, refusing here would strand a node
+    // that was working seconds earlier.
+    let _ = resolve_verifier(roster, root_pk)?;
     let expires = parse_rfc3339(&roster.expires_at)?;
     build_view(roster, expires)
 }
@@ -414,6 +509,8 @@ mod tests {
                 }],
             }],
             revoked_endpoints: vec![],
+            successor_root_pk: None,
+            successor_sig: None,
             sig: String::new(),
         }
     }
@@ -696,5 +793,215 @@ mod tests {
             expired.effective_state(NOW, grace, Some(NOW), max_staleness),
             RosterState::DegradedStopped
         );
+    }
+
+    /// #93 ask c: a node pinned to the PREDECESSOR installs a roster signed by the SUCCESSOR, on
+    /// the strength of a cross-signature — and is told to re-anchor.
+    ///
+    /// This is the property that makes rotation survivable rather than merely possible: the bridge
+    /// rides EVERY roster after a rotation, so a node that was offline for the announcing
+    /// publication still catches up. If it appeared only on the announcing roster, a laptop closed
+    /// for a week would be stranded exactly as it is today.
+    #[test]
+    fn a_cross_signed_successor_installs_against_the_old_anchor_and_reports_the_new_one() {
+        let old = root();
+        let new = SigningKey::from_bytes(&[11u8; 32]);
+        let new_pk = new.verifying_key().to_bytes();
+        let mut b = body(6);
+        b.format = crate::roster::ROSTER_FORMAT_ROTATION.into();
+        b.successor_root_pk = Some(encode_b64u(&new_pk));
+        b.successor_sig = Some(encode_b64u(&crate::roster::sign::sign_org_rotation(
+            &old, "acme", &new_pk,
+        )));
+        // Signed by the NEW root — the node has never seen this key.
+        let r = mint_signed(&new, b);
+
+        let (view, anchor) =
+            validate_for_install_with_anchor(&r, &old.verifying_key(), 5, 1_000_000_000)
+                .expect("a cross-signed successor must install against the old anchor");
+        assert!(view.devices().count() > 0, "the view still builds");
+        assert_eq!(
+            anchor.adopted_root_pk.as_deref(),
+            Some(encode_b64u(&new_pk).as_str()),
+            "the caller must be TOLD to re-anchor — a rotation that lived only in memory would \
+             revert on restart and re-strand the node"
+        );
+    }
+
+    /// A successor is only ever adopted on a statement signed by the key it replaces.
+    #[test]
+    fn a_successor_not_cross_signed_by_the_pinned_root_is_refused() {
+        let old = root();
+        let attacker = SigningKey::from_bytes(&[13u8; 32]);
+        let new = SigningKey::from_bytes(&[11u8; 32]);
+        let new_pk = new.verifying_key().to_bytes();
+
+        // (a) The ATTACKER cross-signs their own successor. Valid crypto, wrong signer.
+        let mut b = body(6);
+        b.format = crate::roster::ROSTER_FORMAT_ROTATION.into();
+        b.successor_root_pk = Some(encode_b64u(&new_pk));
+        b.successor_sig = Some(encode_b64u(&crate::roster::sign::sign_org_rotation(
+            &attacker, "acme", &new_pk,
+        )));
+        let r = mint_signed(&new, b);
+        assert!(
+            validate_for_install_with_anchor(&r, &old.verifying_key(), 5, 1_000_000_000).is_err(),
+            "an attacker who can serve a roster must not be able to introduce their own root"
+        );
+
+        // (b) The cross-signature is for a DIFFERENT org — the replay `org_id` is signed to stop.
+        let mut b = body(6);
+        b.format = crate::roster::ROSTER_FORMAT_ROTATION.into();
+        b.successor_root_pk = Some(encode_b64u(&new_pk));
+        b.successor_sig = Some(encode_b64u(&crate::roster::sign::sign_org_rotation(
+            &old,
+            "other-org",
+            &new_pk,
+        )));
+        let r = mint_signed(&new, b);
+        assert!(
+            validate_for_install_with_anchor(&r, &old.verifying_key(), 5, 1_000_000_000).is_err(),
+            "a rotation statement for one org must not be replayable into another that shares an \
+             operator"
+        );
+
+        // (c) A valid cross-signature, but the BODY is signed by someone else. The statement says
+        // WHO MAY sign, not that this document is signed.
+        let mut b = body(6);
+        b.format = crate::roster::ROSTER_FORMAT_ROTATION.into();
+        b.successor_root_pk = Some(encode_b64u(&new_pk));
+        b.successor_sig = Some(encode_b64u(&crate::roster::sign::sign_org_rotation(
+            &old, "acme", &new_pk,
+        )));
+        let r = mint_signed(&attacker, b);
+        assert!(
+            validate_for_install_with_anchor(&r, &old.verifying_key(), 5, 1_000_000_000).is_err(),
+            "adopting a successor must not admit a body signed by a third key"
+        );
+    }
+
+    /// A roster that verifies DIRECTLY is never re-anchored, even carrying a successor pair.
+    ///
+    /// Otherwise an ordinary roster could silently move a node's trust anchor, which is precisely
+    /// the mechanism an attacker would want out of this feature.
+    #[test]
+    fn a_directly_verifiable_roster_never_moves_the_anchor() {
+        let old = root();
+        let new = SigningKey::from_bytes(&[11u8; 32]);
+        let new_pk = new.verifying_key().to_bytes();
+        let mut b = body(6);
+        b.format = crate::roster::ROSTER_FORMAT_ROTATION.into();
+        b.successor_root_pk = Some(encode_b64u(&new_pk));
+        b.successor_sig = Some(encode_b64u(&crate::roster::sign::sign_org_rotation(
+            &old, "acme", &new_pk,
+        )));
+        // Signed by the CURRENT root: the announcing roster.
+        let r = mint_signed(&old, b);
+        let (_view, anchor) =
+            validate_for_install_with_anchor(&r, &old.verifying_key(), 5, 1_000_000_000)
+                .expect("the announcing roster installs");
+        assert_eq!(
+            anchor.adopted_root_pk, None,
+            "a roster the pinned root signs must not re-anchor the node — the successor is adopted \
+             only when the pinned key no longer signs directly"
+        );
+    }
+
+    /// Rollback protection survives rotation: adopting a successor does not reset the serial.
+    ///
+    /// Resetting it would turn a rotation into a way to replay an old membership list — including
+    /// one that predates a revocation.
+    #[test]
+    fn adopting_a_successor_does_not_reset_rollback_protection() {
+        let old = root();
+        let new = SigningKey::from_bytes(&[11u8; 32]);
+        let new_pk = new.verifying_key().to_bytes();
+        let cross = encode_b64u(&crate::roster::sign::sign_org_rotation(
+            &old, "acme", &new_pk,
+        ));
+        let mut b = body(3);
+        b.format = crate::roster::ROSTER_FORMAT_ROTATION.into(); // OLDER than the installed serial 5
+        b.successor_root_pk = Some(encode_b64u(&new_pk));
+        b.successor_sig = Some(cross);
+        let r = mint_signed(&new, b);
+        assert!(
+            matches!(
+                validate_for_install_with_anchor(&r, &old.verifying_key(), 5, 1_000_000_000),
+                Err(RosterError::StaleSerial { .. })
+            ),
+            "a cross-signed roster with a stale serial must still be refused"
+        );
+    }
+
+    /// #93 ask c: `load_installed` honours the bridge too.
+    ///
+    /// A node adopts a successor and writes the new pin — but if that write failed, or the process
+    /// died between them, the next BOOT re-reads a roster its pinned key no longer signs. Refusing
+    /// there would strand a node that was working seconds earlier, on a machine whose only symptom
+    /// is that roster mode stopped.
+    ///
+    /// Untested until the gate deleted the line and the whole workspace stayed green.
+    #[test]
+    fn load_installed_accepts_a_cross_signed_successor_after_a_failed_re_pin() {
+        let old = root();
+        let new = SigningKey::from_bytes(&[11u8; 32]);
+        let new_pk = new.verifying_key().to_bytes();
+        let mut b = body(6);
+        b.format = crate::roster::ROSTER_FORMAT_ROTATION.into();
+        b.successor_root_pk = Some(encode_b64u(&new_pk));
+        b.successor_sig = Some(encode_b64u(&crate::roster::sign::sign_org_rotation(
+            &old, "acme", &new_pk,
+        )));
+        let r = mint_signed(&new, b);
+        load_installed(&r, &old.verifying_key())
+            .expect("a boot on the OLD pin must still load a roster the bridge covers");
+
+        // …and a roster with no bridge still fails against the wrong key, so this is not a blanket
+        // relaxation of the signature check.
+        let plain = mint_signed(&new, body(6));
+        assert!(load_installed(&plain, &old.verifying_key()).is_err());
+    }
+
+    /// The rotation FORMAT and the successor fields must agree, in both directions.
+    ///
+    /// The format is a promise about the field set. A `/2` with no successor, or a `/1` carrying
+    /// one, would make the version meaningless — and the version is the only thing that turns a
+    /// pre-0.47.0 member's failure from "unknown field" into "upgrade me".
+    #[test]
+    fn the_rotation_format_and_the_successor_fields_must_agree() {
+        let old = root();
+        let new = SigningKey::from_bytes(&[11u8; 32]);
+        let new_pk = new.verifying_key().to_bytes();
+        let cross = encode_b64u(&crate::roster::sign::sign_org_rotation(
+            &old, "acme", &new_pk,
+        ));
+
+        // /2 with NO successor pair.
+        let mut b = body(6);
+        b.format = crate::roster::ROSTER_FORMAT_ROTATION.into();
+        let r = mint_signed(&old, b);
+        assert!(matches!(
+            validate_for_install_with_anchor(&r, &old.verifying_key(), 5, 1_000_000_000),
+            Err(RosterError::BadFormat(_))
+        ));
+
+        // /1 CARRYING a successor pair.
+        let mut b = body(6);
+        b.successor_root_pk = Some(encode_b64u(&new_pk));
+        b.successor_sig = Some(cross.clone());
+        let r = mint_signed(&old, b);
+        assert!(matches!(
+            validate_for_install_with_anchor(&r, &old.verifying_key(), 5, 1_000_000_000),
+            Err(RosterError::BadFormat(_))
+        ));
+
+        // An unknown format is still refused.
+        let mut b = body(6);
+        b.format = "mcpmesh-roster/99".into();
+        let r = mint_signed(&old, b);
+        assert!(matches!(
+            validate_for_install_with_anchor(&r, &old.verifying_key(), 5, 1_000_000_000),
+            Err(RosterError::BadFormat(_))
+        ));
     }
 }

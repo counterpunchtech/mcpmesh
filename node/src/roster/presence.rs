@@ -462,6 +462,8 @@ mod tests {
                     }],
                 }],
                 revoked_endpoints: vec![],
+                successor_root_pk: None,
+                successor_sig: None,
                 sig: String::new(),
             },
         );
@@ -525,6 +527,8 @@ mod tests {
                     }],
                 }],
                 revoked_endpoints: vec![],
+                successor_root_pk: None,
+                successor_sig: None,
                 sig: String::new(),
             },
         );

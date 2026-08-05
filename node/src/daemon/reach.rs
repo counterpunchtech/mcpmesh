@@ -1154,16 +1154,33 @@ mod tests {
     /// exactly the behaviour #176 removes — and leaves every other test in this module green.
     /// Nothing else in the tree names `probes_inflight`.
     ///
-    /// Deterministic: the claim is taken synchronously inside `reachability_of`, before the spawn,
-    /// so the assertion reads state that exists the instant the call returns. No sleeping, and no
-    /// "did a probe start?" timing judgement.
+    /// **The claim must still be held when the call returns, and that needs the probe to still be
+    /// RUNNING** — which is why this peer is given a routable-but-silent address.
+    ///
+    /// The first version claimed to be deterministic because "the claim is taken synchronously
+    /// before the spawn". That reasoning is wrong, and CI proved it: the claim is taken
+    /// synchronously, but on a multi-thread runtime the spawned task can RUN TO COMPLETION and drop
+    /// the guard before the assertion executes. A peer with `last_addr: None` has no address to
+    /// dial, so the probe fails instantly — the fastest possible loser of that race. It passed 5/5
+    /// locally and failed on ubuntu.
+    ///
+    /// Pointing `last_addr` at a loopback port nothing listens on makes the dial hang until
+    /// `PROBE_TIMEOUT` (3s), so the window the assertion reads is three seconds wide instead of
+    /// nanoseconds. That is a bounded, sleeping wait in the code under test rather than a `sleep`
+    /// in the test, and it keeps the mutation coverage the timing version was written for.
     #[tokio::test(flavor = "multi_thread")]
     async fn reachability_of_holds_its_refresh_claim_across_the_probe() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = dir.path().join("config.toml");
         std::fs::write(&cfg, "").unwrap();
         let mesh = crate::daemon::testutil::hermetic_mesh(cfg).await;
-        let eid = [0x7Eu8; 32];
+        // A REAL endpoint id — `EndpointAddr` will not carry an arbitrary 32 bytes — pointed at a
+        // port nothing is bound to.
+        let peer_key = iroh::SecretKey::generate();
+        let peer_id = peer_key.public();
+        let eid = *peer_id.as_bytes();
+        let black_hole: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let addr = iroh::EndpointAddr::from_parts(peer_id, [iroh::TransportAddr::Ip(black_hole)]);
         mesh.store
             .add(crate::allowlist::PeerEntry {
                 endpoint_id: eid,
@@ -1171,7 +1188,7 @@ mod tests {
                 services: vec![],
                 paired_at: None,
                 user_id: None,
-                last_addr: None,
+                last_addr: Some(serde_json::to_string(&addr).unwrap()),
             })
             .unwrap();
 
@@ -1180,7 +1197,7 @@ mod tests {
         assert_eq!(rows.len(), 1, "the stored peer must be projected");
         assert!(
             mesh.probes_inflight.lock().unwrap().contains(&eid),
-            "the refresh claim must still be HELD when reachability_of returns — a claim taken and \
+            "the refresh claim must still be HELD while the probe runs — a claim taken and \
              released before the spawn dedups nothing"
         );
 

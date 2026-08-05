@@ -91,6 +91,8 @@ fn signed_roster(root: &SigningKey, serial: u64) -> Roster {
                 }],
             }],
             revoked_endpoints: vec![],
+            successor_root_pk: None,
+            successor_sig: None,
             sig: String::new(),
         },
     )
@@ -295,6 +297,8 @@ fn roster_owning_our_device(
                 }],
             }],
             revoked_endpoints: vec![],
+            successor_root_pk: None,
+            successor_sig: None,
             sig: String::new(),
         },
     )

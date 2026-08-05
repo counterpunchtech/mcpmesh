@@ -293,6 +293,8 @@ mod tests {
                 } else {
                     vec![]
                 },
+                successor_root_pk: None,
+                successor_sig: None,
                 sig: String::new(),
             },
         );
@@ -611,6 +613,8 @@ mod tests {
                 groups: vec!["team-eng".into()],
                 users,
                 revoked_endpoints: revoked.iter().map(|b| encode_b64u(&[*b; 32])).collect(),
+                successor_root_pk: None,
+                successor_sig: None,
                 sig: String::new(),
             },
         );
