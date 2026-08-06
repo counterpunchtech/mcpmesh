@@ -940,28 +940,23 @@ pub async fn handle_inviter_side(
             let nickname = existing
                 .as_ref()
                 .map_or_else(|| claimed.clone(), |e| e.nickname.clone());
-            // The redeemer's OBSERVED transport address(es), from the live connection's
-            // path snapshot — the pairing-proven dial-back hint. Synthesized as an
-            // `EndpointAddr { id: <TLS-authenticated redeemer id>, addrs: <observed> }` and
-            // stored as an opaque JSON string (see `PeerEntry::last_addr` for why a string).
-            // Merge rule: a fresh observation REFRESHES the hint; an empty path snapshot
-            // (or a serialize failure) preserves the stored one — never downgrade `Some`
-            // to `None`.
-            let observed_addr = {
-                let addrs: Vec<iroh::TransportAddr> = conn
-                    .paths()
-                    .iter()
-                    .map(|p| p.remote_addr().clone())
-                    .collect();
-                if addrs.is_empty() {
-                    None
-                } else {
-                    serde_json::to_string(&iroh::EndpointAddr::from_parts(conn.remote_id(), addrs))
-                        .ok()
-                }
-            };
-            let last_addr =
-                observed_addr.or_else(|| existing.as_ref().and_then(|e| e.last_addr.clone()));
+            // The redeemer's OBSERVED direct address(es), from the live connection — the
+            // pairing-proven dial-back hint. Merge rule: a fresh observation REFRESHES the hint;
+            // learning nothing (relay-only, empty snapshot, serialize failure) preserves the
+            // stored one — never downgrade `Some` to `None`.
+            // #203: through `observed_for`, which filters to IP paths — the THIRD writer of
+            // `last_addr`, and the one the 0.52.2 audit missed. It mapped EVERY path's
+            // `remote_addr()` with no `is_ip()` filter, and iroh keeps a relay path open beside a
+            // direct one, so a WAN pairing persisted a RELAY URL as the dial-back hint. Via the
+            // merge below a relay-only observation then REPLACED a proven direct hint with one
+            // that can never punch — which `dial_hint::observed_for`'s own rustdoc records as a
+            // measured bug it exists to prevent (#124), reproduced here in a second copy of the
+            // same logic.
+            let observed_addr = crate::daemon::dial_hint::observed_for(&conn);
+            let last_addr = crate::daemon::dial_hint::merge_hint(
+                observed_addr,
+                existing.as_ref().and_then(|e| e.last_addr.clone()),
+            );
             let entry = PeerEntry {
                 endpoint_id: tls_id,
                 nickname: nickname.clone(),
@@ -1381,16 +1376,26 @@ pub async fn redeem_invite(
     //  - user_id: the newly VERIFIED binding wins, else keep the existing proven id — a verified
     //    user_id is never downgraded to `None` by a binding-less re-pair;
     //  - paired_at: now — this side stamps each redeem (each is a fresh ceremony we performed);
-    //  - last_addr: the invite's `inviter_addr_json` — the pairing-PROVEN dialable address (we
-    //    just reached the inviter through it, id-verified). A fresh pairing always carries one,
-    //    so this REFRESHES the hint and can never downgrade a stored `Some` to `None`.
+    //  - last_addr: the address THIS CONNECTION actually used, read off the live connection —
+    //    never the invite's address list (#203).
+    //
+    //    The old comment called the invite's list "the pairing-PROVEN dialable address (we just
+    //    reached the inviter through it)". That is true of AT MOST ONE of the addresses in it, and
+    //    the rest were a remote party's unvalidated claim being persisted as dial targets — which
+    //    every later dial then sprays QUIC Initials at, because iroh sends to every known path
+    //    until one is selected. `observed_for` returns exactly the one(s) we reached, filtered to
+    //    IP, which is the same rule `dial_hint::refresh` has always used for a live session.
+    //
+    //    Relay-only pairing yields `None`, which leaves any existing hint alone rather than
+    //    clearing it — the same "learned nothing" rule. That pairing reached the inviter through a
+    //    relay, so a relay/discovery dial is what it will keep using.
     // `endpoint_id` is `invite.inviter_id`, which we verified above equals the TLS id.
     // Resolve + merge + add run in ONE blocking closure (redb reads/writes block + fsync).
     let inviter_id = invite.inviter_id;
     let nickname = local_name.clone();
     let granted = invite.services.clone();
     let paired_at = Some(epoch_now().to_string());
-    let last_addr = Some(invite.inviter_addr_json.clone());
+    let last_addr = crate::daemon::dial_hint::observed_for(&conn);
     tokio::task::spawn_blocking(move || {
         let existing = store.resolve(&inviter_id)?;
         let mut services = existing
@@ -1407,8 +1412,19 @@ pub async fn redeem_invite(
             nickname,
             services,
             paired_at,
-            user_id: inviter_user_id.or_else(|| existing.and_then(|e| e.user_id)),
-            last_addr,
+            user_id: inviter_user_id.or_else(|| existing.as_ref().and_then(|e| e.user_id.clone())),
+            // NEVER downgrade a known hint to `None` (#203 gate). `store.add` is a replace-on-id
+            // upsert, and until 0.52.2 this value was ALWAYS `Some` (the invite's list), so the
+            // field needed no merge guard and had none. Switching it to `observed_for` — which
+            // returns `None` for a relay-only connection — made the missing guard load-bearing
+            // overnight: a re-redeem that happened to complete over the relay WIPED a proven
+            // direct hint. Every sibling field kept its guard; this was the only one without one,
+            // while five places (including this function's own new comment) asserted "leave alone,
+            // never clear".
+            last_addr: crate::daemon::dial_hint::merge_hint(
+                last_addr,
+                existing.and_then(|e| e.last_addr),
+            ),
         })
     })
     .await
@@ -2451,7 +2467,14 @@ pub async fn attest_to(
     let nickname = nickname_for_peer
         .or_else(|| existing.as_ref().map(|e| e.nickname.clone()))
         .unwrap_or(peer_nickname);
-    let addr_json = serde_json::to_string(&endpoint_addr_of(&conn)).ok();
+    // #203: what THIS connection observed, on the same rule as `redeem_invite` and
+    // `dial_hint::refresh` — never the offer's address list.
+    //
+    // This previously stored `endpoint_addr_of(&conn)`, which is `EndpointAddr::from(remote_id)`:
+    // a hint with NO addresses. That is not merely useless, it is destructive — being `Some` it
+    // won the `or_else` below and REPLACED whatever proven hint the peer already had with an empty
+    // one. `observed_for` returns `None` when it learned nothing, so the existing hint survives.
+    let addr_json = crate::daemon::dial_hint::observed_for(&conn);
     store.add(PeerEntry {
         endpoint_id: peer_id,
         nickname: nickname.clone(),
@@ -2469,7 +2492,10 @@ pub async fn attest_to(
             .or_else(|| existing.as_ref().and_then(|e| e.user_id.clone())),
         // …nor a known dial hint. Under `relay_mode = "disabled"` losing it is unrecoverable
         // without another ceremony.
-        last_addr: addr_json.or_else(|| existing.as_ref().and_then(|e| e.last_addr.clone())),
+        last_addr: crate::daemon::dial_hint::merge_hint(
+            addr_json,
+            existing.as_ref().and_then(|e| e.last_addr.clone()),
+        ),
     })?;
     conn.close(0u32.into(), b"done");
     Ok(PairResult {
@@ -2483,9 +2509,4 @@ pub async fn attest_to(
         enrolled_as_self: false,
         services: Vec::new(),
     })
-}
-
-/// The peer's dialable address as observed on the live connection.
-fn endpoint_addr_of(conn: &iroh::endpoint::Connection) -> iroh::EndpointAddr {
-    iroh::EndpointAddr::from(conn.remote_id())
 }

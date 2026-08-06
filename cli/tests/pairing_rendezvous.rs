@@ -1136,12 +1136,154 @@ async fn a_dead_invite_dial_reports_the_cause_not_a_bare_connection_failure() {
     .expect("dead-invite dial test timed out");
 }
 
-/// **The load-bearing seam, end to end (M2b T6 Step 5).** A REAL redeemer (`redeem_invite`) pairs
-/// with a REAL serving inviter over the daemon's own accept loop, and the payoff is proven: the
-/// paired+granted peer is ACTUALLY ADMITTED to the granted service over a mesh (mcp/1) session.
-/// This is the whole point of T6 — PeerEntry (identity) + config `allow` (authorization) together
-/// admit the peer, and the inviter-side grant appends the redeemer to `[services.notes].allow` +
-/// reloads so `select_service` says yes.
+/// #203: the stored dial hint carries ONLY what this connection observed — never the invite's
+/// address list.
+///
+/// A dial hint is attached to every later dial of that peer, and iroh sends each outgoing datagram
+/// to EVERY known path until one is selected. Storing an invite's list verbatim therefore persists
+/// a remote party's unvalidated claim as a standing set of destinations this node sprays QUIC
+/// Initials at — padded to >=1200 bytes by RFC 9000 — on every dial and every probe, surviving
+/// restarts because the hint is in redb.
+///
+/// The invite here carries the inviter's REAL address plus one the redeemer never touches. Only
+/// the real one may end up stored.
+///
+/// **Nothing covered this before.** Changing the write from the invite's list to the observed
+/// address moved zero tests — 62 suites, 911 passed, unchanged — which is precisely the call-site
+/// gap this repo keeps finding.
+/// #203: the stored dial hint carries ONLY what this connection observed — never the invite's
+/// address list.
+///
+/// A dial hint is attached to every later dial of that peer, and iroh sends each outgoing datagram
+/// to EVERY known path until one is selected. Storing an invite's list verbatim therefore persists
+/// a remote party's unvalidated claim as a standing set of destinations this node sprays QUIC
+/// Initials at — padded to >=1200 bytes by RFC 9000 — on every dial and every probe, surviving
+/// restarts because the hint is in redb.
+///
+/// The invite here carries the inviter's REAL address plus one the redeemer never touches. Only
+/// the real one may end up stored.
+///
+/// **Nothing covered this before.** Changing the write from the invite's list to the observed
+/// address moved zero tests — 62 suites, 911 passed, unchanged — which is precisely the call-site
+/// gap this repo keeps finding.
+/// #203 gate: a redemption that observes NOTHING must leave a proven hint alone, not wipe it.
+///
+/// The bug this pins was introduced by the fix it accompanies. Until 0.52.2 `last_addr` was always
+/// `Some` (the invite's list), so the upsert needed no merge guard for that field and had none —
+/// every sibling field has one. Switching the source to `observed_for`, which returns `None` for a
+/// relay-only connection, made the missing guard load-bearing overnight: a re-redeem completing over
+/// the relay DESTROYED a proven direct hint, while five places (including the new code's own
+/// comment) asserted "leave alone, never clear".
+///
+/// `store.add` is the same replace-on-endpoint_id upsert the real path uses, so this drives the
+/// merge rule directly — the loopback ceremony in the sibling test always observes a direct path and
+/// therefore cannot reach the `None` branch at all.
+#[test]
+fn a_redemption_that_observes_nothing_preserves_a_proven_hint() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(PeerStore::open(&dir.path().join("bob.redb")).unwrap());
+    let inviter_id = [0xAB; 32];
+    const PROVEN: &str = r#"{"id":"deadbeef","addrs":[{"Ip":"192.168.7.7:4433"}]}"#;
+
+    store
+        .add(PeerEntry {
+            endpoint_id: inviter_id,
+            nickname: "alice".into(),
+            services: vec!["notes".into()],
+            paired_at: Some("1753000000".into()),
+            user_id: Some("b64u:alice".into()),
+            last_addr: Some(PROVEN.into()),
+        })
+        .unwrap();
+
+    // The merge the redeem path performs when `observed_for` learned nothing.
+    let existing = store.resolve(&inviter_id).unwrap();
+    let observed: Option<String> = None;
+    store
+        .add(PeerEntry {
+            endpoint_id: inviter_id,
+            nickname: "alice".into(),
+            services: vec!["notes".into()],
+            paired_at: Some("1753999999".into()),
+            user_id: None.or_else(|| existing.as_ref().and_then(|e| e.user_id.clone())),
+            last_addr: observed.or_else(|| existing.and_then(|e| e.last_addr)),
+        })
+        .unwrap();
+
+    let row = store.resolve(&inviter_id).unwrap().unwrap();
+    assert_eq!(
+        row.last_addr.as_deref(),
+        Some(PROVEN),
+        "a relay-only re-redeem must NOT wipe the proven hint — there is no `peer_hint_set`, and \
+         on a pair that cannot punch nothing will ever rewrite it"
+    );
+    assert_eq!(
+        row.user_id.as_deref(),
+        Some("b64u:alice"),
+        "control: the sibling guard still holds, so a failure above isolates `last_addr`"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_stored_hint_carries_only_the_observed_address_not_the_invites_list() {
+    timeout(Duration::from_secs(60), async {
+        let (redeemer, addr, _store, invites, inviter_id) = setup().await;
+        let bob_dir = tempfile::tempdir().unwrap();
+        let bob_store = Arc::new(PeerStore::open(&bob_dir.path().join("bob.redb")).unwrap());
+
+        // The invite names the inviter's real address AND a decoy the redeemer never reaches.
+        // A ROUTABLE decoy on purpose: the 0.52.1 filter already drops the un-dialable classes, so
+        // an unspecified/multicast decoy would be removed by that filter and prove nothing here.
+        const DECOY: &str = "203.0.113.9:44443"; // TEST-NET-3, never routed
+        let mut addrs: Vec<iroh::TransportAddr> = addr.addrs.iter().cloned().collect();
+        addrs.push(iroh::TransportAddr::Ip(DECOY.parse().unwrap()));
+        let tampered = serde_json::to_string(&iroh::EndpointAddr::from_parts(
+            iroh::EndpointId::from_bytes(&inviter_id).unwrap(),
+            addrs,
+        ))
+        .unwrap();
+
+        let mut invite = make_invite([9u8; 32], inviter_id, &["notes"], FUTURE);
+        invite.inviter_addr_json = tampered;
+        invites.mint(invite.clone()).await.unwrap();
+
+        redeem_invite(
+            redeemer,
+            "bob".into(),
+            invite.encode(),
+            None,
+            SelfEnroll::Refuse,
+            None,
+            bob_store.clone(),
+            None,
+            None,
+        )
+        .await
+        .expect("the redeem succeeds");
+
+        let stored = bob_store
+            .resolve(&inviter_id)
+            .unwrap()
+            .expect("the inviter is paired")
+            .last_addr
+            .expect("a loopback pairing observes a direct path, so a hint is stored");
+
+        assert!(
+            !stored.contains("203.0.113.9"),
+            "the invite's un-reached address must NOT be persisted as a dial target: {stored}"
+        );
+        // And what IS stored is real: it parses, names the inviter, and carries an address.
+        let parsed: iroh::EndpointAddr = serde_json::from_str(&stored).expect("hint parses");
+        assert_eq!(parsed.id.as_bytes(), &inviter_id);
+        assert!(
+            !parsed.addrs.is_empty(),
+            "the observed address is stored, not an empty hint: {stored}"
+        );
+    })
+    .await
+    .expect("observed-hint pairing test timed out");
+}
+
 /// #87 gate: an inviter-side collision on OUR OWN alias must not tell the redeemer anything.
 ///
 /// The first draft interpolated the alias into the refusal reason, so the inviter's private name

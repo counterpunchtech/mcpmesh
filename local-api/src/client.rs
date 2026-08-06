@@ -12,11 +12,12 @@ use crate::protocol::{
     AuditSummaryResult, BackendSpec, BlobFetchCancelParams, BlobFetchCancelResult, BlobFetchParams,
     BlobFetchResult, BlobGrantParams, BlobPublishParams, BlobPublishResult, BlobScopeList, Hello,
     InviteParams, InviteResult, OpenSessionParams, OrgJoinParams, OrgJoinResult, PairParams,
-    PairResult, PeerEndorseParams, PeerEndorseResult, PeerHintClearParams, PeerHintClearResult,
-    PeerIntroduceParams, PeerRemoveParams, PeerRenameParams, PeerServicesParams,
-    PeerServicesResult, RegisterServiceParams, Request, RosterInstallParams, RosterInstallResult,
-    ServiceAllowParams, SetAppMetadataParams, SetNicknameParams, SetRelaysParams, SetRelaysResult,
-    SetRosterUrlParams, StatusResult, StreamFrame, UnregisterServiceParams,
+    PairResult, PeerDiagnosticsParams, PeerDiagnosticsResult, PeerEndorseParams, PeerEndorseResult,
+    PeerHintClearParams, PeerHintClearResult, PeerIntroduceParams, PeerRemoveParams,
+    PeerRenameParams, PeerServicesParams, PeerServicesResult, RegisterServiceParams, Request,
+    RosterInstallParams, RosterInstallResult, ServiceAllowParams, SetAppMetadataParams,
+    SetNicknameParams, SetRelaysParams, SetRelaysResult, SetRosterUrlParams, StatusResult,
+    StreamFrame, UnregisterServiceParams,
 };
 use crate::transport::{connect_local, split_local};
 
@@ -313,6 +314,37 @@ impl ControlClient {
                 subject_user_id,
             }),
             "peer endorse result",
+        )
+        .await
+    }
+
+    /// Dump the durable per-peer state this node carries for `peer` (#140), `api_minor >= 33`.
+    ///
+    /// The persisted dial hint verbatim, whether the DIAL actually uses it, the addresses inside it,
+    /// iroh's own view (`api_minor >= 56`), the pairing stamp and the live reachability row — one
+    /// capture, intended to be run on BOTH ends of a stuck pairing and compared.
+    ///
+    /// **Read-only, but NOT inert.** It probes nothing, dials nothing and writes nothing — but
+    /// reading iroh's view delivers a message to that remote's actor, which resets its ~60s idle
+    /// timer. Polling this keeps remote state alive (a selected path included) that would otherwise
+    /// be reaped.
+    ///
+    /// That matters for the one experiment this method exists to support: #140's step A is "close
+    /// every session, **wait >60s**, then probe". Poll during the wait and you preserve the very
+    /// state you are trying to clear, and get a false negative.
+    ///
+    /// Existed as a verb since 0.35.0 with no typed method here, so an embedder had to hand-build
+    /// the request — which the one embedder who needs it most (a node embedder debugging #140)
+    /// would have to do at exactly the wrong moment.
+    pub async fn peer_diagnostics(
+        &mut self,
+        peer: &str,
+    ) -> Result<PeerDiagnosticsResult, ClientError> {
+        self.request_typed(
+            Request::PeerDiagnostics(PeerDiagnosticsParams {
+                peer: peer.to_string(),
+            }),
+            "peer diagnostics result",
         )
         .await
     }

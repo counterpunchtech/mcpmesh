@@ -1452,6 +1452,28 @@ async fn a_device_restored_from_a_recovery_phrase_is_admitted_by_attestation() {
          several peers files them all under one nickname"
     );
 
+    // #203: the attester's stored hint for the admitter must not be an EMPTY one.
+    //
+    // `attest_to` used to write `EndpointAddr::from(remote_id)` — a hint with no addresses. Being
+    // `Some`, it won the "never downgrade a known hint" fallback and REPLACED whatever proven hint
+    // the peer already had with a useless one. It now stores what the connection observed, and
+    // `None` (relay-only) leaves the existing hint alone.
+    //
+    // Nothing covered this: reverting the write passed the entire pairing suite.
+    let a_principal = format!("eid:{}", a.endpoint_id());
+    let diag = c_ctl
+        .peer_diagnostics(&a_principal)
+        .await
+        .expect("c holds a row for the admitter it just attested to");
+    if let Some(hint) = diag.last_addr.as_deref() {
+        let parsed: iroh::EndpointAddr = serde_json::from_str(hint).expect("a stored hint parses");
+        assert!(
+            !parsed.addrs.is_empty(),
+            "an attestation must not store an ADDRESS-LESS hint — being `Some` it overwrites a \
+             proven one with nothing: {hint}"
+        );
+    }
+
     // a now holds c, as the SAME person: same user_id, same nickname, and b's services.
     let st = a_ctl.status().await.expect("status");
     let c_principal = format!("eid:{}", c.endpoint_id());

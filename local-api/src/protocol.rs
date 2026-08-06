@@ -1090,7 +1090,7 @@ pub struct PeerDiagnosticsResult {
     pub hint_addrs: Vec<String>,
     /// Whether the stored hint actually contributes anything to a dial. `false` with a present
     /// `last_addr` means it is being silently discarded — because it does not parse, because its
-    /// embedded id is a different peer, or (since 0.53.0, #203) because every address in it is one
+    /// embedded id is a different peer, or (since 0.52.1, #203) because every address in it is one
     /// that can never be a QUIC peer and was filtered out. `last_addr` is reported verbatim above,
     /// so comparing it against `hint_addrs` distinguishes the three.
     pub hint_usable: bool,
@@ -1190,11 +1190,12 @@ pub struct PeerHintClearResult {
     pub cleared: usize,
     /// The raw hints removed, verbatim, in the order the devices resolved.
     ///
-    /// **This is the undo.** There is no `peer_hint_set`, and on the pairing this verb targets the
-    /// hint may never be rewritten on its own: `dial_hint::refresh` is the only writer outside
-    /// pairing, and it deliberately declines to store anything for a RELAY-ONLY connection — which
-    /// is the defining property of a stuck pair. Keep this value; re-pairing is otherwise the only
-    /// way back.
+    /// **This is the undo, and since 0.52.2 it is the ONLY one.** There is no `peer_hint_set`, and
+    /// on the pairing this verb targets the hint may never be rewritten on its own: every writer
+    /// now stores only what a connection OBSERVED, and all of them decline to store anything for a
+    /// relay-only connection — which is the defining property of a stuck pair. Re-pairing no longer
+    /// reliably restores it either: the ceremony writes a hint only if it observes a direct path,
+    /// and on a pair that cannot punch it does not. Keep this value.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forgotten: Vec<String>,
 }
