@@ -51,7 +51,7 @@ pub(crate) const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 /// Three steps, because each alone leaves a hole:
 ///
 /// 1. **Strip** every caller-supplied reserved key — `mcpmesh/*` AND
-/// `tech.counterpunch.mcpmesh/*` (#49). Unconditional, both backends.
+///    `tech.counterpunch.mcpmesh/*` (#49). Unconditional, both backends.
 ///    `mcpmesh/service` is the key `select_service` acts on, so this is authorization-relevant.
 /// 2. **Remove an impersonating `io.modelcontextprotocol/clientInfo`** (#189) — one whose `name` is
 ///    written in mcpmesh's own `eid:`/`b64u:` principal grammar. Under MCP 2026-07-28 that key
