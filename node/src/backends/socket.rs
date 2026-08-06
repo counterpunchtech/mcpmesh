@@ -87,26 +87,18 @@ impl SocketBackend {
             .with_context(|| format!("dial socket backend at {}", self.path))?;
 
         if let Some(id) = &identity {
-            // REPLACE-not-merge: a caller-forged
-            // `mcpmesh/peer` must never survive. Guard non-object shapes before indexing
-            // — `Value`'s IndexMut PANICS on a non-object base — building each level:
-            //   * root: a bare array/string/number/bool first frame would panic on the
-            //     `initialize["params"]` write below (reachable:
-            //     select_service's key-absent default forwards even a non-object frame).
-            //     A fresh object discards it; a null root is coerced by IndexMut anyway.
-            //   * params / _meta: absent or non-object → build an empty object.
-            if !initialize.is_object() {
-                initialize = serde_json::json!({});
-            }
-            if !initialize["params"].is_object() {
-                initialize["params"] = serde_json::json!({});
-            }
-            if !initialize["params"]["_meta"].is_object() {
-                initialize["params"]["_meta"] = serde_json::json!({});
-            }
-            // Whole-value overwrite: forged `groups`/`user_id` (authorization-relevant)
-            // are dropped along with a forged `name`, not merged over.
-            initialize["params"]["_meta"]["mcpmesh/peer"] = peer_meta_value(id);
+            // ONE implementation of the identity rule, shared with every later frame (#45 gate).
+            //
+            // This was an inline copy until 0.50.0, and the two had drifted in three ways: it
+            // invented a `params._meta` on a RESPONSE (malformed JSON-RPC), it discarded a batch
+            // wholesale instead of descending it, and it attributed a frame whose `method` was not
+            // a string. Two implementations of one identity rule is precisely the #164 drift class
+            // this file exists to prevent, and the divergence was invisible because only frames
+            // 2..N were tested against `inject_peer`.
+            //
+            // Whole-value overwrite, forged `groups`/`user_id` dropped rather than merged — that
+            // property lives in `inject_peer` now, asserted once.
+            super::inject_peer(&mut initialize, &peer_meta_value(id), 0);
         }
         // Built once and handed to the pump so a LATER frame that turns out to be the real
         // `initialize` gets the SAME authoritative value (#164). One constructor, so the
@@ -443,13 +435,120 @@ mod tests {
                 json!(true),
                 "and so must a nested non-reserved value: {meta}"
             );
-            // The gate is `method == "initialize"`, and this frame is a `tools/call`. Without this
-            // assertion, widening the gate to inject on EVERY frame was caught only by a helper
-            // unit test — the call site stayed green (#164 gate). Attributing a `tools/call` as
-            // though it were a handshake would tell a server the session re-identified mid-stream.
+            // #45 ask 2, AT THE CALL SITE.
+            //
+            // This assertion was the inverse until 0.50.0, and the #164 gate that wrote it gave a
+            // reason worth answering rather than deleting: *"Attributing a `tools/call` as though it
+            // were a handshake would tell a server the session re-identified mid-stream."*
+            //
+            // The answer: the injected value is CONSTANT for the life of the session. It is derived
+            // once, from the TLS-authenticated endpoint of this connection (`peer_meta_value` is
+            // called on one `PeerIdentity` and the result handed to the pump), and the identity
+            // behind a QUIC connection cannot change under it. So a backend sees the same object on
+            // every frame — a restatement, not a re-identification. What would signal
+            // re-identification is a value that CHANGES mid-stream, which nothing here can produce.
+            //
+            // The objection was correct about the risk it named and did not apply to the constant
+            // case; it is recorded here rather than removed, because the gate was also right that
+            // this assertion is the only thing standing between the widening and a green suite.
+            //
+            // The identity is `PeerIdentity { name: "bob", .. }` from the session setup, so this
+            // also pins that the value forwarded is the authoritative one rather than an echo.
+            assert_eq!(
+                meta["mcpmesh/peer"]["name"], "bob",
+                "an ordinary request must reach the backend authoritatively attributed: {meta}"
+            );
             assert!(
-                meta.get("mcpmesh/peer").is_none(),
-                "a non-initialize frame must be stripped and NOT attributed: {meta}"
+                meta["mcpmesh/peer"]["eid"].is_string(),
+                "and carry the stable device principal, not just a display name: {meta}"
+            );
+
+            drop(client);
+            let _ = session.await.unwrap();
+        })
+        .await
+        .expect("test timed out");
+    }
+
+    /// #45 gate: a NOTIFICATION and a BATCH element are attributed through the REAL backend, not
+    /// only in a helper unit test.
+    ///
+    /// The gate measured it: deleting batch descent, or skipping notifications, each failed exactly
+    /// ONE test — a `sanitize_caller_frame` unit test — while the whole socket path stayed green.
+    /// Those are the two behaviours 0.50.0 newly introduced, so they are the two least defensible
+    /// to leave pinned only at the helper.
+    #[tokio::test]
+    async fn notifications_and_batch_elements_are_attributed_through_the_backend() {
+        timeout(Duration::from_secs(30), async {
+            let dir = tempfile::tempdir().unwrap();
+            let sock = dir.path().join("server.sock");
+            let listener = UnixListener::bind(&sock).unwrap();
+            // init + notification + batch = 3 frames reach the stub.
+            let stub = tokio::spawn(stub_collecting(listener, 3));
+
+            let (server_io, client_io) = duplex(64 * 1024);
+            let (sr, sw) = split(server_io);
+            let backend_transport = mcpmesh_net::transport::NdjsonTransport::new(sr, sw, MAX_FRAME);
+            let (cr, cw) = split(client_io);
+            let mut client = mcpmesh_net::transport::NdjsonTransport::new(cr, cw, MAX_FRAME);
+
+            let backend = SocketBackend {
+                path: sock.to_str().unwrap().to_string(),
+                service: "test".into(),
+                audit: crate::audit::AuditSink::disabled(),
+                limiter: crate::limits::RateLimiter::unlimited_shared(),
+            };
+            let identity = Some(PeerIdentity {
+                endpoint: [0u8; 32].into(),
+                name: "bob".into(),
+                user_id: None,
+                groups: vec![],
+            });
+            let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
+            let session =
+                tokio::spawn(
+                    async move { backend.run_over(identity, init, backend_transport).await },
+                );
+            let _ = client.recv_value().await.unwrap().unwrap();
+
+            // A notification: no `id`, and it carries a forged peer to prove REPLACEMENT.
+            client
+                .send_value(json!({
+                    "jsonrpc": "2.0", "method": "notifications/progress",
+                    "params": {"_meta": {"mcpmesh/peer": {"name": "attacker"}}, "pct": 50}
+                }))
+                .await
+                .unwrap();
+
+            // A batch whose element is an ordinary request.
+            client
+                .send_value(json!([
+                    {"jsonrpc":"2.0","id":2,"method":"tools/call",
+                     "params":{"_meta":{"mcpmesh/peer":{"name":"attacker"}}}}
+                ]))
+                .await
+                .unwrap();
+
+            let seen = stub.await.unwrap();
+            let note = seen
+                .iter()
+                .find(|f| f["method"] == "notifications/progress")
+                .expect("the notification reached the backend");
+            assert_eq!(
+                note["params"]["_meta"]["mcpmesh/peer"]["name"], "bob",
+                "a notification carries no `id` and is still a request — it must be attributed, \
+                 and the forged value replaced: {note}"
+            );
+            assert_eq!(note["params"]["pct"], 50, "its arguments survive: {note}");
+
+            let batch = seen
+                .iter()
+                .find(|f| f.is_array())
+                .expect("the batch reached the backend");
+            assert_eq!(
+                batch[0]["params"]["_meta"]["mcpmesh/peer"]["name"], "bob",
+                "an ordinary request inside a batch must be attributed through the real backend, \
+                 not only in a helper test: {batch}"
             );
 
             drop(client);
@@ -514,13 +613,22 @@ mod tests {
             }
 
             let seen = stub.await.unwrap();
-            // The two `initialize` frames must still have been given the authoritative identity —
-            // a non-object `params`/`_meta` is REPLACED, never merged into.
+            // An odd-shaped frame is attributed when there is somewhere to put the annotation —
+            // a malformed `_meta` inside an OBJECT params is replaced, since `_meta` is protocol
+            // metadata. POSITIONAL params are left intact and un-attributed instead (#45 gate):
+            // they are the caller's arguments, and this daemon pumps rather than rewrites.
             for f in seen.iter().filter(|f| f["method"] == "initialize") {
-                assert_eq!(
-                    f["params"]["_meta"]["mcpmesh/peer"]["name"], "bob",
-                    "an odd-shaped initialize must still be attributed: {f}"
-                );
+                if f["params"].is_array() || f["params"].is_string() {
+                    assert!(
+                        f["params"]["_meta"].is_null(),
+                        "positional params must reach the backend intact, not replaced: {f}"
+                    );
+                } else {
+                    assert_eq!(
+                        f["params"]["_meta"]["mcpmesh/peer"]["name"], "bob",
+                        "an object-params initialize must still be attributed: {f}"
+                    );
+                }
             }
 
             drop(client);
@@ -731,8 +839,8 @@ mod tests {
                 groups: vec![],
             });
 
-            // A bare JSON array as the first frame — `initialize["params"]` would panic
-            // without the root guard.
+            // A bare JSON array as the first frame — indexing it as an object would panic without
+            // a guard, which is what this test has always existed to prove.
             let initialize = json!([1, 2, 3]);
 
             let session = tokio::spawn(async move {
@@ -755,11 +863,21 @@ mod tests {
             let call_resp = client.recv_value().await.unwrap().unwrap();
             assert_eq!(call_resp["result"]["content"][0]["text"], "fresh object");
 
-            // The bare array was discarded; a fresh object carries only the injected id.
+            // The bare array reaches the backend UNTOUCHED (#45 gate).
+            //
+            // It used to be discarded and replaced with a fabricated `{"params":{"_meta":{...}}}` —
+            // a frame with no `method` and no `id`, invented by mcpmesh out of nothing, that no
+            // caller sent. Since frame 1 now shares `inject_peer` with every other frame, an array
+            // root is treated as a JSON-RPC batch: descended, and its elements carry no `method`,
+            // so nothing is attributed and nothing is destroyed. The backend gets the malformed
+            // frame the caller actually sent and rejects it, which is the honest outcome for a
+            // daemon that pumps rather than interprets.
             let observed_init = stub.await.unwrap();
             assert_eq!(
-                observed_init["params"]["_meta"]["mcpmesh/peer"]["name"],
-                "bob"
+                observed_init,
+                json!([1, 2, 3]),
+                "a bare-array first frame must pass through, not be replaced by a fabricated one: \
+                 {observed_init}"
             );
 
             drop(client);

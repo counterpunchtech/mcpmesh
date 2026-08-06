@@ -12,9 +12,111 @@ pub use mcpmesh_local_api::{AuditKind, AuditRecord};
 /// stored — only this digest — because callers' inputs can be sensitive. Deterministic within a
 /// process for a given `params` value (serde_json serialization). `params` may be `Value::Null`
 /// (a parameterless method) — that hashes the four bytes `null`, a stable non-empty digest.
+///
+/// **`_meta["mcpmesh/peer"]` is excluded** (#45 gate). The daemon writes the authenticated caller
+/// into `_meta` before this runs, so hashing it verbatim would fold the caller's identity into a
+/// field documented as "a digest of the arguments": two peers making an identical call would no
+/// longer collide, and renaming a peer or changing its groups would change the hash of arguments
+/// nobody touched. It is the daemon's own annotation, not the caller's input.
+///
+/// Everything else in `_meta` still hashes — an `app/trace-id` a caller sent IS caller input.
 pub fn args_hash(params: &Value) -> String {
-    let bytes = serde_json::to_vec(params).unwrap_or_default();
+    let bytes = match params.get("_meta").and_then(Value::as_object) {
+        // The common case allocates nothing: no `_meta`, or one we did not write into.
+        Some(meta) if meta.contains_key("mcpmesh/peer") => {
+            let mut owned = params.clone();
+            if let Some(m) = owned.get_mut("_meta").and_then(Value::as_object_mut) {
+                m.remove("mcpmesh/peer");
+                // An `_meta` that held ONLY our annotation is dropped entirely, so the digest
+                // matches a request that arrived with no `_meta` at all — which is what the caller
+                // actually sent.
+                if m.is_empty() {
+                    owned.as_object_mut().map(|o| o.remove("_meta"));
+                }
+            }
+            serde_json::to_vec(&owned).unwrap_or_default()
+        }
+        _ => serde_json::to_vec(params).unwrap_or_default(),
+    };
     format!("blake3:{}", blake3::hash(&bytes).to_hex())
+}
+
+#[cfg(test)]
+mod args_hash_tests {
+    use super::args_hash;
+    use serde_json::json;
+
+    /// #45 gate: the digest is of the CALLER'S arguments, and the daemon's own identity annotation
+    /// must not move it.
+    ///
+    /// Since 0.50.0 `_meta["mcpmesh/peer"]` is written onto every forwarded request, and this hash
+    /// is computed after that. Folding it in would make two peers issuing an identical call produce
+    /// different digests, and would change the digest of untouched arguments whenever a peer is
+    /// renamed or its groups change — in a field `docs/local-protocol.md` calls "a digest of the
+    /// arguments". `AuditRecord` rides the `subscribe` stream, so that is published vocabulary.
+    #[test]
+    fn the_injected_caller_identity_does_not_change_the_args_hash() {
+        let bare = json!({"name": "read_file", "arguments": {"path": "/x"}});
+        let expected = args_hash(&bare);
+
+        let with_peer = json!({
+            "name": "read_file",
+            "arguments": {"path": "/x"},
+            "_meta": {"mcpmesh/peer": {"eid": "eid:aa", "name": "alice", "groups": ["eng"]}}
+        });
+        assert_eq!(
+            args_hash(&with_peer),
+            expected,
+            "the same call from any peer must hash identically"
+        );
+
+        // Two DIFFERENT callers, same arguments, same digest — the property that makes the field
+        // usable for correlating calls at all.
+        let other_peer = json!({
+            "name": "read_file",
+            "arguments": {"path": "/x"},
+            "_meta": {"mcpmesh/peer": {"eid": "eid:bb", "name": "bob", "groups": []}}
+        });
+        assert_eq!(args_hash(&other_peer), expected);
+    }
+
+    /// But everything the CALLER put in `_meta` still hashes — it is their input.
+    #[test]
+    fn caller_supplied_meta_still_affects_the_args_hash() {
+        let a = json!({"arguments": {}, "_meta": {"app/trace-id": "one"}});
+        let b = json!({"arguments": {}, "_meta": {"app/trace-id": "two"}});
+        assert_ne!(
+            args_hash(&a),
+            args_hash(&b),
+            "a caller-supplied `_meta` value is caller input and must be covered by the digest"
+        );
+
+        // And removing only OUR key leaves theirs in place rather than dropping `_meta` wholesale.
+        let mixed = json!({"arguments": {},
+                           "_meta": {"app/trace-id": "one", "mcpmesh/peer": {"eid": "eid:aa"}}});
+        assert_eq!(
+            args_hash(&mixed),
+            args_hash(&a),
+            "stripping our annotation must leave the caller's other `_meta` keys hashed: {mixed}"
+        );
+    }
+
+    /// Shapes that must not panic or silently change meaning: no `_meta`, a non-object `_meta`, a
+    /// non-object `params`, and null.
+    #[test]
+    fn odd_params_shapes_hash_without_panicking() {
+        for v in [
+            json!(null),
+            json!("a string"),
+            json!([1, 2, 3]),
+            json!({"_meta": "not an object"}),
+            json!({"_meta": null}),
+            json!({}),
+        ] {
+            let h = args_hash(&v);
+            assert!(h.starts_with("blake3:"), "{v} -> {h}");
+        }
+    }
 }
 
 /// The current wall-clock instant as an RFC3339 UTC millisecond string (the record `ts`). Uses
