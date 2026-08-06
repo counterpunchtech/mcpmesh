@@ -1090,30 +1090,44 @@ Everything else a fresh identity lacks is derived at runtime.
 {"nickname": "jetson", "principal": "eid:9f2k…", "paired_at": "1753600000",
  "last_addr": "{\"id\":\"…\",\"addrs\":[…]}", "hint_addrs": ["192.168.1.50:4433"],
  "hint_usable": true,
- "known_addrs": [{"addr": "relay https://use1.relay:443", "active": true},
+ "known_addrs": [{"addr": "relay https://use1.relay", "active": true},
                  {"addr": "192.168.1.77:4433", "active": false}],
  "hint_addrs_unknown_to_iroh": ["192.168.1.50:4433"],
- "iroh_addrs_not_in_hint": ["192.168.1.77:4433", "relay https://use1.relay:443"],
+ "iroh_addrs_not_in_hint": ["192.168.1.77:4433", "relay https://use1.relay"],
  "reachability": {"name": "jetson", "reachable": true, "path": {"kind": "relay"}, …}}
 ```
 
 **`known_addrs` and the two difference lists are IROH's side of the capture** (`api_minor >= 56`).
 Everything else here describes what *this node stored*; these describe what iroh made of it, read
-straight off its remote map. The example above is the #140 shape: the stored hint names an address
-iroh no longer holds, iroh holds a direct address it is **not** using, and the active path is the
-relay.
+straight off its remote map. The example above is the shape #140 is looking for: the stored hint
+names an address iroh no longer holds, iroh holds a direct address it is **not** using, and the
+active path is the relay. Read the `active` caveat below before concluding from it.
 
-- `known_addrs: null` means iroh has **no entry at all** for this peer — expected on a freshly
-  restarted daemon, and NOT the same as an entry holding no addresses (`[]`).
-- `active` is iroh's own usage flag. A direct address present but `active: false` alongside an active
-  relay is the finding, not the noise.
+- **`known_addrs` ABSENT** (the key is omitted — never `null`; test for presence, not for null)
+  means iroh holds no remote state for this peer *right now*. iroh reaps a remote's state about 60
+  seconds after the last connection to it closes, so this is the normal answer both for a peer never
+  dialled **and** for one talked to a few minutes ago. It is not "iroh has never heard of this peer",
+  and on a question about durability over time that misreading matters.
+- **`known_addrs: []`** is different: iroh has an entry and holds no address in it.
+- `active` is iroh's own flag, and it is **one bit covering three states**. iroh reports active only
+  for an open path; "attempted hole-punching and it did not work", "not yet attempted", and
+  "inactive" all render `false`. So an idle direct address beside an active relay is consistent with
+  the selected-path hypothesis **and** equally consistent with an ordinary failed hole-punch — a NAT
+  diagnosis, the opposite conclusion. Read it as "this is what is carrying traffic", nothing more.
 - The two difference lists are **inferred by set difference**, not read: iroh 1.0.3 exposes no
   provenance for an address, so this cannot say an address *came from* the hint — only that it is in
-  one list and not the other. `hint_addrs_unknown_to_iroh` is dead weight #124's refresh amends but
-  never removes; `iroh_addrs_not_in_hint` is what discovery contributed.
+  one list and not the other. **Both are empty whenever `known_addrs` is absent**, because there is
+  no view to compare against; reporting the whole hint as unknown would call a current hint stale on
+  every idle daemon.
+- `hint_addrs_unknown_to_iroh` is not accumulated cruft. The hint is written **whole** — `#124`
+  replaces the stored value with one built from the live connection's open paths — so these are
+  addresses that were real at the last successful connection and are absent from iroh's view now.
 
-Like the rest of this verb it is **read-only**: `remote_info` is a point read that does not dial,
-probe, or trigger an address lookup, so a capture cannot perturb the reproduction it is observing.
+**Read-only, with one caveat stated rather than glossed.** `remote_info` is a point read: it does not
+dial, probe, or trigger an address lookup. It does, however, deliver a message to iroh's per-remote
+actor, which resets that actor's ~60s idle timer — so polling this verb keeps remote state (including
+a selected path) alive that would otherwise have been reaped. If you are deliberately clearing path
+state by closing every connection, do not poll this while you wait.
 
 `hint_usable` is the field to read first. A stored hint that does not parse, or whose embedded
 endpoint id is a *different* peer, is silently discarded on every dial — the node behaves as though

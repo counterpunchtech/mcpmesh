@@ -1195,9 +1195,10 @@ fn run_peer_state(peer: String, json: bool) -> anyhow::Result<()> {
         // diff two comma-separated lists by eye.
         match &d.known_addrs {
             None => println!(
-                "iroh knows: (no entry) — iroh has never heard of this peer. Expected on a freshly \
-                 restarted daemon that has not dialled it yet; NOT the same as knowing it and \
-                 holding no address."
+                "iroh knows: (no entry) — iroh holds no remote state for this peer right now. It \
+                 reaps that state ~60s after the last connection closes, so this is the normal \
+                 answer both for a peer never dialled AND for one talked to minutes ago. The two \
+                 comparison lines below are omitted: there is no view to compare the hint against."
             ),
             Some(known) if known.is_empty() => println!(
                 "iroh knows: (none) — iroh has an entry for this peer and no address in it"
@@ -1222,24 +1223,25 @@ fn run_peer_state(peer: String, json: bool) -> anyhow::Result<()> {
                     .any(|k| !k.active && !k.addr.starts_with("relay "));
                 if active_relay && idle_direct {
                     println!(
-                        "            RELAY ACTIVE WITH A DIRECT ADDRESS SITTING IDLE — iroh holds \
-                         a direct candidate and is not using it. This is the #140 shape."
+                        "            relay active, direct address present but not carrying \
+                         traffic. Consistent with #140 — and equally consistent with an ordinary \
+                         failed hole-punch: iroh renders 'attempted and unusable' and 'not yet \
+                         attempted' identically here, so this one bit cannot tell them apart."
                     );
                 }
             }
         }
         if !d.hint_addrs_unknown_to_iroh.is_empty() {
             println!(
-                "  stale:    {} — in this node's stored hint, NOT in iroh's view. #124 refreshes \
-                 the hint but never removes an address from it, so a peer that changed networks \
-                 accumulates these.",
+                "  not held: {} — in this node's stored hint, NOT in iroh's current view. The hint \
+                 is written whole from the last connection's open paths, so these were real then \
+                 and are absent now.",
                 d.hint_addrs_unknown_to_iroh.join(", ")
             );
         }
         if !d.iroh_addrs_not_in_hint.is_empty() {
             println!(
-                "  found:    {} — in iroh's view, NOT in the stored hint. Discovery contributed \
-                 these.",
+                "  extra:    {} — in iroh's view, NOT named by the stored hint.",
                 d.iroh_addrs_not_in_hint.join(", ")
             );
         }
