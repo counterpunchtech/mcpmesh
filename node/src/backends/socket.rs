@@ -443,13 +443,22 @@ mod tests {
                 json!(true),
                 "and so must a nested non-reserved value: {meta}"
             );
-            // The gate is `method == "initialize"`, and this frame is a `tools/call`. Without this
-            // assertion, widening the gate to inject on EVERY frame was caught only by a helper
-            // unit test — the call site stayed green (#164 gate). Attributing a `tools/call` as
-            // though it were a handshake would tell a server the session re-identified mid-stream.
+            // #45 ask 2, AT THE CALL SITE. This assertion was written inverted by the #164 gate,
+            // which foresaw exactly this widening and noted that changing it would otherwise be
+            // caught only by a helper unit test while the real socket path stayed green. It was
+            // right, it caught this change, and it is now the test that holds the new rule through
+            // the whole backend: a `tools/call` reaching a real UDS server carries the
+            // AUTHENTICATED caller, not the one the caller asked for.
+            //
+            // The identity is `PeerIdentity { name: "bob", .. }` from the session setup, so this
+            // also pins that the value forwarded is the authoritative one rather than an echo.
+            assert_eq!(
+                meta["mcpmesh/peer"]["name"], "bob",
+                "an ordinary request must reach the backend authoritatively attributed: {meta}"
+            );
             assert!(
-                meta.get("mcpmesh/peer").is_none(),
-                "a non-initialize frame must be stripped and NOT attributed: {meta}"
+                meta["mcpmesh/peer"]["eid"].is_string(),
+                "and carry the stable device principal, not just a display name: {meta}"
             );
 
             drop(client);

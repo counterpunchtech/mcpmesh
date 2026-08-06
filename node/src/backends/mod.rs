@@ -82,9 +82,27 @@ fn sanitize_caller_frame(frame: &mut Value, peer_meta: Option<&Value>) -> bool {
     impersonating
 }
 
-/// Attribute whichever frame is really the handshake, descending a JSON-RPC batch.
+/// Stamp the authenticated caller onto every request the backend will see, descending a JSON-RPC
+/// batch.
 ///
-/// A top-level array has no `method`, so an array-wrapped `initialize` was neither stripped nor
+/// **Every frame carrying a `method`, not just `initialize` (#45 ask 2).** Until 0.50.0 this
+/// returned early for anything else, which was correct only while MCP guaranteed a session opened
+/// with a handshake. Under `2026-07-28` there is no `initialize` — the first frame is an ordinary
+/// request and `_meta` rides all of them — so a served backend could not identify its caller at all.
+///
+/// That gap was fail-closed rather than forgeable, and the distinction is worth keeping straight:
+/// [`sanitize_caller_frame`] strips reserved keys from EVERY frame and always did, so a caller could
+/// never supply an identity mcpmesh had not vouched for. The backend saw nothing, not something
+/// attacker-controlled.
+///
+/// **The strip runs before this, and that ordering is the security property.** Injecting first would
+/// let a caller's forged `mcpmesh/peer` survive on any frame the strip then failed to reach.
+///
+/// A frame with NO `method` is left alone: a caller→backend response (to a server-initiated request,
+/// #91) carries `id` + `result`/`error` and no `params`, and inventing a `params` object on one
+/// would be malformed JSON-RPC.
+///
+/// A top-level array has no `method`, so an array-wrapped request was neither stripped nor
 /// attributed — the strip's own batch bypass, on the injection side (#164 gate). Depth-bounded for
 /// the same reason as [`mcpmesh_net::service::strip_reserved_meta`].
 fn inject_peer(frame: &mut Value, peer: &Value, depth: usize) {
@@ -96,11 +114,11 @@ fn inject_peer(frame: &mut Value, peer: &Value, depth: usize) {
         }
         return;
     }
-    if frame.get("method").and_then(Value::as_str) != Some("initialize") {
+    if !frame.get("method").is_some_and(Value::is_string) {
         return;
     }
-    // No `!frame.is_object()` guard: only an object can carry `method == "initialize"`, and the
-    // check above already returned for everything else. `params`/`_meta` still need theirs.
+    // No `!frame.is_object()` guard: only an object can carry a `method`, and the check above
+    // already returned for everything else. `params`/`_meta` still need theirs.
     if !frame["params"].is_object() {
         frame["params"] = serde_json::json!({});
     }
@@ -450,20 +468,49 @@ mod tests {
 
     /// #164: the injection targets the frame whose METHOD is `initialize`, not a positional guess.
     #[test]
-    fn the_authoritative_peer_lands_on_the_real_initialize_only() {
+    fn the_authoritative_peer_lands_on_every_request_not_only_the_handshake() {
         let peer = json!({"eid":"eid:aa","name":"bob","user_id":null,"groups":[]});
 
-        // A non-initialize frame is stripped but NOT given an identity — inventing one would
-        // attribute a `tools/call` as though it were a handshake.
+        // #45 ask 2: a non-`initialize` request is attributed too. Until 0.50.0 it was stripped and
+        // left BARE, which was correct only while MCP guaranteed a session opened with a handshake
+        // — under 2026-07-28 there is none, so the backend could not identify its caller at all.
+        //
+        // The assertion is REPLACEMENT, not presence. A test that only checked the key exists would
+        // pass on an implementation that injects BEFORE stripping, which would ship the caller's
+        // forged value on every frame the strip later failed to reach.
         let mut call = json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
-                              "params":{"_meta":{"mcpmesh/peer":{"name":"attacker"}}}});
+                              "params":{"_meta":{"mcpmesh/peer":
+                                  {"name":"attacker","groups":["admin"],"user_id":"root"}}}});
         let _ = sanitize_caller_frame(&mut call, Some(&peer));
-        assert!(
-            call["params"]["_meta"].get("mcpmesh/peer").is_none(),
-            "a forged peer on a non-initialize frame is stripped and NOT replaced: {call}"
+        assert_eq!(
+            call["params"]["_meta"]["mcpmesh/peer"], peer,
+            "a forged peer on an ordinary request is REPLACED with the authenticated one, \
+             whole-value: {call}"
         );
 
-        // The real handshake gets the authoritative value, whole-value.
+        // A NOTIFICATION (no `id`) is a request too and carries `_meta` under 2026-07-28.
+        let mut note = json!({"jsonrpc":"2.0","method":"notifications/progress","params":{}});
+        let _ = sanitize_caller_frame(&mut note, Some(&peer));
+        assert_eq!(note["params"]["_meta"]["mcpmesh/peer"], peer, "{note}");
+
+        // A request with NO params at all gets a well-formed object rather than a scalar overwrite.
+        let mut bare = json!({"jsonrpc":"2.0","id":9,"method":"ping"});
+        let _ = sanitize_caller_frame(&mut bare, Some(&peer));
+        assert_eq!(bare["params"]["_meta"]["mcpmesh/peer"], peer, "{bare}");
+
+        // A RESPONSE has no `method` and must be left alone: it carries `id` + `result`, and
+        // inventing a `params` object on one would be malformed JSON-RPC. This is the guard that
+        // keeps "every frame" from meaning literally every frame.
+        let mut resp = json!({"jsonrpc":"2.0","id":3,"result":{"ok":true}});
+        let before = resp.clone();
+        let _ = sanitize_caller_frame(&mut resp, Some(&peer));
+        assert_eq!(
+            resp, before,
+            "a caller→backend response (#91's push direction) is not a request and gains nothing: \
+             {resp}"
+        );
+
+        // The legacy handshake is unchanged.
         let mut init = json!({"jsonrpc":"2.0","id":2,"method":"initialize",
                               "params":{"_meta":{"mcpmesh/peer":
                                   {"name":"attacker","groups":["admin"],"user_id":"root"}}}});
@@ -587,9 +634,10 @@ mod tests {
             batch[0]["params"]["_meta"].get("mcpmesh/service").is_none(),
             "and a forged mcpmesh/service inside a batch must be stripped: {batch}"
         );
-        assert!(
-            batch[1]["params"]["_meta"].get("mcpmesh/peer").is_none(),
-            "a non-initialize batch element is stripped and NOT attributed: {batch}"
+        assert_eq!(
+            batch[1]["params"]["_meta"]["mcpmesh/peer"], peer,
+            "since #45 ask 2 an ordinary request inside a batch is attributed too — and the forged \
+             value is REPLACED, not merged: {batch}"
         );
         assert_eq!(
             batch[0]["params"]["_meta"]["app/keep"], "yes",
