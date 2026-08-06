@@ -712,6 +712,96 @@ async fn a_withdrawn_blob_stays_refused_over_the_wire_after_a_republish_attempt(
 /// 2. With the same dead publisher and a live alternate, it succeeds — and the bytes BLAKE3-verify
 ///    against the ORIGINAL source, so the fallback served the same blob rather than merely
 ///    something.
+/// #83 follow-up: an UNREACHABLE first source must not cost a full `DIAL_TIMEOUT` before the live
+/// alternate is tried.
+///
+/// This is the property the hedging exists for, and the only one that distinguishes it from the
+/// sequential walk it replaced — every other assertion in this file passes either way. #83 was left
+/// open on exactly this: *"if a room of eight means walking eight timeouts behind a dead publisher,
+/// a bounded parallel race is the obvious follow-up."* At `DIAL_TIMEOUT` = 20s, eight sources is
+/// 160 seconds of an indeterminate progress bar that a user cannot tell from a hang.
+///
+/// The publisher's address is a BLACKHOLE (`127.0.0.1:1` with a live endpoint's id): QUIC is UDP,
+/// so packets go nowhere and the dial hangs for the full timeout rather than being refused. Same
+/// device `reach.rs` uses to make a probe hang deterministically.
+///
+/// **The margin is 20x, not a stopwatch.** Hedging starts the alternate after `HEDGE_DELAY` (1s);
+/// the sequential walk starts it after `DIAL_TIMEOUT` (20s). Asserting "under 10s" cannot be
+/// flake-sensitive at that separation, and it fails unambiguously if hedging is removed — which is
+/// the point, since a timing assertion with a tight margin measures the machine rather than the
+/// code, and this repo has twice been misled by exactly that.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreachable_first_source_does_not_cost_a_full_dial_timeout() {
+    timeout(Duration::from_secs(90), async {
+        let root = SigningKey::from_bytes(&[9u8; 32]);
+        let pub_ep = provider_endpoint().await;
+        let relay_ep = provider_endpoint().await;
+        let caller_ep = caller_endpoint().await;
+        let (relay_id, caller_id) = (*relay_ep.id().as_bytes(), *caller_ep.id().as_bytes());
+
+        let pub_roster = Arc::new(RosterGate::empty());
+        let pub_view = mint_view(&root, 1, &[(relay_id, "bob"), (caller_id, "alice")], &[]);
+        let (pub_mesh, pub_dir) = serving_provider(pub_ep.clone(), pub_roster, pub_view).await;
+
+        let relay_roster = Arc::new(RosterGate::empty());
+        let relay_view = mint_view(&root, 1, &[(caller_id, "alice")], &[]);
+        let (relay_mesh, _relay_dir) =
+            serving_provider(relay_ep.clone(), relay_roster, relay_view).await;
+
+        seed_addr(&relay_ep, &pub_ep);
+        seed_addr(&caller_ep, &relay_ep);
+
+        let src = pub_dir.path().join("shared.bin");
+        let payload: Vec<u8> = (0..64_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&src, &payload).unwrap();
+        let source_hash = blake3::hash(&payload);
+        let publisher = pub_mesh.app_blobs().await.unwrap();
+        let (ticket, hash_hex) = publisher.publish_scope("room", &src).await.unwrap();
+        publisher.grant("room", "alice").unwrap();
+        publisher.grant("room", "bob").unwrap();
+
+        // The recipient takes a copy and re-serves it, as in the fallback test above.
+        let relay_blobs = relay_mesh.app_blobs().await.unwrap();
+        relay_blobs.fetch(&ticket).await.unwrap();
+        relay_blobs.grant("room", "alice").unwrap();
+        relay_blobs.republish("room", &hash_hex).await.unwrap();
+
+        // The publisher's laptop closes. Its id stays valid; its address now goes nowhere.
+        pub_ep.close().await;
+        drop(pub_mesh);
+        let blackhole = iroh::EndpointAddr::from_parts(
+            pub_ep.id(),
+            [iroh::TransportAddr::Ip("127.0.0.1:1".parse().unwrap())],
+        );
+
+        let cdir = tempfile::tempdir().unwrap();
+        let caller = AppBlobs::open_fetcher(cdir.path().join("c"), caller_ep.clone())
+            .await
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let got_hash = caller
+            .fetch_from(&ticket, &[blackhole, relay_ep.addr()])
+            .await
+            .expect("the live recipient must serve it despite the dead publisher");
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            blake3::hash(&caller.read_bytes(got_hash).await.unwrap()),
+            source_hash,
+            "the alternate must serve the SAME blob"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the alternate must be raced against the dead publisher, not started after its \
+             20s DIAL_TIMEOUT expires — took {elapsed:?}. A room of eight behind a sleeping \
+             publisher is what #83 was left open on.",
+        );
+    })
+    .await
+    .expect("hedged blob fetch test timed out");
+}
+
 #[tokio::test]
 async fn a_fetch_falls_back_to_a_recipient_when_the_publisher_is_gone() {
     timeout(Duration::from_secs(180), async {

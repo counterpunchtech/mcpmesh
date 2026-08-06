@@ -327,6 +327,105 @@ pub struct BlobGcStats {
 /// an unbounded wait, which is not on offer.
 const SOURCE_TRANSFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// How long a source gets to answer before the NEXT one is started alongside it (#83 follow-up).
+///
+/// The escape from `DIAL_TIMEOUT` (20s): trying eight sources strictly in turn behind a sleeping
+/// publisher costs 160 seconds, and a user watching an indeterminate bar cannot tell that from a
+/// hang. Hedging starts the next source after a second instead of after a timeout.
+///
+/// It is a small fraction of `DIAL_TIMEOUT` on purpose — that is the wait being escaped — but long
+/// enough that a healthy LAN or relay dial finishes first, which is what keeps the common case free
+/// of abandoned work.
+const HEDGE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How many dials may be outstanding at once (#83 follow-up).
+///
+/// The bound on work inflicted on OTHER machines. #83's own review declined a blind parallel race
+/// for exactly this reason — "every abandoned dial is work on someone else's machine" — and with
+/// [`MAX_BLOB_SOURCES`] at 32 an uncapped race is a 32x amplifier any caller can trigger by being
+/// generous with `from`. Hedging answers the objection; this bounds what is left of it.
+///
+/// [`MAX_BLOB_SOURCES`]: mcpmesh_local_api::MAX_BLOB_SOURCES
+const MAX_IN_FLIGHT_DIALS: usize = 3;
+
+/// The hedged-dial SCHEDULE, with no I/O in it (#83 follow-up).
+///
+/// Pure so the rule is testable without waiting real seconds. The alternative — asserting on a live
+/// racer — measures the machine rather than the code, and this repo has twice produced confident
+/// and wrong conclusions from exactly that.
+///
+/// It owns the in-flight set rather than just counting it, which is not bookkeeping pedantry: when
+/// one dial wins, its rivals are dropped, and those sources have to go back in the queue. The first
+/// cut of this tracked an in-flight COUNT, so a winning dial silently retired every source racing
+/// alongside it — and if that winner's TRANSFER then failed (the ordinary room-of-eight case, where
+/// only some recipients republished the hash), the fetch resumed past two or three live sources it
+/// had already connected to and thrown away. Strictly worse than the sequential walk it replaced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HedgePlan {
+    total: usize,
+    /// The next source never yet started. Sources are preferred in the caller's order.
+    next: usize,
+    /// Started, then abandoned when someone else won — retried BEFORE advancing `next`, since they
+    /// are known-reachable-or-not sooner than an untouched source.
+    requeued: Vec<usize>,
+    /// Indices currently dialling.
+    in_flight: Vec<usize>,
+}
+
+impl HedgePlan {
+    pub(crate) fn new(total: usize) -> Self {
+        Self {
+            total,
+            next: 0,
+            requeued: Vec::new(),
+            in_flight: Vec::new(),
+        }
+    }
+
+    /// May another source be started right now? A source is left AND we are under the cap.
+    pub(crate) fn may_start(&self) -> bool {
+        (!self.requeued.is_empty() || self.next < self.total)
+            && self.in_flight.len() < MAX_IN_FLIGHT_DIALS
+    }
+
+    /// Start the next source, returning its index — `None` if [`may_start`](Self::may_start) is
+    /// false. Returning the index rather than letting the caller keep its own counter is what stops
+    /// the plan's idea of what is running from drifting from what actually is.
+    pub(crate) fn start(&mut self) -> Option<usize> {
+        if !self.may_start() {
+            return None;
+        }
+        let idx = self.requeued.pop().unwrap_or_else(|| {
+            let i = self.next;
+            self.next += 1;
+            i
+        });
+        self.in_flight.push(idx);
+        Some(idx)
+    }
+
+    /// A dial finished on its own (it failed, or it won). Retires the source: a failed dial is not
+    /// retried, and a winner is being handed to the transfer.
+    pub(crate) fn finished(&mut self, idx: usize) {
+        self.in_flight.retain(|&i| i != idx);
+    }
+
+    /// `winner`'s rivals were dropped mid-dial. Put them BACK, so a later round can try them.
+    ///
+    /// Without this a winning dial retires every source racing it, and a failed transfer resumes
+    /// past sources that were seconds from connecting.
+    pub(crate) fn abandon_rivals(&mut self, winner: usize) {
+        let rivals = std::mem::take(&mut self.in_flight);
+        self.requeued
+            .extend(rivals.into_iter().filter(|&i| i != winner));
+    }
+
+    /// Nothing left to start and nothing still running.
+    pub(crate) fn exhausted(&self) -> bool {
+        self.requeued.is_empty() && self.next >= self.total && self.in_flight.is_empty()
+    }
+}
+
 /// Build the `GcConfig` handed to `FsStore::load_with_opts` (#80).
 ///
 /// `iroh_blobs`'s `gc_mark` roots the live set in the store's tags and temp tags, then unions
@@ -960,12 +1059,13 @@ impl AppBlobs {
         // The ticket's address is already source 0. An alternate naming the SAME endpoint would
         // otherwise be dialled twice for one timeout each — natural when a caller names the
         // publisher to reach their OTHER devices, since a person expands to all of them.
-        sources.extend(
-            alternates
-                .iter()
-                .filter(|a| a.id != ticket.addr().id)
-                .cloned(),
-        );
+        //
+        // Deduped across the WHOLE list, not just against the ticket. Two `from` entries resolving
+        // to one endpoint (a nickname and its `eid:`, or two people sharing a device) used to cost
+        // two sequential timeouts; since the dials are hedged they would now be two SIMULTANEOUS
+        // dials to one peer, which is the one shape this feature must not produce.
+        let mut seen: std::collections::HashSet<_> = std::iter::once(ticket.addr().id).collect();
+        sources.extend(alternates.iter().filter(|a| seen.insert(a.id)).cloned());
         let total = sources.len();
 
         // #82 ask 2: consume the progress stream instead of dropping it on the floor. Same
@@ -992,14 +1092,24 @@ impl AppBlobs {
         }
 
         let mut last: Option<anyhow::Error> = None;
-        for (i, addr) in sources.into_iter().enumerate() {
+        let mut plan = HedgePlan::new(total);
+        // Dials race; the TRANSFER does not. Exactly one transfer runs at a time, so `st` keeps its
+        // single writer and every progress guarantee above holds unchanged — two concurrent
+        // transfers would interleave two byte counters into one stream, which a consumer renders as
+        // a progress bar jumping backwards.
+        loop {
+            let Some((i, conn)) = self.race_a_connection(&sources, &mut plan, &mut last).await
+            else {
+                break; // every source dialled, none answered
+            };
             // EVERY failure mode falls through to the next source, not just an unreachable dial.
-            // The first version broke out of the loop as soon as a dial SUCCEEDED, so a source that
-            // was online but had not republished the hash — which answers a permission refusal
-            // post-connect — ended the whole fetch with a live alternate sitting untried. That is
-            // the ordinary case for the room-of-eight this feature exists for: some recipients
-            // republished, some did not. Caught by review, by execution.
-            match self.try_source(addr, &ticket, &mut st).await {
+            // An early version broke out as soon as a dial SUCCEEDED, so a source that was online
+            // but had not republished the hash — which answers a permission refusal post-connect —
+            // ended the whole fetch with a live alternate sitting untried. That is the ordinary case
+            // for the room-of-eight this feature exists for: some recipients republished, some did
+            // not. Caught by review, by execution — and it has to survive the hedging rewrite,
+            // which is why the transfer failing RESUMES the racer rather than returning.
+            match self.transfer_from(conn, &ticket, &mut st).await {
                 Ok(()) => {
                     if i > 0 {
                         tracing::info!(
@@ -1030,30 +1140,102 @@ impl AppBlobs {
         )))
     }
 
-    /// One source attempt: dial, then stream. Returns `Ok` only on a completed, verified transfer.
+    /// Race sources for the FIRST connection, hedged (#83 follow-up).
     ///
-    /// Both halves are bounded — the dial by [`DIAL_TIMEOUT`], the transfer by
-    /// [`SOURCE_TRANSFER_TIMEOUT`] — because a source that accepts and then stalls would otherwise
-    /// hold the fetch open forever with live alternates untried. Progress is reported into the
-    /// SHARED `st`, so a transfer that resumes on a later source continues the same counter rather
-    /// than restarting a consumer's progress bar.
+    /// Returns the winning source's index and its connection, leaving `plan` positioned so a later
+    /// call resumes over whatever is left — which is what lets a failed TRANSFER fall back without
+    /// re-dialling from the top.
     ///
-    /// [`DIAL_TIMEOUT`]: crate::daemon::dial::DIAL_TIMEOUT
-    async fn try_source(
+    /// The schedule is [`HedgePlan`]'s; this adds the two things that make it a race:
+    ///
+    /// - a source is started immediately when a slot is free and a [`HEDGE_DELAY`] has passed, so a
+    ///   slow source is overtaken rather than waited out;
+    /// - a FAILED dial refills its slot at once rather than at the next tick, because the whole
+    ///   point is to not spend `DIAL_TIMEOUT` per source.
+    ///
+    /// **The first source is never delayed.** It starts before the loop, so a live publisher is
+    /// connected long before any hedge fires and the common case opens exactly ONE connection —
+    /// which is the property that answers #83's "every abandoned dial is work on someone else's
+    /// machine". Losing dials are dropped on return, cancelling them.
+    ///
+    /// Failures are folded into `last` so a total failure still reports a real error rather than
+    /// the racer's own "nobody answered".
+    async fn race_a_connection(
         &self,
-        addr: iroh::EndpointAddr,
+        sources: &[iroh::EndpointAddr],
+        plan: &mut HedgePlan,
+        last: &mut Option<anyhow::Error>,
+    ) -> Option<(usize, iroh::endpoint::Connection)> {
+        use n0_future::StreamExt as _;
+        let dial = |i: usize| {
+            let addr = sources[i].clone();
+            async move {
+                let r = tokio::time::timeout(
+                    crate::daemon::dial::DIAL_TIMEOUT,
+                    self.endpoint.connect(addr, APP_BLOB_ALPN),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("dial timed out"))
+                .and_then(|r| r.context("dial app-blob provider"));
+                (i, r)
+            }
+        };
+
+        let mut flight = n0_future::FuturesUnordered::new();
+        if let Some(i) = plan.start() {
+            flight.push(dial(i));
+        }
+        loop {
+            if plan.exhausted() && flight.is_empty() {
+                return None;
+            }
+            // `MaybeFuture`-free: an exhausted plan simply never wins this branch, because the
+            // guard is checked before the sleep is polled.
+            let hedge = tokio::time::sleep(HEDGE_DELAY);
+            tokio::select! {
+                Some((i, r)) = flight.next() => {
+                    plan.finished(i);
+                    match r {
+                        Ok(conn) => {
+                            // The rivals are about to be dropped with `flight`. Return them to the
+                            // queue so a failed TRANSFER can still reach them.
+                            plan.abandon_rivals(i);
+                            return Some((i, conn));
+                        }
+                        Err(e) => {
+                            tracing::debug!(source = i, %e, "app-blob dial failed");
+                            *last = Some(e);
+                            // Refill the freed slot NOW rather than on the next tick.
+                            if let Some(next) = plan.start() {
+                                flight.push(dial(next));
+                            }
+                        }
+                    }
+                }
+                _ = hedge, if plan.may_start() => {
+                    if let Some(next) = plan.start() {
+                        flight.push(dial(next));
+                    }
+                }
+                else => return None,
+            }
+        }
+    }
+
+    /// Stream one blob over an already-established connection. `Ok` only on a completed, verified
+    /// transfer.
+    ///
+    /// Bounded by [`SOURCE_TRANSFER_TIMEOUT`], because a source that accepts and then stalls would
+    /// otherwise hold the fetch open forever with live alternates untried. Progress is reported into
+    /// the SHARED `st`, so a transfer that resumes on a later source continues the same counter
+    /// rather than restarting a consumer's progress bar.
+    async fn transfer_from(
+        &self,
+        conn: iroh::endpoint::Connection,
         ticket: &BlobTicket,
         st: &mut TransferProgressState,
     ) -> Result<()> {
         use n0_future::StreamExt as _;
-        let conn = tokio::time::timeout(
-            crate::daemon::dial::DIAL_TIMEOUT,
-            self.endpoint.connect(addr, APP_BLOB_ALPN),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("dial timed out"))?
-        .context("dial app-blob provider")?;
-
         let transfer = async {
             let mut stream =
                 std::pin::pin!(self.store.remote().fetch(conn, ticket.hash()).stream());
@@ -1459,7 +1641,125 @@ fn spawn_gate_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::{PROGRESS_STRIDE_BYTES, TransferProgressState, apply_transfer_update};
+    use super::{
+        HedgePlan, MAX_IN_FLIGHT_DIALS, PROGRESS_STRIDE_BYTES, TransferProgressState,
+        apply_transfer_update,
+    };
+
+    /// The common case must be untouched: ONE source means one dial and no hedging at all.
+    ///
+    /// #83's review declined a blind parallel race because "every abandoned dial is work on someone
+    /// else's machine". A fetch with no alternates must not pay anything for a feature it is not
+    /// using.
+    #[test]
+    fn a_single_source_starts_once_and_is_then_exhausted() {
+        let mut p = HedgePlan::new(1);
+        assert_eq!(p.start(), Some(0));
+        assert!(!p.may_start(), "nothing left to start: {p:?}");
+        assert!(!p.exhausted(), "source 0 is still dialling: {p:?}");
+        p.finished(0);
+        assert!(p.exhausted(), "{p:?}");
+    }
+
+    /// Sources enter in the CALLER's order — the publisher (index 0) first — and the in-flight cap
+    /// holds at every step rather than only at the end.
+    #[test]
+    fn sources_start_in_order_and_the_cap_holds_throughout() {
+        let mut p = HedgePlan::new(8);
+        for expected in 0..MAX_IN_FLIGHT_DIALS {
+            assert_eq!(p.start(), Some(expected), "{p:?}");
+        }
+        assert!(
+            !p.may_start(),
+            "the cap is {MAX_IN_FLIGHT_DIALS}, so a 4th must not start: {p:?}"
+        );
+        assert_eq!(p.start(), None, "{p:?}");
+        // A slot frees exactly one more, never a burst.
+        p.finished(0);
+        assert_eq!(p.start(), Some(MAX_IN_FLIGHT_DIALS), "{p:?}");
+        assert_eq!(p.start(), None, "back at the cap: {p:?}");
+    }
+
+    /// Every source is eventually tried, and none twice — the walk terminates.
+    #[test]
+    fn every_source_is_started_exactly_once() {
+        let mut p = HedgePlan::new(7);
+        let mut seen = Vec::new();
+        while let Some(i) = p.start() {
+            seen.push(i);
+            p.finished(i);
+        }
+        assert_eq!(seen, vec![0, 1, 2, 3, 4, 5, 6], "{p:?}");
+        assert!(p.exhausted(), "{p:?}");
+    }
+
+    /// **The bug this plan was rewritten to prevent.** A winning dial drops its rivals; those
+    /// sources must go BACK in the queue, because the winner's TRANSFER can still fail — a source
+    /// that is online but has not republished the hash answers a permission refusal post-connect,
+    /// which is the ordinary room-of-eight case.
+    ///
+    /// Tracking an in-flight COUNT instead of the set silently retires them, and the fetch resumes
+    /// past two live sources it had already reached. That is strictly worse than the sequential
+    /// walk this replaced, and no timing test would show it.
+    #[test]
+    fn rivals_dropped_by_a_winner_are_retried_not_retired() {
+        let mut p = HedgePlan::new(5);
+        assert_eq!(p.start(), Some(0));
+        assert_eq!(p.start(), Some(1));
+        assert_eq!(p.start(), Some(2));
+        // Source 1 wins; 0 and 2 were dialling alongside it and get dropped.
+        p.finished(1);
+        p.abandon_rivals(1);
+        assert!(!p.exhausted(), "3 of 5 sources remain untried: {p:?}");
+
+        // Its transfer fails. Everything not yet retired must still be reachable — the two
+        // abandoned rivals AND the two never started.
+        let mut rest = Vec::new();
+        while let Some(i) = p.start() {
+            rest.push(i);
+            p.finished(i);
+        }
+        rest.sort_unstable();
+        assert_eq!(
+            rest,
+            vec![0, 2, 3, 4],
+            "the abandoned rivals 0 and 2 must be retried, not skipped: {p:?}"
+        );
+        assert!(p.exhausted(), "{p:?}");
+    }
+
+    /// A dial that fails on its own is retired for good — only a dial ABANDONED by a winner is
+    /// requeued. Without this the plan loops forever on a source that cannot answer.
+    #[test]
+    fn a_failed_dial_is_not_retried() {
+        let mut p = HedgePlan::new(2);
+        assert_eq!(p.start(), Some(0));
+        p.finished(0); // failed
+        assert_eq!(p.start(), Some(1));
+        p.finished(1); // failed
+        assert_eq!(p.start(), None, "both are spent: {p:?}");
+        assert!(p.exhausted(), "{p:?}");
+    }
+
+    /// A winner with no rivals requeues nothing — the single-source path must not resurrect itself.
+    #[test]
+    fn a_lone_winner_requeues_nothing() {
+        let mut p = HedgePlan::new(3);
+        assert_eq!(p.start(), Some(0));
+        p.finished(0);
+        p.abandon_rivals(0);
+        assert!(!p.exhausted(), "sources 1 and 2 are untried: {p:?}");
+        assert_eq!(p.start(), Some(1), "0 must not come back: {p:?}");
+    }
+
+    /// No sources at all is exhausted immediately rather than a loop that never starts anything.
+    #[test]
+    fn an_empty_plan_is_exhausted() {
+        let mut p = HedgePlan::new(0);
+        assert!(p.exhausted(), "{p:?}");
+        assert_eq!(p.start(), None);
+    }
+
     use iroh_blobs::provider::events::{RequestUpdate, TransferProgress, TransferStarted};
     use mcpmesh_local_api::BlobTransferState as S;
 
