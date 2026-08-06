@@ -893,7 +893,28 @@ pub(crate) async fn build_endpoint(
         NetPlan::Mesh {
             relay,
             discovery: DiscoveryPlan::N0,
-        } => iroh::Endpoint::builder(iroh::endpoint::presets::N0).relay_mode(relay),
+        } => {
+            // `presets::N0` expanded, so the RESOLVERS can be wrapped (#203).
+            //
+            // The preset is `Minimal` + a pkarr publisher + a pkarr resolver + a DNS lookup +
+            // n0's default relays; we already override the relay mode on every branch, so the
+            // only reason to expand it is to interpose `Hygienic` on what comes BACK. Filtering
+            // at ingress is the only thing that bounds a self-signed pkarr record naming
+            // arbitrary destinations — four call-site filters could not, because `connect` and
+            // `blobs.fetch` resolve by ID and lookup runs regardless of what a blob carried.
+            //
+            // The PUBLISHER is not wrapped: it carries our own addresses outward, already
+            // governed by `AddrFilter`.
+            iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .address_lookup(iroh::address_lookup::PkarrPublisher::n0_dns())
+                .address_lookup(crate::daemon::lookup_hygiene::Hygienic(
+                    iroh::address_lookup::PkarrResolver::n0_dns(),
+                ))
+                .address_lookup(crate::daemon::lookup_hygiene::Hygienic(
+                    iroh::address_lookup::DnsAddressLookup::n0_dns(),
+                ))
+                .relay_mode(relay)
+        }
         NetPlan::Mesh {
             relay,
             discovery: DiscoveryPlan::Custom(urls),
@@ -902,7 +923,11 @@ pub(crate) async fn build_endpoint(
             for u in urls {
                 b = b
                     .address_lookup(iroh::address_lookup::PkarrPublisher::builder(u.clone()))
-                    .address_lookup(iroh::address_lookup::PkarrResolver::builder(u));
+                    // #203: the resolver is wrapped here too — an operator-run pkarr server is
+                    // still a place records are self-signed by whoever published them.
+                    .address_lookup(crate::daemon::lookup_hygiene::Hygienic(
+                        iroh::address_lookup::PkarrResolver::builder(u),
+                    ));
             }
             b
         }

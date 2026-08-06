@@ -27,6 +27,7 @@ pub(crate) mod config_write;
 pub(crate) mod dial;
 pub(crate) mod dial_hint;
 pub(crate) mod handlers;
+pub(crate) mod lookup_hygiene;
 mod org_author;
 mod path_watch;
 pub(crate) mod reach;
