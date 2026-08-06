@@ -697,22 +697,76 @@ async fn a_withdrawn_blob_stays_refused_over_the_wire_after_a_republish_attempt(
     .expect("withdrawn-over-the-wire test timed out");
 }
 
-/// #83 ask 2: a fetch survives the publisher going offline, by falling back to a RECIPIENT that
-/// republished the blob.
+/// #83 follow-up: a LIVE first source must be the only peer dialled — zero abandoned work.
 ///
-/// The scenario the issue describes is ordinary, not exotic: someone posts a file to a room and
-/// closes their laptop. Content addressing makes every recipient a potential source, and the
-/// single-address ticket made that unusable — the only address anyone held pointed at the sleeping
-/// publisher.
+/// The design's central claim, and the gate found it was asserted in the commit message, asserted
+/// in the spec, and **guarded by nothing** — which is exactly how the first cut shipped a plan that
+/// re-dialled and abandoned a slow-but-live publisher once per round, turning 8 dials into 15. A
+/// timing test cannot see that; only counting can.
 ///
-/// Three real endpoints, one hard shutdown, and the assertions that matter:
+/// #83's review declined a blind parallel race because "every abandoned dial is work on someone
+/// else's machine". Hedging is only an answer to that objection if a healthy fetch costs the
+/// alternates nothing at all.
 ///
-/// 1. With the publisher DOWN and no alternates, the fetch fails. Without this the test could pass
-///    on a fetch that never needed a fallback at all.
-/// 2. With the same dead publisher and a live alternate, it succeeds — and the bytes BLAKE3-verify
-///    against the ORIGINAL source, so the fallback served the same blob rather than merely
-///    something.
-/// #83 follow-up: an UNREACHABLE first source must not cost a full `DIAL_TIMEOUT` before the live
+/// The alternate here is a bare endpoint that accepts and COUNTS, serving nothing: if the hedge
+/// ever fires, or a future version fans out eagerly, the count is non-zero and this fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_live_first_source_is_the_only_peer_dialled() {
+    timeout(Duration::from_secs(60), async {
+        let root = SigningKey::from_bytes(&[9u8; 32]);
+        let pub_ep = provider_endpoint().await;
+        let caller_ep = caller_endpoint().await;
+        let caller_id = *caller_ep.id().as_bytes();
+
+        let pub_roster = Arc::new(RosterGate::empty());
+        let pub_view = mint_view(&root, 1, &[(caller_id, "alice")], &[]);
+        let (pub_mesh, pub_dir) = serving_provider(pub_ep.clone(), pub_roster, pub_view).await;
+        seed_addr(&caller_ep, &pub_ep);
+
+        let src = pub_dir.path().join("shared.bin");
+        let payload: Vec<u8> = (0..64_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&src, &payload).unwrap();
+        let publisher = pub_mesh.app_blobs().await.unwrap();
+        let (ticket, _hash_hex) = publisher.publish_scope("room", &src).await.unwrap();
+        publisher.grant("room", "alice").unwrap();
+
+        // A bystander that answers the ALPN and does nothing else, so a connection to it is
+        // observable. It is a source the caller names but must never need.
+        let bystander_ep = provider_endpoint().await;
+        let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (bep, d) = (bystander_ep.clone(), dials.clone());
+        let _accept = tokio::spawn(async move {
+            while let Some(incoming) = bep.accept().await {
+                if incoming.await.is_ok() {
+                    d.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        });
+        seed_addr(&caller_ep, &bystander_ep);
+
+        let cdir = tempfile::tempdir().unwrap();
+        let caller = AppBlobs::open_fetcher(cdir.path().join("c"), caller_ep.clone())
+            .await
+            .unwrap();
+        caller
+            .fetch_from(&ticket, &[bystander_ep.addr()])
+            .await
+            .expect("the live publisher serves it");
+
+        // A hedge would have fired a whole HEDGE_DELAY ago had it been going to.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(
+            dials.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a live publisher must produce ZERO abandoned dials — the alternate was dialled anyway, \
+             which is the cost #83's review refused a parallel race over"
+        );
+    })
+    .await
+    .expect("no-abandoned-dials test timed out");
+}
+
+/// #83 follow-up: an UNREACHABLE source must not cost a full `DIAL_TIMEOUT` before the live
 /// alternate is tried.
 ///
 /// This is the property the hedging exists for, and the only one that distinguishes it from the
@@ -721,15 +775,21 @@ async fn a_withdrawn_blob_stays_refused_over_the_wire_after_a_republish_attempt(
 /// a bounded parallel race is the obvious follow-up."* At `DIAL_TIMEOUT` = 20s, eight sources is
 /// 160 seconds of an indeterminate progress bar that a user cannot tell from a hang.
 ///
-/// The publisher's address is a BLACKHOLE (`127.0.0.1:1` with a live endpoint's id): QUIC is UDP,
-/// so packets go nowhere and the dial hangs for the full timeout rather than being refused. Same
-/// device `reach.rs` uses to make a probe hang deterministically.
+/// The slow source is a BLACKHOLE: `127.0.0.1:1` under the id of an endpoint that has been closed,
+/// so nothing is listening and QUIC's UDP packets go nowhere — the dial hangs for the full timeout
+/// rather than being refused. Same device `reach.rs` uses to make a probe hang deterministically.
 ///
-/// **The margin is 20x, not a stopwatch.** Hedging starts the alternate after `HEDGE_DELAY` (1s);
-/// the sequential walk starts it after `DIAL_TIMEOUT` (20s). Asserting "under 10s" cannot be
-/// flake-sensitive at that separation, and it fails unambiguously if hedging is removed — which is
-/// the point, since a timing assertion with a tight margin measures the machine rather than the
-/// code, and this repo has twice been misled by exactly that.
+/// **Its endpoint id must differ from the ticket's, and the gate caught that it did not.** The
+/// first version reused the publisher's id, so `fetch_from`'s dedup — added in the same commit —
+/// silently dropped it and the test asserted a mechanism it never exercised. It passed only because
+/// the *closed publisher's own* address happened to hang too, which is a property of a closed local
+/// socket rather than anything this test set up.
+///
+/// **On the threshold.** Hedging reaches the live alternate about a `HEDGE_DELAY` (1s) after
+/// starting; the sequential walk reaches it after a `DIAL_TIMEOUT` (20s) per dead source. The
+/// measured separation is what matters: ~5s green against 20s+ with hedging disabled. 12s sits
+/// clear of both, and a timing assertion is only legitimate at that kind of separation — a tight
+/// margin measures the machine, which has misled this repo twice.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unreachable_first_source_does_not_cost_a_full_dial_timeout() {
     timeout(Duration::from_secs(90), async {
@@ -766,12 +826,25 @@ async fn an_unreachable_first_source_does_not_cost_a_full_dial_timeout() {
         relay_blobs.grant("room", "alice").unwrap();
         relay_blobs.republish("room", &hash_hex).await.unwrap();
 
-        // The publisher's laptop closes. Its id stays valid; its address now goes nowhere.
+        // The publisher's laptop closes.
         pub_ep.close().await;
         drop(pub_mesh);
+
+        // A source that is neither reachable nor the publisher: a DISTINCT endpoint id (so it
+        // survives `fetch_from`'s dedup) at an address nothing listens on. This is the dead weight
+        // the live alternate has to be raced past.
+        let dead_ep = provider_endpoint().await;
+        let dead_id = dead_ep.id();
+        dead_ep.close().await;
         let blackhole = iroh::EndpointAddr::from_parts(
-            pub_ep.id(),
+            dead_id,
             [iroh::TransportAddr::Ip("127.0.0.1:1".parse().unwrap())],
+        );
+        assert_ne!(
+            dead_id,
+            pub_ep.id(),
+            "the blackhole must not share the ticket's endpoint id, or dedup drops it and this \
+             test exercises nothing it claims to"
         );
 
         let cdir = tempfile::tempdir().unwrap();
@@ -792,9 +865,9 @@ async fn an_unreachable_first_source_does_not_cost_a_full_dial_timeout() {
             "the alternate must serve the SAME blob"
         );
         assert!(
-            elapsed < Duration::from_secs(10),
+            elapsed < Duration::from_secs(12),
             "the alternate must be raced against the dead publisher, not started after its \
-             20s DIAL_TIMEOUT expires — took {elapsed:?}. A room of eight behind a sleeping \
+             DIAL_TIMEOUT expires — took {elapsed:?}. A room of eight behind a sleeping \
              publisher is what #83 was left open on.",
         );
     })

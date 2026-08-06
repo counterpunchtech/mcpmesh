@@ -1237,9 +1237,14 @@ pub struct BlobFetchParams {
     /// already held the identical, verified bytes.
     ///
     /// Each entry is a stable principal (`eid:` device, `b64u:` user_id) or a paired nickname —
-    /// the same vocabulary `open_session` takes. They are tried **in order, after** the ticket's own
-    /// address, so the publisher stays the first choice and a live one costs nothing. An offline
-    /// publisher costs one dial timeout before the first alternate is tried.
+    /// the same vocabulary `open_session` takes. They are preferred **in order, after** the ticket's
+    /// own address, so the publisher stays the first choice and a live one costs nothing —
+    /// alternates are not dialled at all when it answers.
+    ///
+    /// Since 0.49.1 the dials are **hedged**: an alternate starts about a second after a source has
+    /// failed to answer, rather than after that source's full dial timeout. A source unreachable at
+    /// the head of the list therefore costs about a second, not twenty, and a long `from` list is no
+    /// longer a long wait. Each source is still dialled at most once.
     ///
     /// **An alternate only works if it can serve you.** The bytes are BLAKE3-verified against the
     /// ticket's hash whoever supplies them, so a hostile alternate cannot substitute content — but
@@ -1257,11 +1262,15 @@ pub struct BlobFetchParams {
 
 /// The ceiling on [`BlobFetchParams::from`] (#83).
 ///
-/// Sources are tried SEQUENTIALLY and each costs up to a dial timeout, so an unbounded list is an
-/// unbounded wait on a request that holds one of the connection's [`MAX_INFLIGHT`] slots — and
-/// naming a PERSON expands to every device of theirs, so the list a caller writes is not the number
+/// Naming a PERSON expands to every device of theirs, so the list a caller writes is not the number
 /// of dials it buys. Comfortably above "everyone in a room", far below anything that turns a fetch
 /// into an hour.
+///
+/// **The justification changed in 0.49.1 and the number did not.** Until then sources were tried
+/// strictly in turn, each costing up to a dial timeout, so the cap bounded a WAIT. Dials are now
+/// hedged, which bounds the wait by roughly a second per unresponsive source instead — but the cap
+/// still bounds the WORK: a fetch holds one of the connection's [`MAX_INFLIGHT`] slots, and a long
+/// list is a long list of other people's machines being asked to answer.
 ///
 /// Exceeding it is an ERROR, not a truncation: silently dropping the tail would make a fetch fail
 /// while the source that had the blob sat unused, which is exactly what this feature exists to

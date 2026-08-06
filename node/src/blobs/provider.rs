@@ -348,28 +348,40 @@ const HEDGE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 /// [`MAX_BLOB_SOURCES`]: mcpmesh_local_api::MAX_BLOB_SOURCES
 const MAX_IN_FLIGHT_DIALS: usize = 3;
 
+/// One in-flight dial: its source index and the connection it produced.
+///
+/// Boxed because [`race_a_connection`](AppBlobs::race_a_connection) hands the set back to its
+/// caller — `fetch_from` owns the losing dials so they survive a failed transfer, which needs a
+/// nameable type.
+type BoxedDial<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = (usize, Result<iroh::endpoint::Connection>)> + Send + 'a>,
+>;
+/// The set of dials currently in progress.
+type DialFlight<'a> = n0_future::FuturesUnordered<BoxedDial<'a>>;
+
 /// The hedged-dial SCHEDULE, with no I/O in it (#83 follow-up).
 ///
 /// Pure so the rule is testable without waiting real seconds. The alternative — asserting on a live
 /// racer — measures the machine rather than the code, and this repo has twice produced confident
 /// and wrong conclusions from exactly that.
 ///
-/// It owns the in-flight set rather than just counting it, which is not bookkeeping pedantry: when
-/// one dial wins, its rivals are dropped, and those sources have to go back in the queue. The first
-/// cut of this tracked an in-flight COUNT, so a winning dial silently retired every source racing
-/// alongside it — and if that winner's TRANSFER then failed (the ordinary room-of-eight case, where
-/// only some recipients republished the hash), the fetch resumed past two or three live sources it
-/// had already connected to and thrown away. Strictly worse than the sequential walk it replaced.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// **Losing dials are never cancelled, which is what keeps this honest.** A first cut dropped the
+/// rivals when one dial won and pushed them back on a retry queue. That is much worse than it
+/// sounds: a publisher that is alive but more than a `HEDGE_DELAY` away — relay-mediated, or still
+/// hole-punching — loses every race it enters, so it was re-dialled and abandoned once per round.
+/// For a room of eight where the alternates answer fast but cannot serve, that is 15 dials against
+/// the sequential walk's 8, with the publisher abandoned seven times. Keeping the losers running
+/// instead means every source is dialled AT MOST ONCE, and a slow-but-good source simply finishes
+/// later and wins a later round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct HedgePlan {
     total: usize,
-    /// The next source never yet started. Sources are preferred in the caller's order.
+    /// The next source never yet started. Sources enter in the caller's order.
     next: usize,
-    /// Started, then abandoned when someone else won — retried BEFORE advancing `next`, since they
-    /// are known-reachable-or-not sooner than an untouched source.
-    requeued: Vec<usize>,
-    /// Indices currently dialling.
-    in_flight: Vec<usize>,
+    /// How many dials are outstanding. A COUNT is sufficient — and correct — precisely because no
+    /// dial is ever abandoned, so the plan never has to name which sources are in flight in order
+    /// to give them back.
+    in_flight: usize,
 }
 
 impl HedgePlan {
@@ -377,15 +389,13 @@ impl HedgePlan {
         Self {
             total,
             next: 0,
-            requeued: Vec::new(),
-            in_flight: Vec::new(),
+            in_flight: 0,
         }
     }
 
-    /// May another source be started right now? A source is left AND we are under the cap.
+    /// May another source be started right now? One is left AND we are under the cap.
     pub(crate) fn may_start(&self) -> bool {
-        (!self.requeued.is_empty() || self.next < self.total)
-            && self.in_flight.len() < MAX_IN_FLIGHT_DIALS
+        self.next < self.total && self.in_flight < MAX_IN_FLIGHT_DIALS
     }
 
     /// Start the next source, returning its index — `None` if [`may_start`](Self::may_start) is
@@ -395,34 +405,21 @@ impl HedgePlan {
         if !self.may_start() {
             return None;
         }
-        let idx = self.requeued.pop().unwrap_or_else(|| {
-            let i = self.next;
-            self.next += 1;
-            i
-        });
-        self.in_flight.push(idx);
+        let idx = self.next;
+        self.next += 1;
+        self.in_flight += 1;
         Some(idx)
     }
 
-    /// A dial finished on its own (it failed, or it won). Retires the source: a failed dial is not
-    /// retried, and a winner is being handed to the transfer.
-    pub(crate) fn finished(&mut self, idx: usize) {
-        self.in_flight.retain(|&i| i != idx);
-    }
-
-    /// `winner`'s rivals were dropped mid-dial. Put them BACK, so a later round can try them.
-    ///
-    /// Without this a winning dial retires every source racing it, and a failed transfer resumes
-    /// past sources that were seconds from connecting.
-    pub(crate) fn abandon_rivals(&mut self, winner: usize) {
-        let rivals = std::mem::take(&mut self.in_flight);
-        self.requeued
-            .extend(rivals.into_iter().filter(|&i| i != winner));
+    /// A dial completed — it failed, or it won and is being handed to the transfer. Either way that
+    /// source is spent: a failed dial is not retried, and a winner is not re-dialled.
+    pub(crate) fn finished(&mut self) {
+        self.in_flight = self.in_flight.saturating_sub(1);
     }
 
     /// Nothing left to start and nothing still running.
     pub(crate) fn exhausted(&self) -> bool {
-        self.requeued.is_empty() && self.next >= self.total && self.in_flight.is_empty()
+        self.next >= self.total && self.in_flight == 0
     }
 }
 
@@ -1028,9 +1025,16 @@ impl AppBlobs {
     /// verified bytes.
     ///
     /// **Order: the ticket's own address first, then `alternates` in the caller's order.** The
-    /// publisher is the authoritative source and a live one costs nothing; an offline one costs one
-    /// dial timeout before the first alternate is tried. Every attempt is bounded, so an
-    /// unreachable source costs a timeout rather than the caller's future.
+    /// publisher is the authoritative source and a live one costs nothing — no alternate is dialled
+    /// at all when it answers.
+    ///
+    /// **The dials are HEDGED, the transfer is not.** A source that has not answered within
+    /// [`HEDGE_DELAY`] is overtaken rather than waited out, up to [`MAX_IN_FLIGHT_DIALS`] at a time,
+    /// so an unreachable head of the list costs about a second instead of a full `DIAL_TIMEOUT`.
+    /// Exactly ONE transfer runs at a time: concurrent transfers of one hash would duplicate work
+    /// and interleave two byte counters into the single shared progress state. Losing dials are
+    /// never cancelled — they keep running and can win a later round, which is what stops a
+    /// slow-but-live source from being re-dialled and abandoned once per round.
     ///
     /// **Substitution is impossible whoever answers.** `store.remote().fetch(conn, hash)` verifies
     /// the BLAKE3 hash from the ticket against the bytes as they stream, so an alternate can serve
@@ -1093,12 +1097,17 @@ impl AppBlobs {
 
         let mut last: Option<anyhow::Error> = None;
         let mut plan = HedgePlan::new(total);
+        // The in-flight dials live HERE, not inside the racer, so a failed transfer resumes over
+        // connections already in progress. See `HedgePlan` for what re-dialling them cost instead.
+        let mut flight: DialFlight<'_> = n0_future::FuturesUnordered::new();
         // Dials race; the TRANSFER does not. Exactly one transfer runs at a time, so `st` keeps its
         // single writer and every progress guarantee above holds unchanged — two concurrent
         // transfers would interleave two byte counters into one stream, which a consumer renders as
         // a progress bar jumping backwards.
         loop {
-            let Some((i, conn)) = self.race_a_connection(&sources, &mut plan, &mut last).await
+            let Some((i, conn)) = self
+                .race_a_connection(&sources, &mut plan, &mut flight, &mut last)
+                .await
             else {
                 break; // every source dialled, none answered
             };
@@ -1142,34 +1151,36 @@ impl AppBlobs {
 
     /// Race sources for the FIRST connection, hedged (#83 follow-up).
     ///
-    /// Returns the winning source's index and its connection, leaving `plan` positioned so a later
-    /// call resumes over whatever is left — which is what lets a failed TRANSFER fall back without
-    /// re-dialling from the top.
+    /// Returns the winning source's index and its connection. **`flight` is the caller's**, so the
+    /// dials that lost are still running when this returns — which is the whole point: a failed
+    /// TRANSFER resumes the race over connections already in progress rather than re-dialling
+    /// sources it has just thrown away.
     ///
     /// The schedule is [`HedgePlan`]'s; this adds the two things that make it a race:
     ///
-    /// - a source is started immediately when a slot is free and a [`HEDGE_DELAY`] has passed, so a
-    ///   slow source is overtaken rather than waited out;
+    /// - a source starts when a slot is free and a [`HEDGE_DELAY`] has passed, so a slow source is
+    ///   overtaken rather than waited out;
     /// - a FAILED dial refills its slot at once rather than at the next tick, because the whole
-    ///   point is to not spend `DIAL_TIMEOUT` per source.
+    ///   point is to not spend a `DIAL_TIMEOUT` per source.
     ///
-    /// **The first source is never delayed.** It starts before the loop, so a live publisher is
-    /// connected long before any hedge fires and the common case opens exactly ONE connection —
-    /// which is the property that answers #83's "every abandoned dial is work on someone else's
-    /// machine". Losing dials are dropped on return, cancelling them.
+    /// **The first source is never delayed.** It starts before any hedge fires, so a live publisher
+    /// is connected long before one does and the common case opens exactly ONE connection. That is
+    /// the property answering #83's "every abandoned dial is work on someone else's machine", and
+    /// `a_live_first_source_is_the_only_peer_dialled` is what holds it.
     ///
-    /// Failures are folded into `last` so a total failure still reports a real error rather than
-    /// the racer's own "nobody answered".
-    async fn race_a_connection(
-        &self,
-        sources: &[iroh::EndpointAddr],
+    /// Failures are folded into `last` so a total failure reports a real error rather than the
+    /// racer's own "nobody answered".
+    async fn race_a_connection<'a>(
+        &'a self,
+        sources: &'a [iroh::EndpointAddr],
         plan: &mut HedgePlan,
+        flight: &mut DialFlight<'a>,
         last: &mut Option<anyhow::Error>,
     ) -> Option<(usize, iroh::endpoint::Connection)> {
         use n0_future::StreamExt as _;
-        let dial = |i: usize| {
+        let dial = |i: usize| -> BoxedDial<'a> {
             let addr = sources[i].clone();
-            async move {
+            Box::pin(async move {
                 let r = tokio::time::timeout(
                     crate::daemon::dial::DIAL_TIMEOUT,
                     self.endpoint.connect(addr, APP_BLOB_ALPN),
@@ -1178,30 +1189,24 @@ impl AppBlobs {
                 .map_err(|_| anyhow::anyhow!("dial timed out"))
                 .and_then(|r| r.context("dial app-blob provider"));
                 (i, r)
-            }
+            })
         };
 
-        let mut flight = n0_future::FuturesUnordered::new();
-        if let Some(i) = plan.start() {
+        if flight.is_empty()
+            && let Some(i) = plan.start()
+        {
             flight.push(dial(i));
         }
         loop {
             if plan.exhausted() && flight.is_empty() {
                 return None;
             }
-            // `MaybeFuture`-free: an exhausted plan simply never wins this branch, because the
-            // guard is checked before the sleep is polled.
             let hedge = tokio::time::sleep(HEDGE_DELAY);
             tokio::select! {
                 Some((i, r)) = flight.next() => {
-                    plan.finished(i);
+                    plan.finished();
                     match r {
-                        Ok(conn) => {
-                            // The rivals are about to be dropped with `flight`. Return them to the
-                            // queue so a failed TRANSFER can still reach them.
-                            plan.abandon_rivals(i);
-                            return Some((i, conn));
-                        }
+                        Ok(conn) => return Some((i, conn)),
                         Err(e) => {
                             tracing::debug!(source = i, %e, "app-blob dial failed");
                             *last = Some(e);
@@ -1657,7 +1662,7 @@ mod tests {
         assert_eq!(p.start(), Some(0));
         assert!(!p.may_start(), "nothing left to start: {p:?}");
         assert!(!p.exhausted(), "source 0 is still dialling: {p:?}");
-        p.finished(0);
+        p.finished();
         assert!(p.exhausted(), "{p:?}");
     }
 
@@ -1675,7 +1680,7 @@ mod tests {
         );
         assert_eq!(p.start(), None, "{p:?}");
         // A slot frees exactly one more, never a burst.
-        p.finished(0);
+        p.finished();
         assert_eq!(p.start(), Some(MAX_IN_FLIGHT_DIALS), "{p:?}");
         assert_eq!(p.start(), None, "back at the cap: {p:?}");
     }
@@ -1687,69 +1692,61 @@ mod tests {
         let mut seen = Vec::new();
         while let Some(i) = p.start() {
             seen.push(i);
-            p.finished(i);
+            p.finished();
         }
         assert_eq!(seen, vec![0, 1, 2, 3, 4, 5, 6], "{p:?}");
         assert!(p.exhausted(), "{p:?}");
     }
 
-    /// **The bug this plan was rewritten to prevent.** A winning dial drops its rivals; those
-    /// sources must go BACK in the queue, because the winner's TRANSFER can still fail — a source
-    /// that is online but has not republished the hash answers a permission refusal post-connect,
-    /// which is the ordinary room-of-eight case.
+    /// **The bug this plan was rewritten to prevent, and the reason no dial is ever cancelled.**
     ///
-    /// Tracking an in-flight COUNT instead of the set silently retires them, and the fetch resumes
-    /// past two live sources it had already reached. That is strictly worse than the sequential
-    /// walk this replaced, and no timing test would show it.
+    /// A first cut requeued the rivals a winner displaced. That reads like carefulness and is the
+    /// opposite: a source alive but more than a `HEDGE_DELAY` away loses every race it enters, so
+    /// it was re-dialled and abandoned once per round. For the room-of-eight this feature exists
+    /// for — alternates that answer fast but have not republished the hash — that is 15 dials
+    /// against the sequential walk's 8, with the publisher abandoned seven times. It made the
+    /// "abandoned dials" cost the design was built to bound STRICTLY WORSE than doing nothing.
+    ///
+    /// The rule that replaced it: a source is started at most once, ever. Losers keep running and
+    /// win a later round.
     #[test]
-    fn rivals_dropped_by_a_winner_are_retried_not_retired() {
-        let mut p = HedgePlan::new(5);
-        assert_eq!(p.start(), Some(0));
-        assert_eq!(p.start(), Some(1));
-        assert_eq!(p.start(), Some(2));
-        // Source 1 wins; 0 and 2 were dialling alongside it and get dropped.
-        p.finished(1);
-        p.abandon_rivals(1);
-        assert!(!p.exhausted(), "3 of 5 sources remain untried: {p:?}");
-
-        // Its transfer fails. Everything not yet retired must still be reachable — the two
-        // abandoned rivals AND the two never started.
-        let mut rest = Vec::new();
-        while let Some(i) = p.start() {
-            rest.push(i);
-            p.finished(i);
+    fn no_source_is_ever_started_twice_however_the_rounds_fall() {
+        let mut p = HedgePlan::new(8);
+        let mut seen = Vec::new();
+        // Round after round: fill to the cap, let one "win", and keep going. The winner and the
+        // losers alike are never re-offered.
+        while !p.exhausted() {
+            while let Some(i) = p.start() {
+                seen.push(i);
+            }
+            p.finished(); // one dial completes; its rivals stay in flight
+            if seen.len() >= 8 {
+                // Drain the rest so `exhausted` can become true.
+                for _ in 0..MAX_IN_FLIGHT_DIALS {
+                    p.finished();
+                }
+            }
         }
-        rest.sort_unstable();
+        seen.sort_unstable();
+        seen.dedup();
         assert_eq!(
-            rest,
-            vec![0, 2, 3, 4],
-            "the abandoned rivals 0 and 2 must be retried, not skipped: {p:?}"
+            seen,
+            vec![0, 1, 2, 3, 4, 5, 6, 7],
+            "every source exactly once, none twice: {p:?}"
         );
-        assert!(p.exhausted(), "{p:?}");
     }
 
-    /// A dial that fails on its own is retired for good — only a dial ABANDONED by a winner is
-    /// requeued. Without this the plan loops forever on a source that cannot answer.
+    /// A dial that completes retires its source whether it won or failed — the plan never re-offers
+    /// it, so the outer loop cannot spin.
     #[test]
-    fn a_failed_dial_is_not_retried() {
+    fn a_completed_dial_is_not_reoffered() {
         let mut p = HedgePlan::new(2);
         assert_eq!(p.start(), Some(0));
-        p.finished(0); // failed
+        p.finished();
         assert_eq!(p.start(), Some(1));
-        p.finished(1); // failed
+        p.finished();
         assert_eq!(p.start(), None, "both are spent: {p:?}");
         assert!(p.exhausted(), "{p:?}");
-    }
-
-    /// A winner with no rivals requeues nothing — the single-source path must not resurrect itself.
-    #[test]
-    fn a_lone_winner_requeues_nothing() {
-        let mut p = HedgePlan::new(3);
-        assert_eq!(p.start(), Some(0));
-        p.finished(0);
-        p.abandon_rivals(0);
-        assert!(!p.exhausted(), "sources 1 and 2 are untried: {p:?}");
-        assert_eq!(p.start(), Some(1), "0 must not come back: {p:?}");
     }
 
     /// No sources at all is exhausted immediately rather than a loop that never starts anything.
