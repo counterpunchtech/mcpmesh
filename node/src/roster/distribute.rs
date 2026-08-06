@@ -137,13 +137,18 @@ pub async fn on_announce<H: DistributionHost>(
     // a typed Err (fail-safe). This add is idempotent + additive (never removes a known addr),
     // so it is safe even when the addr is already known (the localhost test case). BOUNDED: the
     // shared RosterAddrBook dedups by id under a cap; the per-fetch fallback covers tests
-    // without a registered book.
+    // without a registered book. FILTERED (#203): the ticket is a remote party's claim, noted
+    // before its roster signature is ever checked, so its addresses pass `dialable_only` first.
     if let Ok(ticket) = announce.blob_ticket.parse::<BlobTicket>() {
         if let Some(book) = mesh.addr_book() {
+            // `note` filters (#203) — see `RosterAddrBook::note`. Boot always registers a book, so
+            // this is the production path.
             book.note(ticket.addr().clone());
         } else {
+            // No book: a fixture path (boot always registers one). Filtered explicitly with the
+            // same function, since it bypasses `note`.
             let mem = iroh::address_lookup::MemoryLookup::new();
-            mem.add_endpoint_info(ticket.addr().clone());
+            mem.add_endpoint_info(crate::daemon::dial::dialable_only(ticket.addr().clone()));
             if let Ok(lookup) = mesh.endpoint().address_lookup() {
                 lookup.add(mem);
             }

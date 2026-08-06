@@ -242,7 +242,13 @@ impl RosterBlobs {
 /// `MemoryLookup` is not `Clone`, hold the sole instance here and register it lazily on first `note`.
 pub struct RosterAddrBook {
     lookup: iroh::address_lookup::MemoryLookup,
-    known: std::sync::Mutex<std::collections::HashSet<[u8; 32]>>,
+    /// The providers recorded, and the addresses actually handed to `MemoryLookup` for each.
+    ///
+    /// The addresses are kept only so the recording is OBSERVABLE: `MemoryLookup` has no reader,
+    /// so without this nothing outside can tell what this book fed into address lookup — and a
+    /// test could only assert the filter helper, never the call site. That is the exact gap this
+    /// repo keeps finding (#166, #203), so the site is made checkable rather than assumed.
+    known: std::sync::Mutex<std::collections::HashMap<[u8; 32], iroh::EndpointAddr>>,
     cap: usize,
 }
 
@@ -255,7 +261,7 @@ impl RosterAddrBook {
         }
         Self {
             lookup,
-            known: std::sync::Mutex::new(std::collections::HashSet::new()),
+            known: std::sync::Mutex::new(std::collections::HashMap::new()),
             cap,
         }
     }
@@ -264,12 +270,25 @@ impl RosterAddrBook {
     /// whether it was newly added (the test's bound assertion + fail-safe: a full book keeps serving
     /// with the providers it already knows).
     pub fn note(&self, addr: iroh::EndpointAddr) -> bool {
+        // #203: what lands here is a GOSSIP-supplied blob ticket's address — a remote party's
+        // claim, recorded BEFORE the roster blob is fetched and long before its org-root signature
+        // is checked. Everything recorded becomes a candidate path iroh sends padded QUIC Initials
+        // to: the same exposure as the pairing invite, on a site 0.52.1's filter missed entirely.
+        //
+        // Filtered HERE, at the book's own entry point, so it holds for every caller — and so the
+        // effect is observable through `recorded_for`, which is what makes the call site testable
+        // rather than only the helper.
+        //
+        // The `cap` below bounds distinct IDS, not addresses per id. That gap is #203's, not this
+        // function's: bounding addresses means CHOOSING which to keep, and choosing wrong drops the
+        // ones that work — a lesson from an abandoned attempt at exactly that.
+        let addr = crate::daemon::dial::dialable_only(addr);
         let id = *addr.id.as_bytes();
         let mut known = self.known.lock().expect("roster addr book mutex");
-        if known.contains(&id) || known.len() >= self.cap {
+        if known.contains_key(&id) || known.len() >= self.cap {
             return false;
         }
-        known.insert(id);
+        known.insert(id, addr.clone());
         self.lookup.add_endpoint_info(addr);
         true
     }
@@ -278,11 +297,87 @@ impl RosterAddrBook {
     pub fn known_len(&self) -> usize {
         self.known.lock().expect("roster addr book mutex").len()
     }
+
+    /// The addresses actually recorded for `id` — what this book fed into address lookup.
+    ///
+    /// `#[doc(hidden)]` — a TEST SEAM (#203). `MemoryLookup` exposes no reader, so this is the only
+    /// way to assert what a gossip-supplied ticket contributed rather than asserting the filter
+    /// helper and hoping the call site calls it.
+    #[doc(hidden)]
+    pub fn recorded_for(&self, id: &[u8; 32]) -> Option<iroh::EndpointAddr> {
+        self.known
+            .lock()
+            .expect("roster addr book mutex")
+            .get(id)
+            .cloned()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #203: a gossip-supplied ticket cannot seed an un-dialable address into address lookup.
+    ///
+    /// `note` is fed from `on_announce`, which parses a ticket off the gossip topic and records its
+    /// `EndpointAddr` BEFORE the roster blob is fetched and long before its org-root signature is
+    /// checked. Everything recorded becomes a candidate path iroh sends padded QUIC Initials to —
+    /// the same exposure as the pairing invite, on a site 0.52.1's filter missed entirely.
+    ///
+    /// The book has no reader for its addresses, so this asserts through the OBSERVABLE effect: an
+    /// entry whose every address is un-dialable degrades to a bare-id record, which is what
+    /// `dialable_only` produces and what a dial then treats as "discovery only".
+    #[tokio::test]
+    async fn a_gossiped_ticket_address_is_filtered_before_it_reaches_address_lookup() {
+        let id = iroh::SecretKey::from_bytes(&[21u8; 32]).public();
+        let hostile = iroh::EndpointAddr::from_parts(
+            id,
+            [
+                iroh::TransportAddr::Ip("0.0.0.0:53".parse().unwrap()),
+                iroh::TransportAddr::Ip("224.0.0.1:1900".parse().unwrap()),
+                iroh::TransportAddr::Ip("192.168.1.5:4433".parse().unwrap()),
+            ],
+        );
+        // Asserted through what the book RECORDED, not through the filter helper — the helper
+        // passing says nothing about whether this call site invokes it.
+        // A real endpoint, since `register` installs the lookup on one. Relay-disabled so the
+        // test binds nothing beyond loopback.
+        let ep = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .bind()
+            .await
+            .expect("bind");
+        let book = RosterAddrBook::register(&ep, 8);
+        assert!(
+            book.note(hostile),
+            "a ticket with a usable address is still noted"
+        );
+        assert_eq!(book.known_len(), 1);
+        let recorded = book
+            .recorded_for(id.as_bytes())
+            .expect("the provider was recorded");
+        assert_eq!(
+            recorded.addrs.len(),
+            1,
+            "only the dialable address may reach address lookup: {recorded:?}"
+        );
+        assert!(
+            recorded.addrs.iter().all(|a| matches!(
+                a,
+                iroh::TransportAddr::Ip(s) if s.to_string() == "192.168.1.5:4433"
+            )),
+            "and it is the REAL one, not whichever survived by accident: {recorded:?}"
+        );
+
+        // An all-hostile ticket is still noted (the provider id is real and the fetch may still
+        // resolve by discovery) — it simply contributes no destinations.
+        let all_bad = iroh::EndpointAddr::from_parts(
+            iroh::SecretKey::from_bytes(&[22u8; 32]).public(),
+            [iroh::TransportAddr::Ip("0.0.0.0:1".parse().unwrap())],
+        );
+        assert!(book.note(all_bad));
+        assert_eq!(book.known_len(), 2);
+    }
 
     #[test]
     fn topics_are_deterministic_distinct_and_org_scoped() {
