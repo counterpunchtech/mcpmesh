@@ -639,6 +639,21 @@ fn kind_label(kind: AuditKind) -> &'static str {
     }
 }
 
+/// A duration as a human reads it, for the suspend line (#167 ask 2). Nobody parses "7200s" as two
+/// hours at a glance, and that line exists to be glanced at.
+///
+/// Separate from [`render_frame`] so the bands can be asserted on their own: inside the sentence
+/// they are unassertable, because "this **m**achine" and "**m**ay be dead" contain the very unit
+/// letters a band test would look for. Writing that assertion against the whole line is how a test
+/// ends up passing on the prose instead of the number.
+fn humanise_secs(secs: u64) -> String {
+    match secs {
+        s if s < 90 => format!("{s}s"),
+        s if s < 5400 => format!("{}m", s / 60),
+        s => format!("{}h{}m", s / 3600, (s % 3600) / 60),
+    }
+}
+
 /// Render one typed `subscribe` stream frame to a display line. Pure so the rendering is
 /// unit-testable without a live daemon. Optional record fields degrade to an empty piece (a bare
 /// trust event has no peer/service — never a dangling separator). Surface-clean: only
@@ -753,6 +768,13 @@ pub fn render_frame(frame: &StreamFrame) -> String {
                 .unwrap_or_default();
             format!("blob {dir} {short} {st} — {amount}{who}")
         }
+        // #167 ask 2: a suspend is the one frame whose whole point is that a HUMAN watching the
+        // stream sees why their sessions went quiet. Rendering it as `[unknown frame]` would leave
+        // the reference consumer silent about the exact event it was added for.
+        StreamFrame::Resumed { suspended_secs, .. } => format!(
+            "resumed — this machine was suspended for {}; held sessions may be dead",
+            humanise_secs(*suspended_secs)
+        ),
         // `#[non_exhaustive]`: render an unknown frame kind rather than refusing to compile
         // against a newer local-api. The daemon and CLI ship in lockstep, so this is defensive.
         _ => "[unknown frame]".to_string(),
@@ -762,6 +784,41 @@ pub fn render_frame(frame: &StreamFrame) -> String {
 #[cfg(test)]
 mod tests {
     use mcpmesh_local_api::{PeerInfo, ServiceInfo};
+
+    /// #167 ask 2: the resume frame renders as a readable line, and the duration is HUMANISED.
+    ///
+    /// `internal watch` is the documented reference consumer, so a frame it prints as
+    /// `[unknown frame]` is one no embedder has an example for — the rule #82 wrote into this
+    /// function. The duration matters separately: "suspended for 7200s" is the same information a
+    /// reader cannot use, and this line exists to be glanced at.
+    #[test]
+    fn a_resume_frame_renders_a_humanised_duration() {
+        use mcpmesh_local_api::StreamFrame;
+        let at = |suspended_secs| {
+            super::render_frame(&StreamFrame::Resumed {
+                suspended_secs,
+                at_epoch: 1_700_000_000,
+            })
+        };
+        // Never the catch-all — the mutation this test exists to catch is the arm being absent.
+        assert!(
+            !at(7200).contains("unknown frame"),
+            "the reference consumer must render this frame: {}",
+            at(7200)
+        );
+        assert!(at(7200).contains("2h0m"), "{}", at(7200));
+
+        // The bands, asserted on the formatter rather than on the sentence — see `humanise_secs`.
+        // Each renders in its OWN unit: assert one band only and the whole ladder can collapse to
+        // a single arm with the test still green.
+        assert_eq!(super::humanise_secs(45), "45s");
+        assert_eq!(super::humanise_secs(89), "89s");
+        assert_eq!(super::humanise_secs(90), "1m");
+        assert_eq!(super::humanise_secs(600), "10m");
+        assert_eq!(super::humanise_secs(5399), "89m");
+        assert_eq!(super::humanise_secs(5400), "1h30m");
+        assert_eq!(super::humanise_secs(7200), "2h0m");
+    }
 
     /// #87: a multi-use invite SAYS so, and says it first.
     ///

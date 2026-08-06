@@ -2516,6 +2516,38 @@ pub enum StreamFrame {
     /// emit (address churn is chatty and not a decision point; it rides the next frame).
     /// `api_minor >= 28`.
     SelfNetwork { self_network: SelfNetwork },
+    /// This machine was SUSPENDED and has just resumed (#167 ask 2) — a closed laptop lid, a sleep,
+    /// a hibernate. `api_minor >= 55`.
+    ///
+    /// The signal an embedder holding long-lived sessions actually needs. While a machine is
+    /// suspended it sends nothing, so the *peer's* idle timer runs out and tears the connection down
+    /// before the lid is even reopened; `keep_alive_secs` cannot help, because a suspended process
+    /// emits no PINGs. Without this frame the first thing an app learns is a failed send, which is
+    /// the worst possible moment to find out. With it, the app can tear down and re-dial
+    /// deliberately.
+    ///
+    /// **Detected as clock skew, not guessed.** Rust's `Instant` is `CLOCK_MONOTONIC` on Linux and
+    /// `mach_absolute_time` on macOS, and neither advances across a suspend while the wall clock
+    /// does. A tick where the wall clock outran the monotonic clock by more than the threshold is a
+    /// suspend; a tick where BOTH ran long is a starved runtime and emits nothing. That distinction
+    /// is deliberate — a signal that fired under load would train consumers to ignore it.
+    ///
+    /// **It names no session.** The daemon cannot know which of an embedder's sessions survived —
+    /// a short suspend may well leave one intact. It means "this machine was away for N seconds;
+    /// re-check what you hold".
+    ///
+    /// Not retroactive: like [`Reachability`](StreamFrame::Reachability) and
+    /// [`SelfNetwork`](StreamFrame::SelfNetwork) this is a TRANSITION, so a subscriber attaching
+    /// after a resume does not see it — `Snapshot` answers what is true now.
+    Resumed {
+        /// How long the machine was away, in seconds — the number that decides whether to re-dial
+        /// everything or nothing. It is the wall-clock/monotonic skew, so it measures the suspend
+        /// itself and not the time since the last frame.
+        suspended_secs: u64,
+        /// Wall-clock epoch seconds at which the resume was DETECTED (up to one tick after the
+        /// machine actually woke).
+        at_epoch: i64,
+    },
     /// The subscriber fell `dropped` records behind the broadcast ring; the stream continues (a
     /// fresh reconnect would re-`Snapshot`). Never drops the subscriber — lag is reported, never fatal.
     Lagged { dropped: u64 },
@@ -2701,7 +2733,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   thirty have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.54";
+pub const API_VERSION: &str = "1.55";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -2787,7 +2819,13 @@ pub const API_VERSION: &str = "1.54";
 /// refusals — expired line, no live invite, inviter unreachable, id mismatch, name conflict, and
 /// the deliberately-opaque refusal. `ERR_NICKNAME_TAKEN` had been the only coded pairing failure,
 /// so every other one arrived as `-32000` and an embedder could either forward our prose to end
-/// users or substring-match it (#159); to 54 with [`OpenSessionParams::idle_timeout_secs`] — a
+/// users or substring-match it (#159); to 55 with [`StreamFrame::Resumed`] — a SUSPEND/RESUME
+/// signal on `subscribe` (#167 ask 2). A suspended machine sends nothing, so the peer's idle timer
+/// tears the connection down before the lid reopens and `keep_alive_secs` cannot help; the frame is
+/// what lets an embedder re-dial deliberately instead of discovering it on the next send. Detected
+/// as wall-clock/monotonic skew, so a starved runtime (both clocks run long) does NOT emit. It names
+/// no session — the daemon cannot know which survived. Guard on `>= 55`; to 54 with
+/// [`OpenSessionParams::idle_timeout_secs`] — a
 /// PER-CONNECTION QUIC idle timeout on the dial path (#166). The node-wide `[network]` knob made a
 /// chat session, a bulk blob transfer and a media flow share one compromise. Only LOWERING is
 /// unilateral (QUIC negotiates the minimum of both peers), which is also why the absence of an
@@ -2954,7 +2992,7 @@ pub const API_VERSION: &str = "1.54";
 /// its REAL content is a meaning change to `reachable` — the field exists so the new meaning is
 /// observable at all. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 54;
+pub const API_MINOR: u32 = 55;
 
 #[cfg(test)]
 mod tests {
@@ -4320,6 +4358,24 @@ mod tests {
         assert_eq!(v["record"]["peer"], "bob");
         assert_eq!(v["record"]["service"], "notes");
         assert_eq!(serde_json::from_value::<StreamFrame>(v).unwrap(), event);
+
+        // #167 ask 2: the resume frame's wire shape. A consumer dispatches on `type`, so the tag
+        // is part of the contract, and `at_epoch` is signed on purpose — the wire carries epoch
+        // seconds as i64 everywhere else in this file.
+        let resumed = StreamFrame::Resumed {
+            suspended_secs: 7200,
+            at_epoch: 1_700_007_202,
+        };
+        let v = serde_json::to_value(&resumed).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "type": "resumed",
+                "suspended_secs": 7200,
+                "at_epoch": 1_700_007_202i64,
+            })
+        );
+        assert_eq!(serde_json::from_value::<StreamFrame>(v).unwrap(), resumed);
 
         let lagged = StreamFrame::Lagged { dropped: 12 };
         let v = serde_json::to_value(&lagged).unwrap();

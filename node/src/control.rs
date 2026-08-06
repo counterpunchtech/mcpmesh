@@ -507,6 +507,9 @@ async fn run_subscription(
     // The app-blob transfer ring (#82 ask 2), registered before the snapshot for the same
     // gap-loss reason as the other two.
     let mut blob_rx = mesh.map(|m| m.blob_bcast.subscribe());
+    // The suspend/resume ring (#167 ask 2), registered before the snapshot for the same
+    // gap-loss reason as the other three.
+    let mut resume_rx = mesh.map(|m| m.resume_bcast.subscribe());
     let snapshot = StreamFrame::Snapshot {
         active_sessions: audit.active_sessions(),
         reachability: mesh.map(crate::daemon::reachability_of).unwrap_or_default(),
@@ -604,6 +607,24 @@ async fn run_subscription(
         }
     }
 
+    /// The suspend/resume-ring equivalent (#167 ask 2).
+    fn resume_frame(
+        r: Result<crate::daemon::ResumeEvent, RecvError>,
+        closed: &mut bool,
+    ) -> Option<StreamFrame> {
+        match r {
+            Ok(e) => Some(StreamFrame::Resumed {
+                suspended_secs: e.suspended_secs,
+                at_epoch: e.at_epoch,
+            }),
+            Err(RecvError::Lagged(n)) => Some(StreamFrame::Lagged { dropped: n }),
+            Err(RecvError::Closed) => {
+                *closed = true;
+                None
+            }
+        }
+    }
+
     /// Await the next value from an optional tap; an absent tap pends forever, so `select!`
     /// simply never picks it. Replaced the per-combination match when the third ring arrived
     /// (#90) — eight arms was where that shape stopped scaling.
@@ -617,14 +638,19 @@ async fn run_subscription(
     }
 
     let (mut closed_audit, mut closed_reach, mut closed_self) = (false, false, false);
-    let mut closed_blob = false;
+    let (mut closed_blob, mut closed_resume) = (false, false);
     loop {
-        // Four independent rings — audit records, peer-reachability transitions (#58), and
-        // self-network transitions (#90) — merged here rather than at the source, so the audit
-        // broadcast (which is the same call that appends to the on-disk log) keeps its schema
-        // untouched. Lag on ANY ring reports the same `Lagged` frame and never drops the
-        // subscriber.
-        if rx.is_none() && reach_rx.is_none() && self_rx.is_none() && blob_rx.is_none() {
+        // Five independent rings — audit records, peer-reachability transitions (#58),
+        // self-network transitions (#90), blob transfers (#82) and suspend/resume (#167) — merged
+        // here rather than at the source, so the audit broadcast (which is the same call that
+        // appends to the on-disk log) keeps its schema untouched. Lag on ANY ring reports the same
+        // `Lagged` frame and never drops the subscriber.
+        if rx.is_none()
+            && reach_rx.is_none()
+            && self_rx.is_none()
+            && blob_rx.is_none()
+            && resume_rx.is_none()
+        {
             return Ok(());
         }
         let frame = tokio::select! {
@@ -632,6 +658,7 @@ async fn run_subscription(
             r = tap(&mut reach_rx) => reach_frame(r, &mut closed_reach),
             r = tap(&mut self_rx) => self_net_frame(r, &mut closed_self),
             r = tap(&mut blob_rx) => blob_frame(r, &mut closed_blob),
+            r = tap(&mut resume_rx) => resume_frame(r, &mut closed_resume),
         };
         // A tap whose sender is gone is dropped rather than ending the stream — the OTHERS may
         // still be healthy. When all are gone the check at the loop top returns.
@@ -650,6 +677,10 @@ async fn run_subscription(
         if closed_self {
             self_rx = None;
             closed_self = false;
+        }
+        if closed_resume {
+            resume_rx = None;
+            closed_resume = false;
         }
         let Some(frame) = frame else { continue };
         if write_frame(&mut w, &serde_json::to_value(&frame)?)
