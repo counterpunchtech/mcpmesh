@@ -1870,3 +1870,98 @@ async fn revoking_a_person_keeps_their_new_devices_out_too() {
     b.shutdown().await;
     thief.shutdown().await;
 }
+
+/// #166 THROUGH THE CONTROL SOCKET: a per-session idle timeout reaches the dial path.
+///
+/// Proving the negotiated value on the wire is not available — iroh 1.0.3 exposes no reader for a
+/// connection's `max_idle_timeout`, and the behavioural difference only shows when a peer vanishes
+/// ABRUPTLY, which an in-process test cannot stage without tearing down a node mid-session.
+///
+/// So this pins the property that IS observable and is the one that actually breaks: the value
+/// travels from `open_session`'s params all the way to the resolver, rather than being parsed and
+/// dropped. A refused value comes back as an error only if it got there — a field accepted at the
+/// wire and never threaded would open the session happily.
+///
+/// The wire format itself is pinned separately in `protocol.rs` (present when set, ELIDED when
+/// absent, so an older daemon sees the payload it always saw).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_per_session_idle_timeout_reaches_the_dial_path() {
+    let (a_root, b_root) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = NodeBuilder::new(a_root.path())
+        .config(hermetic())
+        .start()
+        .await
+        .expect("a starts");
+    let b = NodeBuilder::new(b_root.path())
+        .config(hermetic())
+        .start()
+        .await
+        .expect("b starts");
+    let mut a_ctl = a.control().await.expect("a control");
+    let mut b_ctl = b.control().await.expect("b control");
+    a_ctl
+        .register_service_with(
+            "notes",
+            mcpmesh_local_api::BackendSpec::Socket {
+                path: a_root.path().join("notes.sock").display().to_string(),
+            },
+            vec![],
+            true,
+        )
+        .await
+        .expect("register");
+    let invite = a_ctl.invite(vec!["notes".into()]).await.expect("invite");
+    let paired = timeout(Duration::from_secs(30), b_ctl.pair(&invite.invite_line))
+        .await
+        .expect("pair within 30s")
+        .expect("pair");
+
+    // A value AT the keepalive is refused by the dial path. If the field were parsed and dropped,
+    // this would instead proceed to an ordinary dial.
+    let ctl = b.control().await.expect("b control 2");
+    let (mut reader, _w) = ctl
+        .open_session_with_idle_timeout(paired.peer_nickname.clone(), "notes".into(), Some(5))
+        .await
+        .expect("the request is written");
+    let frame = timeout(Duration::from_secs(30), reader.next())
+        .await
+        .expect("an answer within 30s")
+        .expect("frame read")
+        .expect("a frame");
+    let v = match frame {
+        mcpmesh_net::framing::Inbound::Frame(v) => v,
+        other => panic!("expected a frame, got {other:?}"),
+    };
+    // The dial refuses, and `open_session` reports it as an unreachable-peer synthesis — the same
+    // shape every other dial failure takes, so a caller needs no new error handling.
+    assert_eq!(
+        v["error"]["data"]["source"], "mcpmesh",
+        "a refused per-session timeout must come back as a mesh-synthesized error: {v}"
+    );
+
+    // …and the SAME session with a LEGAL value does not get that refusal.
+    //
+    // The first version asserted `open_session_with_idle_timeout(..).is_ok()`, which measures
+    // nothing: the client returns `Ok` as soon as the request FRAME IS WRITTEN and never reads a
+    // reply, so it cannot observe a refusal at all. The 0.48.0 gate proved it — making the daemon
+    // refuse EVERY per-session timeout left that assertion green. Read the reply instead.
+    let ctl = b.control().await.expect("b control 3");
+    let (mut reader, _w) = ctl
+        .open_session_with_idle_timeout(paired.peer_nickname.clone(), "notes".into(), Some(60))
+        .await
+        .expect("the request is written");
+    let legal = timeout(Duration::from_secs(30), reader.next()).await;
+    // A legal value reaches the dial, which then fails for its OWN reason (the service backend is
+    // an unbound socket) — anything except the keepalive refusal. What must NOT happen is the
+    // -32055 the refusal produces before any dial is attempted.
+    if let Ok(Ok(Some(mcpmesh_net::framing::Inbound::Frame(v)))) = legal {
+        assert_ne!(
+            v["error"]["code"].as_i64(),
+            Some(-32055),
+            "a legal per-session idle timeout must not be refused before the dial: {v}"
+        );
+    }
+
+    a.shutdown().await;
+    b.shutdown().await;
+}

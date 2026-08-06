@@ -232,6 +232,8 @@ pub struct MeshState {
     pub(crate) local_discovery: std::sync::OnceLock<String>,
     /// `[identity].admit_attested_devices` (#85 ask 3), resolved at boot.
     pub(crate) admit_attested: std::sync::OnceLock<bool>,
+    /// The effective `[network].keep_alive_secs` (#166), resolved at boot.
+    pub(crate) keep_alive_secs: std::sync::OnceLock<u64>,
     pub(crate) config_path: PathBuf,
     /// The relay posture (mode + custom URL set) currently APPLIED to the live endpoint — the
     /// runtime truth the `set_relays` verb (#53) diffs against. Seeded at boot from `[network]`
@@ -608,6 +610,7 @@ impl MeshState {
             presence_mode: std::sync::RwLock::new(crate::daemon::PresenceMode::default()),
             local_discovery: std::sync::OnceLock::new(),
             admit_attested: std::sync::OnceLock::new(),
+            keep_alive_secs: std::sync::OnceLock::new(),
             config_path,
             applied_relays: std::sync::Mutex::new(RelayPosture::default()),
             roster,
@@ -1018,6 +1021,30 @@ impl MeshState {
     /// Install the boot-resolved `[network].local_discovery` spelling (#68).
     pub fn set_local_discovery(&self, mode: String) {
         let _ = self.local_discovery.set(mode);
+    }
+
+    /// This node's EFFECTIVE QUIC keepalive interval in seconds (#166) — `[network].keep_alive_secs`
+    /// if set, else iroh's default.
+    ///
+    /// Read by the per-connection idle-timeout check, which refuses a value at or below it: a
+    /// keepalive arriving after the idle timer has fired severs a session whose peer is alive.
+    /// Stored at boot alongside the other transport knobs rather than re-read from disk, so the
+    /// refusal tracks what this endpoint was actually built with.
+    pub fn keep_alive_secs(&self) -> u64 {
+        self.keep_alive_secs
+            .get()
+            .copied()
+            // iroh's DEFAULT keepalive, which happens to equal its per-path CAP. Named by the cap
+            // constant because the tree has only that one — the gate rightly flagged that
+            // `boot.rs` calls it "not a default, a cap". They are both 5s today, and
+            // `iroh_transport_defaults_are_what_the_docs_claim` pins the default, so that test
+            // fails first if they ever diverge.
+            .unwrap_or(crate::daemon::boot::IROH_MAX_PATH_KEEP_ALIVE_SECS)
+    }
+
+    /// Install the boot-resolved effective keepalive (#166).
+    pub fn set_keep_alive_secs(&self, secs: u64) {
+        let _ = self.keep_alive_secs.set(secs);
     }
 
     /// #85 ask 3: does this node admit attested devices of people it already pairs with?

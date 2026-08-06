@@ -293,6 +293,7 @@ where
                             &loop_state,
                             &p.peer,
                             &p.service,
+                            p.idle_timeout_secs,
                             reader,
                             write_half,
                         )

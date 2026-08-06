@@ -548,4 +548,11 @@ impl Node {
         )
         .await
     }
+    /// TEST SEAM (#166): the effective keepalive this node booted with, which the per-session
+    /// idle-timeout guard validates against. Exposed because deleting boot's `set_keep_alive_secs`
+    /// left the whole suite green — the config→guard link had no test.
+    #[doc(hidden)]
+    pub fn keep_alive_secs_for_test(&self) -> u64 {
+        self.mesh().keep_alive_secs()
+    }
 }

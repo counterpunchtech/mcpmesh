@@ -118,12 +118,33 @@ impl ControlClient {
     /// that must re-box the read half calls `FrameReader::into_inner`, which returns the
     /// BUFFERED reader (its read-ahead travels with it — see the pipelining test below).
     pub async fn open_session(
-        mut self,
+        self,
         peer: String,
         service: String,
     ) -> Result<(FrameReader<ControlRead>, ControlWrite), ClientError> {
-        let frame = serde_json::to_value(Request::OpenSession(OpenSessionParams { peer, service }))
-            .expect("Request serializes");
+        self.open_session_with_idle_timeout(peer, service, None)
+            .await
+    }
+
+    /// [`open_session`](Self::open_session) with a per-session QUIC idle timeout (#166).
+    ///
+    /// See [`OpenSessionParams::idle_timeout_secs`] for what it can and cannot do — in short, it
+    /// can always make this session die sooner when it goes quiet, and can never make it outlive
+    /// what the peer allows.
+    ///
+    /// [`OpenSessionParams::idle_timeout_secs`]: crate::protocol::OpenSessionParams::idle_timeout_secs
+    pub async fn open_session_with_idle_timeout(
+        mut self,
+        peer: String,
+        service: String,
+        idle_timeout_secs: Option<u64>,
+    ) -> Result<(FrameReader<ControlRead>, ControlWrite), ClientError> {
+        let frame = serde_json::to_value(Request::OpenSession(OpenSessionParams {
+            peer,
+            service,
+            idle_timeout_secs,
+        }))
+        .expect("Request serializes");
         write_frame(&mut self.writer, &frame).await?;
         Ok((self.reader, self.writer))
     }

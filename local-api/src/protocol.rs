@@ -942,6 +942,40 @@ pub struct OpenSessionParams {
     pub peer: String,
     #[serde(default)]
     pub service: String,
+    /// A QUIC idle timeout for THIS session only, in seconds (#166, `api_minor >= 54`).
+    ///
+    /// Absent inherits `[network].idle_timeout_secs`, i.e. today's behaviour. `0` means "no idle
+    /// timeout from this side" — the same meaning the node-wide knob gives it, so the two cannot be
+    /// read differently.
+    ///
+    /// **Only LOWERING is unilateral.** QUIC negotiates `max_idle_timeout` to the MINIMUM of the
+    /// two peers' values (RFC 9000 §10.1), so this can always make a session die sooner when it
+    /// goes quiet and can never make it outlive what the peer allows. Raising needs both peers
+    /// configured — which was already true of the node-wide knob, and which no per-connection seam
+    /// changes.
+    ///
+    /// **Outbound only, and that is not half a feature.** An accepted session uses the node-wide
+    /// value, because iroh gives the server config no per-connection seam — but the direction that
+    /// CAN work one-sidedly is available here, and the direction that cannot never worked anywhere.
+    /// A node wanting a shorter timeout on a session it did not initiate can dial instead.
+    ///
+    /// **Ignored on a RACING dial**, because that opens connections it then abandons. The precise
+    /// rule, since the first version of this sentence was wrong in both directions:
+    ///
+    /// - A **roster person** races whenever the roster lists them with ANY device — including
+    ///   exactly one — so a `user_id` naming a rostered person never gets it.
+    /// - A pairing-mode **`b64u:`** races only with TWO OR MORE stored devices; with exactly one it
+    ///   falls through to the single-entry path and DOES get it.
+    ///
+    /// The node logs at `warn!` when it drops the value, naming the peer — a caller cannot know how
+    /// many devices a peer has, so a silent drop would be unattributable. Name one device with
+    /// `eid:` to be certain.
+    ///
+    /// No per-connection KEEPALIVE: iroh caps the per-path keepalive at 5s and discards larger
+    /// values, so one could only make pings more frequent — the node-wide knob already refuses that
+    /// direction (#56).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_secs: Option<u64>,
 }
 
 /// Params of [`Request::RosterInstall`]: the LOCAL roster file `path`, plus the org-root pin
@@ -2667,7 +2701,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   thirty have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.53";
+pub const API_VERSION: &str = "1.54";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -2753,7 +2787,15 @@ pub const API_VERSION: &str = "1.53";
 /// refusals — expired line, no live invite, inviter unreachable, id mismatch, name conflict, and
 /// the deliberately-opaque refusal. `ERR_NICKNAME_TAKEN` had been the only coded pairing failure,
 /// so every other one arrived as `-32000` and an embedder could either forward our prose to end
-/// users or substring-match it (#159); to 53 with `org_rotate` and the roster's
+/// users or substring-match it (#159); to 54 with [`OpenSessionParams::idle_timeout_secs`] — a
+/// PER-CONNECTION QUIC idle timeout on the dial path (#166). The node-wide `[network]` knob made a
+/// chat session, a bulk blob transfer and a media flow share one compromise. Only LOWERING is
+/// unilateral (QUIC negotiates the minimum of both peers), which is also why the absence of an
+/// accept-side twin is a missing symmetry rather than a missing half: the direction that can work
+/// one-sidedly is available, and the direction that cannot never worked anywhere. Ignored on a
+/// RACING dial, which abandons connections (logged at `warn!`, since a caller cannot know how many
+/// devices a peer has). No per-connection keepalive — iroh caps the per-path
+/// interval at 5s, so one could only make pings more frequent. Guard on `>= 54`; to 53 with `org_rotate` and the roster's
 /// `successor_root_pk`/`successor_sig` — ORG ROOT ROTATION (#93 ask c). The schema pinned exactly
 /// one signature slot against one key, so an operator laptop that died took the org with it 90 days
 /// later when the roster expired, and the delay is what made it undiagnosable; recovery was O(N)
@@ -2912,7 +2954,7 @@ pub const API_VERSION: &str = "1.53";
 /// its REAL content is a meaning change to `reachable` — the field exists so the new meaning is
 /// observable at all. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 53;
+pub const API_MINOR: u32 = 54;
 
 #[cfg(test)]
 mod tests {
@@ -3521,10 +3563,22 @@ mod tests {
         let r = Request::OpenSession(OpenSessionParams {
             peer: "alice".into(),
             service: "notes".into(),
+            // #166: seeded NON-default so the round-trip carries it. An absent value would be
+            // elided by `skip_serializing_if` and the assertion below would prove nothing.
+            idle_timeout_secs: Some(7),
         });
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["method"], "open_session");
         assert_eq!(v["params"]["peer"], "alice");
+        assert_eq!(v["params"]["idle_timeout_secs"], 7);
+        // …and an absent one really is absent, so an older daemon sees the payload it always saw.
+        let bare = serde_json::to_value(Request::OpenSession(OpenSessionParams {
+            peer: "alice".into(),
+            service: "notes".into(),
+            idle_timeout_secs: None,
+        }))
+        .unwrap();
+        assert!(bare["params"].get("idle_timeout_secs").is_none());
     }
 
     #[test]
