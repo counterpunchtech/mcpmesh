@@ -1721,26 +1721,86 @@ pub(crate) async fn peer_hint_clear(
     peer: &str,
 ) -> Result<mcpmesh_local_api::PeerHintClearResult> {
     let mesh = state.mesh_required()?;
-    // Resolves nickname / `eid:` / `b64u:`, and ERRORS for an unknown peer — an operator running an
-    // experiment must not be told they cleared a hint for a nickname they typo'd.
-    let endpoint_id = resolve_peer_endpoint(mesh, peer).await?;
+    // EVERY device the selector names, not just the first (#140 gate).
+    //
+    // `resolve_peer_endpoint` returns ONE endpoint, and for a `b64u:` user_id that is whichever
+    // device happens to sort first in redb's key order. Since #186 the racing dial path attaches the
+    // stored hint for EVERY device of a person, so clearing one and reporting success would leave
+    // the pairing still dialling from stored state while telling the operator it addresses like a
+    // fresh identity. On the two-device fleet in #140 that is the difference between the experiment
+    // working and quietly proving nothing.
+    let targets = peer_hint_targets(mesh, peer).await?;
     let store = mesh.store.clone();
-    let cleared = blocking("join peer-hint-clear store write", move || {
-        store.clear_last_addr(&endpoint_id)
-    })
-    .await??;
-    if cleared {
+    let ids = targets.clone();
+    // Paired with its device, so the audit can name WHICH device changed rather than guessing.
+    let outcomes: Vec<([u8; 32], Option<String>)> =
+        blocking("join peer-hint-clear store write", move || {
+            ids.into_iter()
+                .map(|id| store.clear_last_addr(&id).map(|f| (id, f)))
+                .collect::<Result<Vec<_>>>()
+        })
+        .await??;
+
+    let mut forgotten = Vec::new();
+    for (id, previous) in outcomes {
+        let Some(previous) = previous else {
+            continue; // this device had no hint: nothing changed, nothing to record
+        };
+        // One record per device ACTUALLY changed. A person with three devices of which one had a
+        // hint must not read as three clears in a two-machine debugging capture.
         mesh.audit().record(mcpmesh_local_api::AuditRecord::trust(
             crate::audit::record::now_ts(),
             "peer_hint_clear".into(),
-            // The SUBJECT is the peer whose addressing changed. Surface-clean: the resolved
-            // `eid:` principal, never the caller-typed selector, so a nickname collision cannot
-            // make two peers indistinguishable in the record (#41/#73).
-            Some(mcpmesh_net::EndpointId::from_bytes(endpoint_id).principal()),
+            // Surface-clean: the resolved `eid:` principal, never the caller-typed selector, so
+            // a nickname collision cannot make two peers indistinguishable in the record.
+            Some(mcpmesh_net::EndpointId::from_bytes(id).principal()),
             None,
         ));
+        forgotten.push(previous);
     }
-    Ok(mcpmesh_local_api::PeerHintClearResult { cleared })
+
+    Ok(mcpmesh_local_api::PeerHintClearResult {
+        cleared: forgotten.len(),
+        forgotten,
+    })
+}
+
+/// Every stored device a `peer_hint_clear` selector names — and an ERROR if it names none.
+///
+/// Split out because `resolve_peer_endpoint` cannot serve this verb on either count:
+///
+/// - Its `eid:` arm decodes a principal and returns it **without consulting the store**, so an
+///   unpaired `eid:` would flow through to a `cleared: 0` that is indistinguishable from a known
+///   peer with no hint. An operator running an experiment must not be told they cleared a hint for
+///   a device this node has never paired with (#140 gate — the first version did exactly that,
+///   while four doc sites claimed it errored).
+/// - It returns ONE endpoint for a `b64u:` user_id.
+async fn peer_hint_targets(mesh: &Arc<MeshState>, peer: &str) -> Result<Vec<[u8; 32]>> {
+    let store = mesh.store.clone();
+    if let Some(user_id) = peer.strip_prefix("b64u:") {
+        let uid = format!("b64u:{user_id}");
+        let entries = blocking("join peer-hint-targets user lookup", move || {
+            store.entries_for_user(&uid)
+        })
+        .await??;
+        if entries.is_empty() {
+            anyhow::bail!("no paired device for user '{peer}'");
+        }
+        return Ok(entries.into_iter().map(|e| e.endpoint_id).collect());
+    }
+    // Nickname and `eid:` both resolve to one device — but only the nickname path proves the peer
+    // is stored, so membership is checked here for both.
+    let id = resolve_peer_endpoint(mesh, peer).await?;
+    let store = mesh.store.clone();
+    let known = blocking("join peer-hint-targets membership", move || {
+        store.resolve(&id)
+    })
+    .await??
+    .is_some();
+    if !known {
+        anyhow::bail!("no paired peer '{peer}' — nothing to clear");
+    }
+    Ok(vec![id])
 }
 
 /// Resolve a `peer` selector to a stored endpoint id (#52): an `eid:<hex>` decodes directly;
@@ -4383,7 +4443,13 @@ allow = []
         );
 
         let r = peer_hint_clear(&state, "jetson").await.unwrap();
-        assert!(r.cleared, "a peer WITH a hint reports it was cleared");
+        assert_eq!(r.cleared, 1, "a peer WITH a hint reports one clear");
+        assert_eq!(
+            r.forgotten,
+            vec![hint.clone()],
+            "the removed hint is handed back — it is the only undo, since nothing rewrites it on a \
+             relay-only pairing and there is no setter"
+        );
 
         let row = mesh.store.resolve(&eid).unwrap().unwrap();
         assert_eq!(row.last_addr, None, "the hint is gone");
@@ -4411,17 +4477,96 @@ allow = []
 
         // Idempotent: a second clear is a no-op, and the row survives it.
         let again = peer_hint_clear(&state, "jetson").await.unwrap();
-        assert!(!again.cleared, "nothing left to clear");
+        assert_eq!(again.cleared, 0, "nothing left to clear");
+        assert!(again.forgotten.is_empty());
         let row2 = mesh.store.resolve(&eid).unwrap().unwrap();
         assert_eq!(row2.nickname, "jetson");
         assert_eq!(row2.paired_at.as_deref(), Some("1753000000"));
 
         // An unknown peer ERRORS rather than reporting a successful no-op — an operator running the
-        // #140 experiment must not be told they cleared a hint for a nickname they typo'd.
+        // #140 experiment must not be told they cleared a hint for a peer this node never paired
+        // with. All THREE selector forms, because they take different resolution paths and the
+        // first version only covered the nickname: `resolve_peer_endpoint`'s `eid:` arm decodes a
+        // principal WITHOUT consulting the store, so an unpaired `eid:` returned `cleared: 0` —
+        // indistinguishable from a known peer with no hint, and the exact outcome four doc sites
+        // claimed was impossible.
         assert!(
             peer_hint_clear(&state, "jetsonn").await.is_err(),
             "a typo'd nickname must not look like a successful clear"
         );
+        let stranger = iroh::SecretKey::from_bytes(&[99u8; 32]).public();
+        assert!(
+            peer_hint_clear(
+                &state,
+                &format!(
+                    "eid:{}",
+                    data_encoding::HEXLOWER.encode(stranger.as_bytes())
+                )
+            )
+            .await
+            .is_err(),
+            "an eid: this node has never paired with must ERROR, not report a clean no-op"
+        );
+        assert!(
+            peer_hint_clear(&state, "b64u:nobody").await.is_err(),
+            "a user_id with no stored device must error too"
+        );
+    }
+
+    /// #140 gate: a `b64u:` selector clears EVERY device of that person, not just the first.
+    ///
+    /// The first version resolved through `resolve_peer_endpoint`, which returns ONE endpoint — for
+    /// a user_id, whichever device sorts first in redb's key order. Since #186 the racing dial path
+    /// attaches the stored hint for every device, so clearing one and reporting success left the
+    /// pairing still dialling from stored state while telling the operator it now addressed like a
+    /// fresh identity. On the two-device fleet in #140 that is the difference between the
+    /// experiment working and quietly proving nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn peer_hint_clear_forgets_every_device_of_a_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+
+        let mut ids = Vec::new();
+        for (seed, nick) in [(41u8, "mac"), (42u8, "jetson")] {
+            let key = iroh::SecretKey::from_bytes(&[seed; 32]);
+            let eid = *key.public().as_bytes();
+            let hint = serde_json::to_string(&iroh::EndpointAddr::from_parts(
+                key.public(),
+                [iroh::TransportAddr::Ip(
+                    format!("10.0.0.{seed}:4433").parse().unwrap(),
+                )],
+            ))
+            .unwrap();
+            mesh.store
+                .add(crate::allowlist::PeerEntry {
+                    endpoint_id: eid,
+                    nickname: nick.into(),
+                    services: vec![],
+                    paired_at: None,
+                    user_id: Some("b64u:sameperson".into()),
+                    last_addr: Some(hint),
+                })
+                .unwrap();
+            ids.push(eid);
+        }
+
+        let r = peer_hint_clear(&state, "b64u:sameperson").await.unwrap();
+        assert_eq!(
+            r.cleared, 2,
+            "BOTH devices had a hint and both must be cleared"
+        );
+        assert_eq!(r.forgotten.len(), 2, "and both are handed back: {r:?}");
+
+        for id in &ids {
+            assert_eq!(
+                mesh.store.resolve(id).unwrap().unwrap().last_addr,
+                None,
+                "every device of the person must be cleared, not whichever sorted first"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

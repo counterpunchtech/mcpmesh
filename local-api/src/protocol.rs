@@ -1178,9 +1178,22 @@ pub struct PeerHintClearParams {
 /// Result of [`Request::PeerHintClear`] (#140).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerHintClearResult {
-    /// Whether a hint was actually removed. `false` means the peer had none — already the state
-    /// this verb produces, so it is a no-op rather than an error.
-    pub cleared: bool,
+    /// How many hints were removed. A `b64u:` user_id names EVERY device of that person and the
+    /// racing dial path attaches a hint for each, so clearing "the" hint would leave the pairing
+    /// still addressing from stored state while reporting success. Every device is cleared, and the
+    /// count says how many actually had one.
+    ///
+    /// `0` means nothing was stored — already the state this verb produces, so a no-op, not an error.
+    pub cleared: usize,
+    /// The raw hints removed, verbatim, in the order the devices resolved.
+    ///
+    /// **This is the undo.** There is no `peer_hint_set`, and on the pairing this verb targets the
+    /// hint may never be rewritten on its own: `dial_hint::refresh` is the only writer outside
+    /// pairing, and it deliberately declines to store anything for a RELAY-ONLY connection — which
+    /// is the defining property of a stuck pair. Keep this value; re-pairing is otherwise the only
+    /// way back.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forgotten: Vec<String>,
 }
 
 /// Params of [`Request::UnregisterService`] (#50): the persistent (or ephemeral) service name

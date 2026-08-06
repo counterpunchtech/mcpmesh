@@ -655,12 +655,15 @@ enum PeerCmd {
     /// "learned nothing" means leave alone — so a hint written before a network change can persist
     /// indefinitely on a pair whose every connection since has been relayed.
     ///
-    /// Clearing it makes this pairing address like a FRESH identity, which is exactly the
-    /// difference #140 is about. To run that experiment: clear on both ends, stop every session
-    /// between the two so the last connection closes, then probe fresh.
+    /// Clearing it makes this pairing address like a FRESH identity for the parts THIS node
+    /// controls. Run the experiment one variable at a time — see the output for the procedure;
+    /// closing every session is itself a variable and on its own may be enough.
     ///
-    /// Advisory, never authorization — the peer, its user_id, its services and its pairing stamp
-    /// are untouched, and the worst case is one slower dial while discovery runs.
+    /// Never authorization: the peer, its user_id, its services and its pairing stamp are untouched.
+    /// It is NOT harmless, though. With `[network] relay_mode = "disabled"` there is no discovery
+    /// at all and the hint was the only way to reach that peer, so clearing it makes the peer
+    /// unreachable until you re-pair. There is no `peer_hint_set`; the removed hints are printed so
+    /// you can keep them.
     HintClear {
         /// The peer: a nickname or an `eid:` device principal.
         peer: String,
@@ -1112,29 +1115,42 @@ fn run_peer_add(
     })
 }
 
-/// `mcpmesh internal peer state <peer> [--json]` (#140): dump the durable per-peer state.
-///
-/// The human form is laid out to be READ SIDE BY SIDE with the same output from the other end of a
-/// stuck pairing, which is how the state that differs becomes visible. `--json` is the shape to
-/// attach to an issue.
 /// `mcpmesh internal peer hint-clear <peer>` (#140): forget the stored dial hint.
 fn run_peer_hint_clear(peer: String, json: bool) -> anyhow::Result<()> {
     with_daemon(async move |mut client| {
         let res = client.peer_hint_clear(&peer).await?;
         if json {
             println!("{}", serde_json::to_string(&res)?);
-        } else if res.cleared {
-            println!(
-                "dial hint forgotten for {peer} — this node now dials it by id alone, as it would \
-                 a freshly paired peer."
-            );
-            println!(
-                "To test #140: do this on BOTH ends, stop every session between the two so the \
-                 last connection closes, then probe fresh."
-            );
-        } else {
-            println!("{peer} had no stored dial hint — nothing to forget.");
+            return Ok(());
         }
+        if res.cleared == 0 {
+            println!("{peer} had no stored dial hint — nothing to forget.");
+            return Ok(());
+        }
+        println!(
+            "forgot {} dial hint(s) for {peer}. This node now dials it by id alone.",
+            res.cleared
+        );
+        // The undo, printed BEFORE the instructions: there is no `peer_hint_set`, and on a
+        // relay-only pairing nothing rewrites the hint on its own.
+        println!("\nKEEP THESE — this is the only way back short of re-pairing:");
+        for f in &res.forgotten {
+            println!("  {f}");
+        }
+        println!(
+            "\nIf this node runs with [network] relay_mode = \"disabled\" there is NO discovery, \
+             and the stored hint was the only way to reach this peer — it is now unreachable until \
+             you re-pair."
+        );
+        println!(
+            "\nTo test #140, change ONE thing at a time — bundling them proves nothing:\n\
+             \x20 A. FIRST, without clearing anything: stop every session between the two so the\n\
+             \x20    last connection closes, wait >60s (or restart both daemons) so iroh reaps the\n\
+             \x20    remote state, then probe. If it punches HERE, the cause is the selected-path\n\
+             \x20    condition and the hint is innocent.\n\
+             \x20 B. ONLY if A still relays: clear on both ends, repeat A's steps, probe again.\n\
+             \x20    A punch now points at the stored hint."
+        );
         Ok(())
     })
 }

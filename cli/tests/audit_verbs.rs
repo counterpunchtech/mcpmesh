@@ -121,7 +121,12 @@ async fn peer_hint_clear_reaches_the_store_over_the_control_socket_and_is_audite
         .peer_hint_clear("jetson")
         .await
         .expect("the verb dispatches");
-    assert!(res.cleared, "a peer WITH a hint reports it was cleared");
+    assert_eq!(res.cleared, 1, "a peer WITH a hint reports one clear");
+    assert_eq!(
+        res.forgotten.len(),
+        1,
+        "and the removed hint is handed back — the only undo"
+    );
     assert_eq!(
         store.resolve(&eid).unwrap().unwrap().last_addr,
         None,
@@ -129,7 +134,7 @@ async fn peer_hint_clear_reaches_the_store_over_the_control_socket_and_is_audite
     );
 
     // Idempotent over the wire too.
-    assert!(!client.peer_hint_clear("jetson").await.unwrap().cleared);
+    assert_eq!(client.peer_hint_clear("jetson").await.unwrap().cleared, 0);
 
     // An unknown peer is an ERROR, not a cheerful no-op.
     assert!(
