@@ -1190,6 +1190,61 @@ fn run_peer_state(peer: String, json: bool) -> anyhow::Result<()> {
                 );
             }
         }
+        // #140 (api_minor 56): what IROH holds, next to what we stored. The differences are the
+        // reason this verb exists — printed as their own lines rather than left for a reader to
+        // diff two comma-separated lists by eye.
+        match &d.known_addrs {
+            None => println!(
+                "iroh knows: (no entry) — iroh holds no remote state for this peer right now. It \
+                 reaps that state ~60s after the last connection closes, so this is the normal \
+                 answer both for a peer never dialled AND for one talked to minutes ago. The two \
+                 comparison lines below are omitted: there is no view to compare the hint against."
+            ),
+            Some(known) if known.is_empty() => println!(
+                "iroh knows: (none) — iroh has an entry for this peer and no address in it"
+            ),
+            Some(known) => {
+                let rendered: Vec<String> = known
+                    .iter()
+                    .map(|k| {
+                        if k.active {
+                            format!("{} [active]", k.addr)
+                        } else {
+                            k.addr.clone()
+                        }
+                    })
+                    .collect();
+                println!("iroh knows: {}", rendered.join(", "));
+                let active_relay = known
+                    .iter()
+                    .any(|k| k.active && k.addr.starts_with("relay "));
+                let idle_direct = known
+                    .iter()
+                    .any(|k| !k.active && !k.addr.starts_with("relay "));
+                if active_relay && idle_direct {
+                    println!(
+                        "            relay active, direct address present but not carrying \
+                         traffic. Consistent with #140 — and equally consistent with an ordinary \
+                         failed hole-punch: iroh renders 'attempted and unusable' and 'not yet \
+                         attempted' identically here, so this one bit cannot tell them apart."
+                    );
+                }
+            }
+        }
+        if !d.hint_addrs_unknown_to_iroh.is_empty() {
+            println!(
+                "  not held: {} — in this node's stored hint, NOT in iroh's current view. The hint \
+                 is written whole from the last connection's open paths, so these were real then \
+                 and are absent now.",
+                d.hint_addrs_unknown_to_iroh.join(", ")
+            );
+        }
+        if !d.iroh_addrs_not_in_hint.is_empty() {
+            println!(
+                "  extra:    {} — in iroh's view, NOT named by the stored hint.",
+                d.iroh_addrs_not_in_hint.join(", ")
+            );
+        }
         match &d.reachability {
             None => println!(
                 "live:       never probed (this is a cache read — it does not dial, so a fresh \

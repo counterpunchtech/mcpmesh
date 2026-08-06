@@ -1101,6 +1101,70 @@ pub struct PeerDiagnosticsResult {
     /// participant in the reproduction it is meant to observe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reachability: Option<PeerReachability>,
+    /// What **iroh** currently holds for this endpoint, as opposed to what this node stored
+    /// (#140, `api_minor >= 56`). The other half of the capture, and the half the standing
+    /// hypothesis lives in.
+    ///
+    /// Everything above describes our own disk. Until this field there was no way to see what iroh
+    /// made of it — whether the hint's addresses are in its remote map at all, whether discovery
+    /// contributed anything alongside them, or which address is carrying traffic. Read straight off
+    /// `Endpoint::remote_info`, a point read of the remote map: no dial, no probe, no address
+    /// lookup, so this stays safe to run ON a live reproduction.
+    ///
+    /// **`None` means iroh currently holds NO ENTRY — which is not the same as an empty list, and
+    /// is not the same as "never heard of".** iroh reaps a remote's state about 60 seconds after
+    /// the last connection to it closes (`ACTOR_MAX_IDLE_TIMEOUT`), so `None` is the normal answer
+    /// both for a peer never dialled AND for one talked to a few minutes ago. An empty list means
+    /// iroh has an entry and holds no address in it.
+    ///
+    /// This distinction matters most to the question #140 is asking, which is about durability over
+    /// time: reading `None` as "iroh never knew this peer" would be wrong on any daemon that has
+    /// been idle, which is most of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known_addrs: Option<Vec<KnownAddr>>,
+    /// Addresses in [`hint_addrs`](Self::hint_addrs) that iroh does **not** currently hold.
+    ///
+    /// The hint is written whole: `set_last_addr` REPLACES the stored value with one built from the
+    /// live connection's open IP paths, so these are not accumulated cruft — they are addresses
+    /// that were real at the last successful connection and are absent from iroh's view now. (An
+    /// earlier version of this doc said #124 "amends but never removes"; that is false, and
+    /// `dial_hint.rs` says so in as many words.)
+    ///
+    /// **Empty whenever [`known_addrs`](Self::known_addrs) is `None`**, because there is no view to
+    /// difference against. Reporting the whole hint as unknown when iroh simply has no entry would
+    /// call a current, correct hint stale on every idle daemon.
+    ///
+    /// INFERRED by set difference, not read: iroh 1.0.3's `TransportAddrInfo` carries no
+    /// provenance, so "did this come from our hint or from discovery?" cannot be answered directly.
+    /// Naming it an inference is the honest version.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hint_addrs_unknown_to_iroh: Vec<String>,
+    /// The converse: what iroh holds that our stored hint does not name — inferred the same way,
+    /// and empty for the same reason when [`known_addrs`](Self::known_addrs) is `None`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub iroh_addrs_not_in_hint: Vec<String>,
+}
+
+/// One address iroh holds for a peer (#140, `api_minor >= 56`).
+///
+/// Rendered by the SAME labelling [`PeerDiagnosticsResult::hint_addrs`] uses — IPs verbatim, relays
+/// as `relay <url>` sanitized to scheme+host+port — because the two lists exist to be read side by
+/// side, and differently-formatted addresses would make a formatting difference look like a real
+/// one. The sanitization is not optional here either: this output is meant to be pasted into a
+/// public issue, and an operator's relay URL can carry a userinfo token.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KnownAddr {
+    /// The address, labelled as above.
+    pub addr: String,
+    /// Whether iroh reports this address as in ACTIVE use, as opposed to merely known.
+    ///
+    /// **One bit, and it collapses three states.** iroh maps only `PathStatus::Open` to active;
+    /// `Inactive`, `Unusable` ("we attempted holepunching and it didn't work") and `Unknown` ("we
+    /// have not yet attempted holepunching") all render `false`. So an idle direct address beside an
+    /// active relay is *consistent with* #140's selected-path hypothesis and equally consistent with
+    /// an ordinary failed hole-punch — which is a NAT diagnosis, the opposite conclusion. This field
+    /// cannot discriminate them; it says what is carrying traffic and no more.
+    pub active: bool,
 }
 
 /// Params of [`Request::UnregisterService`] (#50): the persistent (or ephemeral) service name
@@ -2764,7 +2828,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   thirty have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.55";
+pub const API_VERSION: &str = "1.56";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -2850,7 +2914,16 @@ pub const API_VERSION: &str = "1.55";
 /// refusals — expired line, no live invite, inviter unreachable, id mismatch, name conflict, and
 /// the deliberately-opaque refusal. `ERR_NICKNAME_TAKEN` had been the only coded pairing failure,
 /// so every other one arrived as `-32000` and an embedder could either forward our prose to end
-/// users or substring-match it (#159); to 55 with [`StreamFrame::Resumed`] — a SUSPEND/RESUME
+/// users or substring-match it (#159); to 56 with [`PeerDiagnosticsResult::known_addrs`] and its two
+/// set-difference companions — IROH's own view of a peer's addresses alongside the hint we stored
+/// (#140). The verb dumped this node's disk and nothing about what iroh made of it, which is the
+/// half the standing hypothesis lives in: iroh skips address lookup while a path is selected, so a
+/// pair holding a relayed connection never re-discovers and the stale hint is the only addressing
+/// the dial contributes. Read-only (a point read of the remote map), so it stays safe to run on a
+/// live reproduction — though it does reset iroh's ~60s per-remote idle timer, so polling it keeps
+/// state alive that would otherwise be reaped. `known_addrs` ABSENT means iroh holds no entry right
+/// now, which is neither an empty list nor "never heard of": iroh reaps a remote ~60s after its last
+/// connection closes. Guard on `>= 56`; to 55 with [`StreamFrame::Resumed`] — a SUSPEND/RESUME
 /// signal on `subscribe` (#167 ask 2). A suspended machine sends nothing, so the peer's idle timer
 /// tears the connection down before the lid reopens and `keep_alive_secs` cannot help; the frame is
 /// what lets an embedder re-dial deliberately instead of discovering it on the next send. Detected
@@ -3023,7 +3096,7 @@ pub const API_VERSION: &str = "1.55";
 /// its REAL content is a meaning change to `reachable` — the field exists so the new meaning is
 /// observable at all. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 55;
+pub const API_MINOR: u32 = 56;
 
 #[cfg(test)]
 mod tests {
@@ -3107,6 +3180,78 @@ mod tests {
     /// 22–29, which ALREADY has both producers — so it must land on `Unknown`, never on `Probe`.
     /// Defaulting to `Probe` would tell a consumer "a throwaway dial saw this" about frames that
     /// were a live session degrading, which is the ambiguity the field exists to remove.
+    /// #140: `known_addrs` absent, empty, and populated are three DIFFERENT wire shapes.
+    ///
+    /// The distinction is the field's whole reason for existing, and it is carried by
+    /// `skip_serializing_if` — so it lives on the wire, not in Rust. An embedder checking
+    /// `known_addrs === null` gets `undefined`, which is why the absent case is asserted as a
+    /// MISSING KEY rather than a null.
+    #[test]
+    fn known_addrs_distinguishes_absent_from_empty_on_the_wire() {
+        let base = PeerDiagnosticsResult {
+            nickname: "jetson".into(),
+            principal: "eid:beef".into(),
+            hint_usable: true,
+            ..Default::default()
+        };
+
+        // Absent: the key is OMITTED, never serialized as null.
+        let v = serde_json::to_value(&base).unwrap();
+        assert!(
+            v.get("known_addrs").is_none(),
+            "an absent iroh entry elides the key — a consumer must test presence, not null: {v}"
+        );
+
+        // Empty: iroh HAS an entry and holds no address. A real, different state.
+        let empty = PeerDiagnosticsResult {
+            known_addrs: Some(vec![]),
+            ..base.clone()
+        };
+        let v = serde_json::to_value(&empty).unwrap();
+        assert_eq!(
+            v["known_addrs"],
+            serde_json::json!([]),
+            "an empty list must survive as `[]` rather than collapsing back to absent: {v}"
+        );
+        assert_eq!(
+            serde_json::from_value::<PeerDiagnosticsResult>(v).unwrap(),
+            empty,
+            "and round-trip back to Some(vec![]), not None"
+        );
+
+        // Populated, with the `active` flag per address.
+        let full = PeerDiagnosticsResult {
+            known_addrs: Some(vec![
+                KnownAddr {
+                    addr: "192.168.1.77:4433".into(),
+                    active: true,
+                },
+                KnownAddr {
+                    addr: "relay https://r.example:8443".into(),
+                    active: false,
+                },
+            ]),
+            hint_addrs_unknown_to_iroh: vec!["10.0.0.9:4433".into()],
+            ..base
+        };
+        let v = serde_json::to_value(&full).unwrap();
+        assert_eq!(v["known_addrs"][0]["addr"], "192.168.1.77:4433");
+        assert_eq!(v["known_addrs"][0]["active"], true);
+        assert_eq!(v["known_addrs"][1]["active"], false);
+        assert_eq!(
+            v["hint_addrs_unknown_to_iroh"],
+            serde_json::json!(["10.0.0.9:4433"])
+        );
+        assert!(
+            v.get("iroh_addrs_not_in_hint").is_none(),
+            "an empty difference elides rather than shipping `[]` noise in every capture: {v}"
+        );
+        assert_eq!(
+            serde_json::from_value::<PeerDiagnosticsResult>(v).unwrap(),
+            full
+        );
+    }
+
     #[test]
     fn reachability_source_tags_and_defaults_to_unknown() {
         let tagged = |s: ReachabilitySource| serde_json::to_value(s).unwrap();

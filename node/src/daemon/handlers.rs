@@ -1517,6 +1517,57 @@ pub(crate) async fn peer_services(
 
 /// Dump the DURABLE per-peer state for one peer (#140), plus this node's live view of it.
 ///
+/// How long [`peer_diagnostics`] waits on iroh's remote-map actor before reporting no entry.
+///
+/// `Endpoint::remote_info` awaits an mpsc send and a oneshot reply with no timeout of its own. Every
+/// other await in that handler is bounded or a cache read, and a diagnostic reached for when
+/// something is already wrong is the last thing that should hang.
+const REMOTE_INFO_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Label ONE transport address for a diagnostic capture (#140): IPs verbatim, relay URLs as
+/// `relay <url>` SANITIZED to scheme+host+port.
+///
+/// Shared by the stored hint and by iroh's own view, deliberately. The two lists are read side by
+/// side and diffed against each other, so labelling them differently would both make a formatting
+/// difference look like a real one and let one list leak a userinfo token the other strips.
+pub(crate) fn label_transport_addr(a: &iroh::TransportAddr) -> String {
+    match a {
+        iroh::TransportAddr::Ip(s) => s.to_string(),
+        iroh::TransportAddr::Relay(u) => format!("relay {}", crate::daemon::sanitize_relay_url(u)),
+        // `TransportAddr` is `#[non_exhaustive]`. A `{other:?}` fallback was the first cut and it
+        // quietly voids the guarantee two lines up: today the only other variant is `Custom`, whose
+        // Debug is an opaque transport id and bytes, but a future URL-bearing variant would print
+        // unsanitized into output whose entire purpose is being pasted into a public issue. The
+        // variant is named, its contents are not.
+        _ => "(unsupported transport address)".to_string(),
+    }
+}
+
+/// The two set differences between our stored hint and iroh's view (#140) — PURE, so the direction
+/// of each is pinned by a test rather than by reading the call site.
+///
+/// Returned as `(in_hint_only, in_iroh_only)`. Getting these backwards is the whole failure mode:
+/// the fields are adjacent, same-typed, and a reversed pair reads perfectly plausibly while telling
+/// a reporter the exact opposite of what is happening on their machine.
+///
+/// An INFERENCE, not a reading: iroh 1.0.3's `TransportAddrInfo` carries no provenance, so this
+/// cannot say an address *came from* the hint — only that it is or is not in both lists.
+pub(crate) fn addr_differences(hint: &[String], known: &[String]) -> (Vec<String>, Vec<String>) {
+    let hint_set: std::collections::HashSet<&str> = hint.iter().map(String::as_str).collect();
+    let known_set: std::collections::HashSet<&str> = known.iter().map(String::as_str).collect();
+    (
+        hint.iter()
+            .filter(|a| !known_set.contains(a.as_str()))
+            .cloned()
+            .collect(),
+        known
+            .iter()
+            .filter(|a| !hint_set.contains(a.as_str()))
+            .cloned()
+            .collect(),
+    )
+}
+
 /// The question behind #140 is "what does a long-lived pairing carry that a fresh identity does
 /// not, that could durably prevent a hole-punch while leaving relayed connectivity healthy?"
 ///
@@ -1537,6 +1588,10 @@ pub(crate) async fn peer_services(
 /// Read-only, and it has to be: it reads the reachability CACHE rather than `status`'s projection,
 /// which would spawn a background probe for every stale peer. A diagnostic that dials the thing it
 /// is measuring is a participant in the reproduction, not an observer of it (#140 gate).
+/// Since `api_minor` 56 it also reports IROH's own view of the peer's addresses, which is the other
+/// half of the same question: the fields above say what this node stored, `known_addrs` says what
+/// iroh made of it.
+///
 pub(crate) async fn peer_diagnostics(
     state: &DaemonState,
     peer: &str,
@@ -1562,17 +1617,7 @@ pub(crate) async fn peer_diagnostics(
     // identified as harmful — it can never punch — and it rendered as an empty line. Relay URLs are
     // SANITIZED to scheme+host+port through the same helper `status` uses: an operator-supplied
     // relay URL can carry a userinfo token, and this output is meant to be pasted into an issue.
-    let hint_addrs: Vec<String> = dialed
-        .addrs
-        .iter()
-        .map(|a| match a {
-            iroh::TransportAddr::Ip(s) => s.to_string(),
-            iroh::TransportAddr::Relay(u) => {
-                format!("relay {}", crate::daemon::sanitize_relay_url(u))
-            }
-            other => format!("{other:?}"),
-        })
-        .collect();
+    let hint_addrs: Vec<String> = dialed.addrs.iter().map(label_transport_addr).collect();
     // An id-only `EndpointAddr` is what a MISSING or REJECTED hint degrades to, so a stored hint
     // that yields no addresses is one being thrown away at every dial.
     let hint_usable = entry.last_addr.is_some() && !dialed.addrs.is_empty();
@@ -1604,6 +1649,45 @@ pub(crate) async fn peer_diagnostics(
         })
     };
 
+    // IROH's own view (#140, api_minor 56) — a point read of the remote map. `remote_info` does
+    // not dial, probe, or trigger an address lookup, which is what keeps this verb safe to run ON
+    // the live reproduction it is meant to observe.
+    //
+    // `None` is preserved rather than flattened to an empty list. It does NOT mean "never heard of":
+    // iroh reaps a remote's state ~60s after its last connection closes, so absent is the normal
+    // answer both for a peer never dialled and for one talked to minutes ago. It still means
+    // something different from "iroh has an entry and holds no address in it".
+    // Bounded: `remote_info` awaits an mpsc send plus a oneshot with no timeout of its own, while
+    // every other await in this handler is bounded or cache-local. A diagnostic must not be the
+    // thing that hangs. A timeout degrades to "no entry", which is already a modelled state.
+    let known_addrs: Option<Vec<mcpmesh_local_api::KnownAddr>> =
+        tokio::time::timeout(REMOTE_INFO_TIMEOUT, mesh.endpoint.remote_info(id))
+            .await
+            .ok()
+            .flatten()
+            .map(|info| {
+                info.addrs()
+                    .map(|a| mcpmesh_local_api::KnownAddr {
+                        addr: label_transport_addr(a.addr()),
+                        active: matches!(a.usage(), iroh::endpoint::TransportAddrUsage::Active),
+                    })
+                    .collect()
+            });
+    // The differences are only meaningful against a view that EXISTS.
+    //
+    // Flattening `None` to an empty list here — which the first cut did — makes every hint address
+    // "unknown to iroh" whenever iroh has no entry, which is the DEFAULT state of a daemon that has
+    // not dialled the peer yet, including the freshly auto-started one the CLI spawns. It printed
+    // "stale: 192.168.1.50:4433" about a hint that was current and correct. A diagnostic that
+    // confidently mislabels the common case is worse than no diagnostic (#140 gate).
+    let (hint_addrs_unknown_to_iroh, iroh_addrs_not_in_hint) = match &known_addrs {
+        Some(known) => {
+            let labels: Vec<String> = known.iter().map(|k| k.addr.clone()).collect();
+            addr_differences(&hint_addrs, &labels)
+        }
+        None => (Vec::new(), Vec::new()),
+    };
+
     Ok(mcpmesh_local_api::PeerDiagnosticsResult {
         nickname: entry.nickname,
         principal: mcpmesh_net::EndpointId::from_bytes(entry.endpoint_id).principal(),
@@ -1613,6 +1697,9 @@ pub(crate) async fn peer_diagnostics(
         hint_addrs,
         hint_usable,
         reachability,
+        known_addrs,
+        hint_addrs_unknown_to_iroh,
+        iroh_addrs_not_in_hint,
     })
 }
 
@@ -2647,6 +2734,90 @@ mod tests {
         assert!(has("notes"));
     }
 
+    /// #140: the two set differences must not be transposed.
+    ///
+    /// They are adjacent fields of the same type, and a reversed pair reads perfectly plausibly
+    /// while telling a reporter the exact opposite of what is happening on their machine — "iroh
+    /// has forgotten three of your hint's addresses" instead of "discovery found three your hint
+    /// never had". Those lead to opposite conclusions about #140.
+    ///
+    /// The two inputs are deliberately DIFFERENT sizes with a shared element, so a transposed
+    /// implementation cannot coincidentally agree.
+    #[test]
+    fn the_hint_and_iroh_differences_are_not_transposed() {
+        let hint = vec![
+            "192.168.1.5:4444".to_string(),
+            "10.0.0.9:4444".to_string(),
+            "relay https://r.example:443".to_string(),
+        ];
+        let known = vec![
+            "192.168.1.5:4444".to_string(),  // in both
+            "192.168.1.77:4444".to_string(), // discovery only
+        ];
+        let (unknown_to_iroh, not_in_hint) = super::addr_differences(&hint, &known);
+        assert_eq!(
+            unknown_to_iroh,
+            vec!["10.0.0.9:4444", "relay https://r.example:443"],
+            "these are in the stored hint and NOT in iroh's view"
+        );
+        assert_eq!(
+            not_in_hint,
+            vec!["192.168.1.77:4444"],
+            "this is in iroh's view and NOT named by the hint"
+        );
+        // The shared address is in NEITHER difference. Without this the two lists could simply be
+        // the two inputs and both assertions above would still hold.
+        for d in [&unknown_to_iroh, &not_in_hint] {
+            assert!(
+                !d.contains(&"192.168.1.5:4444".to_string()),
+                "an address in both lists belongs to neither difference: {d:?}"
+            );
+        }
+    }
+
+    /// Empty on either side is not a crash and not a swap: an empty hint means everything iroh
+    /// knows is discovery's, and an empty iroh view means the whole hint is unknown to it. The
+    /// second is the shape a stuck pairing is expected to show.
+    #[test]
+    fn one_sided_address_differences_land_on_the_correct_side() {
+        let a = vec!["1.2.3.4:1".to_string()];
+        assert_eq!(
+            super::addr_differences(&[], &a),
+            (vec![], a.clone()),
+            "no hint: everything iroh holds came from somewhere else"
+        );
+        assert_eq!(
+            super::addr_differences(&a, &[]),
+            (a, vec![]),
+            "an iroh entry that holds NO address really does leave the whole hint unheld — this is \
+             the `Some([])` case. The `None` case never reaches here; the caller short-circuits it, \
+             which is what the gate's CRITICAL finding was about."
+        );
+    }
+
+    /// A relay URL is sanitized in the SHARED labeller, so `known_addrs` cannot leak a userinfo
+    /// token that `hint_addrs` strips. This output exists to be pasted into a public issue, which
+    /// makes it the highest-risk surface in the tree for that leak.
+    #[test]
+    fn a_relay_url_is_stripped_of_userinfo_wherever_it_is_labelled() {
+        // A NON-default port, so the assertion proves the port is preserved as well as that the
+        // credentials are gone. With `:443` the URL parser normalizes the port away and the test
+        // could pass while dropping it.
+        let url: iroh::RelayUrl = "https://tok3n:s3cret@relay.example:8443/"
+            .parse::<url::Url>()
+            .unwrap()
+            .into();
+        let labelled = super::label_transport_addr(&iroh::TransportAddr::Relay(url));
+        assert_eq!(labelled, "relay https://relay.example:8443");
+        for leak in ["s3cret", "tok3n", "@"] {
+            assert!(
+                !labelled.contains(leak),
+                "a relay URL's userinfo must never reach a diagnostic meant for a public issue: \
+                 {labelled}"
+            );
+        }
+    }
+
     /// #140: the dump reports the durable state, and `hint_usable` agrees with what the DIAL
     /// actually does — including the case that is invisible from outside.
     ///
@@ -2683,6 +2854,16 @@ mod tests {
         // the baseline #140 compares against.
         seed(None);
         let d = peer_diagnostics(&state, "jetson").await.unwrap();
+        // #140 (api_minor 56): a peer this node has never dialled has NO iroh entry, reported as
+        // `None` rather than flattened to an empty list — which still means something different
+        // from "iroh has an entry and holds no address in it". (Absent does not mean "never heard
+        // of": iroh also reaps a remote ~60s after its last connection closes.)
+        assert_eq!(
+            d.known_addrs, None,
+            "an unknown peer must report no iroh ENTRY, not an empty address list"
+        );
+        assert!(d.hint_addrs_unknown_to_iroh.is_empty());
+        assert!(d.iroh_addrs_not_in_hint.is_empty());
         assert_eq!(d.nickname, "jetson");
         assert!(d.principal.starts_with("eid:"), "{}", d.principal);
         assert_eq!(d.last_addr, None);
@@ -2703,6 +2884,24 @@ mod tests {
         assert_eq!(d.last_addr.as_deref(), Some(good.as_str()));
         assert!(d.hint_usable, "a well-formed hint for THIS peer is usable");
         assert_eq!(d.hint_addrs, vec!["192.168.1.50:4433".to_string()]);
+        // **The gate's CRITICAL finding, inverted into a test.** With NO iroh entry there is
+        // nothing to difference against, so BOTH lists must be empty. The first cut flattened
+        // `None` to an empty view and reported the whole hint as "unknown to iroh" — on a daemon
+        // that had simply never dialled the peer, which is the default state of the one the CLI
+        // auto-starts. It printed "stale: 192.168.1.50:4433" about a hint that was current and
+        // correct.
+        assert_eq!(d.known_addrs, None, "precondition: iroh has no entry here");
+        assert!(
+            d.hint_addrs_unknown_to_iroh.is_empty(),
+            "with no iroh view there is nothing to call stale — a current hint must not be \
+             reported as absent from a view that does not exist: {:?}",
+            d.hint_addrs_unknown_to_iroh
+        );
+        assert!(
+            d.iroh_addrs_not_in_hint.is_empty(),
+            "and nothing can be missing from the hint either: {:?}",
+            d.iroh_addrs_not_in_hint
+        );
 
         // The invisible case: a hint whose embedded id is a DIFFERENT peer. The store holds it,
         // and every dial throws it away. Reporting this as usable would send someone hunting the
@@ -4011,6 +4210,97 @@ allow = []
     ///
     /// `probe_seq` is the witness: `probe_peer` takes a ticket before anything else, so the
     /// counter moving is proof a dial started.
+    /// **The gate deleted the entire `remote_info` call and the whole suite stayed green.**
+    ///
+    /// Nothing constructed a `KnownAddr`, exercised the `active` mapping, or labelled an
+    /// iroh-supplied address — the fields were computed by code no test reached. That is the "pin
+    /// the call site, not the helper" failure this repo has now recorded three times in one
+    /// session, and a pure-function test for `addr_differences` does not close it.
+    ///
+    /// So: two real endpoints, one real connection, then read the verb. It needs a live connection
+    /// because that is the only way iroh holds remote state — which is also why this cannot live
+    /// inside `peer_diagnostics_never_dials`, whose whole point is that the VERB does not dial. The
+    /// dial here is the test's, before the verb is called.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn known_addrs_reports_irohs_own_view_once_a_connection_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+
+        // A second relay-disabled endpoint that accepts, so the connection actually completes and
+        // iroh ends up with an OPEN path rather than a half-built one.
+        let hermetic = crate::config::NetworkCfg {
+            relay_mode: "disabled".into(),
+            ..Default::default()
+        };
+        let peer_ep = crate::daemon::boot::build_endpoint(
+            iroh::SecretKey::from_bytes(&[31u8; 32]),
+            &hermetic,
+            false,
+        )
+        .await
+        .unwrap();
+        let peer_id = *peer_ep.id().as_bytes();
+        let peer_addr = peer_ep.addr();
+        let acceptor = peer_ep.clone();
+        let _accept = tokio::spawn(async move {
+            while let Some(incoming) = acceptor.accept().await {
+                let _ = incoming.await;
+            }
+        });
+
+        mesh.store
+            .add(crate::allowlist::PeerEntry {
+                endpoint_id: peer_id,
+                nickname: "jetson".into(),
+                services: vec![],
+                paired_at: None,
+                user_id: None,
+                last_addr: Some(serde_json::to_string(&peer_addr).unwrap()),
+            })
+            .unwrap();
+
+        let _conn = mesh
+            .endpoint
+            .connect(peer_addr, mcpmesh_net::ALPN_MCP)
+            .await
+            .expect("loopback dial to a live endpoint");
+
+        let d = peer_diagnostics(&state, "jetson").await.unwrap();
+        let known = d.known_addrs.expect(
+            "iroh holds remote state for a peer we are connected to right now — `None` here means \
+             the field is not wired to `remote_info` at all",
+        );
+        assert!(
+            !known.is_empty(),
+            "a live connection has at least one path: {known:?}"
+        );
+        assert!(
+            known.iter().any(|k| k.active),
+            "the address carrying this connection must report active — a hardcoded `false` would \
+             make the one bit this field exists for meaningless: {known:?}"
+        );
+        // The labels are the SAME vocabulary the hint uses, which is what makes the two difference
+        // lists comparable at all rather than a diff of two formats.
+        assert!(
+            known
+                .iter()
+                .all(|k| k.addr.parse::<std::net::SocketAddr>().is_ok()
+                    || k.addr.starts_with("relay ")),
+            "every label is an IP or a `relay ` entry: {known:?}"
+        );
+        // And with a real view present, the differences are computed against it rather than
+        // short-circuited — the other side of the CRITICAL finding.
+        assert!(
+            d.hint_addrs_unknown_to_iroh.is_empty(),
+            "the hint was built from this very endpoint's address, so iroh holds it: {:?} vs {:?}",
+            d.hint_addrs_unknown_to_iroh,
+            known
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn peer_diagnostics_never_dials() {
         let dir = tempfile::tempdir().unwrap();
