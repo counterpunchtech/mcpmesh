@@ -365,6 +365,40 @@ impl PeerStore {
         Ok(changed)
     }
 
+    /// Clear an existing row's `last_addr`, atomically, inside ONE write transaction (#140).
+    ///
+    /// Returns whether anything changed. `false` for a peer that had no hint — and, like
+    /// [`set_last_addr`](Self::set_last_addr), that case ABORTS rather than committing an empty
+    /// transaction: an empty commit still costs a ~6ms fsync and holds redb's global writer lock for
+    /// it, blocking pairing, peer add and rename.
+    ///
+    /// An unknown peer is `Ok(false)` here; the CALLER distinguishes it, because "no such peer" and
+    /// "peer had no hint" need different answers for an operator running an experiment.
+    ///
+    /// Only `last_addr` moves. The pairing stamp, `user_id`, `services` and nickname are read back
+    /// and rewritten verbatim — a clear implemented as delete-and-reinsert would drop the pairing
+    /// proof, and the row would still look present.
+    pub fn clear_last_addr(&self, endpoint_id: &[u8; 32]) -> Result<bool> {
+        let txn = self.db.begin_write()?;
+        let changed = {
+            let mut table = txn.open_table(PEERS)?;
+            let Some(existing) = table.get(endpoint_id.as_slice())? else {
+                return Ok(false); // unknown peer — never invent one
+            };
+            let mut entry: PeerEntry = serde_json::from_slice(existing.value())?;
+            drop(existing);
+            if entry.last_addr.is_none() {
+                return Ok(false); // nothing to clear: abort, do not pay the fsync
+            }
+            entry.last_addr = None;
+            let bytes = serde_json::to_vec(&entry)?;
+            table.insert(endpoint_id.as_slice(), bytes.as_slice())?;
+            true
+        };
+        txn.commit()?;
+        Ok(changed)
+    }
+
     /// Resolve a peer by its 32-byte endpoint_id, or `None` if not allowlisted.
     ///
     /// Fails CLOSED on a corrupt stored row: a row that will not deserialize (e.g. an

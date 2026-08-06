@@ -647,6 +647,27 @@ enum PeerCmd {
         #[arg(long)]
         json: bool,
     },
+    /// FORGET this node's stored dial hint for a peer (#140).
+    ///
+    /// The hint is the only durable per-peer state on this node's disk that the dial path reads,
+    /// and the only thing a long-lived pairing carries that a freshly paired identity does not.
+    /// Nothing invalidates it: a relay-only connection deliberately declines to overwrite it, and
+    /// "learned nothing" means leave alone — so a hint written before a network change can persist
+    /// indefinitely on a pair whose every connection since has been relayed.
+    ///
+    /// Clearing it makes this pairing address like a FRESH identity, which is exactly the
+    /// difference #140 is about. To run that experiment: clear on both ends, stop every session
+    /// between the two so the last connection closes, then probe fresh.
+    ///
+    /// Advisory, never authorization — the peer, its user_id, its services and its pairing stamp
+    /// are untouched, and the worst case is one slower dial while discovery runs.
+    HintClear {
+        /// The peer: a nickname or an `eid:` device principal.
+        peer: String,
+        /// Emit the raw result as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -808,6 +829,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             subject_binding,
             cli.json,
         ),
+        Some(Cmd::Internal {
+            command:
+                Internal::Peer {
+                    command: PeerCmd::HintClear { peer, json },
+                },
+        }) => run_peer_hint_clear(peer, json || cli.json),
         Some(Cmd::Internal {
             command:
                 Internal::Peer {
@@ -1090,6 +1117,28 @@ fn run_peer_add(
 /// The human form is laid out to be READ SIDE BY SIDE with the same output from the other end of a
 /// stuck pairing, which is how the state that differs becomes visible. `--json` is the shape to
 /// attach to an issue.
+/// `mcpmesh internal peer hint-clear <peer>` (#140): forget the stored dial hint.
+fn run_peer_hint_clear(peer: String, json: bool) -> anyhow::Result<()> {
+    with_daemon(async move |mut client| {
+        let res = client.peer_hint_clear(&peer).await?;
+        if json {
+            println!("{}", serde_json::to_string(&res)?);
+        } else if res.cleared {
+            println!(
+                "dial hint forgotten for {peer} — this node now dials it by id alone, as it would \
+                 a freshly paired peer."
+            );
+            println!(
+                "To test #140: do this on BOTH ends, stop every session between the two so the \
+                 last connection closes, then probe fresh."
+            );
+        } else {
+            println!("{peer} had no stored dial hint — nothing to forget.");
+        }
+        Ok(())
+    })
+}
+
 /// #65: produce an endorsement for someone else to redeem.
 fn run_peer_endorse(
     subject: String,

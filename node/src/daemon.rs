@@ -67,7 +67,9 @@ pub use handlers::{
     grant_service_access, grant_service_allow, introduce_peer, peer_revoke, peer_unrevoke,
     remove_peer, rename_peer, revoke_service_access, revoke_service_allow,
 };
-pub(crate) use handlers::{attest_offer, attest_to, device_revocation_import, device_revoke};
+pub(crate) use handlers::{
+    attest_offer, attest_to, device_revocation_import, device_revoke, peer_hint_clear,
+};
 pub(crate) use org_author::org_rotate;
 pub(crate) use reach::caller_admitted_services;
 /// The services this identity is admitted to, as the accept path computes them (#100). Test seam:

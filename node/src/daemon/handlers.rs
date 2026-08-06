@@ -1703,6 +1703,46 @@ pub(crate) async fn peer_diagnostics(
     })
 }
 
+/// Forget one peer's persisted dial hint (#140).
+///
+/// The ONE piece of durable per-peer state on this node's disk that the dial path reads, and the
+/// only thing a long-lived pairing carries that a freshly paired identity does not. Clearing it
+/// makes the pairing addressing-equivalent to a fresh one, which is the exact difference #140 is
+/// about.
+///
+/// Advisory, never authorization: the row, its `user_id`, its services and its pairing stamp are
+/// untouched, and an absent hint is a supported state (`stored_dial_addr` degrades to an id-only
+/// dial). Nothing clears a hint automatically — see the verb's rustdoc for why not.
+///
+/// Audited: it changes how this node dials a peer, and #140 is a two-machine debugging session where
+/// "what did we do, and when" is the record.
+pub(crate) async fn peer_hint_clear(
+    state: &DaemonState,
+    peer: &str,
+) -> Result<mcpmesh_local_api::PeerHintClearResult> {
+    let mesh = state.mesh_required()?;
+    // Resolves nickname / `eid:` / `b64u:`, and ERRORS for an unknown peer — an operator running an
+    // experiment must not be told they cleared a hint for a nickname they typo'd.
+    let endpoint_id = resolve_peer_endpoint(mesh, peer).await?;
+    let store = mesh.store.clone();
+    let cleared = blocking("join peer-hint-clear store write", move || {
+        store.clear_last_addr(&endpoint_id)
+    })
+    .await??;
+    if cleared {
+        mesh.audit().record(mcpmesh_local_api::AuditRecord::trust(
+            crate::audit::record::now_ts(),
+            "peer_hint_clear".into(),
+            // The SUBJECT is the peer whose addressing changed. Surface-clean: the resolved
+            // `eid:` principal, never the caller-typed selector, so a nickname collision cannot
+            // make two peers indistinguishable in the record (#41/#73).
+            Some(mcpmesh_net::EndpointId::from_bytes(endpoint_id).principal()),
+            None,
+        ));
+    }
+    Ok(mcpmesh_local_api::PeerHintClearResult { cleared })
+}
+
 /// Resolve a `peer` selector to a stored endpoint id (#52): an `eid:<hex>` decodes directly;
 /// else a stored `PeerEntry` by nickname; else the first device under a `b64u:` user_id.
 pub(crate) async fn resolve_peer_endpoint(mesh: &Arc<MeshState>, peer: &str) -> Result<[u8; 32]> {
@@ -4298,6 +4338,89 @@ allow = []
             "the hint was built from this very endpoint's address, so iroh holds it: {:?} vs {:?}",
             d.hint_addrs_unknown_to_iroh,
             known
+        );
+    }
+
+    /// #140: the hint is forgotten, the DIAL changes, and nothing else about the peer moves.
+    ///
+    /// The dial assertion is the one that matters. Checking only the stored row would leave the
+    /// property the verb exists for — that this pairing now addresses like a fresh identity —
+    /// unpinned, which is the failure every gate in this session has found. `stored_dial_addr` is
+    /// the function the dial path actually calls, so it is asserted rather than re-derived.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn peer_hint_clear_forgets_the_hint_and_changes_the_dial() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+
+        let key = iroh::SecretKey::from_bytes(&[5u8; 32]);
+        let eid = *key.public().as_bytes();
+        let hint = serde_json::to_string(&iroh::EndpointAddr::from_parts(
+            key.public(),
+            [iroh::TransportAddr::Ip(
+                "192.168.1.50:4433".parse().unwrap(),
+            )],
+        ))
+        .unwrap();
+        mesh.store
+            .add(crate::allowlist::PeerEntry {
+                endpoint_id: eid,
+                nickname: "jetson".into(),
+                services: vec!["kb".into()],
+                paired_at: Some("1753000000".into()),
+                user_id: Some("b64u:abc".into()),
+                last_addr: Some(hint.clone()),
+            })
+            .unwrap();
+
+        // BEFORE: the dial carries the hint's address.
+        let before = crate::daemon::dial::stored_dial_addr(Some(hint.as_str()), key.public());
+        assert!(
+            !before.addrs.is_empty(),
+            "precondition: the hint is being used by the dial"
+        );
+
+        let r = peer_hint_clear(&state, "jetson").await.unwrap();
+        assert!(r.cleared, "a peer WITH a hint reports it was cleared");
+
+        let row = mesh.store.resolve(&eid).unwrap().unwrap();
+        assert_eq!(row.last_addr, None, "the hint is gone");
+
+        // AFTER: the dial degrades to id-only — exactly what a freshly paired peer does, which is
+        // the whole point of the verb.
+        let after = crate::daemon::dial::stored_dial_addr(row.last_addr.as_deref(), key.public());
+        assert!(
+            after.addrs.is_empty(),
+            "the dial must now carry NO addresses, so discovery is the only source: {after:?}"
+        );
+        assert_eq!(after.id, key.public(), "and still name the right peer");
+
+        // Nothing else moved. Asserted field by field: a clear implemented as delete-and-reinsert
+        // would leave the row "present" while dropping the pairing proof.
+        assert_eq!(row.nickname, "jetson");
+        assert_eq!(row.user_id.as_deref(), Some("b64u:abc"));
+        assert_eq!(row.services, vec!["kb".to_string()]);
+        assert_eq!(
+            row.paired_at.as_deref(),
+            Some("1753000000"),
+            "the pairing stamp is the proof this peer was ever paired — clearing an ADDRESS must \
+             not touch it"
+        );
+
+        // Idempotent: a second clear is a no-op, and the row survives it.
+        let again = peer_hint_clear(&state, "jetson").await.unwrap();
+        assert!(!again.cleared, "nothing left to clear");
+        let row2 = mesh.store.resolve(&eid).unwrap().unwrap();
+        assert_eq!(row2.nickname, "jetson");
+        assert_eq!(row2.paired_at.as_deref(), Some("1753000000"));
+
+        // An unknown peer ERRORS rather than reporting a successful no-op — an operator running the
+        // #140 experiment must not be told they cleared a hint for a nickname they typo'd.
+        assert!(
+            peer_hint_clear(&state, "jetsonn").await.is_err(),
+            "a typo'd nickname must not look like a successful clear"
         );
     }
 

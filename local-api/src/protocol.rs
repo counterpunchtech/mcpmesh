@@ -1167,6 +1167,22 @@ pub struct KnownAddr {
     pub active: bool,
 }
 
+/// Params of [`Request::PeerHintClear`] (#140): whose stored dial hint to forget.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerHintClearParams {
+    /// Nickname / `eid:` / `b64u:` — the same vocabulary every other peer verb takes.
+    pub peer: String,
+}
+
+/// Result of [`Request::PeerHintClear`] (#140).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerHintClearResult {
+    /// Whether a hint was actually removed. `false` means the peer had none — already the state
+    /// this verb produces, so it is a no-op rather than an error.
+    pub cleared: bool,
+}
+
 /// Params of [`Request::UnregisterService`] (#50): the persistent (or ephemeral) service name
 /// to remove — the deregistration mirror of `register_service`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1615,6 +1631,29 @@ pub enum Request {
     /// unlike every other surface it carries transport vocabulary on purpose. Answers with
     /// [`PeerDiagnosticsResult`]. `api_minor >= 33`.
     PeerDiagnostics(PeerDiagnosticsParams),
+    /// FORGET the persisted dial hint for one peer (#140) — `api_minor >= 59`.
+    ///
+    /// An experiment tool, and a workaround. `PeerEntry.last_addr` is the only durable per-peer
+    /// state on this node's disk that the dial path reads, and it is the ONLY thing a long-lived
+    /// pairing carries that a freshly paired identity does not. Nothing invalidates it: a
+    /// relay-only connection deliberately declines to overwrite it (persisting a relay URL over a
+    /// direct candidate was #124's own bug), and "learned nothing" means leave alone. So a hint
+    /// written before a network change can persist indefinitely on a pair whose every connection
+    /// since has been relayed.
+    ///
+    /// Clearing it makes an existing pairing **addressing-equivalent to a fresh identity**, which
+    /// is exactly the difference #140 is about — a pair that cannot punch as a long-lived pairing
+    /// while punching in 23ms with fresh identities on the same hardware.
+    ///
+    /// **Advisory, never authorization.** A hint is addressing; its absence is a supported state
+    /// (the dial degrades to id-only, which is what every peer does before its first refresh). The
+    /// worst case is one slower dial while discovery runs. The peer row, its `user_id`, its
+    /// services and its pairing stamp are untouched.
+    ///
+    /// Nothing clears a hint automatically — choosing an invalidation policy before the data exists
+    /// is what produced a fix that helped one peer and not this one. Answers
+    /// [`PeerHintClearResult`].
+    PeerHintClear(PeerHintClearParams),
     ServiceAllowGrant(ServiceAllowParams),
     /// Revoke a single stable principal from a single service's allow (#44) — "sharing off"
     /// WITHOUT unpairing (the peer's identity row is untouched; only NEW sessions are refused).
@@ -2828,7 +2867,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   thirty have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.58";
+pub const API_VERSION: &str = "1.59";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -2914,7 +2953,14 @@ pub const API_VERSION: &str = "1.58";
 /// refusals — expired line, no live invite, inviter unreachable, id mismatch, name conflict, and
 /// the deliberately-opaque refusal. `ERR_NICKNAME_TAKEN` had been the only coded pairing failure,
 /// so every other one arrived as `-32000` and an embedder could either forward our prose to end
-/// users or substring-match it (#159); to 58 with the REVERSE-DNS `_meta` key spellings
+/// users or substring-match it (#159); to 59 with [`Request::PeerHintClear`] — FORGET one peer's
+/// persisted dial hint (#140). An experiment tool and a workaround, not a policy change: nothing
+/// clears a hint automatically. `PeerEntry.last_addr` is the only durable per-peer state on a node's
+/// disk that the dial path reads and the only thing a long-lived pairing carries that a freshly
+/// paired identity does not, so clearing it makes the pairing ADDRESSING-EQUIVALENT to a fresh one —
+/// which is exactly the difference #140 is about. Advisory, never authorization: the row, its
+/// `user_id`, its services and its pairing stamp are untouched, and an absent hint is a supported
+/// state. Guard on `>= 59`; to 58 with the REVERSE-DNS `_meta` key spellings
 /// `tech.counterpunch.mcpmesh/{service,peer}` alongside the legacy `mcpmesh/{service,peer}` (#49,
 /// SEP-1788's SHOULD). No shape changed, and **no peer or backend has to change what it READS**:
 /// both spellings are WRITTEN with identical values and EITHER is accepted, which is why this did
@@ -3120,7 +3166,7 @@ pub const API_VERSION: &str = "1.58";
 /// its REAL content is a meaning change to `reachable` — the field exists so the new meaning is
 /// observable at all. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 58;
+pub const API_MINOR: u32 = 59;
 
 #[cfg(test)]
 mod tests {

@@ -10,7 +10,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use mcpmesh::allowlist::{AllowlistGate, PeerStore};
+use mcpmesh::allowlist::{AllowlistGate, PeerEntry, PeerStore};
 use mcpmesh::audit::{AuditLog, AuditSink};
 use mcpmesh::client::connect_control;
 use mcpmesh::control::{DaemonState, serve_control};
@@ -52,9 +52,13 @@ async fn control_over_audit_dir(
     mcpmesh_local_api::client::ControlClient,
     tokio::task::JoinHandle<anyhow::Result<()>>,
     Arc<MeshState>,
+    // `MeshState::store` is private outside the crate, so the harness hands back its own handle —
+    // the SAME Arc the daemon uses, so a test asserts on the store the verb actually wrote to.
+    Arc<PeerStore>,
 ) {
     let store = Arc::new(PeerStore::open(&dir.join("state.redb")).unwrap());
     let gate: Arc<dyn TrustGate> = Arc::new(AllowlistGate::new(store.clone()));
+    let store_for_test = store.clone();
     let ep = local_endpoint().await;
     let mesh = MeshState::new(
         ep,
@@ -76,7 +80,91 @@ async fn control_over_audit_dir(
     let state = Arc::new(DaemonState::with_mesh(STACK_VERSION, mesh.clone()));
     let control = tokio::spawn(serve_control(listener, state));
     let client = connect_control(&socket).await.expect("connect control");
-    (client, control, mesh)
+    (client, control, mesh, store_for_test)
+}
+
+/// #140: `peer_hint_clear` reaches the store THROUGH the real control socket, and is audited.
+///
+/// The dispatch arm and the client method are the parts a unit test cannot reach, and every gate in
+/// this session found a call site no test traversed — twice it was a dispatch arm that could be
+/// deleted with the whole workspace green. This drives the actual JSON-RPC round trip.
+///
+/// It also pins the AUDIT record, because #140 is a two-machine debugging session where "what did we
+/// do to this pair, and when" is the record, and a verb that changes dialling silently would make
+/// the capture unreadable.
+#[tokio::test(flavor = "multi_thread")]
+async fn peer_hint_clear_reaches_the_store_over_the_control_socket_and_is_audited() {
+    let dir = tempfile::tempdir().unwrap();
+    let audit_dir = dir.path().join("audit");
+    let (mut client, _control, _mesh, store) =
+        control_over_audit_dir(dir.path(), audit_dir.clone()).await;
+
+    let key = iroh::SecretKey::from_bytes(&[11u8; 32]);
+    let eid = *key.public().as_bytes();
+    let hint = serde_json::to_string(&iroh::EndpointAddr::from_parts(
+        key.public(),
+        [iroh::TransportAddr::Ip("10.1.2.3:4433".parse().unwrap())],
+    ))
+    .unwrap();
+    store
+        .add(PeerEntry {
+            endpoint_id: eid,
+            nickname: "jetson".into(),
+            services: vec![],
+            paired_at: Some("1753000000".into()),
+            user_id: None,
+            last_addr: Some(hint),
+        })
+        .unwrap();
+
+    let res = client
+        .peer_hint_clear("jetson")
+        .await
+        .expect("the verb dispatches");
+    assert!(res.cleared, "a peer WITH a hint reports it was cleared");
+    assert_eq!(
+        store.resolve(&eid).unwrap().unwrap().last_addr,
+        None,
+        "and the store actually changed — not just the reply"
+    );
+
+    // Idempotent over the wire too.
+    assert!(!client.peer_hint_clear("jetson").await.unwrap().cleared);
+
+    // An unknown peer is an ERROR, not a cheerful no-op.
+    assert!(
+        client.peer_hint_clear("nobody").await.is_err(),
+        "a typo'd nickname must not look like a successful clear"
+    );
+
+    // The clear is audited, keyed on the peer's STABLE principal rather than the typed selector —
+    // a nickname collision must not make two peers indistinguishable in a two-machine capture.
+    // The sink writes asynchronously, so poll rather than assume (the pattern
+    // `trust_mutations_emit_audit_events` uses).
+    let principal = mcpmesh_net::EndpointId::from_bytes(eid).principal();
+    let month = &mcpmesh::audit::now_ts()[..7];
+    let file = audit_dir.join(format!("{month}.jsonl"));
+    let mut body = String::new();
+    for _ in 0..100 {
+        body = std::fs::read_to_string(&file).unwrap_or_default();
+        if body.contains("\"event\":\"peer_hint_clear\"") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        body.contains("\"event\":\"peer_hint_clear\""),
+        "the clear must reach the audit trail: {body}"
+    );
+    assert!(
+        body.contains(&format!("\"target\":\"{principal}\"")),
+        "and name the peer by its stable principal, not the typed selector: {body}"
+    );
+    assert_eq!(
+        body.matches("\"event\":\"peer_hint_clear\"").count(),
+        1,
+        "the idempotent second clear changed nothing and must NOT be recorded as an event: {body}"
+    );
 }
 
 /// `audit_prune { before }` deletes strictly-older months, keeps the named month, reports what
@@ -98,7 +186,7 @@ async fn audit_prune_deletes_strictly_older_months_and_validates_its_input() {
             )
             .unwrap();
         }
-        let (mut client, control, _mesh) =
+        let (mut client, control, _mesh, _store) =
             control_over_audit_dir(dir.path(), audit_dir.clone()).await;
 
         // Malformed month → an error, not a silent no-op string comparison.
@@ -219,7 +307,7 @@ async fn audit_list_filters_and_pages_with_an_honest_total() {
             .concat(),
         )
         .unwrap();
-        let (mut client, control, _mesh) =
+        let (mut client, control, _mesh, _store) =
             control_over_audit_dir(dir.path(), audit_dir.clone()).await;
 
         let list = |p: AuditListParams| Request::AuditList(p);
@@ -337,7 +425,7 @@ async fn status_blobs_gc_is_absent_until_collection_is_configured() {
         let dir = tempfile::tempdir().unwrap();
         let audit_dir = dir.path().join("audit");
         std::fs::create_dir_all(&audit_dir).unwrap();
-        let (mut client, control, mesh) =
+        let (mut client, control, mesh, _store) =
             control_over_audit_dir(dir.path(), audit_dir.clone()).await;
 
         let status: StatusResult =
@@ -402,7 +490,7 @@ async fn status_reports_live_storage_bytes() {
         std::fs::create_dir_all(&audit_dir).unwrap();
         let body = line("2026-07-01T00:00:00.000Z", "session_open", Some("bob"));
         std::fs::write(audit_dir.join("2026-07.jsonl"), &body).unwrap();
-        let (mut client, control, _mesh) =
+        let (mut client, control, _mesh, _store) =
             control_over_audit_dir(dir.path(), audit_dir.clone()).await;
 
         let status: StatusResult =
