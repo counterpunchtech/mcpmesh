@@ -31,7 +31,7 @@ use super::config_write::{
     append_allow_to_config, remove_allow_from_config, remove_principal_from_service,
     remove_service_from_config, write_relays, write_service_to_config,
 };
-use super::{MeshState, dial_service, pipe_session};
+use super::{MeshState, pipe_session};
 
 /// A minted pairing invite lives at most 24h.
 const INVITE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -2376,6 +2376,8 @@ pub(crate) async fn open_session<CR, CW>(
     state: &DaemonState,
     peer: &str,
     service: &str,
+    // #166: a per-session QUIC idle timeout, or `None` for the node-wide value.
+    idle_timeout_secs: Option<u64>,
     control_reader: FrameReader<CR>,
     mut control_writer: CW,
 ) -> Result<()>
@@ -2392,7 +2394,14 @@ where
         .await;
         return Ok(());
     };
-    let transport = match dial_service(mesh, peer, service).await {
+    let transport = match crate::daemon::dial::dial_service_with_idle_timeout(
+        mesh,
+        peer,
+        service,
+        idle_timeout_secs,
+    )
+    .await
+    {
         Ok(t) => t,
         Err(e) => {
             // A failed dial reaches no backend, so the far side's session guard never audits

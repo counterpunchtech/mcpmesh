@@ -69,6 +69,43 @@ are in the [operator runbook §5](operator.md#5-self-hosting-relay--discovery-10
 An unknown mode, or a `"custom"` mode without its URL list, is a **startup error** — the daemon
 refuses to run rather than silently falling back to public infrastructure.
 
+### Per-session idle timeout (#166)
+
+`[network].idle_timeout_secs` is node-wide, so a chat session, a bulk blob transfer and a media flow
+all share one compromise. `open_session` can override it for **one** session:
+
+```
+open_session { peer, service, idle_timeout_secs: 120 }
+```
+
+Three things decide what this can do, and all three follow from how QUIC works:
+
+- **Only lowering is unilateral.** `max_idle_timeout` is negotiated to the **minimum** of the two
+  peers' values (RFC 9000 §10.1), so this can always make a session die sooner when it goes quiet,
+  and can never make it outlive what the peer allows. Raising needs both peers configured — which
+  was already true of the node-wide knob.
+- **Outbound only, and that is not half a feature.** An accepted session uses the node-wide value,
+  because iroh gives the server config no per-connection seam. But the direction that *can* work
+  one-sidedly is available here, and the direction that cannot never worked anywhere. A node wanting
+  a shorter timeout on a session it did not initiate can dial instead.
+- **It must exceed this node's keepalive.** A keepalive arriving after the idle timer has fired
+  severs a session whose peer is alive and answering, so a value at or below `keep_alive_secs`
+  (default 5s) is **refused** — the same rule the node-wide pair is validated against at boot.
+
+**Ignored on a racing dial**, because that opens connections it then abandons. Precisely: a **roster
+person** races whenever the roster lists them with any device — including exactly one — so a
+`user_id` naming a rostered person never gets it; a pairing-mode **`b64u:`** races only with two or
+more stored devices, and with exactly one it does get it. The node logs at `warn!` when it drops the
+value, because a caller cannot know how many devices a peer has. Name one device with `eid:` to be
+certain.
+
+The value is still **validated** on a racing dial even though it is then dropped — a bad value is an
+error whichever path a peer happens to resolve to, so the same call does not succeed or fail
+depending on how many machines someone owns.
+
+There is no per-session **keepalive**: iroh caps the per-path interval at 5s and discards larger
+values, so one could only make pings more frequent.
+
 ### Local discovery — finding peers with no internet (#68)
 
 Peer resolution normally needs external infrastructure: the pkarr publisher a relay provides, or an

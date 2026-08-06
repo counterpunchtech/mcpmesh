@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use mcpmesh_net::SessionTransport;
 use mcpmesh_net::framing::{FrameReader, Inbound, write_frame};
-use mcpmesh_net::{SessionTransport, connect};
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
@@ -70,6 +70,113 @@ pub async fn dial_service(
     peer: &str,
     service: &str,
 ) -> Result<SessionTransport> {
+    dial_service_with_idle_timeout(mesh, peer, service, None).await
+}
+
+/// Say so when a RACING dial drops a caller's per-session transport config (#166 gate).
+///
+/// `race_dial` opens several connections and keeps the winner, so applying a transport config there
+/// would apply it to dials about to be abandoned. Dropping it is the right call; dropping it
+/// SILENTLY is not — a caller who asked for a 120s session and got the node default has no way to
+/// tell, which is the "knob that quietly did nothing" this file refuses twice over.
+///
+/// Not an error: the same `open_session` call is a racing dial or not depending on how many devices
+/// the peer happens to have, which the caller cannot know. Refusing would make a legal request fail
+/// for a reason outside the caller's control.
+fn warn_if_per_session_dropped(
+    per_conn: &Option<iroh::endpoint::QuicTransportConfig>,
+    peer: &str,
+    why: &str,
+) {
+    if per_conn.is_some() {
+        tracing::warn!(
+            peer,
+            "idle_timeout_secs was IGNORED: {why} resolves to a racing dial, which opens several \
+             connections and keeps the winner. Name one device with eid: to apply it"
+        );
+    }
+}
+
+/// Build the COMPLETE per-session transport config for a caller-supplied idle timeout (#166).
+///
+/// **Returns the config rather than mutating a builder, so a test can assert what was actually
+/// set** — the discipline `build_transport_config` already follows, and the reason the 0.48.0 gate
+/// could prove the bug below in one line.
+///
+/// `ConnectOptions::with_transport_config` REPLACES the endpoint's config rather than overlaying
+/// it, so this must carry the node's OWN keepalive too. The first cut built only the idle timeout:
+/// a node with `[network].keep_alive_secs = 2` then got a per-session connection with iroh's 5s
+/// keepalive, and a 3s idle timeout — which this function had just validated as safe against 2s —
+/// severed sessions whose peers were alive and answering. The guard was checking a keepalive the
+/// connection did not have.
+///
+/// `secs`:
+/// - `None` → `Ok(None)`: inherit the endpoint's config, today's behaviour.
+/// - `Some(0)` → no idle timeout FROM THIS SIDE (the peer's value still bounds the connection),
+///   the same meaning `[network].idle_timeout_secs` gives it.
+/// - `Some(s)` → refused at or below `keepalive_secs`, and refused if QUIC cannot encode it. Both
+///   are ERRORS, never a silent fallback to the node default: a knob that quietly did nothing is
+///   what the #56 gate found twice in this same area.
+pub(crate) fn per_session_transport_config(
+    secs: Option<u64>,
+    keepalive_secs: u64,
+) -> Result<Option<iroh::endpoint::QuicTransportConfig>> {
+    let idle = match secs {
+        None => return Ok(None),
+        Some(0) => None,
+        Some(s) => {
+            // A keepalive arriving after the idle timer has fired severs a session whose peer is
+            // alive and answering — never what "cut this one fast if it goes quiet" meant.
+            // `[network].keep_alive_secs` is validated against the idle timeout at boot for exactly
+            // this reason; this is the same rule at the other end. Refused rather than clamped: a
+            // clamped value reads back as honoured and is not.
+            anyhow::ensure!(
+                s > keepalive_secs,
+                "idle_timeout_secs ({s}) must be greater than this node's keepalive interval \
+                 ({keepalive_secs}s): a keepalive arriving after the idle timer has fired would \
+                 sever the session on a clock, even against a peer that is alive and answering"
+            );
+            Some(
+                iroh::endpoint::IdleTimeout::try_from(std::time::Duration::from_secs(s)).map_err(
+                    |e| {
+                        anyhow::anyhow!(
+                            "idle_timeout_secs {s} is out of the range QUIC can encode: {e}"
+                        )
+                    },
+                )?,
+            )
+        }
+    };
+    let d = std::time::Duration::from_secs(keepalive_secs);
+    Ok(Some(
+        iroh::endpoint::QuicTransportConfig::builder()
+            .max_idle_timeout(idle)
+            // BOTH keepalives, mirroring `build_transport_config` — iroh pings on the PATH value,
+            // so setting only the connection-level one leaves a 5s path ping running.
+            .keep_alive_interval(d)
+            .default_path_keep_alive_interval(d)
+            .build(),
+    ))
+}
+
+/// [`dial_service`] with a per-connection QUIC idle timeout (#166).
+///
+/// Applied on the SINGLE-TARGET paths only — an explicit `eid:` and a single stored entry. The
+/// RACING paths (a roster person→device race, a multi-device `user_id`) ignore it: `race_dial`
+/// opens several connections and keeps the winner, so a transport config there would be applied to
+/// dials that are about to be abandoned. A caller who needs a specific timeout for a specific
+/// device names that device with `eid:`, which is the answer #41 gives for every other per-device
+/// concern. Documented on the param rather than silently partial.
+pub async fn dial_service_with_idle_timeout(
+    mesh: &Arc<MeshState>,
+    peer: &str,
+    service: &str,
+    idle_timeout_secs: Option<u64>,
+) -> Result<SessionTransport> {
+    // The EFFECTIVE keepalive: this node's configured value, else iroh's default. Read from the
+    // live config rather than assumed, so the refusal below tracks what the node actually does.
+    let keepalive = mesh.keep_alive_secs();
+    let per_conn = per_session_transport_config(idle_timeout_secs, keepalive)?;
     // #41: an explicit `eid:<hex>` DEVICE principal dials that EXACT authenticated endpoint —
     // the one the socket backend injects into `_meta` and the allow lists use. No nickname
     // ambiguity (nicknames are not unique), no person→device race: it targets one device
@@ -81,7 +188,7 @@ pub async fn dial_service(
         {
             refuse_if_revoked(mesh, &id, peer)?;
         }
-        return dial_by_eid(mesh, hex, service).await;
+        return dial_by_eid(mesh, hex, service, per_conn).await;
     }
 
     // Person→device: `peer` names a roster user with active devices → staggered race.
@@ -91,6 +198,7 @@ pub async fn dial_service(
             let candidates = order_dial_candidates(&devices, &mesh.presence_table, peer);
             // #186: a rostered device often ALSO has a paired row, and its hint is the only address
             // anyone has on a network with no discovery.
+            warn_if_per_session_dropped(&per_conn, peer, "a roster person");
             let candidates = hinted_addrs(mesh, candidates).await?;
             let (transport, conn) = race_dial(&mesh.endpoint, candidates, service)
                 .await
@@ -129,6 +237,7 @@ pub async fn dial_service(
         // #186: these came from `entries_for_user`, so the hints were literally in hand and the
         // old code kept only the ids — making a two-device person unreachable offline while a
         // one-device person was fine.
+        warn_if_per_session_dropped(&per_conn, peer, "a user_id with several devices");
         let multi = hinted_addrs(mesh, multi).await?;
         let (transport, conn) = race_dial(&mesh.endpoint, multi, service)
             .await
@@ -140,9 +249,10 @@ pub async fn dial_service(
     let endpoint_id = iroh::EndpointId::from_bytes(&entry.endpoint_id)
         .map_err(|e| anyhow::anyhow!("stored endpoint id for '{peer}' is invalid: {e}"))?;
     let addr = stored_dial_addr(entry.last_addr.as_deref(), endpoint_id);
-    let (transport, conn) = connect_with_timeout(&mesh.endpoint, addr, service, DIAL_TIMEOUT)
-        .await
-        .with_context(|| format!("dial {peer}/{service}"))?;
+    let (transport, conn) =
+        connect_with_timeout(&mesh.endpoint, addr, service, DIAL_TIMEOUT, per_conn)
+            .await
+            .with_context(|| format!("dial {peer}/{service}"))?;
     Ok(watch_session(mesh, transport, conn))
 }
 
@@ -173,7 +283,12 @@ fn watch_session(
 /// present at that id (cold-dial reachability, issue #27), else a bare-id discovery dial. The
 /// peer's own gate remains the security boundary — dialing is outbound and authorizes nothing
 /// on our side. An invalid hex / wrong length is a clear resolution error, never a panic.
-async fn dial_by_eid(mesh: &Arc<MeshState>, hex: &str, service: &str) -> Result<SessionTransport> {
+async fn dial_by_eid(
+    mesh: &Arc<MeshState>,
+    hex: &str,
+    service: &str,
+    per_conn: Option<iroh::endpoint::QuicTransportConfig>,
+) -> Result<SessionTransport> {
     let bytes = data_encoding::HEXLOWER
         .decode(hex.as_bytes())
         .map_err(|_| anyhow::anyhow!("invalid eid principal: not lowercase hex"))?;
@@ -193,9 +308,10 @@ async fn dial_by_eid(mesh: &Arc<MeshState>, hex: &str, service: &str) -> Result<
         .flatten()
         .and_then(|e| e.last_addr);
     let addr = stored_dial_addr(last_addr.as_deref(), endpoint_id);
-    let (transport, conn) = connect_with_timeout(&mesh.endpoint, addr, service, DIAL_TIMEOUT)
-        .await
-        .with_context(|| format!("dial eid:{hex}/{service}"))?;
+    let (transport, conn) =
+        connect_with_timeout(&mesh.endpoint, addr, service, DIAL_TIMEOUT, per_conn)
+            .await
+            .with_context(|| format!("dial eid:{hex}/{service}"))?;
     Ok(watch_session(mesh, transport, conn))
 }
 
@@ -348,8 +464,16 @@ pub(crate) async fn connect_with_timeout(
     addr: iroh::EndpointAddr,
     service: &str,
     timeout: Duration,
+    // #166: `None` inherits the endpoint's node-wide transport config. A `Some` REPLACES it, so it
+    // must be complete — see `per_session_transport_config`.
+    transport: Option<iroh::endpoint::QuicTransportConfig>,
 ) -> Result<(SessionTransport, iroh::endpoint::Connection)> {
-    match tokio::time::timeout(timeout, connect(endpoint, addr, service)).await {
+    match tokio::time::timeout(
+        timeout,
+        mcpmesh_net::connect_with_transport_config(endpoint, addr, service, transport),
+    )
+    .await
+    {
         // A typed ConnectError (dial vs open-stream) converts into the anyhow chain.
         Ok(r) => r.map_err(Into::into),
         Err(_) => anyhow::bail!("dial timed out after {timeout:?}"),
@@ -540,7 +664,8 @@ async fn dial_one(
     addr: iroh::EndpointAddr,
     service: &str,
 ) -> Result<(SessionTransport, iroh::endpoint::Connection)> {
-    connect_with_timeout(endpoint, addr, service, DIAL_TIMEOUT).await
+    // The racing path: no per-connection config — see `dial_service_with_idle_timeout`.
+    connect_with_timeout(endpoint, addr, service, DIAL_TIMEOUT, None).await
 }
 
 /// Pipe an established mesh session to/from the control connection. The FIRST
@@ -847,7 +972,10 @@ mod tests {
                 .bind()
                 .await
                 .unwrap();
-            let transport = connect(&client_ep, server_addr, "echo").await.unwrap().0;
+            let transport = mcpmesh_net::connect(&client_ep, server_addr, "echo")
+                .await
+                .unwrap()
+                .0;
 
             // Control side, one whole DuplexStream per direction (dropping `ctl_in_w`
             // is the control-side EOF; a split half would keep the stream alive).
@@ -1009,13 +1137,106 @@ mod tests {
             .unwrap();
         let dead = iroh::EndpointAddr::from(iroh::EndpointId::from_bytes(&[3u8; 32]).unwrap());
         let start = std::time::Instant::now();
-        let r =
-            super::connect_with_timeout(&ep, dead, "svc", std::time::Duration::from_millis(300))
-                .await;
+        let r = super::connect_with_timeout(
+            &ep,
+            dead,
+            "svc",
+            std::time::Duration::from_millis(300),
+            None,
+        )
+        .await;
         assert!(r.is_err(), "an unreachable dial times out to Err");
         assert!(
             start.elapsed() < std::time::Duration::from_secs(3),
             "the explicit timeout fired fast"
+        );
+    }
+
+    /// #166: the per-session config is COMPLETE — it carries this node's keepalive, not iroh's.
+    ///
+    /// **This is the test that would have caught the 0.48.0 gate's first finding**, and the reason
+    /// this function returns a config instead of mutating a builder. `ConnectOptions::with_transport_config`
+    /// REPLACES the endpoint's config rather than overlaying it, so a config built from a fresh
+    /// builder resets everything the caller did not name. The first cut set only the idle timeout:
+    /// a node with `keep_alive_secs = 2` got a per-session connection with a **5s** keepalive, so a
+    /// 3s idle timeout — which this same function had just validated as safe against 2s — severed
+    /// sessions whose peers were alive and answering. The guard checked a keepalive the connection
+    /// did not have.
+    ///
+    /// Asserted on `Debug`, the same instrument `iroh_transport_defaults_are_what_the_docs_claim`
+    /// and `build_transport_config`'s tests use: a knob that was never applied is invisible to
+    /// "did it connect".
+    #[test]
+    fn the_per_session_config_carries_this_nodes_keepalive_not_irohs_default() {
+        // A node on a lossy link: keepalive 2s, well under iroh's 5s default.
+        let cfg = super::per_session_transport_config(Some(3), 2)
+            .expect("3s is legal against a 2s keepalive")
+            .expect("a value was supplied, so a config is built");
+        let d = format!("{cfg:?}");
+        assert!(
+            d.contains("max_idle_timeout: Some(3000)"),
+            "the caller's idle timeout must be set: {d}"
+        );
+        assert!(
+            d.contains("keep_alive_interval: Some(2s)"),
+            "this NODE's keepalive must survive — a fresh builder resets it to iroh's 5s, which \
+             would make the 3s idle timeout sever a healthy session: {d}"
+        );
+        assert!(
+            d.contains("default_path_keep_alive_interval: Some(2s)"),
+            "…including the PATH keepalive, which is the one iroh actually pings on: {d}"
+        );
+
+        // `0` = no idle timeout from this side, and the keepalive still survives.
+        let cfg = super::per_session_transport_config(Some(0), 2)
+            .unwrap()
+            .unwrap();
+        let d = format!("{cfg:?}");
+        assert!(d.contains("max_idle_timeout: None"), "{d}");
+        assert!(d.contains("keep_alive_interval: Some(2s)"), "{d}");
+    }
+
+    /// #166: resolution and every refusal, which must be an error and never a silent fallback.
+    ///
+    /// A knob that quietly did nothing is what the #56 gate found TWICE in this same area.
+    #[test]
+    fn a_per_session_idle_timeout_resolves_or_refuses_but_never_silently_ignores() {
+        // Absent → inherit the node-wide config: no per-connection config is built at all, which is
+        // what tells `connect_with_transport_config` to take the plain `connect` path.
+        assert!(
+            super::per_session_transport_config(None, 5)
+                .unwrap()
+                .is_none()
+        );
+
+        // An ordinary value builds one.
+        assert!(
+            super::per_session_transport_config(Some(30), 5)
+                .unwrap()
+                .is_some()
+        );
+
+        // AT or BELOW the keepalive is refused — a keepalive arriving after the idle timer has
+        // fired severs a session whose peer is alive and answering.
+        for bad in [1u64, 4, 5] {
+            let e = super::per_session_transport_config(Some(bad), 5)
+                .expect_err("at or below the keepalive must be refused");
+            let msg = format!("{e:#}");
+            assert!(
+                msg.contains("keepalive") && msg.contains(&bad.to_string()),
+                "the refusal must name the value and the reason: {msg}"
+            );
+        }
+        // …and the boundary is the node's ACTUAL keepalive, not a constant.
+        assert!(super::per_session_transport_config(Some(3), 2).is_ok());
+        assert!(super::per_session_transport_config(Some(2), 2).is_err());
+
+        // Out of QUIC's encodable range is an ERROR, never a fallback to the node default.
+        let e = super::per_session_transport_config(Some(u64::MAX), 5)
+            .expect_err("an unencodable value must be refused");
+        assert!(
+            format!("{e:#}").contains("out of the range QUIC can encode"),
+            "{e:#}"
         );
     }
 }

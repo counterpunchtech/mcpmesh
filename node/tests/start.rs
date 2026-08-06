@@ -325,3 +325,32 @@ async fn an_unknown_local_discovery_refuses_to_boot() {
         );
     }
 }
+
+/// #166 THROUGH BOOT: the per-session idle-timeout guard validates against the node's CONFIGURED
+/// keepalive, not a constant.
+///
+/// The 0.48.0 gate deleted `mesh.set_keep_alive_secs(..)` from boot and left the whole suite green:
+/// the unit test passes the keepalive to the resolver directly, so the config→guard link was never
+/// pinned. Same "pin the call site, not the helper" shape the 0.43.0, 0.45.0 and 0.47.0 gates found.
+///
+/// Driven through `NodeBuilder`, which shares `boot_node` with the standalone daemon.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_per_session_idle_guard_uses_the_configured_keepalive() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("config")).unwrap();
+    // A lossy-link posture: keepalive 2s, well under iroh's 5s default.
+    std::fs::write(
+        root.path().join("config/config.toml"),
+        "[network]\nrelay_mode = \"disabled\"\nkeep_alive_secs = 2\nidle_timeout_secs = 30\n",
+    )
+    .unwrap();
+    let node = NodeBuilder::new(root.path()).start().await.expect("start");
+    assert_eq!(
+        node.keep_alive_secs_for_test(),
+        2,
+        "boot must record the CONFIGURED keepalive — the per-session idle-timeout guard validates \
+         against it, and with the default 5 instead, a legal 3s request would be refused and an \
+         unsafe 5s one accepted"
+    );
+    node.shutdown().await;
+}

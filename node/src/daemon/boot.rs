@@ -477,6 +477,12 @@ async fn boot_node(
     mesh.set_local_discovery(cfg.network.local_discovery.clone());
     // #85 ask 3 — off unless asked for. Read at boot, like every other trust-shaping knob.
     mesh.set_admit_attested_devices(cfg.identity.admit_attested_devices);
+    // #166: the EFFECTIVE keepalive the per-connection idle-timeout check validates against.
+    mesh.set_keep_alive_secs(
+        cfg.network
+            .keep_alive_secs
+            .unwrap_or(IROH_MAX_PATH_KEEP_ALIVE_SECS),
+    );
     // Self-sovereign pairing identity: load
     // (or mint) this person's UserKey and precompute this daemon's binding over `our_id`, so the
     // pairing handlers PRESENT it and paired peers store a VERIFIED `user_id`. The key path mirrors

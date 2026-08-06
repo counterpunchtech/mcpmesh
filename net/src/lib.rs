@@ -50,7 +50,7 @@ pub mod transport;
 pub use endpoint::{
     ALPN_MCP, ALPN_PAIR, ALPN_PING, CLOSE_UNAUTHORIZED, ConnectError, LiveServices, ServeHandle,
     ServiceEntry, ServiceKind, Services, SessionBackend, SessionTransport, connect,
-    run_mesh_connection, serve,
+    connect_with_transport_config, run_mesh_connection, serve,
 };
 pub use framing::{
     FrameReader, Inbound, MAX_FRAME_BYTES, StrikeOutcome, Strikes, Violation, write_frame,

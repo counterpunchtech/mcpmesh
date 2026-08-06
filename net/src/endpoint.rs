@@ -67,6 +67,17 @@ pub enum ConnectError {
     /// connection was closed or lost before the stream could open.
     #[error("opening the session stream failed: {0}")]
     OpenStream(#[from] iroh::endpoint::ConnectionError),
+    /// A dial carrying a PER-CONNECTION transport config failed to start (#166). Distinct from
+    /// [`Dial`](Self::Dial) because `connect_with_opts` reports the options being unusable
+    /// separately from the connection attempt failing, and collapsing them would hide a rejected
+    /// config behind "the peer is unreachable".
+    #[error("dialing with a per-connection transport config failed: {0}")]
+    DialWithOpts(#[from] iroh::endpoint::ConnectWithOptsError),
+    /// The per-connection dial started but the handshake failed (#166). Separate from
+    /// [`Dial`](Self::Dial) only because `connect_with_opts` splits the attempt into two futures
+    /// with two error types; to a caller it means the same thing.
+    #[error("dialing the peer failed: {0}")]
+    Connecting(#[from] iroh::endpoint::ConnectingError),
 }
 
 /// What answers a selected service's session. `run` OWNS the transport so an
@@ -515,8 +526,55 @@ pub async fn connect(
     peer: iroh::EndpointAddr,
     service: &str,
 ) -> Result<(SessionTransport, iroh::endpoint::Connection), ConnectError> {
-    tracing::debug!(service, "dialing mesh service");
-    let conn = endpoint.connect(peer, ALPN_MCP).await?;
+    connect_with_transport_config(endpoint, peer, service, None).await
+}
+
+/// [`connect`] with a per-connection QUIC transport config (#166).
+///
+/// **Takes a COMPLETE config, not an override.** `ConnectOptions::with_transport_config` REPLACES
+/// the endpoint's config for this connection rather than overlaying it (iroh
+/// `endpoint.rs:1132-1135` — `options.transport_config … .unwrap_or(static_config)`), so a config
+/// built from a fresh builder silently resets every setting the caller did not name back to iroh's
+/// defaults.
+///
+/// The first cut passed only an idle timeout and built the config here. The 0.48.0 gate proved the
+/// cost: a node with `[network].keep_alive_secs = 2` got a per-session connection with a **5s**
+/// keepalive, so a 3s idle timeout — which the node had just validated as safe against a 2s
+/// keepalive — severed sessions whose peers were alive and answering. The guard validated against a
+/// keepalive the connection did not have.
+///
+/// So the caller assembles the whole thing from its own settings. This layer does not know what
+/// `[network]` says and must not guess.
+///
+/// **Only LOWERING the idle timeout is unilateral.** QUIC negotiates `max_idle_timeout` to the
+/// MINIMUM of the two peers' advertised values (RFC 9000 §10.1), so a dialer can always make this
+/// connection die sooner when it goes quiet, and can never make it live longer than the peer
+/// allows. Raising needs both peers configured — already true of the node-wide knob, and unchanged
+/// by any per-connection seam on the dial OR the accept path. There is deliberately no accept-side
+/// twin: iroh gives the server config no per-connection seam, but since the direction that CAN work
+/// unilaterally is available here, that is a missing symmetry rather than a missing half.
+pub async fn connect_with_transport_config(
+    endpoint: &iroh::Endpoint,
+    peer: iroh::EndpointAddr,
+    service: &str,
+    transport: Option<iroh::endpoint::QuicTransportConfig>,
+) -> Result<(SessionTransport, iroh::endpoint::Connection), ConnectError> {
+    tracing::debug!(
+        service,
+        per_conn = transport.is_some(),
+        "dialing mesh service"
+    );
+    let conn = match transport {
+        Some(cfg) => {
+            let opts = iroh::endpoint::ConnectOptions::new().with_transport_config(cfg);
+            endpoint
+                .connect_with_opts(peer, ALPN_MCP, opts)
+                .await
+                .map_err(ConnectError::DialWithOpts)?
+                .await?
+        }
+        None => endpoint.connect(peer, ALPN_MCP).await?,
+    };
     let (send, recv) = conn.open_bi().await?;
     Ok((SessionTransport::new(recv, send, MAX_FRAME_BYTES), conn))
 }
@@ -817,6 +875,51 @@ mod tests {
         assert!(
             !caller_admits(&pairing, &allow(&["alice"])),
             "pairing peer has no user_id to match"
+        );
+    }
+
+    /// #166: `connect_with_transport_config` takes the `connect_with_opts` path when a config is
+    /// supplied, and the plain `connect` path when it is not.
+    ///
+    /// **Untested until the 0.48.0 gate**, which forced the `None` arm — making the whole
+    /// per-connection feature a no-op — and ran the ENTIRE workspace suite green. Third occurrence
+    /// of that pattern in three releases.
+    ///
+    /// The negotiated `max_idle_timeout` is not readable in iroh 1.0.3, so the branch is
+    /// discriminated by its ERROR TYPE against a closed endpoint: `connect_with_opts` reports
+    /// `ConnectWithOptsError` (surfaced as `DialWithOpts`), `connect` reports `ConnectError`
+    /// (surfaced as `Dial`). Deterministic, and needs no network.
+    #[tokio::test]
+    async fn a_supplied_transport_config_takes_the_connect_with_opts_path() {
+        let ep = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .bind()
+            .await
+            .expect("bind");
+        let peer = iroh::EndpointAddr::from(iroh::SecretKey::generate().public());
+        ep.close().await;
+
+        let cfg = iroh::endpoint::QuicTransportConfig::builder()
+            .keep_alive_interval(Duration::from_secs(2))
+            .build();
+        let with = connect_with_transport_config(&ep, peer.clone(), "svc", Some(cfg))
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("{e}"));
+        assert!(
+            matches!(with, Err(ref e) if e.contains("per-connection transport config")),
+            "a supplied config must go through connect_with_opts — forcing the None arm makes the \
+             whole feature a no-op, and every other test stays green: {with:?}"
+        );
+
+        let without = connect_with_transport_config(&ep, peer, "svc", None)
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("{e}"));
+        assert!(
+            matches!(without, Err(ref e) if e.contains("dialing the peer failed")),
+            "…and no config must take the plain connect path, so the default is unchanged: \
+             {without:?}"
         );
     }
 }
