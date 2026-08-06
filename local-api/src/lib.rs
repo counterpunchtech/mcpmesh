@@ -66,7 +66,7 @@ pub use protocol::{
     ERR_CANCELLED, ERR_INVITE_EXPIRED, ERR_INVITE_NAME_CONFLICT, ERR_INVITE_NOT_LIVE,
     ERR_INVITE_REFUSED, ERR_INVITER_MISMATCH, ERR_INVITER_UNREACHABLE, ERR_NICKNAME_TAKEN,
     ERR_NO_SUCH_BLOB, ERR_NO_SUCH_SERVICE, ERR_SELF_ENROLL_NOT_OFFERED, ERR_TOO_MANY_INFLIGHT,
-    Hello, InviteParams, InviteResult, MAX_BLOB_SOURCES, MAX_INFLIGHT, MAX_INVITE_USES,
+    Hello, InviteParams, InviteResult, KnownAddr, MAX_BLOB_SOURCES, MAX_INFLIGHT, MAX_INVITE_USES,
     OpenSessionParams, OrgApproveParams, OrgApproveResult, OrgCreateParams, OrgCreateResult,
     OrgJoinCodeParams, OrgJoinCodeResult, OrgJoinParams, OrgJoinResult, OrgRevokeParams,
     OrgRevokeResult, OrgRotateParams, OrgRotateResult, PairParams, PairResult, PeerAddParams,

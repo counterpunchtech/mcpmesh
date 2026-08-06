@@ -1090,8 +1090,30 @@ Everything else a fresh identity lacks is derived at runtime.
 {"nickname": "jetson", "principal": "eid:9f2k…", "paired_at": "1753600000",
  "last_addr": "{\"id\":\"…\",\"addrs\":[…]}", "hint_addrs": ["192.168.1.50:4433"],
  "hint_usable": true,
+ "known_addrs": [{"addr": "relay https://use1.relay:443", "active": true},
+                 {"addr": "192.168.1.77:4433", "active": false}],
+ "hint_addrs_unknown_to_iroh": ["192.168.1.50:4433"],
+ "iroh_addrs_not_in_hint": ["192.168.1.77:4433", "relay https://use1.relay:443"],
  "reachability": {"name": "jetson", "reachable": true, "path": {"kind": "relay"}, …}}
 ```
+
+**`known_addrs` and the two difference lists are IROH's side of the capture** (`api_minor >= 56`).
+Everything else here describes what *this node stored*; these describe what iroh made of it, read
+straight off its remote map. The example above is the #140 shape: the stored hint names an address
+iroh no longer holds, iroh holds a direct address it is **not** using, and the active path is the
+relay.
+
+- `known_addrs: null` means iroh has **no entry at all** for this peer — expected on a freshly
+  restarted daemon, and NOT the same as an entry holding no addresses (`[]`).
+- `active` is iroh's own usage flag. A direct address present but `active: false` alongside an active
+  relay is the finding, not the noise.
+- The two difference lists are **inferred by set difference**, not read: iroh 1.0.3 exposes no
+  provenance for an address, so this cannot say an address *came from* the hint — only that it is in
+  one list and not the other. `hint_addrs_unknown_to_iroh` is dead weight #124's refresh amends but
+  never removes; `iroh_addrs_not_in_hint` is what discovery contributed.
+
+Like the rest of this verb it is **read-only**: `remote_info` is a point read that does not dial,
+probe, or trigger an address lookup, so a capture cannot perturb the reproduction it is observing.
 
 `hint_usable` is the field to read first. A stored hint that does not parse, or whose embedded
 endpoint id is a *different* peer, is silently discarded on every dial — the node behaves as though

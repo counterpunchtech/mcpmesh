@@ -1101,6 +1101,51 @@ pub struct PeerDiagnosticsResult {
     /// participant in the reproduction it is meant to observe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reachability: Option<PeerReachability>,
+    /// What **iroh** currently holds for this endpoint, as opposed to what this node stored
+    /// (#140, `api_minor >= 56`). The other half of the capture, and the half the standing
+    /// hypothesis lives in.
+    ///
+    /// Everything above describes our own disk. Until this field there was no way to see what iroh
+    /// made of it — whether the hint's addresses are in its remote map at all, whether discovery
+    /// contributed anything alongside them, or which address is carrying traffic. Read straight off
+    /// `Endpoint::remote_info`, a point read of the remote map: no dial, no probe, no address
+    /// lookup, so this stays safe to run ON a live reproduction.
+    ///
+    /// **`None` means iroh has no entry for this peer at all, which is NOT the same as an empty
+    /// list.** An empty list means iroh knows the peer and holds no address for it. Both are real
+    /// states and they mean different things.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known_addrs: Option<Vec<KnownAddr>>,
+    /// Addresses in [`hint_addrs`](Self::hint_addrs) that iroh does **not** hold — the dead weight
+    /// #124's refresh amends but never removes. A peer that changed networks accumulates these.
+    ///
+    /// INFERRED by set difference, not read: iroh 1.0.3's `TransportAddrInfo` carries no
+    /// provenance, so "did this come from our hint or from discovery?" cannot be answered directly.
+    /// Naming it an inference is the honest version.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hint_addrs_unknown_to_iroh: Vec<String>,
+    /// The converse: what iroh holds that our stored hint never had — discovery's contribution,
+    /// inferred the same way. Empty on a pair where discovery has not run, which is precisely the
+    /// state the selected-path hypothesis in [`last_addr`](Self::last_addr) predicts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub iroh_addrs_not_in_hint: Vec<String>,
+}
+
+/// One address iroh holds for a peer (#140, `api_minor >= 56`).
+///
+/// Rendered by the SAME labelling [`PeerDiagnosticsResult::hint_addrs`] uses — IPs verbatim, relays
+/// as `relay <url>` sanitized to scheme+host+port — because the two lists exist to be read side by
+/// side, and differently-formatted addresses would make a formatting difference look like a real
+/// one. The sanitization is not optional here either: this output is meant to be pasted into a
+/// public issue, and an operator's relay URL can carry a userinfo token.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KnownAddr {
+    /// The address, labelled as above.
+    pub addr: String,
+    /// Whether iroh reports this address as in ACTIVE use, as opposed to merely known. On a stuck
+    /// pairing the active one is expected to be the relay — and if a direct address is present but
+    /// inactive, that is the finding.
+    pub active: bool,
 }
 
 /// Params of [`Request::UnregisterService`] (#50): the persistent (or ephemeral) service name
@@ -2764,7 +2809,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   thirty have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.55";
+pub const API_VERSION: &str = "1.56";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -2850,7 +2895,14 @@ pub const API_VERSION: &str = "1.55";
 /// refusals — expired line, no live invite, inviter unreachable, id mismatch, name conflict, and
 /// the deliberately-opaque refusal. `ERR_NICKNAME_TAKEN` had been the only coded pairing failure,
 /// so every other one arrived as `-32000` and an embedder could either forward our prose to end
-/// users or substring-match it (#159); to 55 with [`StreamFrame::Resumed`] — a SUSPEND/RESUME
+/// users or substring-match it (#159); to 56 with [`PeerDiagnosticsResult::known_addrs`] and its two
+/// set-difference companions — IROH's own view of a peer's addresses alongside the hint we stored
+/// (#140). The verb dumped this node's disk and nothing about what iroh made of it, which is the
+/// half the standing hypothesis lives in: iroh skips address lookup while a path is selected, so a
+/// pair holding a relayed connection never re-discovers and the stale hint is the only addressing
+/// the dial contributes. Read-only (a point read of the remote map), so it stays safe to run on a
+/// live reproduction. `known_addrs: None` means iroh has NO entry, which is not an empty list.
+/// Guard on `>= 56`; to 55 with [`StreamFrame::Resumed`] — a SUSPEND/RESUME
 /// signal on `subscribe` (#167 ask 2). A suspended machine sends nothing, so the peer's idle timer
 /// tears the connection down before the lid reopens and `keep_alive_secs` cannot help; the frame is
 /// what lets an embedder re-dial deliberately instead of discovering it on the next send. Detected
@@ -3023,7 +3075,7 @@ pub const API_VERSION: &str = "1.55";
 /// its REAL content is a meaning change to `reachable` — the field exists so the new meaning is
 /// observable at all. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 55;
+pub const API_MINOR: u32 = 56;
 
 #[cfg(test)]
 mod tests {

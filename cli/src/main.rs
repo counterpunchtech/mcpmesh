@@ -1190,6 +1190,59 @@ fn run_peer_state(peer: String, json: bool) -> anyhow::Result<()> {
                 );
             }
         }
+        // #140 (api_minor 56): what IROH holds, next to what we stored. The differences are the
+        // reason this verb exists — printed as their own lines rather than left for a reader to
+        // diff two comma-separated lists by eye.
+        match &d.known_addrs {
+            None => println!(
+                "iroh knows: (no entry) — iroh has never heard of this peer. Expected on a freshly \
+                 restarted daemon that has not dialled it yet; NOT the same as knowing it and \
+                 holding no address."
+            ),
+            Some(known) if known.is_empty() => println!(
+                "iroh knows: (none) — iroh has an entry for this peer and no address in it"
+            ),
+            Some(known) => {
+                let rendered: Vec<String> = known
+                    .iter()
+                    .map(|k| {
+                        if k.active {
+                            format!("{} [active]", k.addr)
+                        } else {
+                            k.addr.clone()
+                        }
+                    })
+                    .collect();
+                println!("iroh knows: {}", rendered.join(", "));
+                let active_relay = known
+                    .iter()
+                    .any(|k| k.active && k.addr.starts_with("relay "));
+                let idle_direct = known
+                    .iter()
+                    .any(|k| !k.active && !k.addr.starts_with("relay "));
+                if active_relay && idle_direct {
+                    println!(
+                        "            RELAY ACTIVE WITH A DIRECT ADDRESS SITTING IDLE — iroh holds \
+                         a direct candidate and is not using it. This is the #140 shape."
+                    );
+                }
+            }
+        }
+        if !d.hint_addrs_unknown_to_iroh.is_empty() {
+            println!(
+                "  stale:    {} — in this node's stored hint, NOT in iroh's view. #124 refreshes \
+                 the hint but never removes an address from it, so a peer that changed networks \
+                 accumulates these.",
+                d.hint_addrs_unknown_to_iroh.join(", ")
+            );
+        }
+        if !d.iroh_addrs_not_in_hint.is_empty() {
+            println!(
+                "  found:    {} — in iroh's view, NOT in the stored hint. Discovery contributed \
+                 these.",
+                d.iroh_addrs_not_in_hint.join(", ")
+            );
+        }
         match &d.reachability {
             None => println!(
                 "live:       never probed (this is a cache read — it does not dial, so a fresh \
