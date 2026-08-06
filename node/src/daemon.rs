@@ -101,7 +101,7 @@ pub use reach::{
     REACH_TTL_SECS, ReachEntry, ReachTransition, normalize_relay_url, probe_peer, reachability_of,
     sanitize_relay_url,
 };
-pub use resume::{ResumeEvent, spawn_resume_watch};
+pub use resume::{ClockDeltas, ResumeEvent, spawn_resume_watch};
 pub(crate) use self_net::read_current as self_network_now;
 pub use self_net::spawn_self_net_watch;
 
@@ -712,13 +712,8 @@ impl MeshState {
     /// deltas so the detection AND the broadcast are exercised for real. Returns what was sent, or
     /// `None` if the deltas were an ordinary tick.
     #[doc(hidden)]
-    pub fn resume_tick_for_test(
-        &self,
-        mono_delta_secs: i64,
-        wall_delta_secs: i64,
-        now_wall: i64,
-    ) -> Option<ResumeEvent> {
-        resume::tick(self, mono_delta_secs, wall_delta_secs, now_wall)
+    pub fn resume_tick_for_test(&self, deltas: ClockDeltas, now_wall: i64) -> Option<ResumeEvent> {
+        resume::tick(self, deltas, now_wall)
     }
 
     /// The current probe ticket counter.

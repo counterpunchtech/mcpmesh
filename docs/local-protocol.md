@@ -1293,7 +1293,7 @@ reconnect, or fall back to a `status` read.
 | field | meaning |
 |---|---|
 | `suspended_secs` | how long the machine was away, in seconds — the **sleep**, not the time since the last frame |
-| `at_epoch` | wall-clock epoch seconds when the resume was detected (up to ~2s after the wake) |
+| `at_epoch` | wall-clock epoch seconds when the resume was detected (up to ~5s after the wake — the watcher's tick) |
 
 **Why you need it.** While a machine is suspended it sends nothing, so the *peer's* QUIC idle timer
 runs out and the peer tears the connection down — often before the lid is even reopened.
@@ -1315,8 +1315,18 @@ machine was away for N seconds; re-check what you hold."
 suspend freezes the monotonic clock while the wall clock runs, whereas a starved runtime advances
 both together. A signal that fired under load is one you would learn to ignore.
 
-**Not retroactive.** Like `reachability` and `self_network` this is a transition — subscribe after a
-wake and you will not see it. There is also **no pre-suspend warning**: neither platform gives a
+**It DOES fire on a forward clock step, and cannot tell one from a sleep.** A device with no RTC that
+boots with a bogus time and is then stepped forward by NTP emits a frame claiming a suspend of
+however far the clock jumped. Read `suspended_secs` as "wall time ran this much further than the
+daemon's own elapsed time" — that is what is measured. The frame's advice holds either way; the
+number is not a measurement of sleep alone. Telling the two apart needs a continuous clock
+(`CLOCK_BOOTTIME` / `mach_continuous_time`), which mcpmesh does not currently use.
+
+**Not retroactive, and unrecoverable from `snapshot`.** Like `reachability` and `self_network` this
+is a transition — subscribe after a wake and you will not see it. Unlike those two, the `snapshot`
+frame carries **no** resume field to recover it from ("was this machine recently asleep" is not state
+the daemon keeps), so a consumer that reconnects should assume it missed events and re-check what it
+holds. There is also **no pre-suspend warning**: neither platform gives a
 process reliable notice before it is put to sleep.
 
 ### `blob_transfer` (`api_minor >= 41`, #82)

@@ -2442,7 +2442,17 @@ pub enum BlobTransferState {
 /// **`#[non_exhaustive]`**: a future frame kind must not break a downstream `match`. Adding
 /// `Reachability` in 0.13.0 DID break exhaustive matches — which is why that release is a MINOR,
 /// per `RELEASING.md`'s pre-1.0 rule that breaking changes bump the minor. Consumers now write a
-/// `_ =>` arm and later additions are additive for Rust as well as for JSON.
+/// `_ =>` arm and later additions are additive for Rust.
+///
+/// **They are NOT additive for JSON, and this line claimed they were until 1.55.** The enum is
+/// `#[serde(tag = "type")]` with no catch-all variant, so an unrecognised tag is a hard
+/// deserialization error: [`StreamSubscription::next`](crate::StreamSubscription::next) surfaces a
+/// newer daemon's frame as [`ClientError::Malformed`](crate::ClientError::Malformed) and a consumer
+/// that propagates it loses the whole stream. `#[non_exhaustive]` is a Rust-`match` property and
+/// does nothing for serde. A consumer that must survive a daemon newer than its `mcpmesh-local-api`
+/// reads raw frames via [`ControlClient::open_stream`](crate::ControlClient::open_stream) and
+/// ignores tags it does not know — that is the only forward-compatible path, and the crates ship in
+/// lockstep precisely because of this.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[non_exhaustive]
@@ -2527,8 +2537,8 @@ pub enum StreamFrame {
     /// deliberately.
     ///
     /// **Detected as clock skew, not guessed.** Rust's `Instant` is `CLOCK_MONOTONIC` on Linux and
-    /// `mach_absolute_time` on macOS, and neither advances across a suspend while the wall clock
-    /// does. A tick where the wall clock outran the monotonic clock by more than the threshold is a
+    /// `CLOCK_UPTIME_RAW` on Apple targets, and neither advances across a suspend while the wall
+    /// clock does. A tick where the wall clock outran the monotonic clock by more than the threshold is a
     /// suspend; a tick where BOTH ran long is a starved runtime and emits nothing. That distinction
     /// is deliberate — a signal that fired under load would train consumers to ignore it.
     ///
@@ -2536,9 +2546,21 @@ pub enum StreamFrame {
     /// a short suspend may well leave one intact. It means "this machine was away for N seconds;
     /// re-check what you hold".
     ///
-    /// Not retroactive: like [`Reachability`](StreamFrame::Reachability) and
-    /// [`SelfNetwork`](StreamFrame::SelfNetwork) this is a TRANSITION, so a subscriber attaching
-    /// after a resume does not see it — `Snapshot` answers what is true now.
+    /// **A forward wall-clock STEP also emits, and cannot be told apart from a sleep.** A board with
+    /// no RTC that boots with a bogus epoch and is then stepped months forward by NTP produces a
+    /// frame claiming a multi-year suspend. Read `suspended_secs` as "wall time ran this much
+    /// further than this process did", which is what is actually measured; the frame's advice
+    /// survives either cause, but the number is not a measurement of sleep alone. Distinguishing
+    /// them needs a continuous clock (`CLOCK_BOOTTIME` / `mach_continuous_time`), which is a
+    /// per-platform dependency this does not take.
+    ///
+    /// Not retroactive, and — unlike the other transitions — with **nothing in `Snapshot` to
+    /// recover it from.** [`Reachability`](StreamFrame::Reachability) and
+    /// [`SelfNetwork`](StreamFrame::SelfNetwork) missed frames are recoverable because `Snapshot`
+    /// carries `reachability` and `self_network`; there is no resume field, because "was this
+    /// machine recently asleep" is not a state the daemon holds. A subscriber that attaches after a
+    /// wake cannot learn one happened. If you reconnect, assume you missed events and re-check what
+    /// you hold — the same advice this frame carries.
     Resumed {
         /// How long the machine was away, in seconds — the number that decides whether to re-dial
         /// everything or nothing. It is the wall-clock/monotonic skew, so it measures the suspend

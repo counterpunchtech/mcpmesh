@@ -59,9 +59,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // We read too slowly and the daemon skipped `dropped` records for us; a reconnect
             // would deliver a fresh snapshot to resync from.
             StreamFrame::Lagged { dropped } => println!("(lagged: {dropped} events skipped)"),
-            // `StreamFrame` is `#[non_exhaustive]`: a daemon newer than this client may push a
-            // frame kind it has never heard of. Ignore it rather than failing — that is the
-            // documented contract, and it is what makes new frame kinds additive.
+            // `StreamFrame` is `#[non_exhaustive]`, so this arm keeps the match compiling against a
+            // newer local-api. It does NOT rescue a newer DAEMON's frame: an unrecognised `type`
+            // fails to deserialize inside `next()` and the `?` above exits this loop, so nothing
+            // ever reaches here for an unknown tag. This comment claimed the opposite until 1.55.
+            // A consumer that must tolerate a newer daemon reads raw frames via `open_stream`.
             other => println!("(unrecognized frame: {other:?})"),
         }
     }

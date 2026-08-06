@@ -419,19 +419,31 @@ async fn a_resume_frame_reaches_a_subscriber_carrying_the_sleep_length() {
         let mut sub = SubClient::connect(&socket).await;
         assert_eq!(sub.next().await["type"], "snapshot");
 
-        // An ORDINARY tick first: the watcher runs every 2s forever, and if this emitted, the
+        // An ORDINARY tick first: the watcher runs every 5s forever, and if this emitted, the
         // subscriber below would read that frame instead and the assertions would still pass. It
         // is the guard that makes the rest of this test mean anything.
         assert_eq!(
-            mesh.resume_tick_for_test(2, 2, 1_700_000_000),
+            mesh.resume_tick_for_test(
+                mcpmesh::daemon::ClockDeltas {
+                    mono_secs: 5,
+                    wall_secs: 5,
+                },
+                1_700_000_000
+            ),
             None,
             "an ordinary tick must not emit — otherwise every embedder is told to re-dial its \
-             whole mesh every two seconds",
+             whole mesh every five seconds",
         );
 
         // Now a two-hour lid close: the monotonic clock froze, the wall clock did not.
         let sent = mesh
-            .resume_tick_for_test(2, 7202, 1_700_007_202)
+            .resume_tick_for_test(
+                mcpmesh::daemon::ClockDeltas {
+                    mono_secs: 5,
+                    wall_secs: 7205,
+                },
+                1_700_007_205,
+            )
             .expect("a 2h wall/monotonic skew is a suspend");
         assert_eq!(sent.suspended_secs, 7200);
 
@@ -443,11 +455,11 @@ async fn a_resume_frame_reaches_a_subscriber_carrying_the_sleep_length() {
         );
         assert_eq!(
             frame["suspended_secs"], 7200,
-            "the machine slept 7200s; the tick that noticed took 2s. Reporting anything but the \
+            "the machine slept 7200s; the tick that noticed took 5s. Reporting anything but the \
              sleep tells an embedder the wrong thing about what its peers did in the meantime: \
              {frame}"
         );
-        assert_eq!(frame["at_epoch"], 1_700_007_202i64);
+        assert_eq!(frame["at_epoch"], 1_700_007_205i64);
     })
     .await
     .expect("resume frame subscribe test timed out");
