@@ -10,8 +10,8 @@
 class Mcpmesh < Formula
   desc "Peer-to-peer MCP transport — serve and mount MCP servers across machines"
   homepage "https://github.com/counterpunchtech/mcpmesh"
-  url "https://github.com/counterpunchtech/mcpmesh/archive/refs/tags/v0.52.1.tar.gz"
-  sha256 "d7f367359f086d51fdd3a17bccf18fd9c1435c0a98453d25d5e484633445097d"
+  url "https://github.com/counterpunchtech/mcpmesh/archive/refs/tags/v0.52.2.tar.gz"
+  sha256 "8c2978e95eac5f70898b2330702e7469f5552a025315a3738a2fa218413da235"
   license "MIT OR Apache-2.0"
   head "https://github.com/counterpunchtech/mcpmesh.git", branch: "main"
 
