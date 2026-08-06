@@ -470,6 +470,85 @@ mod tests {
         .expect("test timed out");
     }
 
+    /// #49: BOTH spellings reach a REAL backend, and the audit digest does not move because of them.
+    ///
+    /// The spec for 0.51.0 required an end-to-end test "since every gate in this session found a
+    /// call site no test reached" — and then it was not written, and the gate found exactly that: a
+    /// reader of `_meta` (`args_hash`) that the unit tests never traversed, which silently
+    /// re-broke a property 0.50.0 had fixed. This is that test.
+    #[tokio::test]
+    async fn both_peer_spellings_reach_a_real_backend_with_a_stable_digest() {
+        timeout(Duration::from_secs(30), async {
+            let dir = tempfile::tempdir().unwrap();
+            let sock = dir.path().join("server.sock");
+            let listener = UnixListener::bind(&sock).unwrap();
+            let stub = tokio::spawn(stub_collecting(listener, 2));
+
+            let (server_io, client_io) = duplex(64 * 1024);
+            let (sr, sw) = split(server_io);
+            let backend_transport = mcpmesh_net::transport::NdjsonTransport::new(sr, sw, MAX_FRAME);
+            let (cr, cw) = split(client_io);
+            let mut client = mcpmesh_net::transport::NdjsonTransport::new(cr, cw, MAX_FRAME);
+
+            let backend = SocketBackend {
+                path: sock.to_str().unwrap().to_string(),
+                service: "test".into(),
+                audit: crate::audit::AuditSink::disabled(),
+                limiter: crate::limits::RateLimiter::unlimited_shared(),
+            };
+            let identity = Some(PeerIdentity {
+                endpoint: [0u8; 32].into(),
+                name: "bob".into(),
+                user_id: None,
+                groups: vec![],
+            });
+            let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
+            let session =
+                tokio::spawn(
+                    async move { backend.run_over(identity, init, backend_transport).await },
+                );
+            let _ = client.recv_value().await.unwrap().unwrap();
+
+            client
+                .send_value(json!({
+                    "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": {"name": "read_file", "arguments": {"path": "/x"}}
+                }))
+                .await
+                .unwrap();
+            let _ = client.recv_value().await.unwrap().unwrap();
+
+            let seen = stub.await.unwrap();
+            let call = seen
+                .iter()
+                .find(|f| f["method"] == "tools/call")
+                .expect("the call reached the backend");
+            let meta = &call["params"]["_meta"];
+            for key in mcpmesh_net::service::PEER_KEYS {
+                assert_eq!(
+                    meta[key]["name"], "bob",
+                    "`{key}` must reach a real backend: {meta}"
+                );
+            }
+
+            // The digest the audit trail would record for this frame must equal the digest of the
+            // arguments the CALLER sent — the property the gate found broken, asserted against the
+            // frame that actually crossed the socket rather than a hand-built one.
+            assert_eq!(
+                crate::audit::record::args_hash(&call["params"]),
+                crate::audit::record::args_hash(
+                    &json!({"name": "read_file", "arguments": {"path": "/x"}})
+                ),
+                "the injected identity must not move `args_hash`, under any spelling: {meta}"
+            );
+
+            drop(client);
+            let _ = session.await.unwrap();
+        })
+        .await
+        .expect("test timed out");
+    }
+
     /// #45 gate: a NOTIFICATION and a BATCH element are attributed through the REAL backend, not
     /// only in a helper unit test.
     ///

@@ -1468,10 +1468,14 @@ This value is **authoritative**: the daemon strips any caller-supplied reserved 
 > reverse-DNS form follows SEP-1788's SHOULD; the single-label form never collided with anything
 > MCP reserves, so this is forward-alignment, not a fix.
 >
-> **Nothing needs to upgrade in step.** A backend reading `mcpmesh/peer` keeps working untouched;
-> new backends should read `tech.counterpunch.mcpmesh/peer`. The same applies to the routing key
-> `mcpmesh/service` — both spellings are sent, and a receiving daemon accepts either (preferring
-> reverse-DNS), so peers on different versions interoperate without a gate.
+> **Nothing needs to change what it READS.** A backend reading `mcpmesh/peer` keeps working; new
+> backends should read `tech.counterpunch.mcpmesh/peer`. But see the strict-validation note below —
+> a backend that rejects *unknown* `_meta` keys does have to accept the new one, which is the same
+> class of break that made 0.50.0 a MINOR. The same applies to the routing key
+> `mcpmesh/service` — both spellings are sent, and a receiving daemon accepts either, so peers on
+> different versions interoperate without a gate. (The reverse-DNS key is listed first, but that
+> order never decides anything: an equal pair gives the same answer either way and an unequal one is
+> refused. What is real is the fallback — a frame carrying only the legacy key still routes.)
 >
 > **Both prefixes are stripped** from caller frames. A prefix mcpmesh writes but does not strip is
 > one a caller can forge, and a backend would read it under an authoritative-looking name.
@@ -1509,7 +1513,8 @@ This value is **authoritative**: the daemon strips any caller-supplied reserved 
 > schema with `additionalProperties: false` — will refuse requests it used to accept. That is why
 > 0.50.0 is a MINOR.
 >
-> **Frame size:** the annotation adds a few hundred bytes to every request. A caller that sends a
+> **Frame size:** the annotation adds a few hundred bytes to every request — roughly double since
+> 0.51.0 writes it under two keys. A caller that sends a
 > frame at exactly the 16 MiB cap will produce one slightly over it on the backend side; the backend
 > sees a `TooLarge` violation and the session ends. Previously reachable only on the handshake.
 

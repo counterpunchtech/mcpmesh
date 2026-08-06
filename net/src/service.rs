@@ -1,5 +1,5 @@
 //! Initialize-time service selection and the reserved-namespace rule:
-//! caller-supplied `mcpmesh/*` _meta keys are deleted before anything
+//! caller-supplied reserved `_meta` keys (both spellings) are deleted before anything
 //! acts on the frame; refusal wording never distinguishes unknown from unauthorized.
 use serde_json::Value;
 
@@ -12,7 +12,7 @@ pub enum ServiceDecision {
     Refuse, // caller sends errors::synthesized(id, ERR_SERVICE, MSG_SERVICE)
 }
 
-/// Delete every caller-supplied `mcpmesh/*` key from a frame's `params._meta`.
+/// Delete every caller-supplied reserved key (`mcpmesh/*` and `tech.counterpunch.mcpmesh/*`) from a frame's `params._meta`.
 ///
 /// **The single definition of "reserved".** Called by [`select_service`] on the session's first
 /// frame AND by the backend pump on every later one — #164 was exactly these two drifting apart:
@@ -55,9 +55,13 @@ pub const LEGACY_META_PREFIX: &str = "mcpmesh/";
 
 /// The reverse-DNS `_meta` prefix (#49), per SEP-1788's SHOULD.
 ///
-/// Nothing was ever broken by the single-label form: SEP-1788 reserves only `progressToken` and
-/// second-label `mcp`/`modelcontextprotocol`, so `mcpmesh/` never collided. This is
-/// forward-alignment, which is exactly why it is not worth breaking anyone over.
+/// Nothing was ever broken by the single-label form. The final `2026-07-28` grammar reserves
+/// `progressToken`, the `io.modelcontextprotocol/*` keys, and bare `traceparent`/`tracestate`/
+/// `baggage`; a prefixed key is reserved only by its SECOND label being `mcp` or
+/// `modelcontextprotocol` (the spec's own counter-example is that `com.example.mcp/` is NOT
+/// reserved). `mcpmesh/` has no second label and `tech.counterpunch.mcpmesh/`'s is `counterpunch`,
+/// so neither collides. This is forward-alignment, which is exactly why it is not worth breaking
+/// anyone over.
 pub const META_PREFIX: &str = "tech.counterpunch.mcpmesh/";
 
 /// Every prefix mcpmesh reserves. **The strip must cover ALL of them**, not just the one currently
@@ -65,8 +69,12 @@ pub const META_PREFIX: &str = "tech.counterpunch.mcpmesh/";
 /// reading it would be reading caller-controlled data under an authoritative-looking name.
 pub const RESERVED_META_PREFIXES: [&str; 2] = [LEGACY_META_PREFIX, META_PREFIX];
 
-/// The service-routing key, in both spellings. Reverse-DNS first: it is the preferred one, and
-/// [`select_service`] reads them in this order.
+/// The service-routing key, in both spellings, reverse-DNS first.
+///
+/// The order is a tie-break that never fires: both present and EQUAL gives the same answer either
+/// way, both present and DIFFERENT is refused, and one non-string is refused. What is real is the
+/// FALLBACK — a frame carrying only the legacy spelling still routes, which is how a newer daemon
+/// serves an older caller.
 pub const SERVICE_KEYS: [&str; 2] = ["tech.counterpunch.mcpmesh/service", "mcpmesh/service"];
 
 /// The caller-identity key, in both spellings. Both are WRITTEN, with the identical value: a backend
@@ -178,8 +186,14 @@ pub fn select_service(init: &mut Value, caller_allowed: &[String]) -> ServiceDec
     //
     // BOTH spellings are accepted (#49): reverse-DNS preferred, single-label legacy as fallback, so
     // a newer daemon still serves an older caller and neither peer needs a version gate.
+    // RFC 6901 escaping. `~` would need `~0` first; no reserved key contains one, and
+    // `every_written_key_is_covered_by_a_stripped_prefix` keeps the set to what we control.
     let read = |key: &str| init.pointer(&format!("/params/_meta/{}", key.replace('/', "~1")));
-    let entries: Vec<Option<&Value>> = SERVICE_KEYS.iter().map(|k| read(k)).collect();
+    // A fixed-size array, not a Vec: the conflict check below indexes [0] and [1], and the 1.0
+    // removal of the legacy spelling shrinks SERVICE_KEYS to one entry. As a Vec that becomes a
+    // PANIC on the first frame of every session, on the authorization path; as an array the
+    // compiler stops it.
+    let entries: [Option<&Value>; SERVICE_KEYS.len()] = SERVICE_KEYS.map(read);
     let malformed = entries.iter().flatten().any(|v| !v.is_string());
     // A caller sending BOTH with different values is not making a coherent request. Silently
     // preferring one would let it present a different service to each daemon version — the whole

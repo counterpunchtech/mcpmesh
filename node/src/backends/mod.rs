@@ -41,7 +41,7 @@ pub(crate) const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 // layering constraint), so a "downcast in the daemon" was never possible. The backend owning
 // the refusal is the correct seam.
 
-/// Enforce the reserved `mcpmesh/*` namespace on ONE caller→backend frame (#164).
+/// Enforce the reserved `_meta` namespace on ONE caller→backend frame (#164).
 ///
 /// The rule used to run on the session's first frame only, and `run_session` treats frame 1 as
 /// `initialize` whatever its method actually is. So a caller spent frame 1 on a `ping` — which the
@@ -50,7 +50,8 @@ pub(crate) const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 ///
 /// Three steps, because each alone leaves a hole:
 ///
-/// 1. **Strip** every caller-supplied `mcpmesh/*` key. Unconditional, both backends.
+/// 1. **Strip** every caller-supplied reserved key — `mcpmesh/*` AND
+/// `tech.counterpunch.mcpmesh/*` (#49). Unconditional, both backends.
 ///    `mcpmesh/service` is the key `select_service` acts on, so this is authorization-relevant.
 /// 2. **Remove an impersonating `io.modelcontextprotocol/clientInfo`** (#189) — one whose `name` is
 ///    written in mcpmesh's own `eid:`/`b64u:` principal grammar. Under MCP 2026-07-28 that key

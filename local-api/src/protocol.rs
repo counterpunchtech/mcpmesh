@@ -2916,12 +2916,18 @@ pub const API_VERSION: &str = "1.58";
 /// so every other one arrived as `-32000` and an embedder could either forward our prose to end
 /// users or substring-match it (#159); to 58 with the REVERSE-DNS `_meta` key spellings
 /// `tech.counterpunch.mcpmesh/{service,peer}` alongside the legacy `mcpmesh/{service,peer}` (#49,
-/// SEP-1788's SHOULD). **No shape changed and nothing breaks**: both spellings are WRITTEN with
-/// identical values and EITHER is accepted, so no peer and no backend needs to upgrade in step —
-/// which is why this did not need the coordinated wire change #49 assumed. A backend reading
-/// `mcpmesh/peer` keeps working untouched. Both prefixes are stripped from caller frames, because a
+/// SEP-1788's SHOULD). No shape changed, and **no peer or backend has to change what it READS**:
+/// both spellings are WRITTEN with identical values and EITHER is accepted, which is why this did
+/// not need the coordinated wire change #49 assumed. A backend reading `mcpmesh/peer` keeps working.
+///
+/// **It is not a no-op for every backend, though.** A handler that rejects unknown `_meta` keys —
+/// `deny_unknown_fields`, `additionalProperties: false` — now sees a second one and will refuse
+/// requests it accepted at 57, the same class of break that made 0.50.0 a MINOR. Both prefixes are stripped from caller frames, because a
 /// prefix mcpmesh writes but does not strip is one a caller can forge. A caller sending the two
-/// service spellings with DIFFERENT values is REFUSED rather than reconciled. **The legacy
+/// service spellings with DIFFERENT values is REFUSED rather than reconciled. The reserved-key
+/// enumeration in the 2026-07-28 grammar is `progressToken`, `io.modelcontextprotocol/*`, and bare
+/// `traceparent`/`tracestate`/`baggage`; a prefixed key is reserved only by its SECOND label, so
+/// neither of our spellings ever collided. **The legacy
 /// `mcpmesh/*` spellings are deprecated as of 0.51.0 and will be removed at 1.0** — migrate reads to
 /// the reverse-DNS form. Guard on `>= 58` only if you need the new spelling to be present; to 57
 /// when `_meta["mcpmesh/peer"]` began being injected on

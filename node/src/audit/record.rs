@@ -13,21 +13,35 @@ pub use mcpmesh_local_api::{AuditKind, AuditRecord};
 /// process for a given `params` value (serde_json serialization). `params` may be `Value::Null`
 /// (a parameterless method) — that hashes the four bytes `null`, a stable non-empty digest.
 ///
-/// **`_meta["mcpmesh/peer"]` is excluded** (#45 gate). The daemon writes the authenticated caller
-/// into `_meta` before this runs, so hashing it verbatim would fold the caller's identity into a
-/// field documented as "a digest of the arguments": two peers making an identical call would no
-/// longer collide, and renaming a peer or changing its groups would change the hash of arguments
-/// nobody touched. It is the daemon's own annotation, not the caller's input.
+/// **Every `_meta` key mcpmesh itself writes is excluded** (#45 gate, widened #49). The daemon
+/// writes the authenticated caller into `_meta` before this runs, so hashing it verbatim would fold
+/// the caller's identity into a field documented as "a digest of the arguments": two peers making an
+/// identical call would no longer collide, and renaming a peer or changing its groups would change
+/// the hash of arguments nobody touched.
 ///
-/// Everything else in `_meta` still hashes — an `app/trace-id` a caller sent IS caller input.
+/// **Excluded BY PREFIX, not by an enumerated key.** The first version listed `mcpmesh/peer`
+/// literally; 0.51.0 then added a second spelling of the same annotation and silently re-broke the
+/// property, because the test's fixture only carried the legacy key. Any key mcpmesh writes is
+/// covered by one of [`RESERVED_META_PREFIXES`], so matching on those cannot fall behind a new
+/// spelling.
+///
+/// Caller-supplied `_meta` still hashes — an `app/trace-id` a caller sent IS caller input. And a
+/// caller-FORGED reserved key never reaches here: the strip removes it first.
+///
+/// [`RESERVED_META_PREFIXES`]: mcpmesh_net::service::RESERVED_META_PREFIXES
 pub fn args_hash(params: &Value) -> String {
+    let ours = |k: &str| {
+        mcpmesh_net::service::RESERVED_META_PREFIXES
+            .iter()
+            .any(|p| k.starts_with(p))
+    };
     let bytes = match params.get("_meta").and_then(Value::as_object) {
         // The common case allocates nothing: no `_meta`, or one we did not write into.
-        Some(meta) if meta.contains_key("mcpmesh/peer") => {
+        Some(meta) if meta.keys().any(|k| ours(k)) => {
             let mut owned = params.clone();
             if let Some(m) = owned.get_mut("_meta").and_then(Value::as_object_mut) {
-                m.remove("mcpmesh/peer");
-                // An `_meta` that held ONLY our annotation is dropped entirely, so the digest
+                m.retain(|k, _| !ours(k));
+                // An `_meta` that held ONLY our annotations is dropped entirely, so the digest
                 // matches a request that arrived with no `_meta` at all — which is what the caller
                 // actually sent.
                 if m.is_empty() {
@@ -46,38 +60,49 @@ mod args_hash_tests {
     use super::args_hash;
     use serde_json::json;
 
+    /// The `params` a backend actually receives for `read_file`, with `peer` written into `_meta`
+    /// under EVERY spelling the daemon emits — read off the constant, so a future spelling is
+    /// covered the moment it is added rather than the next time someone notices.
+    fn injected(peer: serde_json::Value) -> serde_json::Value {
+        let mut meta = serde_json::Map::new();
+        for key in mcpmesh_net::service::PEER_KEYS {
+            meta.insert(key.to_string(), peer.clone());
+        }
+        json!({"name": "read_file", "arguments": {"path": "/x"}, "_meta": meta})
+    }
+
     /// #45 gate: the digest is of the CALLER'S arguments, and the daemon's own identity annotation
     /// must not move it.
     ///
-    /// Since 0.50.0 `_meta["mcpmesh/peer"]` is written onto every forwarded request, and this hash
-    /// is computed after that. Folding it in would make two peers issuing an identical call produce
-    /// different digests, and would change the digest of untouched arguments whenever a peer is
-    /// renamed or its groups change — in a field `docs/local-protocol.md` calls "a digest of the
-    /// arguments". `AuditRecord` rides the `subscribe` stream, so that is published vocabulary.
+    /// `AuditRecord` rides the `subscribe` stream and `docs/local-protocol.md` calls `args_hash`
+    /// "a digest of the arguments", so folding the caller in makes two peers issuing an identical
+    /// call produce different digests and moves the digest of untouched arguments whenever a peer
+    /// is renamed.
+    ///
+    /// **This test was written for 0.50.0 and 0.51.0 broke the property anyway**, because the
+    /// fixture hand-built `_meta` with only `mcpmesh/peer` while the code had started writing a
+    /// second spelling. It builds the real shape now — the empty/stale-fixture failure, caught by
+    /// review rather than by this test, which is the whole reason the fixture reads the constant.
     #[test]
     fn the_injected_caller_identity_does_not_change_the_args_hash() {
         let bare = json!({"name": "read_file", "arguments": {"path": "/x"}});
         let expected = args_hash(&bare);
 
-        let with_peer = json!({
-            "name": "read_file",
-            "arguments": {"path": "/x"},
-            "_meta": {"mcpmesh/peer": {"eid": "eid:aa", "name": "alice", "groups": ["eng"]}}
-        });
         assert_eq!(
-            args_hash(&with_peer),
+            args_hash(&injected(
+                json!({"eid": "eid:aa", "name": "alice", "groups": ["eng"]})
+            )),
             expected,
-            "the same call from any peer must hash identically"
+            "the same call from any peer must hash identically, under every spelling written"
         );
-
         // Two DIFFERENT callers, same arguments, same digest — the property that makes the field
         // usable for correlating calls at all.
-        let other_peer = json!({
-            "name": "read_file",
-            "arguments": {"path": "/x"},
-            "_meta": {"mcpmesh/peer": {"eid": "eid:bb", "name": "bob", "groups": []}}
-        });
-        assert_eq!(args_hash(&other_peer), expected);
+        assert_eq!(
+            args_hash(&injected(
+                json!({"eid": "eid:bb", "name": "bob", "groups": []})
+            )),
+            expected
+        );
     }
 
     /// But everything the CALLER put in `_meta` still hashes — it is their input.
@@ -91,18 +116,20 @@ mod args_hash_tests {
             "a caller-supplied `_meta` value is caller input and must be covered by the digest"
         );
 
-        // And removing only OUR key leaves theirs in place rather than dropping `_meta` wholesale.
+        // Removing OUR keys leaves theirs in place rather than dropping `_meta` wholesale — with
+        // both spellings present, which is what is really on the wire.
         let mixed = json!({"arguments": {},
-                           "_meta": {"app/trace-id": "one", "mcpmesh/peer": {"eid": "eid:aa"}}});
+                           "_meta": {"app/trace-id": "one",
+                                     "mcpmesh/peer": {"eid": "eid:aa"},
+                                     "tech.counterpunch.mcpmesh/peer": {"eid": "eid:aa"}}});
         assert_eq!(
             args_hash(&mixed),
             args_hash(&a),
-            "stripping our annotation must leave the caller's other `_meta` keys hashed: {mixed}"
+            "stripping our annotations must leave the caller's other `_meta` keys hashed: {mixed}"
         );
     }
 
-    /// Shapes that must not panic or silently change meaning: no `_meta`, a non-object `_meta`, a
-    /// non-object `params`, and null.
+    /// Shapes that must not panic or silently change meaning.
     #[test]
     fn odd_params_shapes_hash_without_panicking() {
         for v in [
