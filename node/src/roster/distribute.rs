@@ -136,17 +136,32 @@ pub async fn on_announce<H: DistributionHost>(
     // makes the fetch resolve. A malformed ticket string falls through to `fetch`, which returns
     // a typed Err (fail-safe). This add is idempotent + additive (never removes a known addr),
     // so it is safe even when the addr is already known (the localhost test case). BOUNDED: the
-    // shared RosterAddrBook dedups by id under a cap; the per-fetch fallback covers tests
-    // without a registered book. FILTERED (#203): the ticket is a remote party's claim, noted
-    // before its roster signature is ever checked, so its addresses pass `dialable_only` first.
+    // shared RosterAddrBook dedups by id under a cap.
+    //
+    // FILTERED (#203): the ticket is a remote party's claim, noted before its roster signature is
+    // ever checked, so `note` runs `dialable_only` on it first.
+    //
+    // **That filter is far from sufficient, and the limit is worth stating here.** Nothing binds
+    // the ticket's `id` to a roster member, and `blobs.fetch` resolves the provider BY ID — which
+    // triggers iroh's address lookup. On the default `presets::N0` endpoint that means pkarr and
+    // DNS, and a pkarr record is self-signed by the endpoint key, so an announcer can publish any
+    // address list under an id they generated and have it reach the path set with no hygiene at
+    // all. The filter here therefore helps mainly where the ticket is the SOLE source — a
+    // discovery-less deployment. Bounding the rest means constraining address lookup itself, which
+    // is #203's, not this function's.
     if let Ok(ticket) = announce.blob_ticket.parse::<BlobTicket>() {
         if let Some(book) = mesh.addr_book() {
             // `note` filters (#203) — see `RosterAddrBook::note`. Boot always registers a book, so
             // this is the production path.
             book.note(ticket.addr().clone());
         } else {
-            // No book: a fixture path (boot always registers one). Filtered explicitly with the
-            // same function, since it bypasses `note`.
+            // DEFENSIVE AND CURRENTLY UNREACHABLE: `MeshState` is the only `DistributionHost`, and
+            // boot registers the book immediately before spawning this loop, so nothing — not even
+            // a fixture — takes this branch. The retained comment above claiming it "covers tests
+            // without a registered book" was false. Kept rather than deleted because the trait is
+            // public and a future host could omit the book; filtered explicitly for the same
+            // reason, since it bypasses `note`. Nothing pins it, and nothing can while it is
+            // unreachable.
             let mem = iroh::address_lookup::MemoryLookup::new();
             mem.add_endpoint_info(crate::daemon::dial::dialable_only(ticket.addr().clone()));
             if let Ok(lookup) = mesh.endpoint().address_lookup() {

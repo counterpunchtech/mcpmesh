@@ -1051,15 +1051,31 @@ impl AppBlobs {
     ///
     /// Errors carry the LAST failure with every source's count, rather than only the publisher's —
     /// "dial failed" for a blob nobody could serve is a misleading thing to hand a user.
-    pub async fn fetch_from(
+    /// The ordered source list a [`fetch_from`](Self::fetch_from) would dial.
+    ///
+    /// `#[doc(hidden)]` — a TEST SEAM (#203). The dial itself needs a live provider, so without
+    /// this a test could only assert `dialable_only` and hope this function calls it.
+    #[doc(hidden)]
+    pub fn sources_for_test(
         &self,
         ticket_str: &str,
         alternates: &[iroh::EndpointAddr],
-    ) -> Result<Hash> {
+    ) -> Result<Vec<iroh::EndpointAddr>> {
         let ticket: BlobTicket = ticket_str.parse().context("parse blob ticket")?;
+        Ok(Self::sources(&ticket, alternates))
+    }
+
+    /// The ordered set of endpoints a fetch will try: the ticket's publisher, then the caller's
+    /// alternates, deduplicated by endpoint id.
+    fn sources(ticket: &BlobTicket, alternates: &[iroh::EndpointAddr]) -> Vec<iroh::EndpointAddr> {
         // The publisher first, then the caller's alternates.
         let mut sources: Vec<iroh::EndpointAddr> = Vec::with_capacity(1 + alternates.len());
-        sources.push(ticket.addr().clone());
+        // #203: the ticket is a REMOTE party's claim and this is source 0 of a real dial, so it
+        // gets the same filter every other dial path has had since 0.52.1. The `alternates` were
+        // already filtered — they resolve through `stored_dial_addr` — and source 0 was not, which
+        // is the FOURTH site of this shape after the invite, the attestation offer, and the roster
+        // announce. Found by review, not by the audit that fixed the other three.
+        sources.push(crate::daemon::dial::dialable_only(ticket.addr().clone()));
         // The ticket's address is already source 0. An alternate naming the SAME endpoint would
         // otherwise be dialled twice for one timeout each — natural when a caller names the
         // publisher to reach their OTHER devices, since a person expands to all of them.
@@ -1070,6 +1086,16 @@ impl AppBlobs {
         // dials to one peer, which is the one shape this feature must not produce.
         let mut seen: std::collections::HashSet<_> = std::iter::once(ticket.addr().id).collect();
         sources.extend(alternates.iter().filter(|a| seen.insert(a.id)).cloned());
+        sources
+    }
+
+    pub async fn fetch_from(
+        &self,
+        ticket_str: &str,
+        alternates: &[iroh::EndpointAddr],
+    ) -> Result<Hash> {
+        let ticket: BlobTicket = ticket_str.parse().context("parse blob ticket")?;
+        let sources = Self::sources(&ticket, alternates);
         let total = sources.len();
 
         // #82 ask 2: consume the progress stream instead of dropping it on the floor. Same
@@ -1650,6 +1676,58 @@ mod tests {
         HedgePlan, MAX_IN_FLIGHT_DIALS, PROGRESS_STRIDE_BYTES, TransferProgressState,
         apply_transfer_update,
     };
+
+    /// #203: a blob ticket's OWN address is filtered before it becomes source 0 of a dial.
+    ///
+    /// The ticket is a remote party's claim. The `alternates` were already filtered — they resolve
+    /// through `stored_dial_addr` — but source 0 was not, so a ticket naming `0.0.0.0:53` or a
+    /// multicast group reached `Endpoint::connect` untouched. Fourth site of this shape, after the
+    /// pairing invite, the attestation offer and the roster announce.
+    ///
+    /// Asserted on the SOURCE LIST rather than on `dialable_only`: the helper passing says nothing
+    /// about whether this call site invokes it, which is how the previous three attempts in this
+    /// area shipped unpinned.
+    #[tokio::test]
+    async fn a_blob_tickets_own_address_is_filtered_before_it_is_dialled() {
+        let dir = tempfile::tempdir().unwrap();
+        let ep = crate::daemon::boot::build_endpoint(
+            iroh::SecretKey::from_bytes(&[44u8; 32]),
+            &crate::config::NetworkCfg {
+                relay_mode: "disabled".into(),
+                ..Default::default()
+            },
+            false,
+        )
+        .await
+        .unwrap();
+        let blobs = AppBlobs::open_fetcher(dir.path().join("b"), ep)
+            .await
+            .unwrap();
+
+        // A ticket whose address carries one real entry and three that can never be a peer.
+        let provider = iroh::SecretKey::from_bytes(&[45u8; 32]).public();
+        let hash = iroh_blobs::Hash::new(b"x");
+        let addr = iroh::EndpointAddr::from_parts(
+            provider,
+            [
+                iroh::TransportAddr::Ip("0.0.0.0:53".parse().unwrap()),
+                iroh::TransportAddr::Ip("224.0.0.1:1900".parse().unwrap()),
+                iroh::TransportAddr::Ip("192.168.9.9:4433".parse().unwrap()),
+                iroh::TransportAddr::Ip("255.255.255.255:80".parse().unwrap()),
+            ],
+        );
+        let ticket = BlobTicket::new(addr, hash, iroh_blobs::BlobFormat::Raw);
+
+        let sources = blobs.sources_for_test(&ticket.to_string(), &[]).unwrap();
+        assert_eq!(sources.len(), 1, "one source (the ticket's): {sources:?}");
+        assert_eq!(
+            sources[0].addrs.len(),
+            1,
+            "only the dialable address may reach the dial: {:?}",
+            sources[0]
+        );
+        assert_eq!(sources[0].id, provider, "and it still names the provider");
+    }
 
     /// The common case must be untouched: ONE source means one dial and no hedging at all.
     ///

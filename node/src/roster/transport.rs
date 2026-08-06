@@ -242,13 +242,7 @@ impl RosterBlobs {
 /// `MemoryLookup` is not `Clone`, hold the sole instance here and register it lazily on first `note`.
 pub struct RosterAddrBook {
     lookup: iroh::address_lookup::MemoryLookup,
-    /// The providers recorded, and the addresses actually handed to `MemoryLookup` for each.
-    ///
-    /// The addresses are kept only so the recording is OBSERVABLE: `MemoryLookup` has no reader,
-    /// so without this nothing outside can tell what this book fed into address lookup — and a
-    /// test could only assert the filter helper, never the call site. That is the exact gap this
-    /// repo keeps finding (#166, #203), so the site is made checkable rather than assumed.
-    known: std::sync::Mutex<std::collections::HashMap<[u8; 32], iroh::EndpointAddr>>,
+    known: std::sync::Mutex<std::collections::HashSet<[u8; 32]>>,
     cap: usize,
 }
 
@@ -261,7 +255,7 @@ impl RosterAddrBook {
         }
         Self {
             lookup,
-            known: std::sync::Mutex::new(std::collections::HashMap::new()),
+            known: std::sync::Mutex::new(std::collections::HashSet::new()),
             cap,
         }
     }
@@ -279,16 +273,22 @@ impl RosterAddrBook {
         // effect is observable through `recorded_for`, which is what makes the call site testable
         // rather than only the helper.
         //
+        // **RELAY URLs are NOT filtered**, and at this site that is worse than at the pairing
+        // invite: `dialable_only` passes every non-`Ip` variant, iroh opens an outbound TLS
+        // connection to any relay URL it is handed, and unlike a redemption this path is automatic,
+        // unattended and repeatable at the announce rate limit. #203 calls that the sharper edge and
+        // it is not addressed here.
+        //
         // The `cap` below bounds distinct IDS, not addresses per id. That gap is #203's, not this
         // function's: bounding addresses means CHOOSING which to keep, and choosing wrong drops the
         // ones that work — a lesson from an abandoned attempt at exactly that.
         let addr = crate::daemon::dial::dialable_only(addr);
         let id = *addr.id.as_bytes();
         let mut known = self.known.lock().expect("roster addr book mutex");
-        if known.contains_key(&id) || known.len() >= self.cap {
+        if known.contains(&id) || known.len() >= self.cap {
             return false;
         }
-        known.insert(id, addr.clone());
+        known.insert(id);
         self.lookup.add_endpoint_info(addr);
         true
     }
@@ -298,18 +298,19 @@ impl RosterAddrBook {
         self.known.lock().expect("roster addr book mutex").len()
     }
 
-    /// The addresses actually recorded for `id` — what this book fed into address lookup.
+    /// What this book actually handed to address lookup for `id`.
     ///
-    /// `#[doc(hidden)]` — a TEST SEAM (#203). `MemoryLookup` exposes no reader, so this is the only
-    /// way to assert what a gossip-supplied ticket contributed rather than asserting the filter
-    /// helper and hoping the call site calls it.
+    /// `#[doc(hidden)]` — a TEST SEAM (#203), so a test can assert the CALL SITE rather than the
+    /// filter helper. It reads `MemoryLookup` itself rather than a copy: an earlier version kept a
+    /// duplicate `EndpointAddr` per id on the premise that `MemoryLookup` had no reader, which is
+    /// false — `get_endpoint_info` exists — so the duplicate was unnecessary state AND observed a
+    /// sibling rather than the sink it was meant to prove.
     #[doc(hidden)]
     pub fn recorded_for(&self, id: &[u8; 32]) -> Option<iroh::EndpointAddr> {
-        self.known
-            .lock()
-            .expect("roster addr book mutex")
-            .get(id)
-            .cloned()
+        let eid = iroh::EndpointId::from_bytes(id).ok()?;
+        self.lookup
+            .get_endpoint_info(eid)
+            .map(iroh::address_lookup::EndpointInfo::into_endpoint_addr)
     }
 }
 
