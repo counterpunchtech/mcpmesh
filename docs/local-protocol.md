@@ -1463,21 +1463,36 @@ This value is **authoritative**: the daemon strips any caller-supplied `mcpmesh/
 **every** frame it proxies and then writes this object itself, so a caller cannot forge who they are.
 `user_id` is `null` when a pairing peer presented no binding.
 
-> **Since 0.50.0 it is injected on EVERY request** (`#45` ask 2) — every frame carrying a `method`,
-> requests and notifications alike, not only the `initialize`. Before that the strip ran on every
-> frame but the injection ran only on the handshake, so a session whose first frame was not an
-> `initialize` reached the backend with **no** identity at all. That was fail-closed rather than
-> forgeable — the backend saw nothing, never something caller-supplied — but under MCP `2026-07-28`,
-> which removes the handshake entirely, it means a served backend cannot identify its caller.
+> **`api_minor >= 57` guarantees it on EVERY request** (#45 ask 2, 0.50.0) — every frame carrying a
+> `method`, requests and notifications alike.
 >
-> A **response** travelling caller→backend (the push direction, see "Server-initiated frames") has no
-> `method` and is left untouched: it carries `id` + `result`, and inventing a `params` object on one
-> would be malformed JSON-RPC.
+> **Below 57 it was still on the session's FIRST frame**, whatever that frame's method was, plus any
+> later `initialize`. So a backend that binds identity at session start was never blind, including
+> under MCP `2026-07-28` where the first frame is an ordinary request. What was missing was frames
+> 2..N: a backend that authorizes *per request* rather than at session start saw nothing on them.
+> Guard on `>= 57` if that is you.
+>
+> That gap was fail-closed, never forgeable — the strip has run on every frame since `api_minor` 37,
+> so the backend saw nothing rather than something caller-supplied.
+>
+> Two things are deliberately NOT attributed:
+>
+> - A **response** travelling caller→backend (the push direction, see "Server-initiated frames"). It
+>   has no `method`; it carries `id` + `result`, and inventing a `params` object on one would be
+>   malformed JSON-RPC.
+> - A request with **positional (array) params**, or any non-object `params`. There is nowhere to put
+>   `_meta` without deleting the caller's arguments, and this daemon pumps rather than rewrites — so
+>   the frame passes through intact and un-attributed. MCP mandates object params, so this is the
+>   non-MCP JSON-RPC backend case.
 >
 > **If you are writing a backend:** you may now see `_meta["mcpmesh/peer"]` on requests that
 > previously carried none. A handler that rejects unknown `_meta` keys — `deny_unknown_fields`, a
 > schema with `additionalProperties: false` — will refuse requests it used to accept. That is why
 > 0.50.0 is a MINOR.
+>
+> **Frame size:** the annotation adds a few hundred bytes to every request. A caller that sends a
+> frame at exactly the 16 MiB cap will produce one slightly over it on the backend side; the backend
+> sees a `TooLarge` violation and the session ends. Previously reachable only on the handshake.
 
 > **`api_minor >= 37` is what guarantees the STRIP.** Below 37 it was enforced on the first frame
 > only, and `run_session` treats frame 1 as the `initialize` whatever its method is — so a caller

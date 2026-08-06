@@ -2828,7 +2828,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   thirty have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.56";
+pub const API_VERSION: &str = "1.57";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -2914,7 +2914,15 @@ pub const API_VERSION: &str = "1.56";
 /// refusals — expired line, no live invite, inviter unreachable, id mismatch, name conflict, and
 /// the deliberately-opaque refusal. `ERR_NICKNAME_TAKEN` had been the only coded pairing failure,
 /// so every other one arrived as `-32000` and an embedder could either forward our prose to end
-/// users or substring-match it (#159); to 56 with [`PeerDiagnosticsResult::known_addrs`] and its two
+/// users or substring-match it (#159); to 57 when `_meta["mcpmesh/peer"]` began being injected on
+/// EVERY proxied request rather than only the handshake (#45 ask 2). **No shape changed** — this is
+/// the same class as 37, on the same field: what changed is WHEN a backend can rely on the value
+/// being there. Before 57 a served backend learned its caller on the session's first frame and on
+/// any later `initialize`, and saw nothing on frames 2..N; from 57 every request carrying a `method`
+/// is attributed. A backend that authorizes per-request rather than binding at session start must
+/// guard on `>= 57`, exactly as 37's note says to guard before trusting the value at all. Positional
+/// (array) params are the one exception and are deliberately left un-attributed — see
+/// `docs/local-protocol.md`. Guard on `>= 57`; to 56 with [`PeerDiagnosticsResult::known_addrs`] and its two
 /// set-difference companions — IROH's own view of a peer's addresses alongside the hint we stored
 /// (#140). The verb dumped this node's disk and nothing about what iroh made of it, which is the
 /// half the standing hypothesis lives in: iroh skips address lookup while a path is selected, so a
@@ -3096,7 +3104,7 @@ pub const API_VERSION: &str = "1.56";
 /// its REAL content is a meaning change to `reachable` — the field exists so the new meaning is
 /// observable at all. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 56;
+pub const API_MINOR: u32 = 57;
 
 #[cfg(test)]
 mod tests {

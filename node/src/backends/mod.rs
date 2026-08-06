@@ -118,10 +118,22 @@ fn inject_peer(frame: &mut Value, peer: &Value, depth: usize) {
         return;
     }
     // No `!frame.is_object()` guard: only an object can carry a `method`, and the check above
-    // already returned for everything else. `params`/`_meta` still need theirs.
-    if !frame["params"].is_object() {
-        frame["params"] = serde_json::json!({});
+    // already returned for everything else. `params`/`_meta` still need theirs — `Value`'s
+    // IndexMut PANICS on a non-object base, and a non-object frame is reachable (`select_service`'s
+    // key-absent default forwards one).
+    match frame.get("params") {
+        // Absent or null: a parameterless request legitimately has none, so build the object.
+        None | Some(Value::Null) => frame["params"] = serde_json::json!({}),
+        Some(v) if v.is_object() => {}
+        // POSITIONAL params. JSON-RPC 2.0 permits an array and this daemon pumps rather than
+        // interprets, so there is nowhere to put `_meta` without destroying the caller's arguments.
+        // Leave the frame alone and inject nothing: the backend sees no identity, which is
+        // fail-closed, rather than seeing arguments mcpmesh silently deleted. MCP itself mandates
+        // object params, so this is the non-MCP JSON-RPC backend case (#45 gate).
+        Some(_) => return,
     }
+    // `_meta` is protocol metadata rather than the caller's arguments, so a malformed one is
+    // replaced rather than deferred to.
     if !frame["params"]["_meta"].is_object() {
         frame["params"]["_meta"] = serde_json::json!({});
     }
@@ -583,17 +595,41 @@ mod tests {
     #[test]
     fn odd_shapes_survive_sanitize_without_panicking() {
         let peer = json!({"eid":"eid:aa","name":"bob","user_id":null,"groups":[]});
+        // Absent, null, or a malformed `_meta` inside an OBJECT params: attributed. `_meta` is
+        // protocol metadata rather than the caller's arguments, so a malformed one is replaced.
         for mut frame in [
             json!({"jsonrpc":"2.0","id":1,"method":"initialize"}), // no params
-            json!({"jsonrpc":"2.0","id":2,"method":"initialize","params":"a string"}),
-            json!({"jsonrpc":"2.0","id":3,"method":"initialize","params":["an","array"]}),
+            json!({"jsonrpc":"2.0","id":2,"method":"initialize","params":null}),
             json!({"jsonrpc":"2.0","id":4,"method":"initialize","params":{"_meta":42}}),
             json!({"jsonrpc":"2.0","id":5,"method":"initialize","params":{"_meta":["a"]}}),
+            json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{}}),
         ] {
             let _ = sanitize_caller_frame(&mut frame, Some(&peer));
             assert_eq!(
                 frame["params"]["_meta"]["mcpmesh/peer"], peer,
-                "an odd-shaped initialize must still end up attributed: {frame}"
+                "a request with object (or absent) params must end up attributed: {frame}"
+            );
+        }
+
+        // POSITIONAL params are left ALONE — arguments, not metadata (#45 gate).
+        //
+        // These used to be REPLACED with `{"_meta":{...}}`, silently deleting the caller's
+        // arguments. That was near-dead while injection only touched `initialize` (MCP always
+        // sends object params there); widening to every request would have made it fire on every
+        // positional call a non-MCP JSON-RPC backend received. The daemon pumps rather than
+        // interprets, so it does not get to rewrite arguments it cannot annotate — the backend
+        // simply sees no identity, which is fail-closed.
+        for mut frame in [
+            json!({"jsonrpc":"2.0","id":3,"method":"initialize","params":["an","array"]}),
+            json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":[1,2,3]}),
+            json!({"jsonrpc":"2.0","id":8,"method":"tools/call","params":"a string"}),
+        ] {
+            let before = frame.clone();
+            let _ = sanitize_caller_frame(&mut frame, Some(&peer));
+            assert_eq!(
+                frame, before,
+                "positional/scalar params are the caller's arguments and must survive intact, \
+                 un-attributed, rather than being replaced: {frame}"
             );
         }
 
