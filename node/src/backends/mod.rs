@@ -41,7 +41,7 @@ pub(crate) const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 // layering constraint), so a "downcast in the daemon" was never possible. The backend owning
 // the refusal is the correct seam.
 
-/// Enforce the reserved `mcpmesh/*` namespace on ONE caller→backend frame (#164).
+/// Enforce the reserved `_meta` namespace on ONE caller→backend frame (#164).
 ///
 /// The rule used to run on the session's first frame only, and `run_session` treats frame 1 as
 /// `initialize` whatever its method actually is. So a caller spent frame 1 on a `ping` — which the
@@ -50,7 +50,8 @@ pub(crate) const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 ///
 /// Three steps, because each alone leaves a hole:
 ///
-/// 1. **Strip** every caller-supplied `mcpmesh/*` key. Unconditional, both backends.
+/// 1. **Strip** every caller-supplied reserved key — `mcpmesh/*` AND
+///    `tech.counterpunch.mcpmesh/*` (#49). Unconditional, both backends.
 ///    `mcpmesh/service` is the key `select_service` acts on, so this is authorization-relevant.
 /// 2. **Remove an impersonating `io.modelcontextprotocol/clientInfo`** (#189) — one whose `name` is
 ///    written in mcpmesh's own `eid:`/`b64u:` principal grammar. Under MCP 2026-07-28 that key
@@ -137,7 +138,13 @@ fn inject_peer(frame: &mut Value, peer: &Value, depth: usize) {
     if !frame["params"]["_meta"].is_object() {
         frame["params"]["_meta"] = serde_json::json!({});
     }
-    frame["params"]["_meta"]["mcpmesh/peer"] = peer.clone();
+    // BOTH spellings, identical value (#49). A backend is a THIRD-PARTY process reading
+    // `mcpmesh/peer` — not something version-locked to this daemon — so dropping the legacy key
+    // would make every existing backend silently stop seeing an identity, and one that reads "no
+    // identity" as "local caller" would fail OPEN. Legacy deprecated as of 0.51.0, removed at 1.0.
+    for key in mcpmesh_net::service::PEER_KEYS {
+        frame["params"]["_meta"][key] = peer.clone();
+    }
 }
 
 /// Bidirectionally pump one session between the mesh transport and a local MCP
@@ -641,6 +648,47 @@ mod tests {
             assert_eq!(
                 frame, original,
                 "a scalar frame is not an initialize and must pass through unchanged"
+            );
+        }
+    }
+
+    /// #49: BOTH spellings of the identity key are written, with the identical value.
+    ///
+    /// A test asserting only the reverse-DNS key would pass on an implementation that dropped the
+    /// legacy one — which would make every EXISTING backend silently stop seeing an identity.
+    /// Backends are third-party processes reading `mcpmesh/peer`, not something version-locked to
+    /// this daemon, and one that reads "no identity" as "local caller" fails OPEN. That is the
+    /// failure this dual write exists to prevent, so both halves are asserted.
+    #[test]
+    fn both_spellings_of_the_peer_key_are_written_with_the_same_value() {
+        let peer = json!({"eid":"eid:aa","name":"bob","user_id":null,"groups":[]});
+        let mut frame = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{}});
+        let _ = sanitize_caller_frame(&mut frame, Some(&peer));
+
+        let meta = &frame["params"]["_meta"];
+        assert_eq!(
+            meta["mcpmesh/peer"], peer,
+            "the LEGACY key must keep working for existing backends: {meta}"
+        );
+        assert_eq!(
+            meta["tech.counterpunch.mcpmesh/peer"], peer,
+            "and the reverse-DNS key must be there for new ones: {meta}"
+        );
+        assert_eq!(
+            meta["mcpmesh/peer"], meta["tech.counterpunch.mcpmesh/peer"],
+            "the two must never diverge — a backend reading either gets the same answer: {meta}"
+        );
+
+        // A caller forging EITHER spelling is replaced, not merged, in both slots.
+        let mut forged = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"_meta":{
+            "mcpmesh/peer": {"name":"attacker","groups":["admin"]},
+            "tech.counterpunch.mcpmesh/peer": {"name":"attacker","groups":["admin"]},
+        }}});
+        let _ = sanitize_caller_frame(&mut forged, Some(&peer));
+        for k in ["mcpmesh/peer", "tech.counterpunch.mcpmesh/peer"] {
+            assert_eq!(
+                forged["params"]["_meta"][k], peer,
+                "a forged `{k}` is replaced with the authenticated value: {forged}"
             );
         }
     }

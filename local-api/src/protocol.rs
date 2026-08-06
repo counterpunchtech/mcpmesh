@@ -2828,7 +2828,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   thirty have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.57";
+pub const API_VERSION: &str = "1.58";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -2914,7 +2914,23 @@ pub const API_VERSION: &str = "1.57";
 /// refusals — expired line, no live invite, inviter unreachable, id mismatch, name conflict, and
 /// the deliberately-opaque refusal. `ERR_NICKNAME_TAKEN` had been the only coded pairing failure,
 /// so every other one arrived as `-32000` and an embedder could either forward our prose to end
-/// users or substring-match it (#159); to 57 when `_meta["mcpmesh/peer"]` began being injected on
+/// users or substring-match it (#159); to 58 with the REVERSE-DNS `_meta` key spellings
+/// `tech.counterpunch.mcpmesh/{service,peer}` alongside the legacy `mcpmesh/{service,peer}` (#49,
+/// SEP-1788's SHOULD). No shape changed, and **no peer or backend has to change what it READS**:
+/// both spellings are WRITTEN with identical values and EITHER is accepted, which is why this did
+/// not need the coordinated wire change #49 assumed. A backend reading `mcpmesh/peer` keeps working.
+///
+/// **It is not a no-op for every backend, though.** A handler that rejects unknown `_meta` keys —
+/// `deny_unknown_fields`, `additionalProperties: false` — now sees a second one and will refuse
+/// requests it accepted at 57, the same class of break that made 0.50.0 a MINOR. Both prefixes are stripped from caller frames, because a
+/// prefix mcpmesh writes but does not strip is one a caller can forge. A caller sending the two
+/// service spellings with DIFFERENT values is REFUSED rather than reconciled. The reserved-key
+/// enumeration in the 2026-07-28 grammar is `progressToken`, `io.modelcontextprotocol/*`, and bare
+/// `traceparent`/`tracestate`/`baggage`; a prefixed key is reserved only by its SECOND label, so
+/// neither of our spellings ever collided. **The legacy
+/// `mcpmesh/*` spellings are deprecated as of 0.51.0 and will be removed at 1.0** — migrate reads to
+/// the reverse-DNS form. Guard on `>= 58` only if you need the new spelling to be present; to 57
+/// when `_meta["mcpmesh/peer"]` began being injected on
 /// EVERY proxied request rather than only the handshake (#45 ask 2). **No shape changed** — this is
 /// the same class as 37, on the same field: what changed is WHEN a backend can rely on the value
 /// being there. Before 57 a served backend learned its caller on the session's first frame and on
@@ -3104,7 +3120,7 @@ pub const API_VERSION: &str = "1.57";
 /// its REAL content is a meaning change to `reachable` — the field exists so the new meaning is
 /// observable at all. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 57;
+pub const API_MINOR: u32 = 58;
 
 #[cfg(test)]
 mod tests {
