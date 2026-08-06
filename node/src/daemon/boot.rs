@@ -302,7 +302,12 @@ async fn boot_node(
                 endpoint
                     .address_lookup()
                     .map_err(|e| anyhow::anyhow!("endpoint closed before local discovery: {e}"))?
-                    .add(lookup);
+                    // #203: WRAPPED, like the pkarr and DNS resolvers. This is the third
+                    // address-lookup ingress and it is the one with the WEAKEST precondition: an
+                    // mDNS answer is unauthenticated, endpoint ids are public, and any device on
+                    // the link can answer for a paired peer's id with whatever addresses it likes.
+                    // pkarr at least requires generating a keypair and publishing a record.
+                    .add(crate::daemon::lookup_hygiene::wrap(lookup));
                 tracing::info!(
                     advertise = local_disc.advertise,
                     "local discovery enabled on this link"
@@ -872,13 +877,15 @@ pub fn net_plan(net: &crate::config::NetworkCfg) -> Result<NetPlan> {
 /// The `[network]` posture comes from [`net_plan`]:
 /// - Hermetic (`relay_mode = "disabled"`): `presets::Minimal` + `RelayMode::Disabled` — a
 ///   localhost-only endpoint, no relay, no discovery (hermetic tests).
-/// - n0-default discovery: `presets::N0` (pkarr publish + DNS lookup + n0 relays), with the
+/// - n0-default discovery: `presets::N0` EXPANDED (pkarr publish + pkarr resolve + DNS lookup),
+///   with the resolvers wrapped in `lookup_hygiene::Hygienic` (#203) and the relay mode set
+///   explicitly as on every branch — with the
 ///   relay map overridden to the operator's `relay_urls` when `relay_mode = "custom"`.
 /// - Custom discovery (`discovery_urls`): `presets::Minimal` plus a `PkarrPublisher` AND a
 ///   `PkarrResolver` per URL — publish and resolve BOTH go to the self-hosted pkarr relay(s),
 ///   never to n0 (a half-private discovery setup would defeat the metadata-privacy point).
 ///
-/// Verified against iroh 1.0.1: `Builder::alpns(Vec<Vec<u8>>)` advertises MULTIPLE
+/// Verified against iroh 1.0.3: `Builder::alpns(Vec<Vec<u8>>)` advertises MULTIPLE
 /// ALPNs on one endpoint; `Endpoint::builder(preset)`, `.secret_key()`, `.relay_mode()`,
 /// `.address_lookup()`, `.bind()` per the pinned crate; `RelayMode::custom(urls)` builds the
 /// custom `RelayMap`; all preset paths yield the same `Builder` type.
@@ -910,6 +917,9 @@ pub(crate) async fn build_endpoint(
                 .address_lookup(crate::daemon::lookup_hygiene::Hygienic(
                     iroh::address_lookup::PkarrResolver::n0_dns(),
                 ))
+                // `presets::N0` gates this on `#[cfg(not(wasm_browser))]` — the type does not
+                // exist there. Latent today (no wasm target is built) but the expansion is a
+                // hand-maintained copy of an upstream preset, so it carries the gate too.
                 .address_lookup(crate::daemon::lookup_hygiene::Hygienic(
                     iroh::address_lookup::DnsAddressLookup::n0_dns(),
                 ))
@@ -1289,6 +1299,97 @@ async fn compose_roster_transport(
             }
         };
     (Some(gossip), Some(blobs), roster_topic, presence_topic)
+}
+
+#[cfg(test)]
+mod lookup_wiring_tests {
+    use super::*;
+
+    /// #203: the resolvers `build_endpoint` installs are WRAPPED.
+    ///
+    /// The commit that added the wrapper disclosed this as untestable — "iroh exposes no way to
+    /// enumerate an endpoint's installed lookups". **That was false**, and the review proved it:
+    /// `AddressLookupServices` derives `Debug` over its service list, and `Debug` is a supertrait
+    /// of `AddressLookup`, so the wiring is observable with no network at all. Six releases in this
+    /// subsystem have now shipped a change unpinned at its own call site; disclosing the seventh on
+    /// a reason that is untrue is worse than not disclosing it.
+    ///
+    /// Hermetic: the discovery URL points at a port nothing listens on, and nothing resolves.
+    #[tokio::test]
+    async fn build_endpoint_wraps_the_resolvers_it_installs() {
+        // BOTH branches that install a resolver. The first version only built one and asserted on
+        // it — and it silently took the n0 branch, so unwrapping the CUSTOM resolver left it green.
+        // A wiring test that does not name which wiring it checked is not a wiring test.
+        let n0 = crate::config::NetworkCfg::default();
+        let custom = crate::config::NetworkCfg {
+            discovery_mode: "custom".into(),
+            discovery_urls: vec!["http://127.0.0.1:1/".into()],
+            ..Default::default()
+        };
+
+        for (label, net, seed) in [("n0", n0, 91u8), ("custom", custom, 94u8)] {
+            let ep = build_endpoint(iroh::SecretKey::from_bytes(&[seed; 32]), &net, false)
+                .await
+                .unwrap_or_else(|e| panic!("build the {label} endpoint: {e}"));
+            let dbg = format!("{:?}", ep.address_lookup().expect("address lookup"));
+            assert!(
+                dbg.contains("HygienicLookup(PkarrResolver"),
+                "the {label} branch's resolver must be wrapped — an unwrapped one lets a \
+                 self-signed pkarr record put arbitrary destinations into the path set: {dbg}"
+            );
+            // The PUBLISHER is deliberately NOT wrapped: it carries our own addresses outward.
+            assert!(
+                dbg.contains("PkarrPublisher {"),
+                "the {label} branch still installs an unwrapped publisher: {dbg}"
+            );
+            ep.close().await;
+        }
+    }
+
+    /// #203: our expansion of `presets::N0` still matches the preset it replaced.
+    ///
+    /// The expansion exists only to interpose `Hygienic`, so it is a hand-maintained copy of an
+    /// upstream preset — and the next iroh bump that adds a service to `N0` would silently drop it
+    /// here. Compared by the same `Debug` view, with the wrapper names normalised away.
+    #[tokio::test]
+    async fn our_n0_expansion_matches_the_preset() {
+        fn services(dbg: &str) -> Vec<String> {
+            dbg.replace("HygienicLookup(", "")
+                .split(',')
+                .filter_map(|t| {
+                    ["PkarrPublisher", "PkarrResolver", "DnsAddressLookup"]
+                        .into_iter()
+                        .find(|n| t.contains(n))
+                        .map(str::to_string)
+                })
+                .collect()
+        }
+
+        let net = crate::config::NetworkCfg::default();
+        let ours = build_endpoint(iroh::SecretKey::from_bytes(&[92u8; 32]), &net, false)
+            .await
+            .expect("build the n0-default endpoint");
+        let theirs = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+            .secret_key(iroh::SecretKey::from_bytes(&[93u8; 32]))
+            .bind()
+            .await
+            .expect("bind a stock N0 endpoint");
+
+        let ours_dbg = format!("{:?}", ours.address_lookup().expect("ours"));
+        let theirs_dbg = format!("{:?}", theirs.address_lookup().expect("theirs"));
+        assert_eq!(
+            services(&ours_dbg),
+            services(&theirs_dbg),
+            "our expansion must install the same services, in the same order, as `presets::N0` — \
+             ours: {ours_dbg}\n theirs: {theirs_dbg}"
+        );
+        assert!(
+            ours_dbg.contains("Hygienic") && !theirs_dbg.contains("Hygienic"),
+            "and ours must be the wrapped one"
+        );
+        ours.close().await;
+        theirs.close().await;
+    }
 }
 
 #[cfg(test)]

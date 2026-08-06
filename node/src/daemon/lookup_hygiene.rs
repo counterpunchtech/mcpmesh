@@ -40,6 +40,13 @@ impl<B: AddressLookupBuilder> AddressLookupBuilder for Hygienic<B> {
     }
 }
 
+/// Wrap an already-built [`AddressLookup`] — for services added AFTER `bind`, which cannot go
+/// through the builder. mDNS local discovery is one, and it is the ingress with the weakest
+/// precondition of the three: an mDNS answer is unauthenticated and endpoint ids are public.
+pub(crate) fn wrap<L: AddressLookup>(inner: L) -> impl AddressLookup {
+    HygienicLookup(inner)
+}
+
 /// The built service: delegates everything, filters what `resolve` yields.
 #[derive(Debug)]
 struct HygienicLookup<L>(L);
@@ -63,19 +70,37 @@ impl<L: AddressLookup> AddressLookup for HygienicLookup<L> {
 
 /// Strip a resolved item of every address that can never be a unicast QUIC peer.
 ///
-/// Rebuilt rather than mutated: `EndpointInfo` exposes no way to remove a single address, and
-/// `clear_ip_addrs` + re-add would drop the relay entries this deliberately preserves.
+/// Filters the address vector IN PLACE ORDER rather than round-tripping through `EndpointAddr`.
+/// That matters twice, and the first version did neither:
 ///
-/// `user_data` is carried across — it is the endpoint's own annotation and nothing to do with
-/// reachability, and silently dropping it would change behaviour for anyone using it.
+/// - **Order is load-bearing.** iroh-dns documents `EndpointData.addrs` as ordered, "so it can
+///   encode priority for address lookup services, should they not fit into e.g. a single DNS
+///   packet". `EndpointAddr.addrs` is a `BTreeSet`, so a round trip silently re-sorts to
+///   relay-first-then-numeric — and BTreeSet ordering is exactly what sank an earlier attempt in
+///   this area, which capped by prefix and threw away the LAN address and every IPv6.
+/// - **`user_data` cannot survive a round trip at all.** `From<EndpointAddr> for EndpointData`
+///   hardcodes `user_data: None`, so preserving it explicitly (as the first version did) restored a
+///   field the conversion had just discarded — and no fixture built that way could ever prove it.
+///
+/// Relay entries are kept: `is_dialable_addr` passes every non-`Ip` variant, and dropping them here
+/// would disable relay-mediated connectivity for every peer resolved through pkarr, DNS or mDNS.
 pub(crate) fn filter_item(item: Item) -> Item {
     let info = item.endpoint_info().clone();
     let id = info.endpoint_id;
-    let user_data = info.data.user_data().cloned();
+    let mut data = info.data;
 
-    let kept = crate::daemon::dial::dialable_only(iroh::EndpointAddr::from(info));
-    let mut data = EndpointData::from(kept);
-    data.set_user_data(user_data);
+    let kept: Vec<iroh::TransportAddr> = data
+        .addrs()
+        .filter(|a| crate::daemon::dial::is_dialable_addr(a))
+        .cloned()
+        .collect();
+    // `clear_ip_addrs` retains relays, so this removes only the IP entries and re-adds the ones
+    // that survived — preserving both the relay entries and the relative order of what is kept.
+    data.clear_ip_addrs();
+    data.add_addrs(
+        kept.into_iter()
+            .filter(|a| matches!(a, iroh::TransportAddr::Ip(_))),
+    );
 
     Item::new(
         EndpointInfo::from_parts(id, data),
@@ -87,12 +112,22 @@ pub(crate) fn filter_item(item: Item) -> Item {
 #[cfg(test)]
 mod tests {
     use super::filter_item;
-    use iroh::address_lookup::{EndpointInfo, Item};
+    use iroh::address_lookup::{EndpointData, EndpointInfo, Item};
 
+    /// Build an item WITHOUT going through `EndpointAddr`.
+    ///
+    /// `From<EndpointAddr> for EndpointData` hardcodes `user_data: None` and `EndpointAddr.addrs`
+    /// is a `BTreeSet`, so a fixture built that way can carry neither user_data nor a chosen order
+    /// — it cannot express the two things `filter_item` must preserve. The first version used it
+    /// and the user_data assertion measured nothing.
     fn item_of(addrs: Vec<iroh::TransportAddr>) -> (iroh::EndpointId, Item) {
         let id = iroh::SecretKey::from_bytes(&[77u8; 32]).public();
-        let info = EndpointInfo::from(iroh::EndpointAddr::from_parts(id, addrs));
-        (id, Item::new(info, "test", Some(42)))
+        let mut data = EndpointData::new(addrs);
+        data.set_user_data(Some("hello".parse().expect("valid user data")));
+        (
+            id,
+            Item::new(EndpointInfo::from_parts(id, data), "test", Some(42)),
+        )
     }
 
     /// A stand-in service that yields one hostile item, so `resolve` itself can be driven.
@@ -108,7 +143,18 @@ mod tests {
             let info =
                 EndpointInfo::from(iroh::EndpointAddr::from_parts(endpoint_id, self.0.clone()));
             let item = Item::new(info, "fake", None);
-            Some(Box::pin(n0_future::stream::iter(vec![Ok(item)])))
+            // An Err BETWEEN two Ok items: a `resolve` that filtered only the head, or that
+            // swallowed errors with `filter_map(Result::ok)`, would pass a single-Ok fixture.
+            // iroh surfaces inline errors only when nothing was emitted, so dropping them is
+            // silent.
+            Some(Box::pin(n0_future::stream::iter(vec![
+                Ok(item.clone()),
+                Err(iroh::address_lookup::Error::from_err(
+                    "fake",
+                    std::io::Error::other("boom"),
+                )),
+                Ok(item),
+            ])))
         }
     }
 
@@ -132,14 +178,22 @@ mod tests {
 
         let mut stream = iroh::address_lookup::AddressLookup::resolve(&wrapped, id)
             .expect("the wrapper delegates and yields a stream");
-        let first = stream.next().await.expect("one item").expect("ok");
-        let addr = iroh::EndpointAddr::from(first.endpoint_info().clone());
-        assert_eq!(
-            addr.addrs.len(),
-            1,
-            "the wrapper must filter what it yields, not merely delegate: {addr:?}"
-        );
-        assert_eq!(addr.id, id);
+        let mut seen = Vec::new();
+        while let Some(r) = stream.next().await {
+            seen.push(r);
+        }
+        assert_eq!(seen.len(), 3, "every item is forwarded, errors included");
+        assert!(seen[1].is_err(), "an inline error passes through unmapped");
+        for (i, r) in [(0usize, &seen[0]), (2, &seen[2])] {
+            let it = r.as_ref().unwrap_or_else(|_| panic!("item {i} ok"));
+            let addr = iroh::EndpointAddr::from(it.endpoint_info().clone());
+            assert_eq!(
+                addr.addrs.len(),
+                1,
+                "EVERY yielded item is filtered, not just the first: {addr:?}"
+            );
+            assert_eq!(addr.id, id);
+        }
     }
 
     /// #203: a RESOLVED address that can never be a unicast QUIC peer never reaches the path set.
@@ -196,6 +250,28 @@ mod tests {
             "the source label must survive — iroh uses it to attribute paths"
         );
         assert_eq!(out.last_updated(), Some(42));
+        assert_eq!(
+            out.endpoint_info()
+                .data
+                .user_data()
+                .map(ToString::to_string),
+            Some("hello".to_string()),
+            "user_data is the endpoint's own annotation and nothing to do with reachability — \
+             dropping it silently changes behaviour for anyone who reads it"
+        );
+        // ORDER is preserved: iroh-dns documents it as encoding priority for services that cannot
+        // fit every address in one packet.
+        let ordered: Vec<String> = out
+            .endpoint_info()
+            .data
+            .addrs()
+            .map(ToString::to_string)
+            .collect();
+        assert!(
+            ordered.iter().position(|a| a.contains("192.168.1.5"))
+                < ordered.iter().position(|a| a.contains("2001:db8")),
+            "the surviving addresses keep their relative order, not a re-sorted one: {ordered:?}"
+        );
         let addr = iroh::EndpointAddr::from(out.endpoint_info().clone());
         assert_eq!(addr.id, id);
         assert_eq!(
