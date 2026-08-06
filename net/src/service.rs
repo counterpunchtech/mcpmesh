@@ -48,6 +48,33 @@ const MAX_BATCH_DEPTH: usize = 8;
 /// The MCP 2026-07-28 key a client writes its own software name/version into.
 const CLIENT_INFO_KEY: &str = "io.modelcontextprotocol/clientInfo";
 
+/// mcpmesh's ORIGINAL single-label `_meta` prefix. **Deprecated as of 0.51.0, removed at 1.0.**
+///
+/// Still emitted and still accepted — see [`RESERVED_META_PREFIXES`] for why both exist.
+pub const LEGACY_META_PREFIX: &str = "mcpmesh/";
+
+/// The reverse-DNS `_meta` prefix (#49), per SEP-1788's SHOULD.
+///
+/// Nothing was ever broken by the single-label form: SEP-1788 reserves only `progressToken` and
+/// second-label `mcp`/`modelcontextprotocol`, so `mcpmesh/` never collided. This is
+/// forward-alignment, which is exactly why it is not worth breaking anyone over.
+pub const META_PREFIX: &str = "tech.counterpunch.mcpmesh/";
+
+/// Every prefix mcpmesh reserves. **The strip must cover ALL of them**, not just the one currently
+/// emitted: a prefix that is written but not stripped is a key a caller can forge, and a backend
+/// reading it would be reading caller-controlled data under an authoritative-looking name.
+pub const RESERVED_META_PREFIXES: [&str; 2] = [LEGACY_META_PREFIX, META_PREFIX];
+
+/// The service-routing key, in both spellings. Reverse-DNS first: it is the preferred one, and
+/// [`select_service`] reads them in this order.
+pub const SERVICE_KEYS: [&str; 2] = ["tech.counterpunch.mcpmesh/service", "mcpmesh/service"];
+
+/// The caller-identity key, in both spellings. Both are WRITTEN, with the identical value: a backend
+/// is a third-party process reading `mcpmesh/peer`, not something version-locked to this daemon, so
+/// dropping the legacy spelling would make every existing backend silently stop seeing an identity —
+/// and one that reads "no identity" as "local caller" would fail OPEN.
+pub const PEER_KEYS: [&str; 2] = ["tech.counterpunch.mcpmesh/peer", "mcpmesh/peer"];
+
 /// Remove a `clientInfo` that names itself in mcpmesh's PRINCIPAL grammar (#189).
 ///
 /// With the `initialize` handshake gone in MCP 2026-07-28, client identity moves into per-request
@@ -140,7 +167,7 @@ fn strip_reserved_meta_to_depth(frame: &mut Value, depth: usize) {
         .pointer_mut("/params/_meta")
         .and_then(Value::as_object_mut)
     {
-        meta.retain(|k, _| !k.starts_with("mcpmesh/"));
+        meta.retain(|k, _| !RESERVED_META_PREFIXES.iter().any(|p| k.starts_with(p)));
     }
 }
 
@@ -148,9 +175,27 @@ pub fn select_service(init: &mut Value, caller_allowed: &[String]) -> ServiceDec
     // Read the request before stripping, distinguishing "key absent" (may default)
     // from "key present but not a string" (malformed → requested something
     // unresolvable → Refuse; it must never fall through to the default).
-    let entry = init.pointer("/params/_meta/mcpmesh~1service");
-    let malformed = entry.is_some_and(|v| !v.is_string());
-    let requested: Option<String> = entry.and_then(Value::as_str).map(String::from);
+    //
+    // BOTH spellings are accepted (#49): reverse-DNS preferred, single-label legacy as fallback, so
+    // a newer daemon still serves an older caller and neither peer needs a version gate.
+    let read = |key: &str| init.pointer(&format!("/params/_meta/{}", key.replace('/', "~1")));
+    let entries: Vec<Option<&Value>> = SERVICE_KEYS.iter().map(|k| read(k)).collect();
+    let malformed = entries.iter().flatten().any(|v| !v.is_string());
+    // A caller sending BOTH with different values is not making a coherent request. Silently
+    // preferring one would let it present a different service to each daemon version — the whole
+    // reason this transition accepts two spellings is that peers may disagree about which they read.
+    let conflicting = matches!(
+        (
+            entries[0].and_then(Value::as_str),
+            entries[1].and_then(Value::as_str)
+        ),
+        (Some(a), Some(b)) if a != b
+    );
+    let requested: Option<String> = entries
+        .iter()
+        .flatten()
+        .find_map(|v| v.as_str())
+        .map(String::from);
 
     // Strip ALL reserved keys, always — before any decision is acted on.
     strip_reserved_meta(init);
@@ -173,7 +218,7 @@ pub fn select_service(init: &mut Value, caller_allowed: &[String]) -> ServiceDec
         );
     }
 
-    if malformed {
+    if malformed || conflicting {
         return ServiceDecision::Refuse;
     }
     match requested {
@@ -192,6 +237,107 @@ mod tests {
     fn init_with_meta(meta: serde_json::Value) -> serde_json::Value {
         json!({"jsonrpc":"2.0","id":1,"method":"initialize",
                "params":{"protocolVersion":"2025-11-25","_meta": meta,"capabilities":{}}})
+    }
+
+    const NEW_SVC: &str = "tech.counterpunch.mcpmesh/service";
+    const OLD_SVC: &str = "mcpmesh/service";
+
+    /// #49: EITHER spelling routes, so neither peer needs a version gate during the transition.
+    ///
+    /// The reason this release does not need the coordinated break #49 assumed: a newer daemon
+    /// serves an older caller (legacy key), and an older daemon serves a newer caller (which emits
+    /// both). Asserting only the new key would pass on an implementation that dropped the fallback
+    /// and refused every dial from an un-upgraded peer.
+    #[test]
+    fn either_service_key_spelling_routes() {
+        let allowed = vec!["notes".to_string(), "kb".to_string()];
+
+        for key in [NEW_SVC, OLD_SVC] {
+            let mut f = init_with_meta(json!({key: "kb"}));
+            assert_eq!(
+                select_service(&mut f, &allowed),
+                ServiceDecision::Selected("kb".into()),
+                "`{key}` must route"
+            );
+            // And it is stripped whichever spelling arrived — see the prefix test below.
+            assert!(
+                f["params"]["_meta"].get(key).is_none(),
+                "the routing key must never reach the backend: {f}"
+            );
+        }
+
+        // BOTH present, same value — what this release actually puts on the wire.
+        let mut both = init_with_meta(json!({NEW_SVC: "kb", OLD_SVC: "kb"}));
+        assert_eq!(
+            select_service(&mut both, &allowed),
+            ServiceDecision::Selected("kb".into()),
+            "the pair this daemon emits must route: {both}"
+        );
+    }
+
+    /// A caller sending the two spellings with DIFFERENT values is refused, not silently resolved.
+    ///
+    /// Picking one would let a caller show a different service to each daemon version — and the
+    /// whole premise of accepting two spellings is that peers may disagree about which they read.
+    /// This is the attack the transition creates, so it is refused rather than reconciled.
+    #[test]
+    fn conflicting_service_key_spellings_are_refused() {
+        let allowed = vec!["notes".to_string(), "kb".to_string()];
+        let mut f = init_with_meta(json!({NEW_SVC: "kb", OLD_SVC: "notes"}));
+        assert_eq!(
+            select_service(&mut f, &allowed),
+            ServiceDecision::Refuse,
+            "two spellings naming different services is not a coherent request: {f}"
+        );
+        // Refused even when BOTH names would individually be allowed — this is about coherence,
+        // not authorization, and a test using one disallowed name would prove nothing.
+    }
+
+    /// #49: BOTH reserved prefixes are stripped.
+    ///
+    /// The new spelling is the new attack surface: a prefix mcpmesh WRITES but does not STRIP is a
+    /// key a caller can forge, which a backend would then read under an authoritative-looking name.
+    #[test]
+    fn both_reserved_prefixes_are_stripped_including_the_new_one() {
+        let mut f = init_with_meta(json!({
+            "tech.counterpunch.mcpmesh/peer": {"name": "attacker", "groups": ["admin"]},
+            "tech.counterpunch.mcpmesh/anything": "forged",
+            "mcpmesh/peer": {"name": "attacker"},
+            "mcpmesh/anything": "forged",
+            "app/keep": "yes",
+            "io.modelcontextprotocol/clientInfo": {"name": "some-client"},
+        }));
+        let _ = select_service(&mut f, &["notes".to_string()]);
+        let meta = &f["params"]["_meta"];
+        for k in [
+            "tech.counterpunch.mcpmesh/peer",
+            "tech.counterpunch.mcpmesh/anything",
+            "mcpmesh/peer",
+            "mcpmesh/anything",
+        ] {
+            assert!(
+                meta.get(k).is_none(),
+                "`{k}` is a reserved prefix and must not survive: {meta}"
+            );
+        }
+        assert_eq!(meta["app/keep"], "yes", "non-reserved keys survive: {meta}");
+        assert_eq!(
+            meta["io.modelcontextprotocol/clientInfo"]["name"], "some-client",
+            "a clientInfo that does NOT name a principal passes through: {meta}"
+        );
+    }
+
+    /// Every prefix mcpmesh writes must also be one it strips. Written as a loop over the constants
+    /// rather than a hand-listed set, so adding a third prefix without stripping it fails here.
+    #[test]
+    fn every_written_key_is_covered_by_a_stripped_prefix() {
+        for key in SERVICE_KEYS.iter().chain(PEER_KEYS.iter()) {
+            assert!(
+                RESERVED_META_PREFIXES.iter().any(|p| key.starts_with(p)),
+                "`{key}` is written onto the wire but no reserved prefix covers it — a caller \
+                 could forge it and a backend would read it as authoritative"
+            );
+        }
     }
 
     const CI: &str = "io.modelcontextprotocol/clientInfo";

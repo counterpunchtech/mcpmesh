@@ -747,11 +747,19 @@ where
     Ok(())
 }
 
-/// Set `params._meta["mcpmesh/service"] = service` on the `initialize` frame, creating `params`
-/// and `_meta` as objects if absent and REPLACING a non-object `_meta` (never merging — the
-/// rule for the reserved-key injector). This is the one edit the otherwise
-/// verbatim proxy path makes to a frame. A non-object frame is forwarded untouched —
-/// the platform does not interpret MCP semantics; the far side rejects it.
+/// Name the target service in `params._meta` on the first frame, creating `params` and `_meta` as
+/// objects if absent and REPLACING a non-object `_meta` (never merging — the rule for the
+/// reserved-key injector). This is the one edit the otherwise verbatim proxy path makes to a frame.
+/// A non-object frame is forwarded untouched — the platform does not interpret MCP semantics; the
+/// far side rejects it.
+///
+/// **BOTH spellings are written** (#49), carrying the identical value: the reverse-DNS
+/// `tech.counterpunch.mcpmesh/service` and the legacy `mcpmesh/service`. The remote daemon may be
+/// older than this one and read only the legacy key, so emitting just the new one would refuse
+/// every dial to a peer that has not upgraded. The receiving side prefers reverse-DNS and falls
+/// back, so no version gate is needed on either peer.
+///
+/// The legacy spelling is DEPRECATED as of 0.51.0 and removed at 1.0.
 fn inject_service(mut frame: Value, service: &str) -> Value {
     let Some(obj) = frame.as_object_mut() else {
         return frame;
@@ -769,9 +777,10 @@ fn inject_service(mut frame: Value, service: &str) -> Value {
     if !meta.is_object() {
         *meta = Value::Object(Default::default()); // REPLACE a non-object _meta (§6.3)
     }
-    meta.as_object_mut()
-        .expect("meta set to object above")
-        .insert("mcpmesh/service".into(), Value::String(service.to_string()));
+    let meta = meta.as_object_mut().expect("meta set to object above");
+    for key in mcpmesh_net::service::SERVICE_KEYS {
+        meta.insert(key.into(), Value::String(service.to_string()));
+    }
     frame
 }
 
@@ -890,27 +899,49 @@ mod source_tests {
 mod tests {
     use super::*;
 
-    /// `inject_service` sets `params._meta["mcpmesh/service"]`, creating/replacing a non-object
+    /// `inject_service` names the service in `params._meta`, creating/replacing a non-object
     /// `params`/`_meta` and leaving a non-object frame untouched.
+    ///
+    /// **BOTH spellings are asserted every time (#49).** Emitting only the reverse-DNS key would
+    /// make every dial to a peer running <= 0.50.0 refuse — that daemon reads the legacy key and
+    /// would see an unnamed service. Checking one spelling would not catch it.
     #[test]
-    fn inject_service_sets_meta_across_shapes() {
+    fn inject_service_sets_both_meta_spellings_across_shapes() {
         use serde_json::json;
-        // Object frame with no params → params._meta.mcpmesh/service is created; other keys kept.
+        let both = |f: &serde_json::Value, want: &str| {
+            for key in mcpmesh_net::service::SERVICE_KEYS {
+                assert_eq!(
+                    f["params"]["_meta"][key], want,
+                    "`{key}` must name the service: {f}"
+                );
+            }
+        };
+        // Object frame with no params → params._meta is created; other keys kept.
         let f = inject_service(json!({"method": "initialize"}), "kb");
-        assert_eq!(f["params"]["_meta"]["mcpmesh/service"], "kb");
+        both(&f, "kb");
         assert_eq!(f["method"], "initialize");
         // Existing params object is preserved; _meta is added.
         let f = inject_service(json!({"params": {"x": 1}}), "loc");
         assert_eq!(f["params"]["x"], 1);
-        assert_eq!(f["params"]["_meta"]["mcpmesh/service"], "loc");
+        both(&f, "loc");
         // A non-object `params` is REPLACED with an object.
-        let f = inject_service(json!({"params": 7}), "kb");
-        assert_eq!(f["params"]["_meta"]["mcpmesh/service"], "kb");
+        both(&inject_service(json!({"params": 7}), "kb"), "kb");
         // A non-object `_meta` is REPLACED (never merged into a scalar).
-        let f = inject_service(json!({"params": {"_meta": "nope"}}), "kb");
-        assert_eq!(f["params"]["_meta"]["mcpmesh/service"], "kb");
+        both(
+            &inject_service(json!({"params": {"_meta": "nope"}}), "kb"),
+            "kb",
+        );
         // A non-object frame is returned unchanged.
         assert_eq!(inject_service(json!("scalar"), "kb"), json!("scalar"));
+
+        // The two must agree — a receiving daemon reading either gets the same answer, and a
+        // MISMATCHED pair is refused by `select_service`, so emitting one would break every dial.
+        let f = inject_service(json!({"method": "initialize"}), "kb");
+        assert_eq!(
+            f["params"]["_meta"][mcpmesh_net::service::SERVICE_KEYS[0]],
+            f["params"]["_meta"][mcpmesh_net::service::SERVICE_KEYS[1]],
+            "the spellings must never diverge: {f}"
+        );
     }
 
     /// Pins `pipe_session`'s TEARDOWN DISCIPLINE (issue #25): control-side EOF ends only

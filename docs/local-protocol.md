@@ -1459,9 +1459,28 @@ per-process env. Instead the daemon injects it into the requests it forwards, un
 {"name": "alice", "user_id": "b64u:…", "groups": ["team-eng"]}
 ```
 
-This value is **authoritative**: the daemon strips any caller-supplied `mcpmesh/*` `_meta` key from
+This value is **authoritative**: the daemon strips any caller-supplied reserved `_meta` key from
 **every** frame it proxies and then writes this object itself, so a caller cannot forge who they are.
 `user_id` is `null` when a pairing peer presented no binding.
+
+> **Two spellings, one value** (`api_minor >= 58`, #49). Since 0.51.0 the daemon writes the identity
+> under **both** `mcpmesh/peer` and `tech.counterpunch.mcpmesh/peer`, carrying identical values. The
+> reverse-DNS form follows SEP-1788's SHOULD; the single-label form never collided with anything
+> MCP reserves, so this is forward-alignment, not a fix.
+>
+> **Nothing needs to upgrade in step.** A backend reading `mcpmesh/peer` keeps working untouched;
+> new backends should read `tech.counterpunch.mcpmesh/peer`. The same applies to the routing key
+> `mcpmesh/service` — both spellings are sent, and a receiving daemon accepts either (preferring
+> reverse-DNS), so peers on different versions interoperate without a gate.
+>
+> **Both prefixes are stripped** from caller frames. A prefix mcpmesh writes but does not strip is
+> one a caller can forge, and a backend would read it under an authoritative-looking name.
+>
+> A caller sending the two *service* spellings with **different values** is refused rather than
+> reconciled: picking one would let it present a different service to each daemon version.
+>
+> **The legacy `mcpmesh/*` spellings are deprecated as of 0.51.0 and will be removed at 1.0.**
+> Migrate backend reads to the reverse-DNS form; there is no rush before then.
 
 > **`api_minor >= 57` guarantees it on EVERY request** (#45 ask 2, 0.50.0) — every frame carrying a
 > `method`, requests and notifications alike.
@@ -1518,7 +1537,7 @@ Two identity-shaped keys, side by side, with **opposite** trust properties:
 
 | Key | Written by | Trustworthy |
 |---|---|---|
-| `mcpmesh/peer` | mcpmesh, from the TLS-authenticated endpoint | **Yes** — stripped-then-injected on every request (injection widened from the handshake alone in 0.50.0; this row described the intent before the code matched it) |
+| `mcpmesh/peer` and `tech.counterpunch.mcpmesh/peer` | mcpmesh, from the TLS-authenticated endpoint | **Yes** — stripped-then-injected on every request, both spellings with the same value (injection widened from the handshake alone in 0.50.0; the reverse-DNS spelling added in 0.51.0) |
 | `io.modelcontextprotocol/clientInfo` | the caller | **No** — self-asserted, passes through untouched |
 
 **Never authorize on `clientInfo`.** MCP defines it as the client *software's* self-description, so
