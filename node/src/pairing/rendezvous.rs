@@ -1211,6 +1211,12 @@ pub async fn redeem_invite(
     // (the invite carries the dialable `EndpointAddr`, so this works on localhost too).
     let addr: iroh::EndpointAddr = serde_json::from_str(&invite.inviter_addr_json)
         .context("invite carries an undecodable inviter address")?;
+    // #203: the invite's addresses are a REMOTE party's claim, and this dials them before anything
+    // is stored — so the stored-hint filter never sees them. Without this a crafted invite aims
+    // this node's QUIC Initials (padded to >=1200 bytes) at multicast, broadcast or `0.0.0.0`,
+    // which on Linux is localhost. The identity check below is unaffected: TLS still authenticates
+    // whoever answers, and this only removes destinations that cannot be a peer at all.
+    let addr = crate::daemon::dial::dialable_only(addr);
     // #159: unreachable is its own condition — the invite is untouched, so the remedy is "check
     // they are running and retry the same line", not "get a new one".
     let conn = endpoint
@@ -2372,6 +2378,9 @@ pub async fn attest_to(
     )?;
     let addr: iroh::EndpointAddr = serde_json::from_str(&offer.node_addr_json)
         .context("attestation offer carries an unusable address")?;
+    // #203, same as `redeem_invite`: an offer's addresses are the remote party's claim, dialled
+    // before storage.
+    let addr = crate::daemon::dial::dialable_only(addr);
     let conn = endpoint
         .connect(addr, mcpmesh_net::ALPN_PAIR)
         .await

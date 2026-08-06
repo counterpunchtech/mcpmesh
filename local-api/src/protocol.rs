@@ -1088,8 +1088,11 @@ pub struct PeerDiagnosticsResult {
     /// A `relay …` entry with no IP alongside it is worth noticing: that hint can never punch.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hint_addrs: Vec<String>,
-    /// Whether `last_addr` parses AND its embedded id matches this peer. A `false` here with a
-    /// present `last_addr` means the hint is being silently discarded at every dial.
+    /// Whether the stored hint actually contributes anything to a dial. `false` with a present
+    /// `last_addr` means it is being silently discarded — because it does not parse, because its
+    /// embedded id is a different peer, or (since 0.53.0, #203) because every address in it is one
+    /// that can never be a QUIC peer and was filtered out. `last_addr` is reported verbatim above,
+    /// so comparing it against `hint_addrs` distinguishes the three.
     pub hint_usable: bool,
     /// This node's LIVE view of the peer, read straight from the reachability cache — the same
     /// values `status` reports, repeated here so one capture holds both the durable and the live
