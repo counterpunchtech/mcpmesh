@@ -473,9 +473,11 @@ pub(crate) fn dialable_only(addr: iroh::EndpointAddr) -> iroh::EndpointAddr {
 
 /// Can this transport address be a QUIC PEER at all? (#203)
 ///
-/// The dial hint is the one place a REMOTE party's claim becomes a destination this node sends
-/// packets to: `rendezvous` stores an invite's `inviter_addr_json` verbatim, and iroh sends each
-/// outgoing datagram to EVERY known path until one is selected. So a crafted invite could aim a
+/// A dial hint is a set of destinations this node sends packets to, and iroh sends each outgoing
+/// datagram to EVERY known path until one is selected. Since 0.52.2 every stored hint comes from
+/// `dial_hint::observed_for` — addresses this node actually reached — so the remaining remote-supplied
+/// claims are the ONE-SHOT dials at `redeem_invite` and `attest_to`, which happen before any hint
+/// exists and are what this filter guards. So a crafted invite could aim a
 /// node's QUIC Initials — which RFC 9000 requires be padded to ≥1200 bytes — wherever it liked.
 ///
 /// This rejects only what can NEVER be a unicast peer, which is why it is safe to apply at the

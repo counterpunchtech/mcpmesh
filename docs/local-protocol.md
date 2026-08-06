@@ -1131,21 +1131,24 @@ a selected path) alive that would otherwise have been reaped. If you are deliber
 state by closing every connection, do not poll this while you wait.
 
 **Since 0.52.2 a stored hint contains ONLY addresses this node has itself connected through**
-(#203). `dial_hint::observed_for` — the open IP paths of a live connection, relay URLs excluded — is
-now the sole source for all three writers: the live-session refresh, invite redemption, and
-attestation.
+(#203). `dial_hint::observed_for` — the open **IP** paths of a live connection, relay URLs excluded —
+is the sole source for all **four** writers: the live-session refresh, invite redemption,
+attestation, and the inviter side of pairing.
 
-Previously invite redemption stored the invite's **whole** address list, which is a remote party's
-unvalidated claim, and every later dial then contributed all of it as destinations (iroh sends to
-every known path until one is selected). Attestation stored an *address-less* hint, which — being
-present — silently replaced a peer's proven one.
+What each one did before: invite redemption stored the invite's **whole** address list, a remote
+party's unvalidated claim that every later dial then contributed as destinations. Attestation stored
+an *address-less* hint which, being present, silently replaced a peer's proven one. The inviter side
+mapped every path with no IP filter, so a WAN pairing persisted a **relay URL** — which
+`observed_for` exists to prevent, because a relay hint replaces a direct candidate with one that can
+never punch.
 
-The visible consequence: **a pairing completed over a relay stores no hint at all**, because nothing
-direct was observed. That is the honest answer, and such a pairing dials by id through the relay and
-discovery, which is how it reached the peer in the first place.
+The visible consequence: **a pairing that does not observe a direct path stores no hint**, and an
+existing hint is left alone rather than cleared. Note this is a timing property, not a network one —
+hole-punching may simply not have completed when the ceremony ends, in which case the hint is written
+later by a mesh session's path watcher, not by the pairing.
 
 `hint_usable` is the field to read first. A stored hint that does not parse, whose embedded
-endpoint id is a *different* peer, or (since 0.53.0, #203) whose every address is one that can never
+endpoint id is a *different* peer, or (since 0.52.1, #203) whose every address is one that can never
 be a QUIC peer — unspecified, multicast, broadcast, `240.0.0.0/4`, port 0, including their
 IPv4-mapped forms — is silently discarded on every dial — the node behaves as though
 it had no hint at all while the store insists it has one. That discrepancy is invisible from every

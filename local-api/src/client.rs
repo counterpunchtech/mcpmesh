@@ -324,8 +324,14 @@ impl ControlClient {
     /// iroh's own view (`api_minor >= 56`), the pairing stamp and the live reachability row — one
     /// capture, intended to be run on BOTH ends of a stuck pairing and compared.
     ///
-    /// **Read-only**: probes nothing, dials nothing, writes nothing, so running it cannot perturb
-    /// the state being diagnosed.
+    /// **Read-only, but NOT inert.** It probes nothing, dials nothing and writes nothing — but
+    /// reading iroh's view delivers a message to that remote's actor, which resets its ~60s idle
+    /// timer. Polling this keeps remote state alive (a selected path included) that would otherwise
+    /// be reaped.
+    ///
+    /// That matters for the one experiment this method exists to support: #140's step A is "close
+    /// every session, **wait >60s**, then probe". Poll during the wait and you preserve the very
+    /// state you are trying to clear, and get a false negative.
     ///
     /// Existed as a verb since 0.35.0 with no typed method here, so an embedder had to hand-build
     /// the request — which the one embedder who needs it most (a node embedder debugging #140)

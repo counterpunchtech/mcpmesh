@@ -75,6 +75,19 @@ fn write_if_changed(mesh: &Arc<MeshState>, endpoint_id: [u8; 32], observed: Stri
 ///
 /// `None` (empty snapshot, no IP path, or a serialize failure) means "learned nothing", which the
 /// caller treats as leave-alone rather than clear.
+/// The MERGE rule for a dial hint: a fresh observation refreshes it, learning nothing preserves
+/// what is stored. **Never downgrades `Some` to `None`.**
+///
+/// One function so the rule cannot differ between the four writers — and it very nearly did. Until
+/// 0.52.2 `redeem_invite`'s value was always `Some` (the invite's address list), so that call site
+/// needed no guard and had none; switching its source to [`observed_for`] made the missing guard
+/// load-bearing overnight, and a re-redeem completing over the relay wiped a proven direct hint
+/// while five separate places asserted the opposite. The other three writers each had their own
+/// copy of the `or_else`.
+pub(crate) fn merge_hint(observed: Option<String>, existing: Option<String>) -> Option<String> {
+    observed.or(existing)
+}
+
 pub(crate) fn observed_for(conn: &iroh::endpoint::Connection) -> Option<String> {
     let paths = conn.paths();
     // EVERY open IP path, with no preference expressed — deliberately. An earlier version ordered
@@ -92,6 +105,39 @@ pub(crate) fn observed_for(conn: &iroh::endpoint::Connection) -> Option<String> 
         return None; // relay-only, or nothing open: keep whatever we already had
     }
     serde_json::to_string(&iroh::EndpointAddr::from_parts(conn.remote_id(), addrs)).ok()
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::merge_hint;
+
+    /// #203 gate: learning nothing PRESERVES a stored hint. Never `Some` -> `None`.
+    ///
+    /// This is the rule all four writers share, and the one `redeem_invite` was missing when 0.52.2
+    /// changed its source to `observed_for`: `store.add` is a replace-on-id upsert, so a relay-only
+    /// re-redeem wrote `None` straight over a proven direct hint. There is no `peer_hint_set`, and
+    /// on a pair that cannot punch nothing else ever rewrites it — so that loss is permanent.
+    ///
+    /// A loopback ceremony always observes a direct path and therefore cannot reach the `None`
+    /// branch, which is why this is asserted on the rule rather than through a pairing.
+    #[test]
+    fn learning_nothing_preserves_the_stored_hint() {
+        const PROVEN: &str = r#"{"id":"ab","addrs":[{"Ip":"192.168.7.7:4433"}]}"#;
+        const FRESH: &str = r#"{"id":"ab","addrs":[{"Ip":"10.0.0.2:4433"}]}"#;
+
+        assert_eq!(
+            merge_hint(None, Some(PROVEN.into())).as_deref(),
+            Some(PROVEN),
+            "a relay-only observation must not wipe a proven hint"
+        );
+        assert_eq!(
+            merge_hint(Some(FRESH.into()), Some(PROVEN.into())).as_deref(),
+            Some(FRESH),
+            "a fresh observation REFRESHES — the whole point of #124"
+        );
+        assert_eq!(merge_hint(Some(FRESH.into()), None).as_deref(), Some(FRESH));
+        assert_eq!(merge_hint(None, None), None, "nothing known stays nothing");
+    }
 }
 
 #[cfg(test)]
