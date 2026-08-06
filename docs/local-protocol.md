@@ -1130,8 +1130,10 @@ actor, which resets that actor's ~60s idle timer — so polling this verb keeps 
 a selected path) alive that would otherwise have been reaped. If you are deliberately clearing path
 state by closing every connection, do not poll this while you wait.
 
-`hint_usable` is the field to read first. A stored hint that does not parse, or whose embedded
-endpoint id is a *different* peer, is silently discarded on every dial — the node behaves as though
+`hint_usable` is the field to read first. A stored hint that does not parse, whose embedded
+endpoint id is a *different* peer, or (since 0.53.0, #203) whose every address is one that can never
+be a QUIC peer — unspecified, multicast, broadcast, `240.0.0.0/4`, port 0, including their
+IPv4-mapped forms — is silently discarded on every dial — the node behaves as though
 it had no hint at all while the store insists it has one. That discrepancy is invisible from every
 other surface, and it is computed here by running the hint through the same function the dial uses,
 so the two cannot disagree.

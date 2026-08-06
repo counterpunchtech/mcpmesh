@@ -1237,8 +1237,10 @@ fn run_peer_state(peer: String, json: bool) -> anyhow::Result<()> {
                  identity does"
             ),
             (Some(_), false) => println!(
-                "dial hint:  PRESENT BUT UNUSABLE — it does not parse, or its embedded id is not \
-                 this peer, so every dial silently discards it and falls back to id-only"
+                "dial hint:  PRESENT BUT UNUSABLE — it does not parse, its embedded id is not this \
+                 peer, or every address in it is one that can never be a QUIC peer (#203), so \
+                 every dial silently discards it and falls back to id-only. `last_addr` above is \
+                 the stored value verbatim — compare it against `hint addrs` to see which."
             ),
             (Some(_), true) => {
                 println!("dial hint:  {}", d.hint_addrs.join(", "));

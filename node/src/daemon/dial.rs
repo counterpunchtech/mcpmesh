@@ -443,9 +443,104 @@ pub(crate) fn stored_dial_addr(
         && let Ok(addr) = serde_json::from_str::<iroh::EndpointAddr>(json)
         && addr.id == endpoint_id
     {
-        return addr;
+        // Every address filtered out degrades to the bare-id dial, exactly as an absent or
+        // id-mismatched hint does — never a dial to nowhere.
+        return dialable_only(addr);
     }
     iroh::EndpointAddr::from(endpoint_id)
+}
+
+/// Strip a remote-supplied `EndpointAddr` of everything that cannot be a QUIC peer (#203).
+///
+/// The counterpart to [`stored_dial_addr`] for addresses that are dialled **before** they are ever
+/// stored — `redeem_invite` and `attest_to` deserialize a remote blob straight into
+/// `Endpoint::connect`. The first version of this change filtered only the stored path and claimed
+/// it "covers the invite path"; it does not, and the motivating scenario — a crafted invite aiming
+/// this node's padded Initials at a destination of the inviter's choosing — happened in full at
+/// redemption, before storage. The gate found it.
+///
+/// Returns the id alone when nothing survives, which for pairing means the dial falls back to
+/// discovery rather than proceeding with an attacker's address list.
+pub(crate) fn dialable_only(addr: iroh::EndpointAddr) -> iroh::EndpointAddr {
+    let id = addr.id;
+    let kept: Vec<iroh::TransportAddr> = addr.addrs.into_iter().filter(is_dialable_addr).collect();
+    if kept.is_empty() {
+        iroh::EndpointAddr::from(id)
+    } else {
+        iroh::EndpointAddr::from_parts(id, kept)
+    }
+}
+
+/// Can this transport address be a QUIC PEER at all? (#203)
+///
+/// The dial hint is the one place a REMOTE party's claim becomes a destination this node sends
+/// packets to: `rendezvous` stores an invite's `inviter_addr_json` verbatim, and iroh sends each
+/// outgoing datagram to EVERY known path until one is selected. So a crafted invite could aim a
+/// node's QUIC Initials — which RFC 9000 requires be padded to ≥1200 bytes — wherever it liked.
+///
+/// This rejects only what can NEVER be a unicast peer, which is why it is safe to apply at the
+/// single choke point every dial passes through rather than per hint source:
+///
+/// - **Unspecified** (`0.0.0.0`, `::`) — not a destination. On Linux `0.0.0.0:<port>` reaches
+///   localhost, so this is also the cheapest half of the internal-scan concern.
+/// - **Multicast** — a unicast QUIC handshake to a group address is meaningless, and sending there
+///   is a way to make one host emit traffic to many.
+/// - **Broadcast** (`255.255.255.255`) — same.
+///
+/// **Deliberately NOT rejected**, because each is legitimate and filtering it would break real
+/// deployments rather than attackers:
+///
+/// - **Loopback.** Two nodes on one host is supported, and most of this repo's own suite pairs over
+///   `127.0.0.1`.
+/// - **IPv6 link-local (`fe80::`).** Ordinary LAN addressing that iroh may select.
+/// - **IPv4 link-local (`169.254.0.0/16`).** APIPA is real when DHCP fails — and it is also the
+///   cloud-metadata range, so it is the sharpest remaining edge. Left to #203, which is where the
+///   trade belongs.
+///
+/// **What this does not cover, stated so it is not mistaken for coverage:**
+///
+/// - **Arbitrary ROUTABLE addresses.** A hostile invite can still name any real host. Bounding that
+///   needs provenance on the hint — observed-on-an-open-path vs merely-reported — not a destination
+///   blocklist. That is #203's actual subject.
+/// - **RELAY URLs pass through unfiltered, and they are a sharper edge than the UDP case above.**
+///   The first version of this comment said relay transports "are not IP destinations we choose",
+///   which is false: a relay URL in a hint or an invite is chosen by the REMOTE party, and iroh
+///   connects on demand to any URL it is handed. So a hostile invite naming `wss://victim:8443/`
+///   makes this node open an outbound TLS/WebSocket connection to an attacker-chosen host — a
+///   stronger primitive than the padded Initials this filter removes. It is not filtered here
+///   because the same provenance model is what makes it decidable, and guessing a URL policy is how
+///   the last two attempts at this area went wrong.
+/// - **Subnet-directed broadcast** (`192.168.1.255`), which needs the local netmask to recognise
+///   and is a better amplifier than `255.255.255.255` — routers drop the latter.
+pub(crate) fn is_dialable_addr(a: &iroh::TransportAddr) -> bool {
+    let iroh::TransportAddr::Ip(s) = a else {
+        // Relay and custom transports are NOT filtered here, and that is a gap rather than a
+        // judgement — see the "what this does not cover" note above.
+        return true;
+    };
+    // A dial to port 0 is meaningless by this function's own definition of a peer.
+    if s.port() == 0 {
+        return false;
+    }
+    // CANONICALIZE FIRST. `Ipv6Addr::is_multicast` matches only `ff00::/8` and `is_unspecified`
+    // only `::`, so neither sees through the IPv4-MAPPED form — `[::ffff:224.0.0.1]:1900` passed
+    // every check below while iroh's own ingest (`transports::Addr::from`) and its sender
+    // (`IpSender::canonical_addr`) both call `to_canonical()` and turn it back into real
+    // multicast, strictly AFTER this ran. Writing the mapped form was a complete bypass of this
+    // filter; the gate proved it in-tree on all three classes.
+    match s.ip().to_canonical() {
+        std::net::IpAddr::V4(v4) => {
+            !v4.is_unspecified()
+                && !v4.is_multicast()
+                && !v4.is_broadcast()
+                // `240.0.0.0/4`, reserved and not routable to any peer. Written as a comparison
+                // on the octet, NOT `!octet >= 240` — that parses as a bitwise NOT and rejects
+                // everything from `16.0.0.0/8` upward while accepting `240.0.0.0/4`, i.e. exactly
+                // inverted. It compiles and it type-checks.
+                && v4.octets()[0] < 240
+        }
+        std::net::IpAddr::V6(v6) => !v6.is_unspecified() && !v6.is_multicast(),
+    }
 }
 
 /// The person→device dial STAGGER: a live candidate is not blocked waiting on a
@@ -898,6 +993,133 @@ mod source_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The v4-mapped fixtures in the test below must actually REACH the filter as v6.
+    ///
+    /// They did not in the first version: removing `to_canonical()` — the gate's CRITICAL, and the
+    /// whole point of those cases — left the suite green, because something between the JSON and
+    /// the filter had already flattened them. A fixture that cannot express the hostile input is
+    /// the same empty-fixture failure this repo keeps finding, wearing a new hat. This pins the
+    /// fixture itself, so the bypass cases stay real.
+    #[test]
+    fn a_v4_mapped_address_survives_the_hint_round_trip_as_v6() {
+        let id = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
+        let mapped: std::net::SocketAddr = "[::ffff:224.0.0.1]:1900".parse().unwrap();
+        assert!(mapped.is_ipv6(), "precondition: Rust parses this as v6");
+
+        let json = serde_json::to_string(&iroh::EndpointAddr::from_parts(
+            id,
+            [iroh::TransportAddr::Ip(mapped)],
+        ))
+        .unwrap();
+        let back: iroh::EndpointAddr = serde_json::from_str(&json).unwrap();
+        let iroh::TransportAddr::Ip(got) = back.addrs.iter().next().expect("one address") else {
+            panic!("expected an Ip transport address");
+        };
+        assert!(
+            got.is_ipv6(),
+            "the mapped form must survive serde as v6, or the bypass cases below test nothing: \
+             {got:?}"
+        );
+        assert!(
+            got.ip().to_canonical().is_ipv4(),
+            "and canonicalize to the v4 address iroh will actually send to: {got:?}"
+        );
+    }
+
+    /// #203: a hint's undialable addresses are dropped before any dial sees them.
+    ///
+    /// The dial hint is where a REMOTE party's claim becomes a destination this node sends packets
+    /// to — `rendezvous` stores an invite's `inviter_addr_json` verbatim — and iroh sends each
+    /// outgoing datagram to every known path until one is selected. A crafted invite could aim this
+    /// node's QUIC Initials, which RFC 9000 requires be padded to >=1200 bytes, at a chosen victim.
+    ///
+    /// Asserted at `stored_dial_addr` because that is the single function every dial path calls to
+    /// turn a stored hint into addresses. Filtering per hint-source would leave whichever source
+    /// someone adds next unprotected.
+    #[test]
+    fn a_stored_hint_cannot_aim_a_dial_at_a_non_peer() {
+        let id = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
+        let hint = |addrs: Vec<&str>| {
+            serde_json::to_string(&iroh::EndpointAddr::from_parts(
+                id,
+                addrs
+                    .into_iter()
+                    .map(|a| iroh::TransportAddr::Ip(a.parse().unwrap()))
+                    .collect::<Vec<_>>(),
+            ))
+            .unwrap()
+        };
+
+        // Never a unicast peer: dropped.
+        for bad in [
+            "0.0.0.0:4433", // on Linux this reaches localhost
+            "[::]:4433",
+            "224.0.0.1:1900", // multicast — one packet, many hosts
+            "239.255.255.250:1900",
+            "255.255.255.255:80", // broadcast
+            "[ff02::1]:4433",     // IPv6 all-nodes multicast
+            // IPv4-MAPPED forms of the classes above. The gate proved these bypassed the filter
+            // entirely: `Ipv6Addr::is_multicast` matches only `ff00::/8` and `is_unspecified` only
+            // `::`, while iroh calls `to_canonical()` on ingest AND in its sender — so a mapped
+            // address became real multicast strictly AFTER the check ran.
+            "[::ffff:0.0.0.0]:4433",
+            "[::ffff:224.0.0.1]:1900",
+            "[::ffff:239.255.255.250]:1900",
+            "[::ffff:255.255.255.255]:80",
+            "224.0.0.0:4433",       // first multicast
+            "239.255.255.255:4433", // last multicast
+            "240.0.0.0:4433",       // first of the 240/4 reserved range
+            "240.1.2.3:4433",
+            "1.2.3.4:0", // a dial to port 0 is not a dial
+            "[::ffff:1.2.3.4]:0",
+        ] {
+            let got = super::stored_dial_addr(Some(&hint(vec![bad])), id);
+            assert!(
+                got.addrs.is_empty(),
+                "`{bad}` can never be a QUIC peer and must not become a dial target: {got:?}"
+            );
+            assert_eq!(got.id, id, "and the dial still names the peer: {got:?}");
+        }
+
+        // Legitimate addressing SURVIVES — filtering these would break real deployments rather
+        // than attackers. Loopback in particular: two nodes on one host is supported, and most of
+        // this repo's own suite pairs over 127.0.0.1.
+        for good in [
+            "127.0.0.1:4433", // same-host peers, and the test suite
+            "[::1]:4433",
+            "192.168.1.5:4433",
+            "[fe80::1]:4433",   // IPv6 link-local: ordinary LAN addressing
+            "169.254.3.4:4433", // APIPA — real when DHCP fails; see #203
+            "1.2.3.4:4433",
+            "16.0.0.1:4433", // the octet check must be a COMPARISON, not a bitwise NOT
+            "223.255.255.254:4433", // last unicast address below the 224/4 multicast range
+            "[::ffff:192.168.1.5]:4433", // a mapped LEGITIMATE address still survives
+        ] {
+            let got = super::stored_dial_addr(Some(&hint(vec![good])), id);
+            assert_eq!(
+                got.addrs.len(),
+                1,
+                "`{good}` is a legitimate peer address and must survive: {got:?}"
+            );
+        }
+
+        // A MIXED hint keeps the good and drops the bad, rather than discarding the whole thing.
+        let mixed = hint(vec!["0.0.0.0:1", "192.168.1.5:4433", "224.0.0.1:2"]);
+        let got = super::stored_dial_addr(Some(&mixed), id);
+        assert_eq!(
+            got.addrs.len(),
+            1,
+            "only the dialable one survives: {got:?}"
+        );
+
+        // A hint of NOTHING BUT bad addresses degrades to the bare-id dial — the same fallback an
+        // absent or id-mismatched hint takes — never a dial with no addresses and no discovery.
+        let all_bad = hint(vec!["0.0.0.0:1", "224.0.0.1:2"]);
+        let got = super::stored_dial_addr(Some(&all_bad), id);
+        assert!(got.addrs.is_empty());
+        assert_eq!(got.id, id);
+    }
 
     /// `inject_service` names the service in `params._meta`, creating/replacing a non-object
     /// `params`/`_meta` and leaving a non-object frame untouched.
