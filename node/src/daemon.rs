@@ -25,7 +25,7 @@ mod accept;
 pub(crate) mod boot;
 pub(crate) mod config_write;
 pub(crate) mod dial;
-mod dial_hint;
+pub(crate) mod dial_hint;
 pub(crate) mod handlers;
 mod org_author;
 mod path_watch;

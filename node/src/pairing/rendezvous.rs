@@ -1381,16 +1381,26 @@ pub async fn redeem_invite(
     //  - user_id: the newly VERIFIED binding wins, else keep the existing proven id — a verified
     //    user_id is never downgraded to `None` by a binding-less re-pair;
     //  - paired_at: now — this side stamps each redeem (each is a fresh ceremony we performed);
-    //  - last_addr: the invite's `inviter_addr_json` — the pairing-PROVEN dialable address (we
-    //    just reached the inviter through it, id-verified). A fresh pairing always carries one,
-    //    so this REFRESHES the hint and can never downgrade a stored `Some` to `None`.
+    //  - last_addr: the address THIS CONNECTION actually used, read off the live connection —
+    //    never the invite's address list (#203).
+    //
+    //    The old comment called the invite's list "the pairing-PROVEN dialable address (we just
+    //    reached the inviter through it)". That is true of AT MOST ONE of the addresses in it, and
+    //    the rest were a remote party's unvalidated claim being persisted as dial targets — which
+    //    every later dial then sprays QUIC Initials at, because iroh sends to every known path
+    //    until one is selected. `observed_for` returns exactly the one(s) we reached, filtered to
+    //    IP, which is the same rule `dial_hint::refresh` has always used for a live session.
+    //
+    //    Relay-only pairing yields `None`, which leaves any existing hint alone rather than
+    //    clearing it — the same "learned nothing" rule. That pairing reached the inviter through a
+    //    relay, so a relay/discovery dial is what it will keep using.
     // `endpoint_id` is `invite.inviter_id`, which we verified above equals the TLS id.
     // Resolve + merge + add run in ONE blocking closure (redb reads/writes block + fsync).
     let inviter_id = invite.inviter_id;
     let nickname = local_name.clone();
     let granted = invite.services.clone();
     let paired_at = Some(epoch_now().to_string());
-    let last_addr = Some(invite.inviter_addr_json.clone());
+    let last_addr = crate::daemon::dial_hint::observed_for(&conn);
     tokio::task::spawn_blocking(move || {
         let existing = store.resolve(&inviter_id)?;
         let mut services = existing
@@ -2451,7 +2461,14 @@ pub async fn attest_to(
     let nickname = nickname_for_peer
         .or_else(|| existing.as_ref().map(|e| e.nickname.clone()))
         .unwrap_or(peer_nickname);
-    let addr_json = serde_json::to_string(&endpoint_addr_of(&conn)).ok();
+    // #203: what THIS connection observed, on the same rule as `redeem_invite` and
+    // `dial_hint::refresh` — never the offer's address list.
+    //
+    // This previously stored `endpoint_addr_of(&conn)`, which is `EndpointAddr::from(remote_id)`:
+    // a hint with NO addresses. That is not merely useless, it is destructive — being `Some` it
+    // won the `or_else` below and REPLACED whatever proven hint the peer already had with an empty
+    // one. `observed_for` returns `None` when it learned nothing, so the existing hint survives.
+    let addr_json = crate::daemon::dial_hint::observed_for(&conn);
     store.add(PeerEntry {
         endpoint_id: peer_id,
         nickname: nickname.clone(),
@@ -2483,9 +2500,4 @@ pub async fn attest_to(
         enrolled_as_self: false,
         services: Vec::new(),
     })
-}
-
-/// The peer's dialable address as observed on the live connection.
-fn endpoint_addr_of(conn: &iroh::endpoint::Connection) -> iroh::EndpointAddr {
-    iroh::EndpointAddr::from(conn.remote_id())
 }
