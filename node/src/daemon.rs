@@ -30,6 +30,7 @@ pub(crate) mod handlers;
 mod org_author;
 mod path_watch;
 pub(crate) mod reach;
+mod resume;
 mod roster_install;
 mod self_net;
 mod sever;
@@ -100,6 +101,7 @@ pub use reach::{
     REACH_TTL_SECS, ReachEntry, ReachTransition, normalize_relay_url, probe_peer, reachability_of,
     sanitize_relay_url,
 };
+pub use resume::{ClockDeltas, ResumeEvent, spawn_resume_watch};
 pub(crate) use self_net::read_current as self_network_now;
 pub use self_net::spawn_self_net_watch;
 
@@ -324,6 +326,10 @@ pub struct MeshState {
     /// `reach_bcast` for the same reason that one is separate from audit: the frames have
     /// different shapes and different producers, and merging happens at the subscription.
     pub(crate) self_net_bcast: tokio::sync::broadcast::Sender<mcpmesh_local_api::SelfNetwork>,
+    /// Suspend/resume ring (#167 ask 2) — `subscribe`'s fifth tap, fed by
+    /// [`spawn_resume_watch`](resume::spawn_resume_watch). Its own ring for the same reason as the
+    /// others: a different shape, a different producer, merged at the subscription.
+    pub(crate) resume_bcast: tokio::sync::broadcast::Sender<resume::ResumeEvent>,
     /// The duplicate-identity observation (#134) — the SAME cell as whatever
     /// [`IdentityConflictLayer`](crate::diag::IdentityConflictLayer) is recording into. Set once
     /// by the standalone daemon at boot, or by an embedder via
@@ -645,6 +651,7 @@ impl MeshState {
             blob_bcast: tokio::sync::broadcast::channel(BLOB_BROADCAST_DEPTH).0,
             // Same depth as the reachability ring: posture transitions are rarer still.
             self_net_bcast: tokio::sync::broadcast::channel(REACH_BROADCAST_DEPTH).0,
+            resume_bcast: tokio::sync::broadcast::channel(REACH_BROADCAST_DEPTH).0,
             self_net_change: std::sync::Mutex::new(None),
             probe_seq: std::sync::atomic::AtomicU64::new(0),
             probes_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -696,6 +703,17 @@ impl MeshState {
 
     pub fn reach_bcast_for_test(&self) -> &tokio::sync::broadcast::Sender<ReachTransition> {
         &self.reach_bcast
+    }
+
+    /// Drive ONE suspend-watcher tick with supplied clock deltas (#167 ask 2).
+    ///
+    /// `#[doc(hidden)]` — a TEST SEAM. The watcher's own loop reads two real clocks, and staging a
+    /// genuine suspend would mean suspending the machine running the suite; this hands a test the
+    /// deltas so the detection AND the broadcast are exercised for real. Returns what was sent, or
+    /// `None` if the deltas were an ordinary tick.
+    #[doc(hidden)]
+    pub fn resume_tick_for_test(&self, deltas: ClockDeltas, now_wall: i64) -> Option<ResumeEvent> {
+        resume::tick(self, deltas, now_wall)
     }
 
     /// The current probe ticket counter.

@@ -630,6 +630,9 @@ async fn boot_node(
     // `last_change_epoch` for `status`. Every mode, including relay-disabled (where it simply
     // never observes a relay and never emits): the projection is what `status` reads either way.
     background.push(crate::daemon::spawn_self_net_watch(mesh.clone()));
+    // #167 ask 2: the suspend watcher — pushes a StreamFrame::Resumed when this machine wakes from
+    // a sleep. Every mode: a closed lid kills sessions whatever the relay configuration is.
+    background.push(crate::daemon::spawn_resume_watch(mesh.clone()));
 
     let accept_task = spawn_accept_loop(mesh.clone(), services);
     mesh.set_accept_task(accept_task).await;

@@ -391,6 +391,80 @@ async fn blob_transfer_frames_reach_a_subscriber() {
     .expect("blob frame subscribe test timed out");
 }
 
+/// #167 ask 2: a RESUME frame must actually reach a subscriber, carrying the sleep's length.
+///
+/// Driven through `resume_tick_for_test`, which is the watcher's real per-tick body — so this
+/// covers detection, the broadcast, the `resume_frame` mapping and the `select!` arm together. Only
+/// the two clock reads are outside it, and staging those would mean suspending the machine running
+/// the suite.
+///
+/// It also pins the number: `suspended_secs` must be the SLEEP, not the tick that observed it.
+/// Those differ by three orders of magnitude here, so an implementation reporting the wall delta
+/// (or the tick period) fails rather than looking plausible.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resume_frame_reaches_a_subscriber_carrying_the_sleep_length() {
+    timeout(Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(&config, "").unwrap();
+        let ep = local_endpoint().await;
+        let store = Arc::new(PeerStore::open(&dir.path().join("s.redb")).unwrap());
+        let mesh = assemble_mesh(ep, store, config);
+        let state = Arc::new(DaemonState::with_mesh(STACK_VERSION, mesh.clone()));
+
+        let socket = dir.path().join("s.sock");
+        let listener = mcpmesh::ipc::bind_control_socket(&socket).await.unwrap();
+        let _control = tokio::spawn(serve_control(listener, state));
+
+        let mut sub = SubClient::connect(&socket).await;
+        assert_eq!(sub.next().await["type"], "snapshot");
+
+        // An ORDINARY tick first: the watcher runs every 5s forever, and if this emitted, the
+        // subscriber below would read that frame instead and the assertions would still pass. It
+        // is the guard that makes the rest of this test mean anything.
+        assert_eq!(
+            mesh.resume_tick_for_test(
+                mcpmesh::daemon::ClockDeltas {
+                    mono_secs: 5,
+                    wall_secs: 5,
+                },
+                1_700_000_000
+            ),
+            None,
+            "an ordinary tick must not emit — otherwise every embedder is told to re-dial its \
+             whole mesh every five seconds",
+        );
+
+        // Now a two-hour lid close: the monotonic clock froze, the wall clock did not.
+        let sent = mesh
+            .resume_tick_for_test(
+                mcpmesh::daemon::ClockDeltas {
+                    mono_secs: 5,
+                    wall_secs: 7205,
+                },
+                1_700_007_205,
+            )
+            .expect("a 2h wall/monotonic skew is a suspend");
+        assert_eq!(sent.suspended_secs, 7200);
+
+        let frame = sub.next().await;
+        assert_eq!(
+            frame["type"], "resumed",
+            "the frame must arrive tagged `resumed`, or no non-Rust client can dispatch on it: \
+             {frame}"
+        );
+        assert_eq!(
+            frame["suspended_secs"], 7200,
+            "the machine slept 7200s; the tick that noticed took 5s. Reporting anything but the \
+             sleep tells an embedder the wrong thing about what its peers did in the meantime: \
+             {frame}"
+        );
+        assert_eq!(frame["at_epoch"], 1_700_007_205i64);
+    })
+    .await
+    .expect("resume frame subscribe test timed out");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn reachability_flips_are_pushed_to_subscribers() {
     timeout(Duration::from_secs(60), async {

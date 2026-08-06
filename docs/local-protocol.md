@@ -791,7 +791,7 @@ connection, but not on one the peer already closed.
 | | Today |
 |---|---|
 | Does `open_session` transparently re-establish? | **No.** The connection ends and your client sees EOF on the pipe. There is no automatic re-dial, and no retry budget. |
-| Is there a resume/suspend signal to hook? | **No.** mcpmesh surfaces no OS suspend/resume event. Your platform has one; mcpmesh does not wrap it. |
+| Is there a resume/suspend signal to hook? | **Yes, since `api_minor >= 55`** (0.49.0): a `{"type":"resumed","suspended_secs":N,...}` frame on `subscribe` when this machine wakes from a sleep. See [`resumed`](#resumed-api_minor--55-167). It says the machine was away for N seconds — it names no session, because the daemon cannot know which of yours survived. This answered **No** through 0.48.0. |
 | What does `subscribe` do? | The stream **terminates** with the connection. It does not resume, and events that occurred while you were gone are not replayed. You do learn about in-session loss: a `{"type":"lagged","dropped":N}` frame reports events dropped because your consumer fell behind — but that is backpressure, not a reconnect. |
 
 **So: hold the session loosely and re-dial on failure.** Treat `open_session` as a pipe that can end
@@ -799,12 +799,17 @@ at any time, keep the state your application needs outside it, and re-open on EO
 assuming a long-lived session. For presence, poll `status` or re-`subscribe` after a reconnect and
 take a fresh snapshot — the stream gives you transitions, and a reconnect means you missed some.
 
+Since 0.49.0 you no longer have to wait for a failed send to learn a sleep happened: subscribe, and
+on a `resumed` frame re-dial the sessions you still need. That is the difference between an app that
+works after lunch and one that discovers the problem when a user tries to send a message.
+
 `reachable` on a `status` row is the signal that a peer is currently dialable; it is advisory, and
 absence never blocks a dial, so re-dialling an "unreachable" peer is legitimate and often works.
 
-**Not implemented, and worth knowing it is not:** transparent session resumption, a resume signal,
-and replay of missed `subscribe` events. These need reconnection semantics rather than transport
-tuning — see #167.
+**Not implemented, and worth knowing it is not:** transparent session resumption and replay of
+missed `subscribe` events. Both need reconnection semantics rather than transport tuning — see #167.
+There is also no PRE-suspend warning: neither platform gives a process reliable notice before it is
+put to sleep, so `resumed` necessarily arrives after the damage.
 
 ### Server-initiated frames (push), and what is metered
 
@@ -1276,6 +1281,53 @@ reconnect, or fall back to a `status` read.
 ```json
 {"type": "lagged", "dropped": 12}
 ```
+
+### `resumed` (`api_minor >= 55`, #167)
+
+**This machine was suspended and has just woken** — a closed laptop lid, a sleep, a hibernate.
+
+```json
+{"type": "resumed", "suspended_secs": 7200, "at_epoch": 1700007202}
+```
+
+| field | meaning |
+|---|---|
+| `suspended_secs` | how long the machine was away, in seconds — the **sleep**, not the time since the last frame |
+| `at_epoch` | wall-clock epoch seconds when the resume was detected (up to ~5s after the wake — the watcher's tick) |
+
+**Why you need it.** While a machine is suspended it sends nothing, so the *peer's* QUIC idle timer
+runs out and the peer tears the connection down — often before the lid is even reopened.
+`[network].keep_alive_secs` cannot prevent that (a suspended process emits no PINGs), and
+`idle_timeout_secs` is negotiated to the minimum of both peers, so surviving a long sleep would mean
+raising it across every peer in the mesh to cover the longest expected suspend — which is the "a dead
+peer is never detected" trade in the other direction. Without this frame, the first thing your app
+learns is a failed send, at the moment a user tried to do something.
+
+**What to do with it:** treat held sessions as suspect and re-dial the ones you still need.
+`open_session` does **not** re-establish itself, by design (see "Sessions do not survive the
+transport" above), so this is the hook that makes holding a session loosely practical.
+
+**It names no session, deliberately.** The daemon cannot know which of your sessions survived — a
+short sleep may well leave one intact, and asserting otherwise would be a guess. Read it as "this
+machine was away for N seconds; re-check what you hold."
+
+**It does not fire when the machine is merely busy.** Detection is wall-clock/monotonic skew: a
+suspend freezes the monotonic clock while the wall clock runs, whereas a starved runtime advances
+both together. A signal that fired under load is one you would learn to ignore.
+
+**It DOES fire on a forward clock step, and cannot tell one from a sleep.** A device with no RTC that
+boots with a bogus time and is then stepped forward by NTP emits a frame claiming a suspend of
+however far the clock jumped. Read `suspended_secs` as "wall time ran this much further than the
+daemon's own elapsed time" — that is what is measured. The frame's advice holds either way; the
+number is not a measurement of sleep alone. Telling the two apart needs a continuous clock
+(`CLOCK_BOOTTIME` / `mach_continuous_time`), which mcpmesh does not currently use.
+
+**Not retroactive, and unrecoverable from `snapshot`.** Like `reachability` and `self_network` this
+is a transition — subscribe after a wake and you will not see it. Unlike those two, the `snapshot`
+frame carries **no** resume field to recover it from ("was this machine recently asleep" is not state
+the daemon keeps), so a consumer that reconnects should assume it missed events and re-check what it
+holds. There is also **no pre-suspend warning**: neither platform gives a
+process reliable notice before it is put to sleep.
 
 ### `blob_transfer` (`api_minor >= 41`, #82)
 

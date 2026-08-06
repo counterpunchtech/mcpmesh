@@ -69,7 +69,7 @@ Per-verb output, abbreviated:
 | `use <peer>/<svc>` | `{"peer": …, "mounts": [{"target", "claude_code_command", "mcp_server": {name, command, args}}]}` |
 | `doctor` | `{"findings": [{"check","level","message"}], "warnings", "errors", "ok"}` (exit 1 iff any error) |
 | `join` / `org create/approve/revoke` / `devices code/add` | the flow's artifacts (`join_code`, `org_invite`, fingerprints, serials, …) |
-| `internal watch` | JSONL: one typed stream frame per line (snapshot / event / lagged) |
+| `internal watch` | JSONL: one typed stream frame per line (snapshot / event / reachability / self_network / blob_transfer / resumed / lagged) |
 | `internal audit tail` | JSONL audit records (in both modes — already machine-readable) |
 
 ## Blocking commands
