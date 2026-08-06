@@ -989,6 +989,18 @@ pub(crate) async fn handle_request(req: &Value, state: &DaemonState) -> Value {
                 crate::daemon::peer_diagnostics(state, &p.peer).await,
             )
         }
+        // #140: forget a peer's stored dial hint. An experiment tool — see the verb's rustdoc.
+        Some("peer_hint_clear") => {
+            let p: mcpmesh_local_api::PeerHintClearParams = match params_of(&params) {
+                Ok(p) => p,
+                Err(e) => return error(id, -32602, format!("peer_hint_clear: {e}")),
+            };
+            respond(
+                id,
+                "peer_hint_clear",
+                crate::daemon::peer_hint_clear(state, &p.peer).await,
+            )
+        }
         // Deregistration (#50): remove a service registration, mirror of register_service.
         Some("unregister_service") => respond(
             id,

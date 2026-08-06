@@ -12,11 +12,11 @@ use crate::protocol::{
     AuditSummaryResult, BackendSpec, BlobFetchCancelParams, BlobFetchCancelResult, BlobFetchParams,
     BlobFetchResult, BlobGrantParams, BlobPublishParams, BlobPublishResult, BlobScopeList, Hello,
     InviteParams, InviteResult, OpenSessionParams, OrgJoinParams, OrgJoinResult, PairParams,
-    PairResult, PeerEndorseParams, PeerEndorseResult, PeerIntroduceParams, PeerRemoveParams,
-    PeerRenameParams, PeerServicesParams, PeerServicesResult, RegisterServiceParams, Request,
-    RosterInstallParams, RosterInstallResult, ServiceAllowParams, SetAppMetadataParams,
-    SetNicknameParams, SetRelaysParams, SetRelaysResult, SetRosterUrlParams, StatusResult,
-    StreamFrame, UnregisterServiceParams,
+    PairResult, PeerEndorseParams, PeerEndorseResult, PeerHintClearParams, PeerHintClearResult,
+    PeerIntroduceParams, PeerRemoveParams, PeerRenameParams, PeerServicesParams,
+    PeerServicesResult, RegisterServiceParams, Request, RosterInstallParams, RosterInstallResult,
+    ServiceAllowParams, SetAppMetadataParams, SetNicknameParams, SetRelaysParams, SetRelaysResult,
+    SetRosterUrlParams, StatusResult, StreamFrame, UnregisterServiceParams,
 };
 use crate::transport::{connect_local, split_local};
 
@@ -313,6 +313,27 @@ impl ControlClient {
                 subject_user_id,
             }),
             "peer endorse result",
+        )
+        .await
+    }
+
+    /// Forget this node's stored dial hint for `peer` (#140), `api_minor >= 59`.
+    ///
+    /// The hint is the only durable per-peer state on this node's disk that the dial path reads, and
+    /// the only thing a long-lived pairing carries that a freshly paired identity does not — so
+    /// clearing it makes the pairing address like a fresh one. Advisory, never authorization: the
+    /// peer row, its `user_id`, its services and its pairing stamp are untouched, and an absent hint
+    /// is a supported state (the dial degrades to id-only). Errors for an unknown peer; `cleared`
+    /// is `false` for a known peer that had no hint.
+    pub async fn peer_hint_clear(
+        &mut self,
+        peer: &str,
+    ) -> Result<PeerHintClearResult, ClientError> {
+        self.request_typed(
+            Request::PeerHintClear(PeerHintClearParams {
+                peer: peer.to_string(),
+            }),
+            "peer hint clear result",
         )
         .await
     }

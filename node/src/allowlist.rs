@@ -365,6 +365,43 @@ impl PeerStore {
         Ok(changed)
     }
 
+    /// Clear an existing row's `last_addr`, atomically, inside ONE write transaction (#140).
+    ///
+    /// Returns the hint that was removed, so a caller can hand it back to an operator: there is no
+    /// setter, and on a relay-only pairing nothing will rewrite it. `None` for a peer that had no
+    /// hint — and, like
+    /// [`set_last_addr`](Self::set_last_addr), that case ABORTS rather than committing an empty
+    /// transaction: an empty commit still costs a ~6ms fsync and holds redb's global writer lock for
+    /// it, blocking pairing, peer add and rename.
+    ///
+    /// An unknown peer is `Ok(None)` here; the CALLER must distinguish it, because "no such peer"
+    /// and "peer had no hint" need different answers for an operator running an experiment. The
+    /// `eid:` selector reaches this branch — it decodes a principal without consulting the store —
+    /// so the caller checks membership itself rather than trusting the resolver to have done it.
+    ///
+    /// Only `last_addr` moves. The pairing stamp, `user_id`, `services` and nickname are read back
+    /// and rewritten verbatim — a clear implemented as delete-and-reinsert would drop the pairing
+    /// proof, and the row would still look present.
+    pub fn clear_last_addr(&self, endpoint_id: &[u8; 32]) -> Result<Option<String>> {
+        let txn = self.db.begin_write()?;
+        let forgotten = {
+            let mut table = txn.open_table(PEERS)?;
+            let Some(existing) = table.get(endpoint_id.as_slice())? else {
+                return Ok(None); // unknown peer — never invent one
+            };
+            let mut entry: PeerEntry = serde_json::from_slice(existing.value())?;
+            drop(existing);
+            let Some(previous) = entry.last_addr.take() else {
+                return Ok(None); // nothing to clear: abort, do not pay the fsync
+            };
+            let bytes = serde_json::to_vec(&entry)?;
+            table.insert(endpoint_id.as_slice(), bytes.as_slice())?;
+            previous
+        };
+        txn.commit()?;
+        Ok(Some(forgotten))
+    }
+
     /// Resolve a peer by its 32-byte endpoint_id, or `None` if not allowlisted.
     ///
     /// Fails CLOSED on a corrupt stored row: a row that will not deserialize (e.g. an
