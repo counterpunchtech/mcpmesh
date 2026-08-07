@@ -1144,6 +1144,37 @@ pub struct PeerDiagnosticsResult {
     pub hint_addrs_unknown_to_iroh: Vec<String>,
     /// The converse: what iroh holds that our stored hint does not name — inferred the same way,
     /// and empty for the same reason when [`known_addrs`](Self::known_addrs) is `None`.
+    ///
+    /// **A non-empty list here is the NORMAL state of a healthy peer, and a growing one is not
+    /// evidence that the stored hint has drifted.** The two lists are built from different things
+    /// and are expected to differ in size:
+    ///
+    /// - [`hint_addrs`](Self::hint_addrs) comes from the open **IP** paths of one live connection —
+    ///   typically one to three addresses.
+    /// - [`known_addrs`](Self::known_addrs) is iroh's remote map: every address it has learned for
+    ///   the peer, from discovery and from paths, active or not, **relay URLs included**.
+    ///
+    /// So this list grows when **iroh learns more candidates**, which is discovery working. It says
+    /// nothing about whether the hint is current; [`hint_addrs_unknown_to_iroh`] is the field that
+    /// speaks to that, in the other direction.
+    ///
+    /// A relay URL iroh holds will sit here for as long as a hint whose addresses came from
+    /// `dial_hint::observed_for` stands: that function filters to IP paths, so a value it produced
+    /// cannot name a relay. Verified end to end against a **real** relay by
+    /// `a_live_session_refreshes_the_dial_hint_and_never_stores_a_relay`
+    /// (`cli/tests/dial_hint_refresh.rs`), which starts a relayed session and asserts the healed
+    /// hint carries the peer's direct address and no relay.
+    ///
+    /// **Sourced-from, not written-when — the distinction is load-bearing.** A stored hint can
+    /// still name a relay three ways, and each is reported rather than hidden: a legacy row written
+    /// before 0.52.2; a legacy value *carried forward* by a later write, since `merge_hint` and the
+    /// attestation admit path preserve a stored value rather than originating one; and a direct
+    /// `PeerStore::add` by an embedder, `allowlist` being a public module.
+    ///
+    /// This warning exists because the reading was gotten wrong in the field, on #140 itself: a
+    /// reporter read this going 5 -> 8 across an upgrade as the hint drifting from iroh's view.
+    ///
+    /// [`hint_addrs_unknown_to_iroh`]: Self::hint_addrs_unknown_to_iroh
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub iroh_addrs_not_in_hint: Vec<String>,
 }

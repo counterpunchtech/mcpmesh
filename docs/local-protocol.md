@@ -1123,6 +1123,20 @@ active path is the relay. Read the `active` caveat below before concluding from 
 - `hint_addrs_unknown_to_iroh` is not accumulated cruft. The hint is written **whole** — `#124`
   replaces the stored value with one built from the live connection's open paths — so these are
   addresses that were real at the last successful connection and are absent from iroh's view now.
+- **`iroh_addrs_not_in_hint` being non-empty is the normal state of a healthy peer, and a growing
+  one is not evidence the hint has drifted.** The lists are built from different things: `hint_addrs`
+  is the open **IP** paths of one live connection (typically one to three), while `known_addrs` is
+  every address iroh has learned for the peer — discovery and paths, active or not, **relay URLs
+  included**. This list grows when *iroh learns more candidates*, which is discovery working.
+  `hint_addrs_unknown_to_iroh` is the field that speaks to whether the hint is current. A relay URL
+  iroh holds sits here for as long as a hint whose addresses came from `observed_for` stands, since
+  that function filters to IP paths — verified against a real relay by
+  `a_live_session_refreshes_the_dial_hint_and_never_stores_a_relay`. Note **sourced-from**, not
+  written-when: a stored hint can still name a relay if it is a legacy row from before 0.52.2, if a
+  later write *carried a legacy value forward* (`merge_hint` and the attestation admit path preserve
+  rather than originate), or if an embedder called `PeerStore::add` directly. All three are reported
+  rather than hidden. This is spelled out because the reading was gotten wrong on #140 itself: 5 → 8
+  across an upgrade was read as the hint drifting.
 
 **Read-only, with one caveat stated rather than glossed.** `remote_info` is a point read: it does not
 dial, probe, or trigger an address lookup. It does, however, deliver a message to iroh's per-remote
