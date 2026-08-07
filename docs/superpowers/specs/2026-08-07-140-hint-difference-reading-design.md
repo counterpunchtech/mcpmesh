@@ -27,11 +27,12 @@ different things and are expected to diverge:
 
 Two structural consequences follow, and neither is currently written down:
 
-1. A hint **written since 0.52.2** is IP-only by construction — `observed_for` filters to `is_ip`,
-   and it is the sole source for all four writers. So every relay URL iroh holds is in
-   `iroh_addrs_not_in_hint` for as long as that hint stands. It is never evidence of anything.
-   (Scoped deliberately: a **legacy** row written before 0.52.2 can carry a relay URL, and
-   `peer_diagnostics` reports that shape rather than hiding it.)
+1. A hint **whose addresses came from `observed_for`** is IP-only by construction — that function
+   filters to `is_ip`. So every relay URL iroh holds is in `iroh_addrs_not_in_hint` for as long as
+   such a hint stands. It is never evidence of anything. (Scoped by SOURCE, not by release: a
+   legacy row, a legacy value carried forward by a later write, or a direct `PeerStore::add` by an
+   embedder can each still name a relay, and `peer_diagnostics` reports that shape rather than
+   hiding it.)
 2. A growing `iroh_addrs_not_in_hint` means **iroh learned more candidates** — the normal result of
    discovery running. It does not mean the stored hint went stale.
 
@@ -78,15 +79,15 @@ candidate with its tradeoff, not shipped.
 ## The change
 
 **`local-api/src/protocol.rs`** — give `iroh_addrs_not_in_hint` the interpretation guidance its
-counterpart has: the hint is IP-only by construction so relay URLs are always in this list; growth
-means iroh learned candidates, not that the hint drifted; the two lists have different cardinality
-by design.
+counterpart has: growth means iroh learned candidates, not that the hint drifted; the two lists have
+different cardinality by design; a hint sourced from `observed_for` is IP-only, so relay URLs iroh
+holds sit in this list — with the three routes by which a stored hint can still name one.
 
 **`docs/local-protocol.md`** — the same two points as a bullet beside the existing
 `hint_addrs_unknown_to_iroh` bullet, keeping the prose doc and the rustdoc in sync.
 
 **No `API_MINOR` bump.** No field is added, removed, or changed shape; no verb changes. This is
-documentation over an existing `api_minor 57` surface.
+documentation over an existing `api_minor 59` surface.
 
 ## Testing
 
@@ -119,18 +120,32 @@ separately compute `addr_differences` in one direction only. Each must fail the 
 This also demonstrates the doc's point directly: a peer that is connected **right now**, whose view
 is live and whose hint is well-formed, reports a non-empty `iroh_addrs_not_in_hint`.
 
-### Relay exclusion is NOT tested, and that is stated rather than glossed
+### Relay exclusion IS tested — an earlier draft of this spec claimed otherwise, and was wrong
 
-The strongest form of the claim — *a relay URL iroh holds is always in `iroh_addrs_not_in_hint`,
-because a hint written since 0.52.2 cannot contain one* — is **not** pinned by any test, here or
-elsewhere. Hermetic endpoints run `relay_mode = "disabled"`, so no test in this repo can put a relay
-address into iroh's remote map, and `observed_for`'s relay filtering has no direct test for the same
-reason (it needs a live `Connection`).
+This section originally asserted that no test in this repo could put a relay address into iroh's
+remote map, because hermetic endpoints run `relay_mode = "disabled"`, and therefore that
+`observed_for`'s relay filtering was unverifiable. **Both statements are false**, and the gate
+caught them.
 
-The doc therefore states the relay point as a consequence of `observed_for` filtering to `is_ip`,
-attributed to that function, and does not claim a test proves it. Note also that a **legacy** hint
-written before 0.52.2 can carry a relay URL — `peer_diagnostics` reports exactly that shape, and
-there is a test for it — so the claim is scoped to hints written since, not to every row on disk.
+`cli/tests/dial_hint_refresh.rs::a_live_session_refreshes_the_dial_hint_and_never_stores_a_relay`
+stands up a real relay with `iroh::test_utils::run_relay_server()`, binds both endpoints with
+`RelayMode::Custom`, seeds a relay-only `last_addr` so the session starts relayed, drives
+`dial_service` → path watcher → `observed_for` → the stored hint, and asserts the healed hint
+contains an `Ip` and no `Relay`. Four other suites also run non-disabled relays
+(`live_path_events`, `peer_path`, `self_network`, `relay_race`).
+
+So the docs cite that test rather than excusing the absence of one.
+
+### The claim's axis is sourced-from, not written-when
+
+A second correction from the gate. `merge_hint(None, existing)` preserves a stored value, and the
+attestation admit path (`rendezvous.rs:680`) re-persists `prior.last_addr` — so a **write performed
+today** can carry a relay whose value is legacy. `allowlist` is also a public module, so an embedder
+can `PeerStore::add` anything.
+
+The accurate claim is therefore about a hint **whose addresses came from `observed_for`**, not one
+written after a particular release. The docs say it that way, and name all three routes by which a
+stored hint can still carry a relay.
 
 ## Consumer impact
 

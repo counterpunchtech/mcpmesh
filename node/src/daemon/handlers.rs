@@ -4401,6 +4401,114 @@ allow = []
         );
     }
 
+    /// #140: `iroh_addrs_not_in_hint` is a real set difference against a LIVE view — and a
+    /// non-empty one is the NORMAL reading on a connected peer, not evidence of a stale hint.
+    ///
+    /// The test above pins `hint_addrs_unknown_to_iroh` against a real view and asserts nothing
+    /// about the converse, so the direction a reader actually reaches for was computed by code no
+    /// test observed with a view present. That is the same "pin the call site, not the helper"
+    /// shape its own docstring was written to close, left open in the other direction — and the
+    /// direction that got misread in the field: the reporter on #140 read `iroh_addrs_not_in_hint`
+    /// going 5 -> 8 as the stored hint drifting. It is not. The hint holds the open IP paths of one
+    /// live connection; iroh's remote map accumulates every candidate it ever learned. The two have
+    /// different cardinality BY DESIGN, and the gap widening means iroh learned more, nothing else.
+    ///
+    /// Deterministic by construction rather than by what the host's interfaces happen to be: the
+    /// hint carries only `192.0.2.7:4433` (TEST-NET-1 — dialable under `is_dialable_addr`, and
+    /// never a real local address), while iroh's map holds only what the test's own explicit dial
+    /// inserted. The two sets cannot intersect, so both assertions hold on any machine.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_live_view_differences_in_both_directions() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+
+        let hermetic = crate::config::NetworkCfg {
+            relay_mode: "disabled".into(),
+            ..Default::default()
+        };
+        let peer_ep = crate::daemon::boot::build_endpoint(
+            iroh::SecretKey::from_bytes(&[32u8; 32]),
+            &hermetic,
+            false,
+        )
+        .await
+        .unwrap();
+        let peer_id = *peer_ep.id().as_bytes();
+        let peer_addr = peer_ep.addr();
+        let acceptor = peer_ep.clone();
+        let _accept = tokio::spawn(async move {
+            while let Some(incoming) = acceptor.accept().await {
+                let _ = incoming.await;
+            }
+        });
+
+        // A well-formed hint for the RIGHT peer, naming an address iroh will never hold. Well-formed
+        // matters: an id mismatch or a parse failure degrades to the bare-id dial and empties
+        // `hint_addrs`, which would make both assertions below pass for the wrong reason.
+        const ONLY_IN_HINT: &str = "192.0.2.7:4433";
+        let hint = serde_json::to_string(&iroh::EndpointAddr::from_parts(
+            peer_ep.id(),
+            [iroh::TransportAddr::Ip(ONLY_IN_HINT.parse().unwrap())],
+        ))
+        .unwrap();
+        mesh.store
+            .add(crate::allowlist::PeerEntry {
+                endpoint_id: peer_id,
+                nickname: "jetson".into(),
+                services: vec![],
+                paired_at: None,
+                user_id: None,
+                last_addr: Some(hint),
+            })
+            .unwrap();
+
+        // The dial names `peer_addr` explicitly, so iroh's remote map gets the peer's REAL
+        // addresses and never the hint's. `peer_diagnostics` does not dial, so nothing else can
+        // insert `ONLY_IN_HINT` behind the assertions.
+        let _conn = mesh
+            .endpoint
+            .connect(peer_addr, mcpmesh_net::ALPN_MCP)
+            .await
+            .expect("loopback dial to a live endpoint");
+
+        let d = peer_diagnostics(&state, "jetson").await.unwrap();
+        let known = d
+            .known_addrs
+            .clone()
+            .expect("iroh holds remote state for a peer we are connected to right now");
+        assert!(
+            d.hint_usable,
+            "precondition: the hint parses and names THIS peer, so the dial would use it"
+        );
+        assert_eq!(
+            d.hint_addrs,
+            vec![ONLY_IN_HINT.to_string()],
+            "precondition: the hint contributes exactly the one address iroh cannot hold"
+        );
+
+        assert_eq!(
+            d.hint_addrs_unknown_to_iroh,
+            vec![ONLY_IN_HINT.to_string()],
+            "the hint's address is absent from a view that EXISTS — the one case where calling a \
+             hint address unknown is correct: {known:?}"
+        );
+        // The converse, and the point of this test: with a live connection the peer's real
+        // addresses are in iroh's view and not in the hint. A reader must not take this for drift.
+        assert!(
+            !d.iroh_addrs_not_in_hint.is_empty(),
+            "iroh holds this connection's real address and the hint does not name it, so the \
+             difference must be reported rather than hardcoded empty: {known:?}"
+        );
+        assert!(
+            !d.iroh_addrs_not_in_hint.contains(&ONLY_IN_HINT.to_string()),
+            "and it is a genuine difference, not a copy of the view: {:?}",
+            d.iroh_addrs_not_in_hint
+        );
+    }
+
     /// #140: the hint is forgotten, the DIAL changes, and nothing else about the peer moves.
     ///
     /// The dial assertion is the one that matters. Checking only the stored row would leave the
