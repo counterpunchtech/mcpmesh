@@ -1009,26 +1009,57 @@ fn build_transport_config(
              keepalive traffic. Lower it to make pings MORE frequent on a lossy link; there is no \
              supported way to make them less frequent"
         );
-        // Validate against the EFFECTIVE idle timeout, not just an explicitly configured one.
-        // Unreachable for a BARE keepalive while the cap above (5s) sits under iroh's default idle
-        // timeout (30s) — kept because it is what bites if a bump moves either number, and
-        // `iroh_transport_defaults_are_what_the_docs_claim` is what tells us one moved.
-        let effective = idle.unwrap_or(IROH_DEFAULT_IDLE_SECS);
-        anyhow::ensure!(
-            effective == 0 || k < effective,
-            "[network] keep_alive_secs ({k}) must be less than the idle timeout ({effective}s{}): \
-             a keepalive arriving after the peer's idle timer has fired severs sessions on a clock \
-             rather than keeping them open",
-            // Always "" in practice: the cap above admits only <= 5s, which is under iroh's 30s
-            // default, so a BARE keepalive cannot reach this check. Kept with the `unwrap_or`
-            // because it is what bites if a bump moves either number.
-            if idle.is_some() {
-                ""
-            } else {
-                ", iroh's default — set idle_timeout_secs to raise it"
-            }
-        );
     }
+
+    // The ordering check runs on the EFFECTIVE values of BOTH knobs — outside the `if let` above,
+    // deliberately (#210).
+    //
+    // It used to sit inside that block, so it only ever saw a keepalive the operator had written
+    // down. But omitting `keep_alive_secs` does not remove the keepalive: iroh runs its 5s default
+    // on the connection AND every path. So `idle_timeout_secs = 3` alone set a 3s idle timer beside
+    // a 5s keepalive and BOOTED — the exact condition the message below describes, reached silently
+    // by the config the docs invite ("lowering it works one-sidedly").
+    //
+    // That direction is also the reachable one. A bare KEEPALIVE cannot fail this check while the
+    // cap (5s) sits under iroh's default idle timeout (30s); a bare IDLE TIMEOUT fails it for any
+    // value at or below 5. The mirror case was the one that mattered and the one that was missing.
+    //
+    // `iroh_transport_defaults_are_what_the_docs_claim` is what notices if a bump moves either
+    // constant out from under this reasoning.
+    let effective_keep = keep.unwrap_or(IROH_MAX_PATH_KEEP_ALIVE_SECS);
+    let effective_idle = idle.unwrap_or(IROH_DEFAULT_IDLE_SECS);
+    anyhow::ensure!(
+        // `0` is QUIC's "no idle timeout" — nothing can arrive after it, so there is nothing to
+        // race. STRICTLY less than otherwise: a keepalive arriving exactly at the idle deadline is
+        // the race, not a margin.
+        effective_idle == 0 || effective_keep < effective_idle,
+        "[network] the keepalive ({effective_keep}s{}) must be less than the idle timeout \
+         ({effective_idle}s{}): a keepalive arriving after the peer's idle timer has fired severs \
+         sessions on a clock rather than keeping them open{}",
+        if keep.is_some() {
+            ""
+        } else {
+            ", iroh's default"
+        },
+        if idle.is_some() {
+            ""
+        } else {
+            ", iroh's default"
+        },
+        // Name the fix that matches the operator's actual file. Telling someone to lower
+        // `keep_alive_secs` is useless when the reason they are here is that they never set it.
+        // The floor is stated because it is a real dead end, not a rounding detail:
+        // `keep_alive_secs` must be >= 1, so `idle_timeout_secs = 1` cannot be satisfied by ANY
+        // keepalive. Offering "lower keep_alive_secs" there would be advice that cannot be taken.
+        if keep.is_some() {
+            ". Lower keep_alive_secs, or raise idle_timeout_secs (keep_alive_secs must be at \
+             least 1, so idle_timeout_secs must be at least 2 — or 0 for no timeout at all)"
+        } else {
+            ". Raise idle_timeout_secs above the keepalive, or set keep_alive_secs below it \
+             (keep_alive_secs must be at least 1, so idle_timeout_secs must be at least 2 — or 0 \
+             for no timeout at all)"
+        }
+    );
 
     let mut cfg = iroh::endpoint::QuicTransportConfig::builder();
     if let Some(i) = idle {
@@ -2124,6 +2155,130 @@ mod tests {
             .await
             .expect("keepalive below the timeout is the working configuration");
         ep.close().await;
+    }
+
+    /// #210: a BARE `idle_timeout_secs` is validated against iroh's DEFAULT keepalive.
+    ///
+    /// The ordering check used to live inside `if let Some(k) = keep`, so it only ever saw a
+    /// keepalive the operator had written down. Omitting the key does not remove the keepalive —
+    /// iroh still runs its 5s default on both the connection and the path — so
+    /// `idle_timeout_secs = 3` alone booted straight into the race the check exists to prevent:
+    /// the keepalive fires AFTER the idle timer and severs sessions whose peers are alive and
+    /// answering.
+    ///
+    /// **The silent direction is the dangerous one.** A refused config costs five minutes; one that
+    /// boots and then kills live sessions on a clock reads as a flaky network, and the config that
+    /// caused it looks accepted. Same shape as #128.
+    ///
+    /// Asserted through `build_transport_config`, which returns the config rather than mutating a
+    /// builder precisely so a test can see what was decided.
+    #[test]
+    fn a_bare_idle_timeout_is_checked_against_irohs_default_keepalive() {
+        let cfg = |idle: Option<u64>, keep: Option<u64>| crate::config::NetworkCfg {
+            relay_mode: "disabled".into(),
+            idle_timeout_secs: idle,
+            keep_alive_secs: keep,
+            ..Default::default()
+        };
+
+        // THE BUG. No keepalive configured, idle timeout below iroh's default keepalive.
+        let e = build_transport_config(&cfg(Some(3), None)).expect_err(
+            "an idle timeout under iroh's default keepalive severs healthy sessions on a clock — \
+             it must be refused at boot, not accepted silently",
+        );
+        let msg = format!("{e:#}");
+        assert!(
+            msg.contains('3') && msg.contains(&IROH_MAX_PATH_KEEP_ALIVE_SECS.to_string()),
+            "the error must name BOTH values — the operator cannot fix what it does not \
+             identify: {msg}"
+        );
+        // It must NOT send the reader after a key they never set. The whole failure mode is that
+        // `keep_alive_secs` is absent from their file; an error telling them to lower it is
+        // advice they cannot act on.
+        //
+        // Asserted on the ATTRIBUTION ITSELF — `(5s, iroh's default)` — not on the bare word
+        // "default". The gate caught that: the remedy clause also contains "default", so
+        // `msg.contains("default")` stayed green with the attribution deleted outright, and the
+        // whole module passed with the feature this assertion exists to pin removed.
+        let attribution = format!("({IROH_MAX_PATH_KEEP_ALIVE_SECS}s, iroh's default)");
+        assert!(
+            msg.contains(&attribution),
+            "the error must attribute the keepalive to iroh's DEFAULT, not to a key the operator \
+             never wrote — expected {attribution:?} in: {msg}"
+        );
+        // And the CONFIGURED arm must NOT claim the value came from a default. Without this, one
+        // unconditional attribution satisfies the assertion above and the two arms are
+        // indistinguishable.
+        let configured = format!(
+            "{:#}",
+            build_transport_config(&cfg(Some(4), Some(5)))
+                .expect_err("5s keepalive against a 4s idle timeout is the same race")
+        );
+        assert!(
+            !configured.contains("iroh's default"),
+            "a keepalive the operator DID set must not be reported as iroh's default: {configured}"
+        );
+
+        // `idle_timeout_secs = 1` is a genuine DEAD END, not merely a low value: `keep_alive_secs`
+        // must be >= 1 and strictly less than the idle timeout, so no keepalive can satisfy it.
+        // The error must not offer "lower keep_alive_secs" as though it were reachable.
+        for keep in [None, Some(1), Some(2), Some(5)] {
+            let e = format!(
+                "{:#}",
+                build_transport_config(&cfg(Some(1), keep))
+                    .expect_err("idle_timeout_secs = 1 cannot be satisfied by any keepalive")
+            );
+            assert!(
+                e.contains("at least 2"),
+                "the error must name the floor rather than suggest an unreachable fix \
+                 (keep={keep:?}): {e}"
+            );
+        }
+
+        // THE BOUNDARY, and the reason this test is not vacuous. With the keepalive defaulted to 5
+        // and the idle timeout at 5, both operands are EQUAL — so `<` and `<=` disagree here and
+        // nowhere else. A fixture that only tried 3 would pass under either operator.
+        //
+        // Equal must FAIL: a keepalive arriving exactly at the idle deadline is the race, not a
+        // safe margin.
+        build_transport_config(&cfg(Some(IROH_MAX_PATH_KEEP_ALIVE_SECS), None)).expect_err(
+            "an idle timeout EQUAL to the default keepalive is the race itself, not a margin",
+        );
+        build_transport_config(&cfg(Some(IROH_MAX_PATH_KEEP_ALIVE_SECS + 1), None))
+            .expect("one second above the default keepalive is a working configuration");
+
+        // `0` is QUIC's "no idle timeout", so nothing can outlive it — the escape hatch must
+        // survive the hoist. Deleting the `== 0` short-circuit turns a valid config into a boot
+        // failure claiming the keepalive must be less than `0s`.
+        build_transport_config(&cfg(Some(0), None))
+            .expect("no idle timeout means no keepalive can arrive after it");
+
+        // Neither key set is untouched: iroh's own defaults are internally consistent (30s idle vs
+        // 5s keepalive), and this must stay a no-op rather than becoming a boot-time opinion.
+        assert!(
+            build_transport_config(&cfg(None, None))
+                .expect("an unconfigured node must not acquire an opinion")
+                .is_none(),
+            "neither key set must still leave iroh's transport config entirely alone"
+        );
+
+        // And the CONFIGURED path still behaves exactly as before — the hoist must not weaken the
+        // two checks that are genuinely about a value the operator wrote.
+        build_transport_config(&cfg(Some(1200), Some(0)))
+            .expect_err("keep_alive_secs = 0 is still a zero-length timer");
+        build_transport_config(&cfg(Some(1200), Some(6)))
+            .expect_err("6s is still above iroh's per-path cap");
+        build_transport_config(&cfg(Some(30), Some(5)))
+            .expect("the documented working configuration still builds");
+
+        // `doctor` must not bless a config the daemon then refuses to boot on. It reaches this
+        // through `validate_transport_config`, the crate's only PUBLIC entry point here, so the
+        // agreement is asserted rather than assumed — a `doctor` that says "ok" to a config the
+        // node dies on is worse than no `doctor`.
+        super::validate_transport_config(&cfg(Some(3), None))
+            .expect_err("doctor must refuse what boot refuses");
+        super::validate_transport_config(&cfg(Some(30), Some(5)))
+            .expect("and must still pass the working configuration");
     }
 
     /// #56: an absent config changes NOTHING — the endpoint gets iroh's defaults verbatim, so a
