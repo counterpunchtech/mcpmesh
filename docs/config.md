@@ -60,7 +60,7 @@ are in the [operator runbook §5](operator.md#5-self-hosting-relay--discovery-10
 | `relay_urls` | `[]` | Your self-hosted relay URLs. Required when `relay_mode = "custom"`. **Live-editable** at runtime via the `set_relays` control verb (#53) — when already in `custom` mode, adding/removing relays is applied to the running endpoint with no restart and no dropped peer sessions; see [local-protocol.md](local-protocol.md). |
 | `discovery_mode` | `"default"` | `"default"` \| `"custom"` (your own discovery service — requires `discovery_urls`). Ignored when `relay_mode = "disabled"`. |
 | `discovery_urls` | `[]` | Your self-hosted discovery URLs, used for both publishing and resolving peer addresses. Required when `discovery_mode = "custom"`. |
-| `idle_timeout_secs` | iroh's (**30 s**) | QUIC idle timeout. **Negotiated** — the connection uses the minimum of both peers' values, so raising it needs every node configured. See [Idle timeout and keepalive](#idle-timeout-and-keepalive-56). |
+| `idle_timeout_secs` | iroh's (**30 s**) | QUIC idle timeout. **Negotiated** — the connection uses the minimum of both peers' values, so raising it needs every node configured. Must be **greater than the effective keepalive** (`keep_alive_secs` if set, else iroh's 5 s), or boot fails — so `1`–`5` **alone** is a startup error, and `1` is a startup error at every `keep_alive_secs` too (its floor is `1`). Lowest usable value is `2` (with `keep_alive_secs = 1`); `0` (no timeout) is always allowed. See [Idle timeout and keepalive](#idle-timeout-and-keepalive-56). |
 | `keep_alive_secs` | iroh's (**5 s**) | QUIC keepalive interval. **Legal range is `1`–`5`** — iroh caps the per-path keepalive at 5 s, so a larger value is a **startup error**, not a slower ping. `0` is refused too (a PING storm, not "disabled"). Must additionally be less than the effective idle timeout. See [Idle timeout and keepalive](#idle-timeout-and-keepalive-56). |
 | `local_discovery` | `"off"` | **Find peers on the LAN with no internet at all** (#68). `"off"` \| `"on"` (resolve *and* announce) \| `"resolve"` (listen only, never announce). See [Local discovery](#local-discovery-finding-peers-with-no-internet-68). |
 | `presence_mode` | `"paired"` | **Who gets a reachability pong** on `mcpmesh/ping/1` (#89). `"paired"` = any paired peer (today's behaviour) \| `"granted"` = only a peer currently holding at least one service grant \| `"off"` = never pong. See [Presence](#presence-who-can-see-that-you-are-online-89). |
@@ -274,7 +274,7 @@ sharing rather than services, `"granted"` will not track it.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `idle_timeout_secs` | iroh's (**30 s** on iroh 1.0.3) | How long a connection survives with no traffic **and no keepalive** before QUIC closes it. `0` = no timeout at all. |
+| `idle_timeout_secs` | iroh's (**30 s** on iroh 1.0.3) | How long a connection survives with no traffic **and no keepalive** before QUIC closes it. `0` = no timeout at all. Otherwise must be **greater than** the effective keepalive (`keep_alive_secs` if set, else iroh's 5 s), or boot fails; since `keep_alive_secs` cannot go below `1`, the lowest usable value is `2` — see the note below. |
 | `keep_alive_secs` | iroh's (**5 s** on iroh 1.0.3) | How often the transport PINGs an otherwise idle connection. **Can only be LOWERED — legal range `1`–`5`**; see the ceiling note below. Must be **less than** the effective idle timeout (`idle_timeout_secs` if set, else iroh's 30 s), or boot fails. |
 
 **A held session does not die when idle.** iroh already keepalives every 5 s, so `open_session` and
@@ -294,6 +294,19 @@ QUIC PING never becomes one.
 > arms a zero-length timer, so every packet emits a PING; no value disables them, and the daemon
 > refuses `0` rather than let it saturate the link it was meant to quiet. If a future iroh lifts the
 > cap, `iroh_transport_defaults_are_what_the_docs_claim` fails and this note gets revisited.
+
+> **A low `idle_timeout_secs` ALONE is refused too, as of 0.53.0 (#210).** The ordering rule is
+> checked against the **effective** keepalive, not just a configured one — omitting `keep_alive_secs`
+> does not remove the keepalive, it leaves iroh's 5 s default running on the connection and every
+> path. So `idle_timeout_secs = 3` with no `keep_alive_secs` sets a 3 s idle timer beside a 5 s
+> keepalive: the ping arrives **after** the timer has already fired, and sessions whose peers are
+> alive and answering get severed on a clock. Before 0.53.0 that config booted silently and read as
+> a flaky network. It now fails at boot naming both values. To use a sub-5 s idle timeout, lower
+> `keep_alive_secs` beneath it in the same `[network]` block (e.g. `idle_timeout_secs = 3` with
+> `keep_alive_secs = 2`). **`idle_timeout_secs = 1` cannot be made to work at all** — `keep_alive_secs`
+> has a floor of `1` and must be strictly less, so `2` is the lowest usable idle timeout.
+> `idle_timeout_secs = 0` is unaffected — with no timeout there is nothing for a keepalive to
+> arrive after.
 
 The first three rows of the table above are pinned by that test and cannot drift silently. The
 **relay-path idle timeout is not** — it comes from `RELAY_PATH_MAX_IDLE_TIMEOUT` and is applied
