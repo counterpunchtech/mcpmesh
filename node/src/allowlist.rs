@@ -77,6 +77,19 @@ pub struct RevokedEntry {
     pub issued_at: Option<u64>,
 }
 
+/// [`PeerStore::admission`]'s answer (#218). `Refused` and `Unpaired` both deny, and they are kept
+/// apart because the composed gate treats them differently: a refused endpoint is refused even when
+/// the roster lists it (rule 1), an unpaired one may still resolve through the roster (rule 2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Admission {
+    /// Revoked — the endpoint table, or the identity its row carries — or unreadable (fail-closed).
+    Refused,
+    /// Not revoked, and no readable pair row: nothing to admit from this store.
+    Unpaired,
+    /// A live pair row that nothing revokes.
+    Admitted(PeerEntry),
+}
+
 /// One pair-allowlist entry. `endpoint_id` is the routing key; `nickname` is
 /// the local human name the gate resolves peers to; `services` is the set the peer
 /// was granted at pairing time. Durable on-disk JSON — see the module additive-only note.
@@ -217,46 +230,70 @@ impl PeerStore {
         }
     }
 
-    /// Is this stored row's IDENTITY revoked (#218) — does it carry a `user_id` that
-    /// [`is_user_revoked`](Self::is_user_revoked) refuses?
+    /// What this store alone decides about one endpoint (#218): refused on revocation grounds,
+    /// admissible through a live pair row, or neither — in ONE read transaction.
     ///
-    /// THE row-level revocation question, asked by every gate entry point and by the two paths
-    /// that write such a row (invite redemption, `peer_introduce`). Until #218 only attestation
-    /// asked it: `peer_revoke b64u:` wrote the identity table and endpoint-revoked the devices it
-    /// knew, and a fresh invite then landed a row for a NEW device with the same `user_id` that
-    /// nothing consulted. A row with no `user_id` (legacy, `internal peer add`, a binding-less
-    /// pairing) has no identity to revoke and answers `false`.
+    /// Three tables answer it, in precedence order, and every gate entry point asks all three:
     ///
-    /// The `user_id` is compared as the store keys it: the `b64u:` rendering `verify_presented`
-    /// returns and `peer_revoke` was given (it only accepts a `b64u:` that matched a row, so the two
-    /// spellings cannot diverge). Fails CLOSED through `is_user_revoked`.
-    pub fn is_identity_revoked(&self, e: &PeerEntry) -> bool {
-        e.user_id
-            .as_deref()
-            .is_some_and(|uid| self.is_user_revoked(uid))
+    /// 1. the ENDPOINT revocation table (#85 ask 4) — any row there refuses, readable or not, the
+    ///    same reading [`is_revoked`](Self::is_revoked) gives it;
+    /// 2. the pair row — absent or undeserializable means [`Admission::Unpaired`], the same
+    ///    default-deny [`resolve`](Self::resolve) gives a corrupt row (it is not a revocation);
+    /// 3. the IDENTITY revocation table, on the row's `user_id`. Until #218 only attestation asked
+    ///    this: `peer_revoke b64u:` wrote the identity table and endpoint-revoked the devices it knew,
+    ///    and a fresh invite then landed a row for a NEW device with the same `user_id` that nothing
+    ///    consulted. A row with no `user_id` has no identity to revoke. The `user_id` is compared as
+    ///    the store keys it: the `b64u:` rendering `verify_presented` returns.
+    ///
+    /// One transaction rather than three reads because this is the accept path: the composed gate
+    /// used to spend six (`is_revoked` then `resolve`, each three), and a per-session caller pays
+    /// that on every session. Fails CLOSED: any read error answers [`Admission::Refused`], as each
+    /// of the composed reads did.
+    pub fn admission(&self, endpoint_id: &[u8; 32]) -> Admission {
+        let read = || -> Result<Admission> {
+            let txn = self.db.begin_read()?;
+            if txn
+                .open_table(REVOKED)?
+                .get(endpoint_id.as_slice())?
+                .is_some()
+            {
+                return Ok(Admission::Refused);
+            }
+            let peers = txn.open_table(PEERS)?;
+            let Some(v) = peers.get(endpoint_id.as_slice())? else {
+                return Ok(Admission::Unpaired);
+            };
+            let entry = match serde_json::from_slice::<PeerEntry>(v.value()) {
+                Ok(entry) => entry,
+                Err(e) => {
+                    tracing::warn!(
+                        key_prefix = ?&endpoint_id[..8],
+                        error = %e,
+                        "corrupt peer entry for queried key; treating as unresolved (deny)"
+                    );
+                    return Ok(Admission::Unpaired);
+                }
+            };
+            if let Some(uid) = entry.user_id.as_deref()
+                && txn.open_table(REVOKED_USERS)?.get(uid)?.is_some()
+            {
+                return Ok(Admission::Refused);
+            }
+            Ok(Admission::Admitted(entry))
+        };
+        read().unwrap_or_else(|e| {
+            tracing::warn!(%e, "admission read failed; treating the endpoint as REVOKED (fail-closed)");
+            Admission::Refused
+        })
     }
 
     /// Is this endpoint REFUSED on revocation grounds — by the endpoint table, or by the identity
-    /// its stored row carries (#218)? The one endpoint-keyed question every site that means
-    /// "revoked" asks: the gate's check-register recheck and sever, and every OUTBOUND dial
-    /// filter (#85 ask 4 made revocation two-way; an identity revocation that only bit inbound
-    /// would hand a request to a device the gate refuses).
-    ///
-    /// A missing row is not refused by this — there is no identity to be revoked, and a caller
-    /// that needs the row refuses its absence on its own terms. Fails CLOSED: an unreadable row
-    /// answers `true`, like both reads it composes.
+    /// its stored row carries (#218)? [`admission`](Self::admission) reduced to the question every
+    /// endpoint-keyed "revoked" site asks: the gate's check-register recheck and sever, the
+    /// `eid:` arm of `principal_is_revoked`, and every OUTBOUND dial filter, the redeemer's pair
+    /// dial included (#85 ask 4 made revocation two-way). A missing row is not refused — there is no identity to be revoked.
     pub fn is_refused(&self, endpoint_id: &[u8; 32]) -> bool {
-        if self.is_revoked(endpoint_id) {
-            return true;
-        }
-        match self.resolve(endpoint_id) {
-            Ok(Some(e)) => self.is_identity_revoked(&e),
-            Ok(None) => false,
-            Err(e) => {
-                tracing::warn!(%e, "peer store read failed; treating the endpoint as REVOKED (fail-closed)");
-                true
-            }
-        }
+        matches!(self.admission(endpoint_id), Admission::Refused)
     }
 
     /// Revoke a `b64u:` IDENTITY — every device of that person, including ones we have never seen.
@@ -583,49 +620,50 @@ impl AllowlistGate {
     pub fn new(store: Arc<PeerStore>) -> Self {
         Self { store }
     }
+
+    /// [`PeerStore::admission`] for an inbound endpoint — the single read the composed gate takes
+    /// for its rule 1 AND its rule 3, rather than `is_revoked` followed by `resolve`.
+    pub fn admission(&self, endpoint: &EndpointId) -> Admission {
+        self.store.admission(endpoint.as_bytes())
+    }
+
+    /// Is this `b64u:` identity revoked? For the composed gate's rule 2 (#218), where a ROSTER
+    /// `user_id` spelled as a pairing identity must not route around `peer_revoke b64u:`.
+    pub fn is_user_revoked(&self, user_id: &str) -> bool {
+        self.store.is_user_revoked(user_id)
+    }
+
+    /// The pairing-mode identity an admitted row resolves to (nickname only; groups are a
+    /// roster-mode concept).
+    pub fn identity_of(endpoint: &EndpointId, e: PeerEntry) -> PeerIdentity {
+        PeerIdentity {
+            endpoint: *endpoint,
+            user_id: e.user_id, // self-sovereign user_id from a verified pairing binding (else None)
+            name: e.nickname,
+            groups: vec![],
+        }
+    }
 }
 
 impl TrustGate for AllowlistGate {
-    /// Resolve an inbound endpoint to a pairing-mode identity (nickname only; groups are a
-    /// roster-mode concept), or refuse.
+    /// Resolve an inbound endpoint to a pairing-mode identity, or refuse.
     ///
-    /// The store is keyed by the raw 32 bytes of the `EndpointId`. A store read that errors
-    /// collapses to `None` = default-deny, logged at `warn!`: a gate read failing is
-    /// operationally notable but must NEVER fail open.
+    /// REVOCATION WINS over a live pair row (#85 ask 4), matching `ComposedGate`'s rule 1 — a
+    /// revoked endpoint still in the allowlist is the ordinary case, the whole point being to kill a
+    /// device you previously paired with — and so does an IDENTITY revocation on the row's
+    /// `user_id` (#218): the row a fresh invite lands for the person's next device, and a known
+    /// device whose endpoint row a per-device `peer_unrevoke` lifted while the identity row stands.
+    /// [`PeerStore::admission`] asks all three in that order, in one transaction, and fails CLOSED.
     fn resolve(&self, endpoint: &EndpointId) -> Option<PeerIdentity> {
-        // (1) REVOCATION WINS over a live pair row (#85 ask 4), matching `ComposedGate`'s rule 1
-        // for the roster. A revoked endpoint that is still in the allowlist is the ordinary case —
-        // the whole point is to kill a device you previously paired with — so checking the pair row
-        // first and returning early would make the feature a no-op.
-        if self.store.is_revoked(endpoint.as_bytes()) {
-            return None;
-        }
-        match self.store.resolve(endpoint.as_bytes()) {
-            // (1b) …and so does an IDENTITY revocation on the row's `user_id` (#218). `peer_revoke
-            // b64u:` endpoint-revokes the devices it knows about as well, so this bites the rows
-            // (1) cannot see: one written AFTER the revocation (the person's next device), and a
-            // known device whose endpoint row a per-device `peer_unrevoke` lifted while the
-            // identity row stands. One more redb read, taken only for a row carrying a `user_id`.
-            Ok(Some(e)) if self.store.is_identity_revoked(&e) => None,
-            Ok(Some(e)) => Some(PeerIdentity {
-                endpoint: *endpoint,
-                user_id: e.user_id, // self-sovereign user_id from a verified pairing binding (else None)
-                name: e.nickname,
-                groups: vec![],
-            }),
-            Ok(None) => None,
-            Err(e) => {
-                tracing::warn!(%e, "peer store read failed; refusing (default-deny)");
-                None
-            }
+        match self.admission(endpoint) {
+            Admission::Admitted(e) => Some(Self::identity_of(endpoint, e)),
+            Admission::Refused | Admission::Unpaired => None,
         }
     }
 
     /// The check-register recheck (#85 ask 4) — closes the same TOCTOU window #54 closed for
     /// roster revocation: a connection that registers just after a revoke must self-close rather
-    /// than run to completion on a decision that was true when it was accepted. Both tables (#218):
-    /// this is also `ComposedGate`'s rule 1, which must refuse a rostered endpoint whose pair row
-    /// carries a revoked identity before rule 2 resolves it through the roster.
+    /// than run to completion on a decision that was true when it was accepted. Both tables (#218).
     fn is_revoked(&self, endpoint: &EndpointId) -> bool {
         self.store.is_refused(endpoint.as_bytes())
     }
@@ -1055,9 +1093,8 @@ mod tests {
     /// identity, no ENDPOINT revocation — the stand-in for the fresh redeem) and alice's (live).
     /// The inverse is pinned too: `unrevoke_user` restores EVERY device of the identity.
     ///
-    /// Deleting the `is_identity_revoked` check in `AllowlistGate::resolve` fails the first
-    /// `is_none`; deleting it in `AllowlistGate::is_revoked` fails the `is_revoked` /
-    /// `should_sever_now` assertions.
+    /// Deleting the identity-table check in `PeerStore::admission` fails the first `is_none`, and
+    /// the `is_revoked` / `should_sever_now` assertions with it (all three ride on `admission`).
     #[test]
     fn a_revoked_identity_is_refused_even_with_a_live_pair_row() {
         use mcpmesh_net::TrustGate;
@@ -1135,6 +1172,98 @@ mod tests {
             assert_eq!(p.user_id.as_deref(), Some("b64u:mallory"));
             assert!(!gate.is_revoked(id));
             assert!(!gate.should_sever_now(id, None));
+        }
+    }
+
+    /// #218: `PeerStore::admission` — the single transaction every gate entry point now takes —
+    /// gives each outcome the answer the separate reads it replaced gave, fail-closed included.
+    ///
+    /// Every outcome is seeded in one store, and both sides of each boundary: an endpoint revoked
+    /// with a CLEAN row (endpoint table wins), a clean endpoint whose row carries a revoked identity
+    /// (identity table), a live row, no row, a CORRUPT row (default-deny, but not a revocation —
+    /// it must not be `Refused`, or rule 2 could never admit a rostered device whose stale pair row
+    /// went bad), and an UNREADABLE revocation row over a live pair row (still refuses).
+    ///
+    /// Requiring the revocation row to deserialize fails the `[4;32]` assertion; mapping a corrupt
+    /// pair row to `Refused` fails the `[3;32]` one; skipping the identity table fails `[6;32]`.
+    #[test]
+    fn admission_answers_each_outcome_in_one_read_and_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.redb");
+        {
+            let db = Database::create(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut peers = txn.open_table(PEERS).unwrap();
+                peers
+                    .insert([3u8; 32].as_slice(), b"{not json".as_slice())
+                    .unwrap();
+                let mut revoked = txn.open_table(REVOKED).unwrap();
+                revoked
+                    .insert([4u8; 32].as_slice(), b"{not json".as_slice())
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let store = PeerStore::open(&path).unwrap();
+        let row = |b: u8, uid: Option<&str>| PeerEntry {
+            endpoint_id: [b; 32],
+            nickname: format!("p-{b}"),
+            services: vec![],
+            paired_at: None,
+            user_id: uid.map(str::to_owned),
+            last_addr: None,
+        };
+        let revoked_at = |b: u8| RevokedEntry {
+            endpoint_id: [b; 32],
+            revoked_at: 1,
+            reason: None,
+            source: "local".into(),
+            signer_user_id: None,
+            issued_at: None,
+        };
+        store.add(row(4, None)).unwrap(); // live row UNDER the unreadable revocation row
+        store.add(row(5, Some("b64u:alice"))).unwrap();
+        store.revoke(revoked_at(5)).unwrap(); // endpoint-revoked, identity clean
+        store.add(row(6, Some("b64u:mallory"))).unwrap();
+        store.revoke_user("b64u:mallory", &revoked_at(0)).unwrap(); // identity-revoked, endpoint clean
+        store.add(row(7, Some("b64u:alice"))).unwrap(); // live
+
+        assert_eq!(
+            store.admission(&[5u8; 32]),
+            Admission::Refused,
+            "endpoint table"
+        );
+        assert_eq!(
+            store.admission(&[6u8; 32]),
+            Admission::Refused,
+            "identity table"
+        );
+        assert_eq!(
+            store.admission(&[4u8; 32]),
+            Admission::Refused,
+            "an unreadable revocation row still refuses, even over a live pair row"
+        );
+        assert_eq!(
+            store.admission(&[7u8; 32]),
+            Admission::Admitted(row(7, Some("b64u:alice")))
+        );
+        assert_eq!(store.admission(&[8u8; 32]), Admission::Unpaired, "no row");
+        assert_eq!(
+            store.admission(&[3u8; 32]),
+            Admission::Unpaired,
+            "a corrupt pair row denies but is not a revocation"
+        );
+        // The reductions agree with it.
+        for (b, refused) in [
+            (3u8, false),
+            (4, true),
+            (5, true),
+            (6, true),
+            (7, false),
+            (8, false),
+        ] {
+            assert_eq!(store.is_refused(&[b; 32]), refused, "is_refused([{b};32])");
         }
     }
 

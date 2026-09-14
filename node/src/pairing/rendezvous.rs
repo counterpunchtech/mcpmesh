@@ -64,11 +64,13 @@ const MAX_PAIR_FRAME: usize = 64 * 1024;
 /// id mismatch get their own reasons — neither is a secret oracle.
 const REASON_REFUSED: &str = "pairing refused";
 
-/// The reason on an [`RefusalCode::IdentityRevoked`] refusal (#218). Names the remedy and the
-/// non-remedy: a redeemer's first instinct is to ask for another invite, and that is refused the
-/// same way.
-const REASON_IDENTITY_REVOKED: &str = "your identity is revoked on the inviter; a fresh invite \
-                                       will not help — the inviter has to lift the revocation \
+/// The reason on an [`RefusalCode::IdentityRevoked`] refusal (#218). Says exactly what the
+/// revocation refuses — a device PRESENTING that identity — and who can lift it. It does not claim
+/// another invite "will not help": identity revocation cannot stop a person who stops presenting
+/// the key (no binding, or a new user key, lands as an ordinary `eid:` pairing), and a sentence
+/// promising otherwise would be the overclaim this reason exists to avoid.
+const REASON_IDENTITY_REVOKED: &str = "your identity is revoked on the inviter, which refuses any \
+                                       device presenting it — only the inviter can lift that \
                                        (peer_unrevoke)";
 const REASON_MALFORMED: &str = "malformed request";
 const REASON_ID_MISMATCH: &str = "id mismatch";
@@ -145,8 +147,9 @@ enum RefusalCode {
     /// The redeemer's PROVEN `user_id` is one the inviter has revoked (`peer_revoke b64u:`), so no
     /// row is written and no grant is made (#218). Sent after the burn, to a caller that proved a
     /// live secret AND a binding for that identity — it learns nothing it did not already hold.
-    /// The remedy is the inviter's `peer_unrevoke`, never a fresh invite, which is why the redeemer
-    /// maps it to its own control code rather than [`ERR_INVITE_REFUSED`]'s "ask for another".
+    /// The remedy is the inviter's `peer_unrevoke` — another invite redeemed presenting the same
+    /// identity is refused the same way — which is why the redeemer maps it to its own control code
+    /// rather than [`ERR_INVITE_REFUSED`]'s "ask for another".
     IdentityRevoked,
     /// A refusal kind this node predates. Never sent — only reached on receive.
     Unknown,
@@ -996,7 +999,7 @@ pub async fn handle_inviter_side(
             // did not, so `peer_revoke b64u:` was void the moment a fresh invite was minted: the
             // person's next device landed a row and a `services[].allow` grant that the gate then
             // refused — the caller told "paired", every session refused. Same store predicate
-            // the gate uses on the way in (`is_identity_revoked` over `is_user_revoked`).
+            // the gate uses on the way in (`PeerStore::admission`'s identity check).
             //
             // After the burn, like the post-redeem collision guard: the caller proved a live secret
             // AND a binding for this identity, so the coded truth discloses nothing it did not
@@ -1250,6 +1253,32 @@ pub async fn redeem_invite(
         ));
     }
 
+    // REVOCATION, REDEEMER SIDE (#218 review) — before the dial, before the secret is on the wire.
+    // An ordinary redemption writes a row for the inviter AND runs the #43 grant-back, appending
+    // its principal to every service this node serves; with the inviter revoked here, the row is
+    // one our own gate refuses, `pair` reported success, and a later `peer_unrevoke` would silently
+    // switch on grants this operator never deliberately made. `is_refused` covers what is knowable
+    // from the line: the inviter's endpoint, and the identity its existing row carries. Nothing is
+    // contacted, so the invite is untouched. A self-enrollment writes neither row nor grant.
+    //
+    // The code is `-32056` rather than a pairing code: its remedy ("`peer_unrevoke` here if the
+    // revocation was a mistake") is true for THIS node's operator, while `-32045` says the invite
+    // is dead and `-32057` says the OTHER side revoked you — both false here.
+    if !invite.as_self {
+        let (s, id) = (store.clone(), invite.inviter_id);
+        let refused = tokio::task::spawn_blocking(move || s.is_refused(&id))
+            .await
+            .context("join inviter revocation check")?;
+        if refused {
+            bail!(PairRefusal::new(
+                mcpmesh_local_api::ERR_PRINCIPAL_REVOKED,
+                "this inviter is revoked on this node, so pairing with it would write a row and \
+                 grants your own gate refuses — nothing was contacted and the invite is untouched. \
+                 Lift the revocation first (peer_unrevoke) if it was a mistake",
+            ));
+        }
+    }
+
     // Dial the inviter at the exact address the invite embeds — pairing needs no discovery
     // (the invite carries the dialable `EndpointAddr`, so this works on localhost too).
     let addr: iroh::EndpointAddr = serde_json::from_str(&invite.inviter_addr_json)
@@ -1410,6 +1439,28 @@ pub async fn redeem_invite(
         });
     }
 
+    // …and the identity the inviter PROVED in its reply (#218 review), which the line does not
+    // carry — so this one runs after the exchange: the invite is consumed, and the inviter may have
+    // recorded the pairing on its side. Nothing is written HERE: no row, no grant-back.
+    if let Some(uid) = inviter_user_id.clone() {
+        let s = store.clone();
+        let uid_r = uid.clone();
+        let revoked = tokio::task::spawn_blocking(move || s.is_user_revoked(&uid_r))
+            .await
+            .context("join inviter identity revocation check")?;
+        if revoked {
+            bail!(PairRefusal::new(
+                mcpmesh_local_api::ERR_PRINCIPAL_REVOKED,
+                format!(
+                    "the inviter proved identity '{uid}', which is revoked on this node — no row \
+                     and no grant were written here (the invite is consumed, and the inviter may \
+                     have recorded the pairing on its side). Lift the revocation first \
+                     (peer_unrevoke) if it was a mistake"
+                ),
+            ));
+        }
+    }
+
     // Returned to the redeemer in PairResult (#30) so it learns the peer's STABLE identity at
     // pair time — cloned before `inviter_user_id` is moved into the stored PeerEntry below.
     let peer_user_id = inviter_user_id.clone();
@@ -1527,7 +1578,7 @@ fn refusal_error(reason: &str, code: Option<RefusalCode>) -> anyhow::Error {
     match code {
         Some(RefusalCode::NicknameTaken) => anyhow::Error::new(NicknameTaken(msg)),
         // #218: the inviter revoked THIS identity. Its own code, because the remedy every other
-        // refusal implies — a fresh invite — is exactly what does not help here.
+        // refusal implies — a fresh invite — is refused the same way while the identity is presented.
         Some(RefusalCode::IdentityRevoked) => anyhow::Error::new(PairRefusal::new(
             mcpmesh_local_api::ERR_PAIR_IDENTITY_REVOKED,
             msg,
@@ -1693,9 +1744,15 @@ mod tests {
             mcpmesh_local_api::ERR_PAIR_IDENTITY_REVOKED,
             "its own code, not the opaque -32049"
         );
+        let msg = e.to_string();
         assert!(
-            e.to_string().contains("peer_unrevoke") && e.to_string().contains("fresh invite"),
-            "the message names the remedy and the non-remedy: {e:#}"
+            msg.contains("refuses any device presenting it") && msg.contains("peer_unrevoke"),
+            "the message says what is refused and who lifts it: {e:#}"
+        );
+        assert!(
+            !msg.contains("will not help") && !msg.contains("fresh invite"),
+            "and does not promise another invite fails — a person who stops presenting the \
+             identity is not refused by it: {e:#}"
         );
 
         // The neighbours are untouched: a kind this node predates, and no code at all, still

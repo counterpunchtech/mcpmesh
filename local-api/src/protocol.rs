@@ -774,6 +774,11 @@ pub struct PeerRevokeResult {
 }
 
 /// Params of [`Request::PeerUnrevoke`] (#85 ask 4).
+///
+/// A nickname or `eid:` lifts that device's ENDPOINT revocation and reports it in `unrevoked` —
+/// but under a standing IDENTITY revocation (`peer_revoke b64u:`) on the `user_id` its row carries,
+/// that re-admits nothing (#218, `api_minor >= 61`): the gate still refuses the device on the
+/// identity. Unrevoke the `b64u:` to restore every device of the person.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PeerUnrevokeParams {
@@ -2931,8 +2936,11 @@ pub const ERR_PRINCIPAL_REVOKED: i64 = -32056;
 /// session it opened was refused.
 ///
 /// The one `pair` refusal besides [`ERR_INVITER_MISMATCH`] that must NOT be rendered as "ask for a
-/// fresh invite": the invite was consumed, and a new one is refused the same way until the inviter
-/// lifts the revocation. Coded rather than folded into [`ERR_INVITE_REFUSED`] for the reason #147
+/// fresh invite": the invite was consumed, and any invite redeemed by a device presenting that
+/// identity is refused the same way until the inviter lifts the revocation. What it does NOT do:
+/// identity revocation refuses a device presenting the identity, and cannot stop a person who stops
+/// presenting the key — redeeming with no binding (or under a new user key) lands as an ordinary
+/// `eid:` pairing of an endpoint the inviter never revoked. Coded rather than folded into [`ERR_INVITE_REFUSED`] for the reason #147
 /// codes anything: a caller that has PROVEN a live secret may be told the truth (the redemption
 /// oracle that keeps `-32049` opaque is about unproven secrets), and the remedy differs from every
 /// other refusal's — it is on the other side of the wire.
@@ -3046,9 +3054,11 @@ pub const API_VERSION: &str = "1.61";
 /// began to hold at every site (#218): `pair` answers [`ERR_PAIR_IDENTITY_REVOKED`] when the
 /// inviter has revoked the redeemer's proven `user_id`, `peer_introduce` answers
 /// [`ERR_PRINCIPAL_REVOKED`] for a subject proving one this node revoked, and admission refuses
-/// any stored row carrying a revoked `user_id` — as does every OUTBOUND dial (`open_session`,
-/// `peer_services`, `peer_diagnostics`), which answers the same "REVOKED" refusal an
-/// endpoint-revoked device gets. Below 61 only device attestation consulted the
+/// any stored row carrying a revoked `user_id` — as does every OUTBOUND dial: `open_session`,
+/// `peer_services` and `peer_diagnostics` answer the same "REVOKED" refusal an endpoint-revoked
+/// device gets, and `pair` REDEEMING an invite from an inviter this node revoked (its endpoint, the
+/// identity its row carries, or the identity it proves in its reply) answers
+/// [`ERR_PRINCIPAL_REVOKED`] before writing a row or running the grant-back. Below 61 only device attestation consulted the
 /// identity table: a fresh invite (or an introduction) landed a row for the person's next device,
 /// the caller was told "paired", and the row's `services[].allow` grant was honoured — which is
 /// also why minor 60's "a `b64u:` hides only while EVERY device is refused" no longer holds: a

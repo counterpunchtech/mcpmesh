@@ -2396,6 +2396,178 @@ async fn a_revoked_identity_cannot_redeem_until_the_inviter_unrevokes_it() {
     .expect("revoked-identity redemption test timed out");
 }
 
+/// #218 review: the REDEEMER refuses an inviter it has revoked, before writing its row or running
+/// the #43 grant-back — two nodes, the real accept loop, the real `redeem_invite`.
+///
+/// Bob (the redeemer) has revoked Alice (the inviter). Before this, `pair` succeeded: Bob wrote a
+/// row his own gate refuses and granted Alice every service he serves, so a later `peer_unrevoke`
+/// would silently activate grants Bob never deliberately made. Three phases on ONE invite line
+/// where it survives:
+///
+/// 1. Alice's ENDPOINT revoked on Bob → refused `-32056` BEFORE the dial: no row, no grant, and
+///    the invite is untouched (proven by phase 2 reaching Alice with the same line).
+/// 2. Endpoint lifted, Alice's IDENTITY revoked on Bob → the line reaches Alice (so it was live),
+///    she proves her identity, Bob refuses `-32056`: no row, no grant.
+/// 3. Identity lifted → a fresh line pairs: row written, grant-back fires once.
+///
+/// Deleting the pre-dial check fails phase 1 (the redeem succeeds: Bob's identity table is clean);
+/// deleting the post-reply check fails phase 2.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_redeemer_refuses_an_inviter_it_has_revoked_before_writing_a_row_or_grant() {
+    timeout(Duration::from_secs(90), async {
+        // ---- Alice: a serving inviter presenting her self-sovereign binding ----
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let store = Arc::new(PeerStore::open(&dir.path().join("state.redb")).unwrap());
+        let gate: Arc<dyn TrustGate> = Arc::new(AllowlistGate::new(store.clone()));
+        let invites = Arc::new(LiveInvites::new());
+        let alice = inviter_endpoint().await;
+        let alice_id = *alice.id().as_bytes();
+        let alice_addr = alice.addr();
+        let (alice_uk, _) =
+            mcpmesh_trust::UserKey::load_or_generate(&dir.path().join("alice-user.key")).unwrap();
+        let alice_uid = mcpmesh_trust::binding::user_id(&alice_uk);
+        let (a_pk, a_sig) = mcpmesh_trust::binding::present(&alice_uk, &alice_id);
+        let cfg = Config::load(&config_path).unwrap();
+        let mesh = MeshState::new(
+            alice,
+            gate,
+            store,
+            invites.clone(),
+            "alice".into(),
+            config_path,
+            Arc::new(RosterGate::empty()),
+            Arc::new(ConnRegistry::new()),
+            None,
+            None,
+            None,
+            None,
+        );
+        mesh.set_self_binding(Some(SelfBinding {
+            user_pk: a_pk,
+            sig: a_sig,
+        }));
+        let task = spawn_accept_loop(mesh.clone(), Arc::new(build_services(&cfg)));
+        mesh.set_accept_task(task).await;
+        let mint = |secret: [u8; 32]| Invite {
+            secret,
+            inviter_id: alice_id,
+            inviter_addr_json: serde_json::to_string(&alice_addr).unwrap(),
+            nickname: "alice".into(),
+            services: vec!["notes".into()],
+            expires_at_epoch: FUTURE,
+            app_label: None,
+            uses_remaining: 1,
+            peer_nickname: None,
+            as_self: false,
+        };
+
+        // ---- Bob: the redeemer, with a recording grant-back ----
+        let bob = redeemer_endpoint().await;
+        let bob_dir = tempfile::tempdir().unwrap();
+        let bob_store = Arc::new(PeerStore::open(&bob_dir.path().join("state.redb")).unwrap());
+        let granted_back: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let redeem = |invite: Invite| {
+            let rec = granted_back.clone();
+            let grant_back: GrantBackFn = Box::new(move |principal, _display| {
+                let rec = rec.clone();
+                Box::pin(async move {
+                    rec.lock().unwrap().push(principal);
+                    Ok(())
+                })
+            });
+            redeem_invite(
+                bob.clone(),
+                "bob".into(),
+                invite.encode(),
+                None,
+                SelfEnroll::Refuse,
+                None,
+                bob_store.clone(),
+                None,
+                Some(grant_back),
+            )
+        };
+        let code_of = |e: &anyhow::Error| {
+            e.downcast_ref::<mcpmesh::pairing::rendezvous::PairRefusal>()
+                .map(|r| r.code())
+        };
+        let entry = |b: [u8; 32]| mcpmesh::allowlist::RevokedEntry {
+            endpoint_id: b,
+            revoked_at: 1,
+            reason: None,
+            source: "local".into(),
+            signer_user_id: None,
+            issued_at: None,
+        };
+        let nothing_written = |phase: &str| {
+            assert!(
+                bob_store.resolve(&alice_id).unwrap().is_none(),
+                "{phase}: no row for the inviter on the redeemer"
+            );
+            assert!(
+                granted_back.lock().unwrap().is_empty(),
+                "{phase}: no grant-back: {:?}",
+                granted_back.lock().unwrap()
+            );
+        };
+
+        // ---- Phase 1: Alice's ENDPOINT revoked on Bob ----
+        let first = mint([41u8; 32]);
+        invites.mint(first.clone()).await.unwrap();
+        bob_store.revoke(entry(alice_id)).unwrap();
+        let e = redeem(first.clone())
+            .await
+            .expect_err("a redeemer must not pair with an inviter it has revoked");
+        assert_eq!(
+            code_of(&e),
+            Some(mcpmesh_local_api::ERR_PRINCIPAL_REVOKED),
+            "{e:#}"
+        );
+        assert!(
+            e.to_string().contains("peer_unrevoke") && e.to_string().contains("untouched"),
+            "{e:#}"
+        );
+        nothing_written("endpoint revoked");
+
+        // ---- Phase 2: endpoint lifted, Alice's IDENTITY revoked on Bob — the SAME line ----
+        assert!(bob_store.unrevoke(&alice_id).unwrap());
+        bob_store
+            .revoke_user(&alice_uid, &entry([0u8; 32]))
+            .unwrap();
+        let e = redeem(first).await.expect_err(
+            "a redeemer must not pair with an inviter whose proven identity it revoked",
+        );
+        assert_eq!(
+            code_of(&e),
+            Some(mcpmesh_local_api::ERR_PRINCIPAL_REVOKED),
+            "the line reached Alice (phase 1 left it live) and Bob refused her identity: {e:#}"
+        );
+        assert!(
+            e.to_string().contains(&alice_uid),
+            "names the identity: {e:#}"
+        );
+        nothing_written("identity revoked");
+
+        // ---- Phase 3: identity lifted — a fresh line pairs ----
+        assert!(bob_store.unrevoke_user(&alice_uid).unwrap());
+        let second = mint([42u8; 32]);
+        invites.mint(second.clone()).await.unwrap();
+        redeem(second).await.expect("an unrevoked inviter pairs");
+        let row = bob_store
+            .resolve(&alice_id)
+            .unwrap()
+            .expect("the inviter's row is written");
+        assert_eq!(row.user_id.as_deref(), Some(alice_uid.as_str()));
+        assert_eq!(*granted_back.lock().unwrap(), vec![alice_uid.clone()]);
+
+        drop(bob_dir);
+        std::mem::forget(dir);
+    })
+    .await
+    .expect("redeemer-side revocation test timed out");
+}
+
 /// P3 negative (address-swap defense): the invite NAMES one inviter id, but its embedded ADDRESS
 /// routes to a DIFFERENT endpoint. `redeem_invite` verifies the TLS-authenticated peer id against
 /// the invite's `inviter_id` BEFORE sending the secret, so the mismatch bails — no entry written,
