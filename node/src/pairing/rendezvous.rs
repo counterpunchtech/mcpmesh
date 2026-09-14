@@ -485,7 +485,9 @@ pub struct InviterCtx {
     /// TLS-authenticated endpoint id. `None` when this daemon has no user key — there is then no
     /// identity to enroll into, and a self-enrollment is refused rather than silently completing.
     /// Also `None` when this node's identity changed since [`self_binding`](Self::self_binding) was
-    /// snapshotted (#221), so the signature always verifies under the `user_pk` the reply presents.
+    /// snapshotted, or when the key on disk is not the one behind that binding's `user_pk` (#221).
+    /// The daemon's implementation checks both under its user-key lock before signing, so a
+    /// `Some` verifies under the `user_pk` the reply presents.
     ///
     /// A hook rather than the key itself, so this module never learns where the key lives.
     pub sign_binding: SignBindingFn,
