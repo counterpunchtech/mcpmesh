@@ -250,48 +250,34 @@ impl PeerStore {
     /// that on every session. Fails CLOSED: any read error answers [`Admission::Refused`], as each
     /// of the composed reads did.
     pub fn admission(&self, endpoint_id: &[u8; 32]) -> Admission {
-        let read = || -> Result<Admission> {
-            let txn = self.db.begin_read()?;
-            if txn
-                .open_table(REVOKED)?
-                .get(endpoint_id.as_slice())?
-                .is_some()
-            {
-                return Ok(Admission::Refused);
-            }
-            let peers = txn.open_table(PEERS)?;
-            let Some(v) = peers.get(endpoint_id.as_slice())? else {
-                return Ok(Admission::Unpaired);
-            };
-            let entry = match serde_json::from_slice::<PeerEntry>(v.value()) {
-                Ok(entry) => entry,
-                Err(e) => {
-                    tracing::warn!(
-                        key_prefix = ?&endpoint_id[..8],
-                        error = %e,
-                        "corrupt peer entry for queried key; treating as unresolved (deny)"
-                    );
-                    return Ok(Admission::Unpaired);
-                }
-            };
-            if let Some(uid) = entry.user_id.as_deref()
-                && txn.open_table(REVOKED_USERS)?.get(uid)?.is_some()
-            {
-                return Ok(Admission::Refused);
-            }
-            Ok(Admission::Admitted(entry))
-        };
-        read().unwrap_or_else(|e| {
-            tracing::warn!(%e, "admission read failed; treating the endpoint as REVOKED (fail-closed)");
-            Admission::Refused
-        })
+        // ONE read transaction; `decide_admission` owns every decision, including what an error
+        // from each read means, so that mapping is testable with injected failures.
+        let txn = self.db.begin_read().map_err(anyhow::Error::from);
+        let txn = || txn.as_ref().map_err(|e| anyhow::anyhow!("{e:#}"));
+        decide_admission(
+            endpoint_id,
+            || {
+                Ok(txn()?
+                    .open_table(REVOKED)?
+                    .get(endpoint_id.as_slice())?
+                    .is_some())
+            },
+            || {
+                Ok(txn()?
+                    .open_table(PEERS)?
+                    .get(endpoint_id.as_slice())?
+                    .map(|v| v.value().to_vec()))
+            },
+            |uid| Ok(txn()?.open_table(REVOKED_USERS)?.get(uid)?.is_some()),
+        )
     }
 
     /// Is this endpoint REFUSED on revocation grounds — by the endpoint table, or by the identity
     /// its stored row carries (#218)? [`admission`](Self::admission) reduced to the question every
     /// endpoint-keyed "revoked" site asks: the gate's check-register recheck and sever, the
     /// `eid:` arm of `principal_is_revoked`, and every OUTBOUND dial filter, the redeemer's pair
-    /// dial included (#85 ask 4 made revocation two-way). A missing row is not refused — there is no identity to be revoked.
+    /// dial included (#85 ask 4 made revocation two-way). A missing row is not refused — there is
+    /// no identity to be revoked.
     pub fn is_refused(&self, endpoint_id: &[u8; 32]) -> bool {
         matches!(self.admission(endpoint_id), Admission::Refused)
     }
@@ -606,6 +592,54 @@ impl PeerStore {
         txn.commit()?;
         Ok(removed)
     }
+}
+
+/// [`PeerStore::admission`]'s decision over its three reads, each INJECTED as a `Result` so the
+/// fail-closed mapping is pinned without a corrupt database (#218 review): `endpoint_revoked` (is
+/// there a row in the endpoint revocation table), `pair_row` (the raw pair row, if any), and
+/// `identity_revoked` (is this `user_id` in the identity table). The reads are lazy and taken in
+/// precedence order, so a refused endpoint never reads its pair row.
+///
+/// **Any read error answers [`Admission::Refused`]** — from each of the three, not only the first.
+/// `Unpaired` also denies `AllowlistGate::resolve`, which is why that mapping looks harmless; it is
+/// not: `is_refused` would answer `false`, so the composed gate's rule 2 could still admit the
+/// endpoint through the roster, the outbound dial filters would dial it, and the check-register
+/// recheck and sever would keep its session.
+fn decide_admission(
+    endpoint_id: &[u8; 32],
+    endpoint_revoked: impl FnOnce() -> Result<bool>,
+    pair_row: impl FnOnce() -> Result<Option<Vec<u8>>>,
+    identity_revoked: impl FnOnce(&str) -> Result<bool>,
+) -> Admission {
+    let decide = || -> Result<Admission> {
+        if endpoint_revoked()? {
+            return Ok(Admission::Refused);
+        }
+        let Some(raw) = pair_row()? else {
+            return Ok(Admission::Unpaired);
+        };
+        let entry = match serde_json::from_slice::<PeerEntry>(&raw) {
+            Ok(entry) => entry,
+            Err(e) => {
+                tracing::warn!(
+                    key_prefix = ?&endpoint_id[..8],
+                    error = %e,
+                    "corrupt peer entry for queried key; treating as unresolved (deny)"
+                );
+                return Ok(Admission::Unpaired);
+            }
+        };
+        if let Some(uid) = entry.user_id.as_deref()
+            && identity_revoked(uid)?
+        {
+            return Ok(Admission::Refused);
+        }
+        Ok(Admission::Admitted(entry))
+    };
+    decide().unwrap_or_else(|e| {
+        tracing::warn!(%e, "admission read failed; treating the endpoint as REVOKED (fail-closed)");
+        Admission::Refused
+    })
 }
 
 /// The production trust gate: a [`TrustGate`] over the
@@ -1265,6 +1299,62 @@ mod tests {
         ] {
             assert_eq!(store.is_refused(&[b; 32]), refused, "is_refused([{b};32])");
         }
+    }
+
+    /// #218 review: `decide_admission` fails CLOSED on a read error from EACH of its three reads —
+    /// the endpoint table, the pair row, and the identity table. The store-level test above only
+    /// seeds an unreadable revocation ROW, whose read succeeds, so it could not tell an error mapped
+    /// to `Refused` from one mapped to `Unpaired`; every read here fails for real. Each injected
+    /// failure sits beside a fixture that would otherwise ADMIT (a live row, identity not revoked),
+    /// so `Refused` is caused by the error alone.
+    ///
+    /// Mapping the identity-read error to `Unpaired` fails the third assertion; mapping the whole
+    /// `unwrap_or_else` to `Unpaired` fails all three.
+    #[test]
+    fn decide_admission_refuses_on_a_read_error_from_each_table() {
+        let row = serde_json::to_vec(&PeerEntry {
+            endpoint_id: [5u8; 32],
+            nickname: "alice".into(),
+            services: vec![],
+            paired_at: None,
+            user_id: Some("b64u:alice".into()),
+            last_addr: None,
+        })
+        .unwrap();
+        let eid = [5u8; 32];
+        let boom = || anyhow::anyhow!("injected read failure");
+
+        // Control: the same reads, none failing, admit — so each `Refused` below is the error's.
+        assert!(matches!(
+            decide_admission(&eid, || Ok(false), || Ok(Some(row.clone())), |_| Ok(false)),
+            Admission::Admitted(_)
+        ));
+
+        assert_eq!(
+            decide_admission(
+                &eid,
+                || Err(boom()),
+                || Ok(Some(row.clone())),
+                |_| Ok(false)
+            ),
+            Admission::Refused,
+            "an endpoint-table read error refuses"
+        );
+        assert_eq!(
+            decide_admission(&eid, || Ok(false), || Err(boom()), |_| Ok(false)),
+            Admission::Refused,
+            "a pair-row read error refuses"
+        );
+        assert_eq!(
+            decide_admission(
+                &eid,
+                || Ok(false),
+                || Ok(Some(row.clone())),
+                |_| Err(boom())
+            ),
+            Admission::Refused,
+            "an identity-table read error refuses"
+        );
     }
 
     /// A revocation must survive a restart.

@@ -2408,10 +2408,15 @@ async fn a_revoked_identity_cannot_redeem_until_the_inviter_unrevokes_it() {
 ///    the invite is untouched (proven by phase 2 reaching Alice with the same line).
 /// 2. Endpoint lifted, Alice's IDENTITY revoked on Bob → the line reaches Alice (so it was live),
 ///    she proves her identity, Bob refuses `-32056`: no row, no grant.
-/// 3. Identity lifted → a fresh line pairs: row written, grant-back fires once.
+/// 2b. Identity still revoked, Bob holds a row carrying it for a second inviter node of Alice's
+///    that presents NO binding → refused `-32056` before the dial; the row is untouched and no
+///    grant-back runs.
+/// 3. Identity lifted → the 2b line (left live) pairs, and a fresh line pairs Alice's first node:
+///    rows written, exactly one grant-back per redeem.
 ///
 /// Deleting the pre-dial check fails phase 1 (the redeem succeeds: Bob's identity table is clean);
-/// deleting the post-reply check fails phase 2.
+/// deleting the post-reply check fails phase 2; narrowing the pre-dial check to the endpoint table
+/// (`is_refused` → `is_revoked`) fails phase 2b.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_redeemer_refuses_an_inviter_it_has_revoked_before_writing_a_row_or_grant() {
     timeout(Duration::from_secs(90), async {
@@ -2443,10 +2448,11 @@ async fn a_redeemer_refuses_an_inviter_it_has_revoked_before_writing_a_row_or_gr
             None,
             None,
         );
-        mesh.set_self_binding(Some(SelfBinding {
+        let alice_binding = SelfBinding {
             user_pk: a_pk,
             sig: a_sig,
-        }));
+        };
+        mesh.set_self_binding(Some(alice_binding.clone()));
         let task = spawn_accept_loop(mesh.clone(), Arc::new(build_services(&cfg)));
         mesh.set_accept_task(task).await;
         let mint = |secret: [u8; 32]| Invite {
@@ -2549,8 +2555,94 @@ async fn a_redeemer_refuses_an_inviter_it_has_revoked_before_writing_a_row_or_gr
         );
         nothing_written("identity revoked");
 
-        // ---- Phase 3: identity lifted — a fresh line pairs ----
+        // ---- Phase 2b: identity still revoked; a SECOND inviter node of Alice's that presents NO
+        // binding, and a row on Bob for it carrying her identity ----
+        // Nothing in the exchange names her identity, so the post-reply check has nothing to read;
+        // only the pre-dial check sees it, through the identity the EXISTING row carries. Without
+        // it the redeem succeeds, the merge keeps `user_id = b64u:alice` on the row, and the
+        // grant-back hands out the inviter's `eid:` — the bypass the review demonstrated. A second
+        // node because a daemon's binding is set once at boot and cannot be withdrawn mid-test.
+        let (alice2_invites, alice2_id, alice2_addr) = {
+            let dir2 = tempfile::tempdir().unwrap();
+            let config_path = dir2.path().join("config.toml");
+            let store = Arc::new(PeerStore::open(&dir2.path().join("state.redb")).unwrap());
+            let gate: Arc<dyn TrustGate> = Arc::new(AllowlistGate::new(store.clone()));
+            let invites = Arc::new(LiveInvites::new());
+            let ep = inviter_endpoint().await;
+            let (id, addr) = (*ep.id().as_bytes(), ep.addr());
+            let cfg = Config::load(&config_path).unwrap();
+            let mesh2 = MeshState::new(
+                ep,
+                gate,
+                store,
+                invites.clone(),
+                "alice".into(),
+                config_path,
+                Arc::new(RosterGate::empty()),
+                Arc::new(ConnRegistry::new()),
+                None,
+                None,
+                None,
+                None,
+            ); // no `set_self_binding`: this node presents no identity
+            let task = spawn_accept_loop(mesh2.clone(), Arc::new(build_services(&cfg)));
+            mesh2.set_accept_task(task).await;
+            std::mem::forget(dir2);
+            (invites, id, addr)
+        };
+        let seeded = mcpmesh::allowlist::PeerEntry {
+            endpoint_id: alice2_id,
+            nickname: "alice-2".into(),
+            services: vec![],
+            paired_at: None,
+            user_id: Some(alice_uid.clone()),
+            last_addr: None,
+        };
+        bob_store.add(seeded.clone()).unwrap();
+        assert!(
+            !bob_store.is_revoked(&alice2_id),
+            "fixture: no endpoint revocation — only the row's identity refuses"
+        );
+        let bindingless = Invite {
+            inviter_id: alice2_id,
+            inviter_addr_json: serde_json::to_string(&alice2_addr).unwrap(),
+            nickname: "alice-2".into(),
+            ..mint([43u8; 32])
+        };
+        alice2_invites.mint(bindingless.clone()).await.unwrap();
+        let e = redeem(bindingless.clone()).await.expect_err(
+            "an inviter whose stored identity is revoked must not pair, binding or not",
+        );
+        assert_eq!(
+            code_of(&e),
+            Some(mcpmesh_local_api::ERR_PRINCIPAL_REVOKED),
+            "refused before the dial: {e:#}"
+        );
+        assert_eq!(
+            bob_store.resolve(&alice2_id).unwrap(),
+            Some(seeded),
+            "the existing row is untouched — no merge, no paired_at stamp"
+        );
+        assert!(
+            granted_back.lock().unwrap().is_empty(),
+            "no grant-back: {:?}",
+            granted_back.lock().unwrap()
+        );
+
+        // ---- Phase 3: identity lifted — the 2b line was left live and pairs; a fresh line pairs
+        // Alice's binding-presenting node ----
         assert!(bob_store.unrevoke_user(&alice_uid).unwrap());
+        redeem(bindingless)
+            .await
+            .expect("an unrevoked inviter pairs, on the line the pre-dial refusal left live");
+        let row2 = bob_store
+            .resolve(&alice2_id)
+            .unwrap()
+            .expect("the binding-less inviter's row");
+        assert!(
+            row2.paired_at.is_some(),
+            "this redeem wrote the row: {row2:?}"
+        );
         let second = mint([42u8; 32]);
         invites.mint(second.clone()).await.unwrap();
         redeem(second).await.expect("an unrevoked inviter pairs");
@@ -2559,7 +2651,14 @@ async fn a_redeemer_refuses_an_inviter_it_has_revoked_before_writing_a_row_or_gr
             .unwrap()
             .expect("the inviter's row is written");
         assert_eq!(row.user_id.as_deref(), Some(alice_uid.as_str()));
-        assert_eq!(*granted_back.lock().unwrap(), vec![alice_uid.clone()]);
+        assert_eq!(
+            *granted_back.lock().unwrap(),
+            vec![
+                mcpmesh_net::EndpointId::from_bytes(alice2_id).principal(),
+                alice_uid.clone()
+            ],
+            "one grant-back per successful redeem, and only those"
+        );
 
         drop(bob_dir);
         std::mem::forget(dir);
