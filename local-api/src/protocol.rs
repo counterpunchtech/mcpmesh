@@ -1667,7 +1667,8 @@ pub enum Request {
     /// `"self_enroll_detach"`.
     ///
     /// Drops the adopted device→user binding, live and on disk, so this node goes back to
-    /// presenting its own boot-derived identity. The exit that self-enrollment otherwise lacks: an
+    /// presenting its own identity (imported, else boot-derived). The exit that self-enrollment
+    /// otherwise lacks: an
     /// enrolled device holds no user key, so `user_key_import` — the only other verb that clears
     /// the slot — is not available to it, and a person handed a substituted `mcpmesh-enroll:` line
     /// was permanently a device of a stranger's identity.
@@ -1985,8 +1986,8 @@ impl std::fmt::Debug for UserKeyExportResult {
 /// Result of [`Request::SelfEnrollDetach`] (#214).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SelfEnrollDetachResult {
-    /// The `b64u:` identity now in effect — this node's own, boot-derived one. What a UI shows to
-    /// confirm the exit took. `None` only when this node has no user key of its own: boot mints
+    /// The `b64u:` identity now in effect — this node's own (imported, else boot-derived). What a
+    /// UI shows to confirm the exit took. `None` only when this node has no user key of its own: boot mints
     /// one, so that is a boot that could NOT load or mint it (logged as a warning there) — the
     /// same condition under which `status.self_user_id` is absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3131,7 +3132,10 @@ pub const API_VERSION: &str = "1.61";
 /// machine, as the opaque `-32049`. Guard on `>= 60` before offering the detach; the two fields
 /// read `false` from an older daemon, which is wrong for exactly the case each exists to name
 /// (`self_user_key_held` for a key-holder, `self_enroll` for an enrollment row), so guard before
-/// rendering them; to 61 when an IDENTITY revocation (`peer_revoke b64u:`)
+/// rendering them. Crate-level, this one is a MINOR release of `mcpmesh-node` (0.53 → 0.54), not a
+/// patch: `InviterCtx::record_pairing`'s closure signature changed (`RecordPairingFn` now takes the
+/// whole `RecentPairing`) and `MeshState::recent_pairings` became `pub`, both on that crate's
+/// public surface; to 61 when an IDENTITY revocation (`peer_revoke b64u:`)
 /// began to hold at every site (#218): `pair` answers [`ERR_PAIR_IDENTITY_REVOKED`] when the
 /// inviter has revoked the redeemer's proven `user_id`, `peer_introduce` answers
 /// [`ERR_PRINCIPAL_REVOKED`] for a subject proving one this node revoked, and admission refuses

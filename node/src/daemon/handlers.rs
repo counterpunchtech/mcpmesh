@@ -2886,6 +2886,12 @@ pub(crate) async fn user_key_import(
 /// `user_key_import` tolerates that as best-effort because its live state is already the right
 /// identity; here the exit IS the verb, so a removal failure leaves the slot set and is the error.
 ///
+/// Idempotent ON DISK, not only live. A sidecar with no live adoption is reachable — an import
+/// removed it best-effort and only warned, or boot declined to present a file that did not verify
+/// for this endpoint — and in both cases the next boot re-reads it. So the "nothing adopted"
+/// refusal still removes a stale file first, and says so, rather than answering "already done"
+/// over a file that would undo the answer at the next restart.
+///
 /// Local only: it changes what this device PRESENTS, not what anyone believes. A peer that already
 /// learned this endpoint as that person's device still has; telling them is `device_revoke`, from
 /// the device that holds the key.
@@ -2893,7 +2899,8 @@ pub(crate) async fn self_enroll_detach(
     state: &DaemonState,
 ) -> Result<mcpmesh_local_api::SelfEnrollDetachResult> {
     let mesh = state.mesh_required()?;
-    // Serialized against `user_key_import`, the other writer of this slot and its sidecar.
+    // Serialized against `user_key_import` and `adopt_hook`, the other writers of this slot and
+    // its sidecar.
     let _guard = mesh.user_key_lock.lock().await;
     let Some(adopted) = mesh
         .adopted_binding
@@ -2901,26 +2908,25 @@ pub(crate) async fn self_enroll_detach(
         .expect("adopted_binding lock not poisoned")
         .clone()
     else {
+        let stale = remove_adopted_sidecar(mesh).await?;
+        let path = mesh.adopted_binding_path();
         anyhow::bail!(crate::pairing::rendezvous::PairRefusal::new(
             mcpmesh_local_api::ERR_NOT_ENROLLED,
-            "this device is not enrolled into another identity: there is no adopted binding to \
-             detach, and it already presents its own",
+            if stale {
+                format!(
+                    "this device is not enrolled into another identity, but a stale enrollment \
+                     file was left at {} (an earlier import or boot did not remove it) and has \
+                     been removed, so the next boot will not re-adopt it",
+                    path.display()
+                )
+            } else {
+                "this device is not enrolled into another identity: there is no adopted binding \
+                 to detach, and it already presents its own"
+                    .into()
+            },
         ));
     };
-    let sidecar = mesh.adopted_binding_path();
-    blocking("join adopted binding remove", move || {
-        match std::fs::remove_file(&sidecar) {
-            Ok(()) => Ok(()),
-            // A binding adopted live but never persisted (a write that failed after the install,
-            // or a fixture) still detaches: what matters is what boot will re-read, and nothing.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(anyhow::anyhow!(
-                "remove the adopted binding at {}: {e}",
-                sidecar.display()
-            )),
-        }
-    })
-    .await??;
+    remove_adopted_sidecar(mesh).await?;
     mesh.set_self_binding_live(None);
     // Audited like the adoption it undoes (`self_enroll_adopt`), keyed on the identity left.
     mesh.audit().record(AuditRecord::trust(
@@ -2939,6 +2945,26 @@ pub(crate) async fn self_enroll_detach(
         user_id,
         detached_from: adopted.user_pk,
     })
+}
+
+/// Remove the adopted-binding sidecar (#214). `Ok(true)` when a file was removed, `Ok(false)` when
+/// there was none — a binding adopted live but never persisted (`adopt_hook` writes before it
+/// installs, so that is a fixture, not a failed write) still detaches: what matters is what boot
+/// will re-read, and nothing. Any other error is the caller's error.
+async fn remove_adopted_sidecar(mesh: &Arc<MeshState>) -> Result<bool> {
+    let sidecar = mesh.adopted_binding_path();
+    blocking(
+        "join adopted binding remove",
+        move || match std::fs::remove_file(&sidecar) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(anyhow::anyhow!(
+                "remove the adopted binding at {}: {e}",
+                sidecar.display()
+            )),
+        },
+    )
+    .await?
 }
 
 #[cfg(test)]
@@ -4299,7 +4325,7 @@ mod tests {
         assert_eq!(
             mesh.self_binding().unwrap().user_pk,
             own_uid,
-            "the boot-derived identity is presented again, without a restart"
+            "this device's own identity is presented again, without a restart"
         );
         assert!(
             !mesh.adopted_binding_path().exists(),
@@ -4404,6 +4430,123 @@ mod tests {
         assert_eq!(out.detached_from, "b64u:third");
         assert!(!mesh.adopted_binding_path().exists());
         assert!(mesh.adopted_binding.read().expect("lock").is_none());
+    }
+
+    /// #214 review: a sidecar with NO live adoption is reachable (an import removes it
+    /// best-effort and only warns; boot leaves a file that does not verify), and the next boot
+    /// re-reads it. Detach must remove it even while answering "nothing adopted", or the answer is
+    /// undone at the next restart.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn self_enroll_detach_removes_a_stale_sidecar_even_when_nothing_is_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        mesh.set_user_key_path(dir.path().join("user.key"));
+        mesh.set_self_binding(Some(crate::pairing::rendezvous::SelfBinding {
+            user_pk: "b64u:own".into(),
+            sig: "b64u:sig".into(),
+        }));
+        let stale = mesh.adopted_binding_path();
+        std::fs::write(
+            &stale,
+            serde_json::to_vec(&crate::pairing::rendezvous::SelfBinding {
+                user_pk: "b64u:left-behind".into(),
+                sig: "b64u:sig".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(mesh.adopted_binding.read().expect("lock").is_none());
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+
+        let e = self_enroll_detach(&state)
+            .await
+            .expect_err("nothing is adopted LIVE, so the answer is still the coded refusal");
+        assert_eq!(
+            e.downcast_ref::<crate::pairing::rendezvous::PairRefusal>()
+                .map(|r| r.code()),
+            Some(mcpmesh_local_api::ERR_NOT_ENROLLED),
+            "{e:#}"
+        );
+        assert!(
+            !stale.exists(),
+            "the stale sidecar must be GONE — boot would have re-adopted it"
+        );
+        assert!(
+            format!("{e:#}").contains("stale enrollment file"),
+            "and the refusal must say a file was removed, since 'already done' was not true on \
+             disk: {e:#}"
+        );
+
+        // With nothing on disk either, the plain refusal.
+        let e = self_enroll_detach(&state)
+            .await
+            .expect_err("still nothing adopted");
+        assert!(
+            !format!("{e:#}").contains("stale"),
+            "no file, no claim that one was removed: {e:#}"
+        );
+    }
+
+    /// #214 review: import X, then adopt Y. The enrollment must WIN (`self_binding()` is Y,
+    /// `status` reports Y and `self_user_key_held: false`), and a detach must fall back to X — the
+    /// identity whose key is actually on disk — not the pre-import boot binding. The first version
+    /// let the imported slot outrank the adopted one, so the node presented X live while the
+    /// sidecar held Y and `self_user_key_held` contradicted `self_user_id`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_enrollment_supersedes_an_imported_key_and_a_detach_restores_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        let key_path = dir.path().join("user.key");
+        mesh.set_user_key_path(key_path.clone());
+        mesh.set_self_binding(Some(crate::pairing::rendezvous::SelfBinding {
+            user_pk: "b64u:boot".into(),
+            sig: "b64u:sig".into(),
+        }));
+        let _ = mesh.user_key_minted_at_boot.set(true);
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+
+        // Import X.
+        let (x, _) = mcpmesh_trust::UserKey::load_or_generate(&dir.path().join("x.key")).unwrap();
+        let x_uid = mcpmesh_trust::binding::user_id(&x);
+        let phrase = crate::pairing::recovery::encode(&x.signing_key().to_bytes());
+        let out = user_key_import(&state, phrase, false).await.unwrap();
+        assert_eq!(out.user_id, x_uid);
+        assert_eq!(mesh.self_binding().unwrap().user_pk, x_uid, "precondition");
+
+        // Adopt Y.
+        let y = crate::pairing::rendezvous::SelfBinding {
+            user_pk: "b64u:Y-someone-elses".into(),
+            sig: "b64u:sig".into(),
+        };
+        adopt_hook(&mesh)(y.clone()).await.unwrap();
+        assert_eq!(
+            mesh.self_binding().unwrap().user_pk,
+            y.user_pk,
+            "the enrollment is the most recent act and must be what this device presents"
+        );
+        let status = crate::control::status_result(&state).unwrap();
+        assert_eq!(status.self_user_id.as_deref(), Some(y.user_pk.as_str()));
+        assert!(
+            !status.self_user_key_held,
+            "enrolled: the key behind Y lives elsewhere, whatever is on disk"
+        );
+
+        // Detach → X, not the boot binding: X's key is the one on disk.
+        let out = self_enroll_detach(&state).await.unwrap();
+        assert_eq!(out.detached_from, y.user_pk);
+        assert_eq!(
+            out.user_id.as_deref(),
+            Some(x_uid.as_str()),
+            "the identity restored must be the IMPORTED one — its key is what `user.key` holds"
+        );
+        assert_eq!(mesh.self_binding().unwrap().user_pk, x_uid);
+        let status = crate::control::status_result(&state).unwrap();
+        assert_eq!(status.self_user_id.as_deref(), Some(x_uid.as_str()));
+        assert!(status.self_user_key_held);
     }
 
     /// #214 ask 3: `status.self_user_key_held` is the one field that tells an enrolled device from

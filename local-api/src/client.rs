@@ -678,7 +678,8 @@ impl ControlClient {
 
     /// DETACH this device from an identity it was enrolled into (#214) — the inverse of
     /// `pair_opts(.., allow_self_enroll: true)`. Drops the adopted binding live and on disk; the
-    /// node goes back to presenting its own boot-derived identity, returned as `user_id`.
+    /// node goes back to presenting its own identity (imported, else boot-derived), returned as
+    /// `user_id`.
     ///
     /// Local only: peers who already learned this endpoint as that person's device are not told —
     /// that is `device_revoke`, from the device holding the key. Refused with `ERR_NOT_ENROLLED`

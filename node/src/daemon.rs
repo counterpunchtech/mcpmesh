@@ -1220,20 +1220,12 @@ impl MeshState {
     /// A clone of this daemon's self-sovereign pairing identity, or `None` when unset (control-only /
     /// test daemon) or when this daemon has no user key. The pairing handlers present it to peers.
     pub(crate) fn self_binding(&self) -> Option<crate::pairing::rendezvous::SelfBinding> {
-        // An IMPORTED key wins over everything (#85 ask 2). It is the most recent explicit act, and
-        // unlike an adoption it means this device HOLDS the key — so it also supersedes any earlier
-        // enrollment, which `user_key_import` clears rather than leaving to out-rank it here.
-        if let Some(imported) = self
-            .imported_binding
-            .read()
-            .expect("imported_binding lock not poisoned")
-            .clone()
-        {
-            return Some(imported);
-        }
-        // An ADOPTED binding wins over the boot-derived one (#86): this device was enrolled into
-        // another device's identity, so presenting the locally-derived one would resolve it to a
-        // stranger again — the exact symptom the issue reports.
+        // The most recent explicit act wins. An ADOPTED binding outranks everything (#86, #214):
+        // this device was enrolled into another device's identity, so presenting its own — imported
+        // or boot-derived — would resolve it to a stranger again. An import CLEARS this slot
+        // (`set_imported_binding`), so the two never both apply; an adoption after an import does
+        // not clear the imported slot but outranks it, so `self_enroll_detach` falls back to the
+        // identity whose key is actually on disk rather than the pre-import boot one.
         if let Some(adopted) = self
             .adopted_binding
             .read()
@@ -1241,6 +1233,16 @@ impl MeshState {
             .clone()
         {
             return Some(adopted);
+        }
+        // An IMPORTED key wins over the boot-derived one (#85 ask 2): the `OnceLock` cannot be
+        // reset, and the key file on disk is now the imported one.
+        if let Some(imported) = self
+            .imported_binding
+            .read()
+            .expect("imported_binding lock not poisoned")
+            .clone()
+        {
+            return Some(imported);
         }
         self.self_binding.get().cloned().flatten()
     }
