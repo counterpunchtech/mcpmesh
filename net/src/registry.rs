@@ -75,10 +75,12 @@ pub struct Registration {
 
 impl Drop for Registration {
     fn drop(&mut self) {
+        // Recover from poison rather than `expect`: a Drop that panics while the thread is already
+        // unwinding (e.g. from a panic inside a closure run under this lock) aborts the process.
         self.registry
             .inner
             .lock()
-            .expect("conn registry mutex")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&self.id);
     }
 }
@@ -154,6 +156,14 @@ impl ConnTracker {
     /// Record that a session on this connection is being admitted as `principals`, returning the
     /// guard that un-records them when the session ends — or `None` to refuse the session.
     ///
+    /// **Not lock-free (a deliberate deviation from #222's "lock-free accept path").** Every admitted
+    /// session takes the registry mutex twice — here, and in [`AdmittedSession`]'s drop — each a
+    /// short synchronous section, never held across an `.await`. Lock order is registry mutex →
+    /// `LiveServices` read lock (the closure calls `LiveServices::get` under the mutex); nothing
+    /// takes them in the other order (`LiveServices::store` holds its write lock alone, and a sever
+    /// computes its predicate sets before locking). The mutex is what makes the admit atomic with
+    /// the sever; a lock-free record could not close the race below.
+    ///
     /// UNDER the registry lock every sever takes, `still_admitted` is evaluated (the caller re-reads
     /// the live service registry) and the principals are recorded — atomically. A revoke is
     /// swap-before-sever (#99), so either its sever runs after this record and finds the principal,
@@ -190,7 +200,14 @@ pub(crate) struct AdmittedSession {
 
 impl Drop for AdmittedSession {
     fn drop(&mut self) {
-        let mut map = self.registry.inner.lock().expect("conn registry mutex");
+        // Poison-tolerant for the same reason as `Registration::drop`: `admit_session` runs the
+        // caller's closure under this lock, so a panic there must not turn a later drop into an
+        // abort.
+        let mut map = self
+            .registry
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(tracked) = map.get_mut(&self.id) else {
             return; // the connection already deregistered
         };
@@ -512,5 +529,44 @@ mod tests {
         // The connection deregistered: an admit refuses rather than recording on a ghost.
         drop(registration);
         assert!(tracker.admit_session(vec!["x".into()], || true).is_none());
+    }
+
+    /// #222 review: a panic inside a closure run UNDER the registry lock (the admit recheck)
+    /// poisons the mutex; the RAII drops must still clean up rather than panic — a panicking Drop
+    /// during unwinding aborts the process.
+    #[tokio::test]
+    async fn guards_drop_cleanly_after_the_registry_mutex_is_poisoned() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        let (_keep, conn) = live_conn().await;
+        let registry = Arc::new(ConnRegistry::new());
+        let registration = registry
+            .register_checked(&conn, None, |_| false)
+            .expect("registers");
+        let tracker = registration.tracker(false);
+        let session = tracker
+            .admit_session(vec!["b64u:OLD".into()], || true)
+            .expect("admitted");
+
+        let poisoned = catch_unwind(AssertUnwindSafe(|| {
+            tracker.admit_session(vec!["x".into()], || {
+                panic!("recheck panicked under the lock")
+            })
+        }));
+        assert!(poisoned.is_err(), "setup: the closure panicked");
+        assert!(registry.inner.is_poisoned(), "setup: the mutex is poisoned");
+
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| drop(session))).is_ok(),
+            "AdmittedSession::drop must tolerate a poisoned registry mutex"
+        );
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| drop(registration))).is_ok(),
+            "Registration::drop must tolerate a poisoned registry mutex"
+        );
+        let map = registry
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(map.is_empty(), "the poisoned drops still deregistered");
     }
 }

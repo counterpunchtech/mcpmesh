@@ -109,7 +109,8 @@ async fn fixture(user_id: Option<&str>, private_allow: &str) -> Fixture {
     let toml = format!(
         "[services.echo]\nrun = ['{STUB}']\nallow = [\"{eid}\"]\n\
          \n[services.private]\nrun = ['{STUB}']\nallow = [\"{private_allow}\"]\n\
-         \n[services.carol]\nrun = ['{STUB}']\nallow = [\"carol\"]\n"
+         \n[services.carol]\nrun = ['{STUB}']\nallow = [\"carol\"]\n\
+         \n[services.team]\nrun = ['{STUB}']\nallow = [\"team-eng\"]\n"
     );
     let config_path = dir.path().join("config.toml");
     std::fs::write(&config_path, &toml).unwrap();
@@ -436,13 +437,23 @@ async fn a_revoke_severs_a_session_by_the_principal_it_was_admitted_as() {
 }
 
 fn mint_view(root: &SigningKey, serial: u64, devices: &[([u8; 32], &str)]) -> RosterView {
+    mint_view_in(root, serial, devices, "team-eng")
+}
+
+/// [`mint_view`] with every user in `group` (both `team-eng` and `team-ops` are declared).
+fn mint_view_in(
+    root: &SigningKey,
+    serial: u64,
+    devices: &[([u8; 32], &str)],
+    group: &str,
+) -> RosterView {
     let users = devices
         .iter()
         .map(|(eid, uid)| RosterUser {
             user_id: (*uid).into(),
             display_name: (*uid).into(),
             user_pk: encode_b64u(&[1u8; 32]),
-            groups: vec!["team-eng".into()],
+            groups: vec![group.into()],
             devices: vec![RosterDevice {
                 endpoint_id: encode_b64u(eid),
                 label: "device".into(),
@@ -458,7 +469,7 @@ fn mint_view(root: &SigningKey, serial: u64, devices: &[([u8; 32], &str)]) -> Ro
             serial,
             issued_at: "2000-01-01T00:00:00Z".into(),
             expires_at: "2999-01-01T00:00:00Z".into(),
-            groups: vec!["team-eng".into()],
+            groups: vec!["team-eng".into(), "team-ops".into()],
             users,
             revoked_endpoints: vec![],
             successor_root_pk: None,
@@ -521,4 +532,59 @@ async fn a_connection_that_gains_a_roster_identity_is_severed_when_the_roster_dr
     })
     .await
     .expect("roster promotion test timed out");
+}
+
+/// A revoke of a GROUP reaches a session admitted through that group after the device has moved to
+/// another group (#222 review). The registry must record the session's FULL principal set — groups
+/// included — because the current roster no longer maps `team-eng` to this device, so the
+/// endpoint lookup alone cuts nothing.
+#[tokio::test]
+async fn a_group_revoke_severs_a_session_admitted_through_the_group_it_has_since_left() {
+    timeout(Duration::from_secs(90), async {
+        let f = fixture(None, NEW).await;
+        let root = SigningKey::from_bytes(&[9u8; 32]);
+        let me = *f.dialer.id().as_bytes();
+        let other = [7u8; 32];
+        assert_eq!(
+            install_roster_view_and_sever(
+                &f.mesh,
+                mint_view_in(&root, 1, &[(me, "carol"), (other, "dave")], "team-eng"),
+            ),
+            0,
+            "setup: joining severs nothing"
+        );
+
+        let conn = dial(&f).await;
+        let mut session = open_session(&conn, "team").await;
+        let admitted = first_reply(&mut session).await;
+        assert!(
+            is_served(&admitted),
+            "setup: admitted via team-eng: {admitted}"
+        );
+
+        // The device moves to team-ops: still an active roster device, so nothing is severed.
+        assert_eq!(
+            install_roster_view_and_sever(
+                &f.mesh,
+                mint_view_in(&root, 2, &[(me, "carol"), (other, "dave")], "team-ops"),
+            ),
+            0,
+            "setup: a group move severs nothing"
+        );
+        assert!(conn.close_reason().is_none(), "setup: still connected");
+
+        revoke_service_allow(&f.mesh, "team".into(), "team-eng".into())
+            .await
+            .expect("revoke succeeds");
+        timeout(Duration::from_secs(5), conn.closed())
+            .await
+            .expect("revoking team-eng must sever the session admitted as team-eng");
+        let _ = session.send_value(tools_call_frame("after")).await;
+        let next = timeout(Duration::from_secs(5), session.recv_value())
+            .await
+            .expect("the severed session ends promptly");
+        assert!(!matches!(next, Ok(Some(_))), "{next:?}");
+    })
+    .await
+    .expect("group revoke test timed out");
 }

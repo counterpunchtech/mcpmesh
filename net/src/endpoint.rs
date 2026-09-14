@@ -454,6 +454,15 @@ fn still_admits(
 
 /// Drive one accepted session: enforce framing on the first frame, select a
 /// service, then attach the backend or refuse.
+///
+/// **Locks (#222).** The issue asked for a lock-free accept path; this is not quite that. Each
+/// session does short synchronous sections only, none held across an `.await`: `LiveServices` and
+/// roster-view `RwLock` reads, the peer store's redb read transactions (see
+/// `resolve_session_principal`), and — for an ADMITTED session — the `ConnRegistry` mutex twice
+/// (the admit recheck + record in `ConnTracker::admit_session`, and the un-record when the session
+/// ends), plus once more if the connection's roster discriminator is promoted. Lock order:
+/// registry mutex → `LiveServices` read lock. The mutex is the price of making the admit atomic
+/// with a revoke's sever.
 async fn run_session(
     recv: iroh::endpoint::RecvStream,
     send: iroh::endpoint::SendStream,
