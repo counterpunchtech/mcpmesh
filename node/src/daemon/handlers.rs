@@ -2397,7 +2397,8 @@ async fn sever_principal(mesh: &Arc<MeshState>, principal: &str) -> Result<usize
     sever_principals(mesh, std::slice::from_ref(&principal.to_string())).await
 }
 
-/// Close every live connection held by ANY of `principals`' devices, returning the number severed.
+/// Close every live connection held by ANY of `principals`' devices, or carrying a live session
+/// ADMITTED as one of them (#222 review), returning the number severed.
 ///
 /// The liveness half of a revoke (#54): stripping the config `allow` and swapping the live
 /// registry stop NEW sessions, but an in-flight session on an already-open connection keeps running
@@ -2419,7 +2420,7 @@ async fn sever_principal(mesh: &Arc<MeshState>, principal: &str) -> Result<usize
 /// those arms keeps its own gate), and the peer reconnects; documented in `docs/local-protocol.md`
 /// so it is not a surprise.
 ///
-/// A principal naming no device (or no live connection) severs nothing.
+/// A principal naming no device and admitting no live session severs nothing.
 async fn sever_principals(mesh: &Arc<MeshState>, principals: &[String]) -> Result<usize> {
     // #99: hand the observer the registry AS OF NOW — before any connection is cut. A caller that
     // severed before swapping would show a registry here that still admits the principal.
@@ -2446,13 +2447,16 @@ async fn sever_principals(mesh: &Arc<MeshState>, principals: &[String]) -> Resul
         anyhow::Ok(all)
     })
     .await??;
-    if targets.is_empty() {
-        return Ok(0);
-    }
-    Ok(mesh.conn_registry.sever_matching(
+    // Match on BOTH what the principal maps to NOW (the store/roster endpoints) AND what live
+    // sessions were ADMITTED as (#222 review). Sessions re-resolve their principal per session, so a
+    // device the store now calls `b64u:NEW` can still carry a session admitted as `b64u:OLD`; the
+    // endpoint lookup alone would sever nothing for a revoke of `b64u:OLD` while the verb reported
+    // success. No early return on empty `targets` for the same reason.
+    Ok(mesh.conn_registry.sever_matching_admitted(
         mcpmesh_net::CLOSE_UNAUTHORIZED, // 401 — "no longer authorized"
         b"access revoked",
-        |eid, _| targets.contains(eid),
+        |eid| targets.contains(eid),
+        |admitted_as| principals.iter().any(|p| p == admitted_as),
     ))
 }
 

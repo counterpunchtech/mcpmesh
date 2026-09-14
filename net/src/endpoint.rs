@@ -317,14 +317,16 @@ pub async fn run_mesh_connection(
     // 1. Accept-time trust gate — before any MCP traffic. `remote_id()` on a
     //    handshake-complete connection returns the peer id directly.
     let remote: EndpointId = conn.remote_id().into();
-    let Some(identity) = gate.resolve(&remote) else {
+    //    This resolve gates ACCEPTING the connection only; its identity is NOT kept — every
+    //    session re-resolves (#222, see `resolve_session_principal`).
+    if gate.resolve(&remote).is_none() {
         // Default-deny: refuse the stranger with a QUIC application close code
         // BEFORE opening any stream. No MCP frame is ever exchanged. The
         // EndpointId is deliberately NOT logged (surface-leak discipline).
         conn.close(CLOSE_UNAUTHORIZED.into(), b"unauthorized");
         tracing::debug!("refused unresolved peer (QUIC 401)");
         return;
-    };
+    }
     // CHECK-register the connection so a roster install that swapped the view between the
     // `resolve` above and here cannot leave a to-be-severed session live (the TOCTOU close — see the
     // registry module doc's three-case argument). The recheck runs UNDER the registry lock,
@@ -335,10 +337,10 @@ pub async fn run_mesh_connection(
     // time (`None` for a pairing-only peer) — NOT `identity.user_id`, which since the self-sovereign
     // device→user binding is also `Some` for a paired peer and would wrongly sever it. A `true` means
     // the endpoint must be severed per the live gate → self-close (QUIC 401) with no session and no
-    // registry entry. The returned RAII `_registration` is held for the whole accept_bi loop below
+    // registry entry. The returned RAII `registration` is held for the whole accept_bi loop below
     // and DEREGISTERS the connection when this fn returns (deregister-on-close, no leak).
     let roster_user = gate.roster_user(&remote);
-    let Some(_registration) = registry.register_checked(&conn, roster_user.clone(), |eid| {
+    let Some(registration) = registry.register_checked(&conn, roster_user.clone(), |eid| {
         gate.should_sever_now(eid, roster_user.as_deref())
     }) else {
         conn.close(CLOSE_UNAUTHORIZED.into(), b"unauthorized");
@@ -347,19 +349,67 @@ pub async fn run_mesh_connection(
     };
     // 2. Sessions: one bi-stream each; a connection may carry several.
     //    `accept_bi()` yields `(send, recv)`.
+    //
+    //    Nothing that feeds authorization is captured per connection (#222): each session
+    //    re-resolves the principal — and re-reads the live registry (#54) — inside `run_session`,
+    //    once its `initialize` has arrived. Before #222 the identity resolved above was cloned into
+    //    every session, so a principal change that does not sever (a re-pair rewriting `user_id`,
+    //    a device re-assigned, a group change) never reached an already-open connection.
+    let tracker = registration.tracker(roster_user.is_some());
     while let Ok((send, recv)) = conn.accept_bi().await {
-        // Read the LIVE registry PER SESSION (#54): a revoke landing between two sessions on
-        // this same connection is honored by the second one. Before this, each connection carried
-        // an `Arc<Services>` captured when the accept loop was spawned, so a revoked peer kept
-        // opening admitted sessions until it happened to disconnect.
-        let services = services.get();
-        let identity = identity.clone();
+        let gate = gate.clone();
+        let services = services.clone();
+        let tracker = tracker.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_session(recv, send, &identity, &services).await {
-                tracing::warn!(peer = %identity.name, %e, "session ended with error");
+            if let Err(e) = run_session(recv, send, &remote, &*gate, &services, &tracker).await {
+                tracing::warn!(%e, "session ended with error");
             }
         });
     }
+}
+
+/// Resolve the principal ONE session is authorized as, at the moment its `initialize` arrived
+/// (#222).
+///
+/// Through the SAME gate the connection-level check uses, so a re-pair rewriting `user_id`, a device
+/// re-assigned to another user, or a roster update moving a user between groups reaches the very
+/// next session on an already-open connection — none of those sever. `None` means the endpoint no
+/// longer resolves at all; the caller refuses the session exactly as an unauthorized service
+/// (-32054 on that stream), since the connection-level 401 has no per-stream form.
+///
+/// The roster discriminator is read on BOTH sides of `resolve` and promoted into the connection's
+/// registry entry before the session may be served — see
+/// [`ConnTracker`](crate::registry::ConnTracker). Reading it on both sides means `resolve` can
+/// only return a roster identity neither read observed if the roster view changed TWICE between the
+/// reads (rostered, then not — two installs, or an install plus a degraded-state flip). The
+/// connection-level check reads it once, after `resolve`, so a single change can slip between its
+/// two reads — harmless now that its identity authorizes no session.
+///
+/// A failed promotion refuses the session (fail closed) — including the benign race where the
+/// roster dropped the device between the two reads and `resolve` fell through to a still-valid pair
+/// identity; the next session resolves cleanly.
+///
+/// Sync on purpose: no lock or redb read transaction can be held across an `.await`. The work is
+/// the same class the connection-level check already does on the executor — in-memory `RwLock`
+/// reads of the roster view plus redb READ transactions on the peer store. For `ComposedGate` that
+/// is ONE for a rostered peer (`pairs.is_revoked`, then the roster answers) and THREE for a
+/// pairing peer (`pairs.is_revoked`, then `AllowlistGate::resolve`'s own `is_revoked` + `resolve`);
+/// a promotion adds `should_sever_now`'s. The blob provider does the same per request.
+fn resolve_session_principal(
+    remote: &EndpointId,
+    gate: &dyn TrustGate,
+    tracker: &crate::registry::ConnTracker,
+) -> Option<PeerIdentity> {
+    let roster_before = gate.roster_user(remote);
+    let identity = gate.resolve(remote)?;
+    let roster_user = roster_before.or_else(|| gate.roster_user(remote));
+    if !tracker.admit_roster_user(roster_user.as_deref(), |eid| {
+        gate.should_sever_now(eid, roster_user.as_deref())
+    }) {
+        tracing::debug!("refused a session whose roster promotion rechecked as severed");
+        return None;
+    }
+    Some(identity)
 }
 
 /// Does this service's `allow` list admit the resolved caller? The flat authorization namespace
@@ -385,16 +435,41 @@ fn caller_admits(identity: &PeerIdentity, allow: &[String]) -> bool {
     admitted
 }
 
+/// The admit recheck `run_session` runs UNDER the registry lock (#222 review): does the LIVE
+/// registry still admit `identity` to `name`? `true` without re-evaluating when nothing was swapped
+/// since `snapshot` was taken; otherwise the swapped-in registry decides (a revoke that landed
+/// between the snapshot and the admit refuses; an unrelated grant does not).
+fn still_admits(
+    live: &LiveServices,
+    snapshot: &Arc<Services>,
+    name: &str,
+    identity: &PeerIdentity,
+) -> bool {
+    let now = live.get();
+    Arc::ptr_eq(&now, snapshot)
+        || now
+            .get(name)
+            .is_some_and(|e| caller_admits(identity, &e.allow))
+}
+
 /// Drive one accepted session: enforce framing on the first frame, select a
 /// service, then attach the backend or refuse.
+///
+/// **Locks (#222).** The issue asked for a lock-free accept path; this is not quite that. Each
+/// session does short synchronous sections only, none held across an `.await`: `LiveServices` and
+/// roster-view `RwLock` reads, the peer store's redb read transactions (see
+/// `resolve_session_principal`), and — for an ADMITTED session — the `ConnRegistry` mutex twice
+/// (the admit recheck + record in `ConnTracker::admit_session`, and the un-record when the session
+/// ends), plus once more if the connection's roster discriminator is promoted. Lock order:
+/// registry mutex → `LiveServices` read lock. The mutex is the price of making the admit atomic
+/// with a revoke's sever.
 async fn run_session(
     recv: iroh::endpoint::RecvStream,
     send: iroh::endpoint::SendStream,
-    // Peer identity is resolved by the gate and threaded here: it is matched
-    // against each service's `allow` to compute the caller's admitted set, and
-    // the `_meta["mcpmesh/peer"]` injection reads it too.
-    identity: &PeerIdentity,
-    services: &Services,
+    remote: &EndpointId,
+    gate: &dyn TrustGate,
+    services: &LiveServices,
+    tracker: &crate::registry::ConnTracker,
 ) -> anyhow::Result<()> {
     let mut transport = SessionTransport::new(recv, send, MAX_FRAME_BYTES);
     let mut strikes = Strikes::default();
@@ -413,13 +488,49 @@ async fn run_session(
     // the user_id (`identity.user_id`, present for roster callers and bound pairing peers),
     // and group — so a roster caller named only by its user_id is admitted. The roster's
     // flat-namespace disjointness rule guarantees a group and a user_id never collide.
-    let allowed: Vec<String> = services
-        .iter()
-        .filter(|(_, e)| caller_admits(identity, &e.allow))
-        .map(|(name, _)| name.clone())
+    //
+    // BOTH inputs are read HERE, after `initialize` arrived — not when the stream was accepted. A
+    // dialer can open a stream with a partial frame and complete it later; a snapshot taken at
+    // accept would authorize that session against a principal (#222) or an allow list (#54) that
+    // has since changed. The principal is resolved per session through the connection-level gate
+    // and is the identity the backend's env/`_meta` injection receives, so the backend always sees
+    // the principal the session was authorized as.
+    let live = services;
+    let services = live.get();
+    let identity = resolve_session_principal(remote, gate, tracker);
+    let allowed: Vec<String> = match &identity {
+        Some(identity) => services
+            .iter()
+            .filter(|(_, e)| caller_admits(identity, &e.allow))
+            .map(|(name, _)| name.clone())
+            .collect(),
+        // No longer resolvable: nothing is admitted, so `select_service` refuses with the same
+        // -32054 an unauthorized service gets (no existence oracle, no connection close).
+        None => Vec::new(),
+    };
+    // Paired with the identity so a selection WITHOUT a resolved principal is unrepresentable (an
+    // empty `allowed` already refuses; this keeps a future change there from reaching a backend).
+    if let (ServiceDecision::Selected(name), Some(identity)) =
+        (select_service(&mut init, &allowed), identity)
+    {
+        // Record what this session is admitted AS on the connection's registry entry, so a revoke
+        // of that principal severs it even after the store has re-mapped the device to another
+        // principal (#222 review). Under the registry lock, the admit is re-checked against the
+        // LIVE registry: a revoke swaps before it severs (#99), so a swap this session's snapshot
+        // missed is seen here and the session is refused instead of escaping the sever.
+        let eid = identity.endpoint.principal();
+        let principals: Vec<String> = mcpmesh_local_api::principal_set(
+            Some(&eid),
+            identity.user_id.as_deref(),
+            &identity.groups,
+        )
+        .into_iter()
+        .map(str::to_string)
         .collect();
-    match select_service(&mut init, &allowed) {
-        ServiceDecision::Selected(name) => {
+        let admitted = tracker.admit_session(principals, || {
+            still_admits(live, &services, &name, &identity)
+        });
+        if let Some(_admitted) = admitted {
             let backend = services
                 .get(&name)
                 .expect("selected from registry")
@@ -428,27 +539,29 @@ async fn run_session(
             // Hand off: the backend owns the transport and its teardown. The
             // gate-resolved identity is threaded through `run` (per-caller), not
             // baked into the shared backend — it drives the backend's
-            // env/`_meta` injection. Every admitted session has a resolved
-            // identity post-gate.
-            backend.run(Some(identity.clone()), init, transport).await
-        }
-        ServiceDecision::Refuse => {
-            // Unknown or unauthorized — identical wording either way.
-            // Echo the initialize `id` when present.
-            let id = init.get("id").cloned().unwrap_or(Value::Null);
-            // Best-effort teardown: the refusal decision (-32054) is final, but a
-            // peer that already vanished must not turn a NORMAL refusal into a
-            // warn!("session ended with error"). Write + finish are advisory —
-            // same treatment `recv_frame` gives its own teardown writes.
-            let _ = transport
-                .send_value(synthesized(id, ERR_SERVICE, MSG_SERVICE))
-                .await;
-            // Finish the stream so the refusal frame flushes to the peer before
-            // the write half closes (a bare drop abandons buffered data).
-            let _ = transport.shutdown().await;
-            Ok(())
+            // env/`_meta` injection. `_admitted` is held until the session ends, then
+            // un-records its principals.
+            let peer = identity.name.clone();
+            return backend
+                .run(Some(identity), init, transport)
+                .await
+                .map_err(|e| e.context(format!("session for peer {peer}")));
         }
     }
+    // Unknown or unauthorized (or no longer resolvable, or revoked under the admit recheck) —
+    // identical wording either way. Echo the initialize `id` when present.
+    let id = init.get("id").cloned().unwrap_or(Value::Null);
+    // Best-effort teardown: the refusal decision (-32054) is final, but a
+    // peer that already vanished must not turn a NORMAL refusal into a
+    // warn!("session ended with error"). Write + finish are advisory —
+    // same treatment `recv_frame` gives its own teardown writes.
+    let _ = transport
+        .send_value(synthesized(id, ERR_SERVICE, MSG_SERVICE))
+        .await;
+    // Finish the stream so the refusal frame flushes to the peer before
+    // the write half closes (a bare drop abandons buffered data).
+    let _ = transport.shutdown().await;
+    Ok(())
 }
 
 /// Read the next MCP frame, enforcing the framing-violation protocol.
@@ -627,6 +740,44 @@ mod tests {
                 })
                 .collect(),
         )
+    }
+
+    /// #222 review: the admit recheck. The snapshot a session was selected under is still live →
+    /// admitted without re-evaluating; a swap that REVOKED this principal → refused; a swap that
+    /// changed something unrelated → admitted.
+    #[test]
+    fn still_admits_rereads_a_swapped_registry_and_only_that() {
+        let alice = PeerIdentity {
+            endpoint: EndpointId::from_bytes([1u8; 32]),
+            name: "alice".into(),
+            user_id: Some("b64u:OLD".into()),
+            groups: vec![],
+        };
+        let snapshot = Arc::new(registry(&[("private", &["b64u:OLD"])]));
+        let live = LiveServices::new(snapshot.clone());
+        assert!(still_admits(&live, &snapshot, "private", &alice));
+
+        // Same snapshot, even for a service it does not admit: nothing swapped, nothing to recheck.
+        assert!(still_admits(&live, &snapshot, "absent", &alice));
+
+        live.store(Arc::new(
+            snapshot
+                .with_allow_replaced("private", vec![])
+                .expect("present"),
+        ));
+        assert!(
+            !still_admits(&live, &snapshot, "private", &alice),
+            "a revoke swapped in after the snapshot must refuse the admit"
+        );
+
+        live.store(Arc::new(registry(&[
+            ("private", &["b64u:OLD"]),
+            ("other", &[]),
+        ])));
+        assert!(
+            still_admits(&live, &snapshot, "private", &alice),
+            "an unrelated swap must not refuse a still-admitted principal"
+        );
     }
 
     /// #94: replacing ONE service's allow leaves every other entry untouched — and reuses the
