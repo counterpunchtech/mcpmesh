@@ -2707,10 +2707,29 @@ where
 ///
 /// Errors when this node has no user key: there is nothing to export, and minting one here would
 /// hand back a phrase for an identity nobody has ever seen.
+///
+/// Refuses (`-32602`) on an ENROLLED device (#86, #219): the local key is not the identity this
+/// node presents, so its phrase would restore a stranger.
 pub(crate) async fn user_key_export(
     state: &DaemonState,
 ) -> Result<mcpmesh_local_api::UserKeyExportResult> {
     let mesh = state.mesh_required()?;
+    // #86 gate (#219): an ENROLLED device presents an identity it holds no key for. The LOCAL key
+    // boot minted underneath backs an identity no peer has ever paired with, so exporting it hands
+    // a person "backing up their identity" the wrong phrase — discovered only on the new hardware,
+    // as a stranger to every peer. Same predicate and shape as `peer_endorse`, checked BEFORE the
+    // key is read.
+    anyhow::ensure!(
+        mesh.adopted_binding
+            .read()
+            .expect("adopted_binding lock not poisoned")
+            .is_none(),
+        crate::control::InvalidParams(
+            "user_key_export: this device was enrolled into another device's identity (#86) and \
+             does not hold that user key. Export from the device that does."
+                .into()
+        )
+    );
     let _guard = mesh.user_key_lock.lock().await;
     let path = mesh
         .user_key_path
@@ -4255,6 +4274,78 @@ mod tests {
             (mesh.inviter_ctx().sign_binding)(subject.as_bytes()).is_none(),
             "an enrolled device must not sign a binding for a THIRD device — it would be for an \
              identity no peer has seen"
+        );
+    }
+
+    /// #219: `user_key_export` on an ENROLLED device must refuse, not hand back the LOCAL key.
+    ///
+    /// Boot always mints a local user key. On a device enrolled into someone else's identity
+    /// (#86) that key backs an identity no peer has ever paired with, and its `user_id` is not the
+    /// one the node presents. A person "backing up their identity" on that laptop would write down
+    /// the wrong phrase — and only find out on the new hardware, as a stranger to every peer.
+    ///
+    /// The same gate `peer_endorse` uses, checked BEFORE the key is read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_enrolled_device_refuses_to_export_the_local_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        let key_path = dir.path().join("user.key");
+        mesh.set_user_key_path(key_path.clone());
+        // The boot-minted LOCAL key and the binding derived from it — what an un-gated export
+        // would happily hand back.
+        let (local, _) = mcpmesh_trust::UserKey::load_or_generate(&key_path).unwrap();
+        let local_id = mcpmesh_trust::binding::user_id(&local);
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+
+        // Precondition: before enrollment the export works and names the local key, so the
+        // refusal below is the gate and not a broken fixture.
+        let before = user_key_export(&state)
+            .await
+            .expect("a device holding its own key exports it");
+        assert_eq!(before.user_id, local_id);
+
+        // Enroll this device into someone else's identity through the REAL adopt hook — the
+        // path a `mcpmesh-enroll:` redemption takes — so `adopted_binding` is set the way it is
+        // on a real enrolled device, and the key file still sits underneath.
+        adopt_hook(&mesh)(crate::pairing::rendezvous::SelfBinding {
+            user_pk: "b64u:someone-elses-identity".into(),
+            sig: "b64u:sig".into(),
+        })
+        .await
+        .expect("the hook persists and installs");
+        assert!(
+            key_path.exists(),
+            "the local boot key is still on disk underneath"
+        );
+        assert_ne!(
+            mesh.self_binding().expect("a binding").user_pk,
+            mcpmesh_trust::roster::encode_b64u(&local.public_bytes()),
+            "fixture: the presented identity is NOT the local key's"
+        );
+
+        // THE assertion: refused, with no phrase and no user_id in the answer.
+        let e = match user_key_export(&state).await {
+            Ok(out) => panic!(
+                "an enrolled device must refuse to export — it returned a phrase for {} instead \
+                 (the local key no peer has paired with)",
+                out.user_id
+            ),
+            Err(e) => e,
+        };
+        assert!(
+            e.downcast_ref::<crate::control::InvalidParams>().is_some(),
+            "the refusal must be the coded (-32602) one peer_endorse uses, not a bare failure: {e:#}"
+        );
+        let msg = format!("{e:#}");
+        assert!(
+            msg.contains("does not hold that user key") && msg.contains("#86"),
+            "and say WHY, in the same shape as peer_endorse: {msg}"
+        );
+        assert!(
+            !msg.contains(&local_id),
+            "the refusal must not leak the local user_id either: {msg}"
         );
     }
 
