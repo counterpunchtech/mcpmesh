@@ -884,6 +884,24 @@ pub async fn introduce_peer(
         }
     };
 
+    // IDENTITY REVOCATION, before anything is written (#218) — the question the gate asks of every
+    // row (`PeerStore::admission`) and redemption asks before its own write. A proven
+    // `user_id` this node has revoked would land a row the gate refuses on sight, with the caller
+    // told "installed". The same coded refusal as a grant to a revoked principal (#212): the same
+    // fact about the same table, and the same remedy. Checked on the PROVEN id only — an
+    // endorser cannot name one (above), so there is nothing else it could be checked on.
+    if let Some(uid) = verified_user_id.clone() {
+        let store = mesh.store.clone();
+        let revoked = blocking("join introduce revocation check", {
+            let uid = uid.clone();
+            move || store.is_user_revoked(&uid)
+        })
+        .await?;
+        if revoked {
+            anyhow::bail!(PrincipalRevoked(uid));
+        }
+    }
+
     // The same display-uniqueness guard pairing runs, for the same reason: a duplicate nickname
     // makes our own `<peer>/<service>` routing ambiguous (#87).
     let store = mesh.store.clone();
@@ -1818,7 +1836,7 @@ pub(crate) async fn resolve_peer_endpoint(mesh: &Arc<MeshState>, peer: &str) -> 
         // test for this guard, not by review. A direct device principal is the most precise way to
         // reach a revoked machine, so of the three selectors it is the one that most needed it.
         anyhow::ensure!(
-            !mesh.store.is_revoked(&eid),
+            !mesh.store.is_refused(&eid),
             "peer '{peer}' is REVOKED on this node"
         );
         return Ok(eid);
@@ -1843,7 +1861,7 @@ pub(crate) async fn resolve_peer_endpoint(mesh: &Arc<MeshState>, peer: &str) -> 
     // declared stolen. Checked here rather than at each caller — this is the one resolver they
     // share.
     anyhow::ensure!(
-        !mesh.store.is_revoked(&eid),
+        !mesh.store.is_refused(&eid),
         "peer '{peer}' is REVOKED on this node"
     );
     Ok(eid)
@@ -6408,6 +6426,113 @@ allow = []
         );
     }
 
+    /// #218: an IDENTITY revocation blocks the OUTBOUND direction for every device carrying it, on
+    /// the endpoint table's own terms — including a device whose endpoint row was lifted by a
+    /// per-device `peer_unrevoke`. The gate refuses that device inbound on the identity alone, so a
+    /// dial that still went out would be #85 ask 4's backwards verb again: the claim "not on any of
+    /// their machines" enforced one way, and the request handed over the other.
+    ///
+    /// Fixture: two devices of `b64u:mallory`, revoked as a person, then the laptop lifted by
+    /// nickname — its endpoint row is gone (asserted), the identity row stands (asserted). The
+    /// phone keeps its endpoint row, so the `b64u:` race has nothing to fall back on. The inverse:
+    /// `peer_unrevoke` on the identity restores the outbound path for both.
+    ///
+    /// Each outbound site reverted to `PeerStore::is_revoked` fails exactly one group: the `eid:`
+    /// arm of `resolve_peer_endpoint` (the `eid:` resolve), its tail (the nickname and `b64u:`
+    /// resolves), `refuse_if_revoked` (the nickname and `eid:` session dials), the `hinted_addrs`
+    /// filter (the `b64u:` race).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_revoked_identity_is_refused_on_the_outbound_path_even_after_a_device_unrevoke() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+        let (laptop, phone) = ([5u8; 32], [6u8; 32]);
+        let laptop_eid = mcpmesh_net::EndpointId::from_bytes(laptop).principal();
+        for (eid, nickname) in [(laptop, "mallory-laptop"), (phone, "mallory-phone")] {
+            mesh.store
+                .add(PeerEntry {
+                    endpoint_id: eid,
+                    nickname: nickname.into(),
+                    services: vec!["notes".into()],
+                    paired_at: None,
+                    user_id: Some("b64u:mallory".into()),
+                    last_addr: None,
+                })
+                .unwrap();
+        }
+        let unrevoke = |peer: &str| {
+            peer_unrevoke(
+                &state,
+                mcpmesh_local_api::PeerUnrevokeParams { peer: peer.into() },
+            )
+        };
+        peer_revoke(
+            &state,
+            mcpmesh_local_api::PeerRevokeParams {
+                peer: "b64u:mallory".into(),
+                reason: None,
+            },
+        )
+        .await
+        .unwrap();
+        unrevoke("mallory-laptop").await.unwrap();
+        assert!(
+            !mesh.store.is_revoked(&laptop),
+            "fixture: the laptop's endpoint row is lifted"
+        );
+        assert!(
+            mesh.store.is_user_revoked("b64u:mallory"),
+            "fixture: the identity row stands"
+        );
+        assert!(
+            mesh.gate.resolve(&laptop.into()).is_none(),
+            "fixture: the gate refuses the laptop inbound"
+        );
+
+        for sel in ["mallory-laptop", laptop_eid.as_str()] {
+            let e = resolve_peer_endpoint(&mesh, sel)
+                .await
+                .expect_err("a device of a revoked identity must not be resolved for a dial");
+            assert!(format!("{e:#}").contains("REVOKED"), "{sel}: {e:#}");
+            let e = match crate::daemon::dial::dial_service(&mesh, sel, "notes").await {
+                Ok(_) => panic!("dial_service must refuse a device of a revoked identity ({sel})"),
+                Err(e) => e,
+            };
+            assert!(format!("{e:#}").contains("REVOKED"), "{sel}: {e:#}");
+        }
+        // By identity: the shared resolver picks the first device (the laptop), and the session
+        // dial RACES both — so the race filter must drop the laptop too (the phone is still
+        // endpoint-revoked, leaving nothing). Bounded: a race that wrongly kept the laptop would
+        // dial an unreachable id.
+        let e = resolve_peer_endpoint(&mesh, "b64u:mallory")
+            .await
+            .expect_err("resolving by identity must refuse the laptop");
+        assert!(format!("{e:#}").contains("REVOKED"), "{e:#}");
+        let raced = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::daemon::dial::dial_service(&mesh, "b64u:mallory", "notes"),
+        )
+        .await
+        .expect("the refusal is immediate, not a dial timeout");
+        let e = match raced {
+            Ok(_) => panic!("the person race must refuse every device of a revoked identity"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{e:#}").contains("every device of that peer is REVOKED"),
+            "{e:#}"
+        );
+
+        unrevoke("b64u:mallory").await.unwrap();
+        for sel in ["mallory-laptop", "mallory-phone", "b64u:mallory"] {
+            resolve_peer_endpoint(&mesh, sel).await.unwrap_or_else(|e| {
+                panic!("unrevoking the identity restores the outbound path ({sel}): {e:#}")
+            });
+        }
+    }
+
     /// #212: `service_allow_grant` to a REVOKED principal is refused with a coded error BEFORE
     /// anything is written — config, ephemeral overlay, or the live registry. It used to succeed
     /// and mint an `allow` entry that admission would never honour.
@@ -6518,8 +6643,9 @@ allow = []
         );
         assert!(live_allow().contains(&alice_eid));
 
-        // Lifting the device revocation makes the eid: grantable again — the refusal was the
-        // table's state, not a permanent property of the principal.
+        // Lifting only the DEVICE revocation is not enough while the identity row stands: the gate
+        // refuses the device on the identity its row carries (#218), so the eid: is still revoked.
+        // (This test used to assert the opposite — it certified the #218 defect.)
         peer_unrevoke(
             &state,
             mcpmesh_local_api::PeerUnrevokeParams {
@@ -6528,10 +6654,283 @@ allow = []
         )
         .await
         .unwrap();
+        let e = grant_service_allow(&mesh, "kb".into(), mallory_eid.clone())
+            .await
+            .expect_err("a device of a still-revoked identity is not grantable");
+        assert!(e.downcast_ref::<PrincipalRevoked>().is_some(), "{e:#}");
+
+        // Lifting the identity makes the eid: grantable again — the refusal was the tables' state,
+        // not a permanent property of the principal.
+        peer_unrevoke(
+            &state,
+            mcpmesh_local_api::PeerUnrevokeParams {
+                peer: "b64u:mallory".into(),
+            },
+        )
+        .await
+        .unwrap();
         grant_service_allow(&mesh, "kb".into(), mallory_eid.clone())
             .await
             .expect("an unrevoked eid: is grantable");
         assert!(config_allow().contains(&mallory_eid));
+    }
+
+    /// #218: an introduction whose SUBJECT proves an identity this node has REVOKED is refused
+    /// with the coded `PrincipalRevoked` (`-32056` on the wire) before any row is written. It used
+    /// to install the row — the person's next device, exactly what `peer_revoke b64u:` meant to
+    /// refuse — and the gate then refused every session from it.
+    ///
+    /// Fixture: mallory is a person we paired with once (her laptop row carries her `user_id`),
+    /// revoked through the REAL `peer_revoke`; the phone is a NEW endpoint the endpoint table has
+    /// never seen, so the identity row alone must carry the refusal. Carol, a paired endorser,
+    /// vouches for the phone and mallory proves the identity with a fresh binding — every check
+    /// ahead of the revocation one passes. The inverse is pinned: `peer_unrevoke` on the identity
+    /// makes the same introduction succeed, and the gate admits the row it writes.
+    ///
+    /// Deleting the `is_user_revoked` check in `introduce_peer` fails the first `expect_err`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn introducing_a_revoked_identity_is_refused_until_it_is_unrevoked() {
+        use mcpmesh_local_api::PeerIntroduceParams;
+        use mcpmesh_trust::keys::UserKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+
+        let (carol, _) = UserKey::load_or_generate(&dir.path().join("carol.key")).unwrap();
+        let carol_uid = mcpmesh_trust::binding::user_id(&carol);
+        let (mallory, _) = UserKey::load_or_generate(&dir.path().join("mallory.key")).unwrap();
+        let mallory_uid = mcpmesh_trust::binding::user_id(&mallory);
+        let laptop = iroh::SecretKey::from_bytes(&[0xA1; 32]).public();
+        for (eid, nickname, uid) in [
+            ([0xC0; 32], "carol", &carol_uid),
+            (*laptop.as_bytes(), "mallory", &mallory_uid),
+        ] {
+            mesh.store
+                .add(PeerEntry {
+                    endpoint_id: eid,
+                    nickname: nickname.into(),
+                    services: vec![],
+                    paired_at: Some("1".into()),
+                    user_id: Some(uid.clone()),
+                    last_addr: None,
+                })
+                .unwrap();
+        }
+        peer_revoke(
+            &state,
+            mcpmesh_local_api::PeerRevokeParams {
+                peer: mallory_uid.clone(),
+                reason: Some("left the team".into()),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            mesh.store.is_user_revoked(&mallory_uid),
+            "fixture: the identity row is written"
+        );
+
+        let phone = iroh::SecretKey::from_bytes(&[0xA2; 32]).public();
+        let phone_eid = *phone.as_bytes();
+        assert!(
+            !mesh.store.is_revoked(&phone_eid),
+            "fixture: the phone is unknown to the endpoint table — the identity row alone refuses"
+        );
+        let params = || PeerIntroduceParams {
+            subject: phone.to_string(),
+            endorsed_by: carol_uid.clone(),
+            evidence: mcpmesh_trust::binding::endorse(&carol, &phone_eid, Some(&mallory_uid))
+                .unwrap(),
+            subject_user_id: Some(mallory_uid.clone()),
+            subject_binding: Some(mcpmesh_trust::binding::present(&mallory, &phone_eid).1),
+            nickname: "mallory-phone".into(),
+        };
+
+        let e = introduce_peer(&state, params())
+            .await
+            .expect_err("a subject proving a revoked identity must be refused");
+        let refusal = e.downcast_ref::<PrincipalRevoked>().unwrap_or_else(|| {
+            panic!("the refusal must be the coded PrincipalRevoked, got: {e:#}")
+        });
+        assert_eq!(refusal.0, mallory_uid, "the refusal names the identity");
+        assert!(
+            mesh.store.resolve(&phone_eid).unwrap().is_none(),
+            "nothing written"
+        );
+
+        // The same refusal on the wire, with the code a consumer branches on.
+        let req = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "peer_introduce",
+            "params": serde_json::to_value(params()).unwrap()
+        });
+        let r = crate::control::handle_request(&req, &state).await;
+        assert_eq!(
+            r["error"]["code"],
+            mcpmesh_local_api::ERR_PRINCIPAL_REVOKED,
+            "peer_introduce must answer -32056 for a revoked identity, got: {r}"
+        );
+        assert!(
+            r["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("peer_unrevoke"),
+            "the message names the remedy: {r}"
+        );
+        assert!(mesh.store.resolve(&phone_eid).unwrap().is_none());
+
+        // The other side of the boundary: a subject proving NO identity is not this check's
+        // concern, and carol's power to introduce is untouched by mallory's revocation.
+        let dave = iroh::SecretKey::from_bytes(&[0xDA; 32]).public();
+        introduce_peer(
+            &state,
+            PeerIntroduceParams {
+                subject: dave.to_string(),
+                endorsed_by: carol_uid.clone(),
+                evidence: mcpmesh_trust::binding::endorse(&carol, dave.as_bytes(), None).unwrap(),
+                subject_user_id: None,
+                subject_binding: None,
+                nickname: "dave".into(),
+            },
+        )
+        .await
+        .expect("an identity-less subject is introduced as before");
+
+        // The inverse: lifting the IDENTITY revocation makes the same introduction land, and the
+        // gate admits the row it writes.
+        peer_unrevoke(
+            &state,
+            mcpmesh_local_api::PeerUnrevokeParams {
+                peer: mallory_uid.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        introduce_peer(&state, params())
+            .await
+            .expect("an unrevoked identity is introducible again");
+        let row = mesh
+            .store
+            .resolve(&phone_eid)
+            .unwrap()
+            .expect("the phone is installed");
+        assert_eq!(row.user_id.as_deref(), Some(mallory_uid.as_str()));
+        assert!(
+            mesh.gate.resolve(&phone_eid.into()).is_some(),
+            "and admission agrees"
+        );
+    }
+
+    /// #218 review: an `eid:` naming a device whose ROW carries a revoked identity is revoked —
+    /// by the predicate, on `status`, and on `service_allow_grant` — because the gate refuses that
+    /// device. The `eid:` arm used to read only the endpoint table, so in exactly the state a
+    /// per-device `peer_unrevoke` leaves (identity row, no endpoint row) `status` showed the grant
+    /// and the grant verb accepted a fresh one while every session was refused.
+    ///
+    /// Fixture: the laptop [5;32] carries `b64u:mallory`, and the identity is revoked with NO
+    /// endpoint revocation (asserted); alice [6;32] is the live side of the boundary, granted in
+    /// the same service. Inverse: lifting the identity restores all three answers.
+    ///
+    /// Reverting the `eid:` arm of `principal_is_revoked` to `PeerStore::is_revoked` fails the
+    /// first assertion, and the `status` / wire assertions after it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_eid_of_a_device_carrying_a_revoked_identity_is_revoked_everywhere_admission_says() {
+        let laptop = mcpmesh_net::EndpointId::from_bytes([5u8; 32]).principal();
+        let alice = mcpmesh_net::EndpointId::from_bytes([6u8; 32]).principal();
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[services.kb]\nsocket = \"/run/kb.sock\"\nallow = [\"{laptop}\", \"{alice}\"]\n"
+            ),
+        )
+        .unwrap();
+        let mesh = hermetic_mesh(config_path.clone()).await;
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+        for (b, nickname, uid) in [
+            (5u8, "mallory-laptop", "b64u:mallory"),
+            (6, "alice", "b64u:alice"),
+        ] {
+            mesh.store
+                .add(PeerEntry {
+                    endpoint_id: [b; 32],
+                    nickname: nickname.into(),
+                    services: vec![],
+                    paired_at: None,
+                    user_id: Some(uid.into()),
+                    last_addr: None,
+                })
+                .unwrap();
+        }
+        mesh.store
+            .revoke_user(
+                "b64u:mallory",
+                &crate::allowlist::RevokedEntry {
+                    endpoint_id: [0u8; 32],
+                    revoked_at: 1,
+                    reason: None,
+                    source: "local".into(),
+                    signer_user_id: None,
+                    issued_at: None,
+                },
+            )
+            .unwrap();
+        assert!(
+            !mesh.store.is_revoked(&[5u8; 32]),
+            "fixture: no ENDPOINT revocation — the identity row alone must carry this"
+        );
+        assert!(
+            mesh.gate.resolve(&[5u8; 32].into()).is_none(),
+            "fixture: the gate refuses the laptop"
+        );
+        let kb_allow = || {
+            crate::control::status_result(&state)
+                .unwrap()
+                .services
+                .into_iter()
+                .find(|s| s.name == "kb")
+                .expect("kb service in status")
+                .allow
+        };
+        let grant = |principal: &str, id: u64| {
+            let req = serde_json::json!({
+                "jsonrpc": "2.0", "id": id, "method": "service_allow_grant",
+                "params": {"service": "kb", "principal": principal}
+            });
+            let state = &state;
+            async move { crate::control::handle_request(&req, state).await }
+        };
+
+        assert!(
+            principal_is_revoked(&mesh.store, None, &laptop),
+            "the eid: of a device the gate refuses on its identity is revoked"
+        );
+        assert!(!principal_is_revoked(&mesh.store, None, &alice));
+        assert_eq!(
+            kb_allow(),
+            vec![alice.clone()],
+            "status hides only the laptop"
+        );
+        let r = grant(&laptop, 1).await;
+        assert_eq!(
+            r["error"]["code"],
+            mcpmesh_local_api::ERR_PRINCIPAL_REVOKED,
+            "a grant to it is refused -32056, got: {r}"
+        );
+        let r = grant(&alice, 2).await;
+        assert!(r.get("error").is_none(), "alice is granted as before: {r}");
+
+        assert!(mesh.store.unrevoke_user("b64u:mallory").unwrap());
+        assert!(!principal_is_revoked(&mesh.store, None, &laptop));
+        assert_eq!(kb_allow(), vec![laptop.clone(), alice.clone()]);
+        let r = grant(&laptop, 3).await;
+        assert!(
+            r.get("error").is_none(),
+            "an unrevoked identity's device is grantable: {r}"
+        );
     }
 
     /// #212: the refusal reaches the wire as `-32056` (`ERR_PRINCIPAL_REVOKED`), not `-32000` —
@@ -6689,9 +7088,10 @@ fn principal_to_endpoint(principal: &str) -> Option<mcpmesh_net::EndpointId> {
     Some(mcpmesh_net::EndpointId::from_bytes(arr))
 }
 
-/// `service_allow_grant` named a principal this node has REVOKED (#212). A distinct error type so
-/// `respond` can map it to [`ERR_PRINCIPAL_REVOKED`](mcpmesh_local_api::ERR_PRINCIPAL_REVOKED) —
-/// the same `downcast_ref` idiom [`NoSuchService`] uses.
+/// `service_allow_grant` (#212) or `peer_introduce` (#218) named a principal this node has
+/// REVOKED. A distinct error type so `respond` can map it to
+/// [`ERR_PRINCIPAL_REVOKED`](mcpmesh_local_api::ERR_PRINCIPAL_REVOKED) — the same `downcast_ref`
+/// idiom [`NoSuchService`] uses.
 #[derive(Debug)]
 pub struct PrincipalRevoked(pub String);
 
@@ -6699,8 +7099,8 @@ impl std::fmt::Display for PrincipalRevoked {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "principal '{}' is revoked on this node, so a grant would admit nobody — nothing was \
-             written. Lift the revocation first (peer_unrevoke) if it was a mistake",
+            "principal '{}' is revoked on this node, so a row or grant for it would admit nobody — \
+             nothing was written. Lift the revocation first (peer_unrevoke) if it was a mistake",
             self.0
         )
     }
@@ -6714,26 +7114,28 @@ impl std::error::Error for PrincipalRevoked {}
 /// call. It is never wider than admission (nothing it calls revoked is admitted); it can be
 /// narrower in one roster-masked corner — a device paired with `user_id = b64u:x` that is ALSO in
 /// the installed roster resolves to its ROSTER identity, so a `b64u:x` entry never admits it
-/// while the roster is live, yet this predicate reports the entry as honoured.
+/// while the roster is live, yet this predicate reports the entry as honoured. A second, #218's:
+/// a ROSTERED device whose roster `user_id` is spelled as a revoked `b64u:` identity is refused by
+/// the composed gate's rule 2, and an `eid:` entry naming it still shows — the roster view can be
+/// degraded, and then the gate falls through to the pair row instead, so reporting it revoked here
+/// would make this predicate WIDER than admission, which is the direction it must never err in.
 ///
-/// - an **`eid:`** is revoked iff its endpoint is in the pairing revocation table
-///   ([`PeerStore::is_revoked`]) or the installed roster's `revoked_endpoints` — the two sources
-///   `ComposedGate::resolve` consults first, before any service authz runs. The entry is PARSED
+/// - an **`eid:`** is revoked iff [`PeerStore::is_refused`] refuses its endpoint — the endpoint
+///   revocation table, or (#218) the identity its stored row carries — or the installed roster's
+///   `revoked_endpoints`: the sources `ComposedGate::resolve` consults first, before any service
+///   authz runs. Before this, only the endpoint table was read, so after `peer_revoke b64u:x` and a
+///   per-device `peer_unrevoke`, the gate refused the device while `status` showed its `eid:` as
+///   granted and `service_allow_grant` accepted it. The entry is PARSED
 ///   with the strict inverse of `EndpointId::principal` rather than compared as a string, so the
 ///   lookup is the same byte-keyed read the gate performs; a string that is not that exact
 ///   rendering admits nobody in the first place and is not this predicate's concern.
 /// - a **`b64u:`** identity is revoked iff `peer_revoke` revoked the PERSON
-///   ([`PeerStore::is_user_revoked`]) AND none of the devices that identity still names
-///   ([`endpoints_for_principal`]) is admitted. The second clause matters: `peer_unrevoke` on ONE
-///   device (by nickname) lifts that endpoint's row and leaves the identity row, and the gate then
-///   admits that device through its pair row's `user_id` — so a `b64u:` entry is honoured again
-///   and must show. Note what the identity row does NOT do: only the ATTESTATION branch of
-///   pairing checks it (`rendezvous.rs`, `is_user_revoked`); an ordinary invite redemption and
-///   `peer_introduce` both write a pair row carrying a revoked `b64u:` with no identity check,
-///   and `AllowlistGate::resolve` never consults the identity table. So a freshly paired device
-///   of a revoked identity is ADMITTED, and because this predicate re-reads the live rows the
-///   `b64u:` grant correctly reappears with it. That gate gap is tracked in #218; this
-///   predicate reports admission as it is, not as it should be.
+///   ([`PeerStore::is_user_revoked`]). Since #218 that is the whole answer: the gate refuses every
+///   row carrying a revoked `user_id` ([`PeerStore::admission`], consulted at every entry
+///   point), and redemption and `peer_introduce` refuse to write one. #212 first shipped this
+///   arm with a second clause — "AND none of its known devices is admitted" — because the gate of
+///   the day admitted a per-device-unrevoked row through its pair row; that gate was the #218
+///   defect, and the clause described it rather than the intent.
 /// - a **bare** entry (a roster group, a roster `user_id`, a legacy nickname) is never revoked here:
 ///   roster membership is withdrawn by roster INSTALL, which rebuilds the view, not by this table.
 ///
@@ -6744,22 +7146,11 @@ pub(crate) fn principal_is_revoked(
     roster: Option<&mcpmesh_trust::roster::validate::RosterView>,
     principal: &str,
 ) -> bool {
-    let endpoint_refused = |id: &mcpmesh_net::EndpointId| {
-        store.is_revoked(id.as_bytes()) || roster.is_some_and(|v| v.is_revoked(id.as_bytes()))
-    };
     if let Some(id) = principal_to_endpoint(principal) {
-        return endpoint_refused(&id);
+        return store.is_refused(id.as_bytes())
+            || roster.is_some_and(|v| v.is_revoked(id.as_bytes()));
     }
-    if principal.starts_with("b64u:") && store.is_user_revoked(principal) {
-        return match super::sever::endpoints_for_principal(store, roster, principal) {
-            Ok(devices) => devices.iter().all(endpoint_refused),
-            Err(e) => {
-                tracing::warn!(%e, principal, "peer store read failed; treating the identity as revoked (default-deny)");
-                true
-            }
-        };
-    }
-    false
+    principal.starts_with("b64u:") && store.is_user_revoked(principal)
 }
 
 /// The `mcpmesh-revoke:` token scheme, mirroring `mcpmesh-invite:` / `mcpmesh-enroll:`.
@@ -6914,7 +7305,14 @@ pub async fn peer_revoke(
     // the ones already established, which would otherwise run for as long as the peer kept them —
     // unbounded for a warm MCP session.
     let principals: Vec<String> = targets.iter().map(|e| e.principal()).collect();
-    let severed = sever_principals(mesh, &principals).await?;
+    // A `b64u:` is ALSO severed as itself (#218), re-enumerated here, AFTER the writes. `targets`
+    // was computed before them, so a device that paired with this identity in between (a
+    // redemption or introduction landing mid-revoke) would hold a live session nobody cuts. The
+    // gate refuses it from the identity row onward, and `sever_principals` resolves the identity to
+    // every row carrying it now.
+    let mut sever: Vec<String> = principals.clone();
+    sever.extend(revoked_user.clone());
+    let severed = sever_principals(mesh, &sever).await?;
 
     for p in &principals {
         mesh.audit().record(AuditRecord::trust(

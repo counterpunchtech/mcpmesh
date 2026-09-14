@@ -648,14 +648,18 @@ mod tests {
         );
     }
 
-    /// #212: a `b64u:` entry hides only while admission refuses EVERY device it names. `peer_unrevoke`
-    /// by nickname lifts one device's row and leaves the identity row; the gate then admits that
-    /// device through its pair row's `user_id`, so the grant is honoured again and must show.
+    /// #212 + #218: a `b64u:` entry hides exactly while the IDENTITY is revoked, and `status` and
+    /// the gate agree at every step. `peer_unrevoke` by nickname lifts one device's ENDPOINT row
+    /// and leaves the identity row — and since #218 the gate refuses that device on the identity
+    /// row alone, so the grant must stay hidden (under #212's original clause it reappeared here,
+    /// which was true of a gate that never consulted `is_user_revoked`). Only `peer_unrevoke` on
+    /// the identity restores both: the grant shows, and EVERY device resolves again.
     ///
-    /// Deleting the "every device refused" clause in `principal_is_revoked` fails this: the
-    /// identity row alone would keep hiding a grant a live session gets.
+    /// Asserted through the real gate (`mesh.gate.resolve`) beside the status filter, so the two
+    /// cannot be shown agreeing on the wrong answer. Restoring #212's "every device refused"
+    /// clause in `principal_is_revoked` fails the `is_empty` after the per-device unrevoke.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_user_grant_reappears_once_one_of_their_devices_is_admitted_again() {
+    async fn a_user_grant_stays_hidden_until_the_identity_itself_is_unrevoked() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
         std::fs::write(
@@ -701,10 +705,11 @@ mod tests {
             kb_allow().is_empty(),
             "both devices and the identity are refused — nothing is granted"
         );
+        let admits = |b: u8| mesh.gate.resolve(&[b; 32].into()).is_some();
+        assert!(!admits(3) && !admits(4), "the gate refuses both devices");
 
-        // Lift ONE device. The identity row stays (`status.revoked` still lists it), but the
-        // phone's pair row now resolves with `user_id = b64u:mallory`, and `caller_admits` matches
-        // that against the allow — so the grant is live for the phone and must be reported.
+        // Lift ONE device. The identity row stays (`status.revoked` still lists it), so the phone
+        // is refused on the identity alone — the grant is worth nothing yet and must stay hidden.
         crate::daemon::peer_unrevoke(
             &state,
             mcpmesh_local_api::PeerUnrevokeParams {
@@ -717,10 +722,36 @@ mod tests {
             mesh.store.is_user_revoked("b64u:mallory"),
             "fixture: the identity row must survive a per-device unrevoke"
         );
+        assert!(
+            !mesh.store.is_revoked(&[4u8; 32]),
+            "fixture: the phone's ENDPOINT revocation is lifted"
+        );
+        assert!(
+            !admits(4),
+            "the identity revocation alone refuses the phone (#218)"
+        );
+        assert!(
+            kb_allow().is_empty(),
+            "a grant no device can use must not show — status and the gate agree"
+        );
+
+        // Lift the IDENTITY: the grant is live for every device of the person, and shows.
+        crate::daemon::peer_unrevoke(
+            &state,
+            mcpmesh_local_api::PeerUnrevokeParams {
+                peer: "b64u:mallory".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            admits(3) && admits(4),
+            "unrevoking the identity restores admission for every device"
+        );
         assert_eq!(
             kb_allow(),
             vec!["b64u:mallory".to_string()],
-            "a grant one admitted device gets must show"
+            "a grant an admitted device gets must show"
         );
     }
 }

@@ -55,10 +55,13 @@ use crate::allowlist::PeerEntry;
 /// `peer_revoke`, the compromise claim, did not. Backwards, and in the direction that leaks data to
 /// whoever holds the device.
 ///
-/// Fails CLOSED on a read error, like every other revocation read (`PeerStore::is_revoked`).
+/// Both tables (#218, `PeerStore::is_refused`): a device carrying a revoked IDENTITY is refused
+/// inbound by the gate, so dialling it would be this same backwards verb one level up.
+///
+/// Fails CLOSED on a read error, like every other revocation read.
 fn refuse_if_revoked(mesh: &Arc<MeshState>, id: &[u8; 32], peer: &str) -> Result<()> {
     anyhow::ensure!(
-        !mesh.store.is_revoked(id),
+        !mesh.store.is_refused(id),
         "{peer} is REVOKED on this node — dialling it would hand the request to a device you \
          declared compromised. Use `mcpmesh revoke undo` if that was a mistake"
     );
@@ -725,7 +728,7 @@ async fn hinted_addrs(
     // three devices, one of them stolen, must still be reachable on the other two.
     let candidates: Vec<[u8; 32]> = candidates
         .into_iter()
-        .filter(|id| !mesh.store.is_revoked(id))
+        .filter(|id| !mesh.store.is_refused(id))
         .collect();
     anyhow::ensure!(
         !candidates.is_empty(),

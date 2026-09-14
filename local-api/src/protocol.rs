@@ -774,6 +774,11 @@ pub struct PeerRevokeResult {
 }
 
 /// Params of [`Request::PeerUnrevoke`] (#85 ask 4).
+///
+/// A nickname or `eid:` lifts that device's ENDPOINT revocation and reports it in `unrevoked` —
+/// but under a standing IDENTITY revocation (`peer_revoke b64u:`) on the `user_id` its row carries,
+/// that re-admits nothing (#218, `api_minor >= 61`): the gate still refuses the device on the
+/// identity. Unrevoke the `b64u:` to restore every device of the person.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PeerUnrevokeParams {
@@ -2898,7 +2903,8 @@ pub const ERR_TOO_MANY_INFLIGHT: i64 = -32051;
 pub const ERR_SELF_ENROLL_NOT_OFFERED: i64 = -32052;
 
 /// `service_allow_grant` — the principal is REVOKED on this node, so the grant was refused before
-/// anything was written (#212, `api_minor >= 60`).
+/// anything was written (#212, `api_minor >= 60`). Also `peer_introduce` (#218, `api_minor >= 61`)
+/// when the SUBJECT proves a `user_id` this node has revoked: the row would be refused on sight.
 ///
 /// Admission runs two gates: the revocation table first (`peer_revoke`), then the service's
 /// `allow`. A grant to a revoked principal used to succeed and write a real `allow` entry that the
@@ -2908,11 +2914,9 @@ pub const ERR_SELF_ENROLL_NOT_OFFERED: i64 = -32052;
 ///
 /// "Revoked" here means what admission means by it, read live: an `eid:` that `peer_revoke` marked
 /// dead (locally or by a signed import, or by the installed roster), or a `b64u:` identity that
-/// `peer_revoke` revoked AND none of whose known devices is still admitted. The second clause is
-/// live state, not a promise: only attested pairing checks the identity table, so a device of a
-/// revoked identity that pairs by ordinary invite (or `peer_introduce`) is admitted, and a grant to
-/// that `b64u:` is then accepted again — a gate gap tracked in #218. Remedy: `peer_unrevoke`
-/// first if the revocation was a mistake; otherwise there is nothing to grant.
+/// `peer_revoke` revoked — every row carrying that `user_id` is refused, whatever the endpoint
+/// table says about the device (#218). Remedy: `peer_unrevoke` first if the revocation was a
+/// mistake; otherwise there is nothing to grant.
 ///
 /// **Numbering:** `-32053`..`-32055` are skipped. They are the SESSION-plane codes
 /// (`mcpmesh_net::errors`: rate-limited / service refused / unreachable), and `-32053` in particular
@@ -2921,6 +2925,26 @@ pub const ERR_SELF_ENROLL_NOT_OFFERED: i64 = -32052;
 /// planes never share a frame — but a control `-32053` would make "guard on `-32053`" ambiguous on
 /// the page that documents both. The control family continues from `-32056`.
 pub const ERR_PRINCIPAL_REVOKED: i64 = -32056;
+
+/// `pair` — the INVITER refused because it has revoked YOUR identity (`peer_revoke b64u:` on its
+/// side) (#218, `api_minor >= 61`).
+///
+/// The inviter-side twin of [`ERR_PRINCIPAL_REVOKED`], and a different code because it names a
+/// different node's table: that one is "this node revoked X, run `peer_unrevoke` here"; this one is
+/// "the peer revoked me, and nothing on this side lifts it". Before #218 the inviter made no such
+/// check — the row was written with the revoked `user_id`, the caller was told "paired", and every
+/// session it opened was refused.
+///
+/// The one `pair` refusal besides [`ERR_INVITER_MISMATCH`] that must NOT be rendered as "ask for a
+/// fresh invite": the invite was consumed, and any invite redeemed by a device presenting that
+/// identity is refused the same way until the inviter lifts the revocation. What it does NOT do:
+/// identity revocation refuses a device presenting the identity, and cannot stop a person who stops
+/// presenting the key — redeeming with no binding (or under a new user key) lands as an ordinary
+/// `eid:` pairing of an endpoint the inviter never revoked. Coded rather than folded into [`ERR_INVITE_REFUSED`] for the reason #147
+/// codes anything: a caller that has PROVEN a live secret may be told the truth (the redemption
+/// oracle that keeps `-32049` opaque is about unproven secrets), and the remedy differs from every
+/// other refusal's — it is on the other side of the wire.
+pub const ERR_PAIR_IDENTITY_REVOKED: i64 = -32057;
 
 /// How many requests one control connection may have in flight at once (#172), after which it
 /// answers [`ERR_TOO_MANY_INFLIGHT`]. Per connection, not per daemon.
@@ -2940,7 +2964,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   thirty have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.60";
+pub const API_VERSION: &str = "1.61";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -3026,7 +3050,21 @@ pub const API_VERSION: &str = "1.60";
 /// refusals — expired line, no live invite, inviter unreachable, id mismatch, name conflict, and
 /// the deliberately-opaque refusal. `ERR_NICKNAME_TAKEN` had been the only coded pairing failure,
 /// so every other one arrived as `-32000` and an embedder could either forward our prose to end
-/// users or substring-match it (#159); to 60 when `services[].allow` on `status` became
+/// users or substring-match it (#159); to 61 when an IDENTITY revocation (`peer_revoke b64u:`)
+/// began to hold at every site (#218): `pair` answers [`ERR_PAIR_IDENTITY_REVOKED`] when the
+/// inviter has revoked the redeemer's proven `user_id`, `peer_introduce` answers
+/// [`ERR_PRINCIPAL_REVOKED`] for a subject proving one this node revoked, and admission refuses
+/// any stored row carrying a revoked `user_id` — as does every OUTBOUND dial: `open_session`,
+/// `peer_services` and `peer_diagnostics` answer the same "REVOKED" refusal an endpoint-revoked
+/// device gets, and `pair` REDEEMING an invite from an inviter this node revoked (its endpoint, the
+/// identity its row carries, or the identity it proves in its reply) answers
+/// [`ERR_PRINCIPAL_REVOKED`] before writing a row or running the grant-back. Below 61 only device attestation consulted the
+/// identity table: a fresh invite (or an introduction) landed a row for the person's next device,
+/// the caller was told "paired", and the row's `services[].allow` grant was honoured — which is
+/// also why minor 60's "a `b64u:` hides only while EVERY device is refused" no longer holds: a
+/// per-device `peer_unrevoke` under a standing identity revocation re-admits nothing, and the
+/// entry stays hidden until the identity itself is unrevoked. Guard on `>= 61` before branching
+/// on the new code; to 60 when `services[].allow` on `status` became
 /// REVOCATION-AWARE and `service_allow_grant` began refusing a revoked principal with
 /// [`ERR_PRINCIPAL_REVOKED`] (#212). No shape changed — minor 17's class again. #100 made
 /// `services[].allow` answer from the live registry so it could not report a grant the accept path
@@ -3252,7 +3290,7 @@ pub const API_VERSION: &str = "1.60";
 /// its REAL content is a meaning change to `reachable` — the field exists so the new meaning is
 /// observable at all. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 60;
+pub const API_MINOR: u32 = 61;
 
 #[cfg(test)]
 mod tests {

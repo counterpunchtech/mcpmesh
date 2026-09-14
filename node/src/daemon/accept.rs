@@ -197,7 +197,10 @@ pub fn spawn_accept_loop(mesh: Arc<MeshState>, services: Arc<Services>) -> JoinH
                         // taken. Refusing here keeps the two halves telling the same story.
                         //
                         // Same close reason as no-live-invite: a revoked device learning WHY it was
-                        // refused is a disclosure with no upside.
+                        // refused is a disclosure with no upside. `gate.is_revoked` covers both
+                        // tables (#218): a known device whose row carries a revoked IDENTITY is
+                        // closed here too; a device with no row reaches the handler, proves the
+                        // secret, and gets the coded identity refusal there.
                         let remote_id = mcpmesh_net::EndpointId::from(conn.remote_id());
                         if mesh.gate.is_revoked(&remote_id) {
                             tracing::warn!(
