@@ -258,6 +258,29 @@ Four things worth knowing:
 out-of-band channel and does not want a pairing invite. It authorizes nothing — a peer dialling it
 still faces the gate.
 
+### Is this connection relayed? (`Node::connection_path`, #213)
+
+```rust
+use mcpmesh_local_api::PeerPath;
+match mcpmesh_node::Node::connection_path(&conn).await {
+    PeerPath::Direct => { /* no relay in the loop */ }
+    PeerPath::Relay { .. } | PeerPath::Unknown => { /* not private: ask before sending audio */ }
+    _ => { /* a variant this version does not know: treat as not-private */ }
+}
+```
+
+The reading mcpmesh trusts for its own sessions, for a connection you hold — from
+`connect_protocol` or handed to your `accept_protocol` handler. It **measures**: it samples every
+open path's application-frame counters, waits 250ms, and reports the path that moved (any frame
+over a relay in the window is `Relay`). Only an idle connection falls back to the structural reading
+(`Path::is_selected()`, or the single open path).
+
+Do not read `Connection::paths()` + `Path::is_selected()` yourself for this. iroh keeps one selected
+path per *remote endpoint*, not per connection, so on the **accepting** side of a second connection
+to the same peer `is_selected()` can be false on every open path for the connection's whole life
+while every byte flows over it (#213). `Unknown` means "not known" — an idle connection with several
+open paths and none selected, or a teardown snapshot — and must never be rendered as private.
+
 ## Holding the device key yourself (`device_key`, #85)
 
 By default the device key is 32 raw ed25519 secret bytes at 0600, in a directory the node owns — no

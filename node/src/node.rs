@@ -353,6 +353,41 @@ impl Node {
         self.mesh().register_app_protocol(alpn, handler)
     }
 
+    /// Is this connection's application data going over a relay or over a direct IP path (#213)?
+    ///
+    /// The reading mcpmesh trusts for its own sessions, for a connection YOU hold — one from
+    /// [`connect_protocol`](Self::connect_protocol) or handed to your
+    /// [`accept_protocol`](Self::accept_protocol) handler. It **measures**: it samples every open
+    /// path's application-frame counters (STREAM + DATAGRAM, both directions), waits
+    /// [`PATH_MEASURE_WINDOW`](crate::daemon::reach::PATH_MEASURE_WINDOW) (250ms), and reports
+    /// the path that moved. Any frame over a relay in that window is `Relay`; otherwise a moving
+    /// direct path is `Direct`. Only when nothing moved does it fall back to the structural
+    /// reading (`Path::is_selected()`, or the single open path).
+    ///
+    /// Measuring is what makes it reliable on the **accepting** side. iroh 1.0.3 keeps one selected
+    /// four-tuple per remote endpoint, not per connection, so the accept side of a second
+    /// connection to the same peer can have `is_selected()` false on every open path for the
+    /// connection's whole life while every byte flows over it. This does not read that flag as
+    /// the truth about the traffic; the counters are.
+    ///
+    /// `Unknown` means exactly that: an idle connection with several open paths and none
+    /// selected, a teardown snapshot, or a transport mcpmesh does not model. Never render it as
+    /// private. A connection that is carrying data during the window never answers `Unknown`.
+    ///
+    /// ```no_run
+    /// # async fn f(node: &mcpmesh_node::Node, conn: iroh::endpoint::Connection) {
+    /// use mcpmesh_local_api::PeerPath;
+    /// match mcpmesh_node::Node::connection_path(&conn).await {
+    ///     PeerPath::Direct => { /* private: no confirmation needed */ }
+    ///     PeerPath::Relay { .. } | PeerPath::Unknown => { /* ask before sending audio */ }
+    ///     _ => { /* a variant this version does not know: treat as not-private */ }
+    /// }
+    /// # }
+    /// ```
+    pub async fn connection_path(conn: &iroh::endpoint::Connection) -> mcpmesh_local_api::PeerPath {
+        crate::daemon::reach::measured_path(conn, crate::daemon::reach::PATH_MEASURE_WINDOW).await
+    }
+
     /// This node's currently-dialable address (#67) — its endpoint id plus whatever direct
     /// addresses and relay it has, exactly what a pairing invite embeds.
     ///
