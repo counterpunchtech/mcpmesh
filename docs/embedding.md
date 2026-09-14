@@ -270,19 +270,21 @@ match mcpmesh_node::Node::connection_path(&conn).await {
 ```
 
 For a connection you hold — from `connect_protocol` or handed to your `accept_protocol` handler. It
-**measures**: it samples every open path's application-frame counters, waits 250ms, and reports the
-path that moved (any frame over a relay in the window is `Relay`). Only an idle connection falls back
-to the structural reading mcpmesh's own probes and session watcher use (`Path::is_selected()`, or
-the single open path). An `Unknown` window on a still-open connection is measured again, up to
-three windows (750ms) in all; `Direct`/`Relay` are never retried.
+**measures**: it samples every open path's application-frame counters, watches the connection's path
+events for 250ms (a path that closes mid-window is attributed from its final counters), and reports
+the path that moved (any frame over a relay in the window is `Relay`). Only an idle connection falls
+back to the structural reading mcpmesh's own probes and session watcher use (`Path::is_selected()`,
+or the single open path). An idle window reading `Unknown` is measured again, up to three windows
+(750ms) in all; nothing else is retried, so a window that may have carried relayed frames is never
+followed by `Direct`.
 
 Do not read `Connection::paths()` + `Path::is_selected()` yourself for this. iroh keeps one selected
 path per *remote endpoint*, not per connection, so on the **accepting** side of a second connection
 to the same peer `is_selected()` can be false on every open path for the connection's whole life
 while every byte flows over it (#213). `Unknown` means "not known" — an idle connection with several
-open paths and none selected, a connection that is already closed, frames that moved on a path which
-closed inside the window, or a transport mcpmesh does not model — and must never be rendered as
-private.
+open paths and none selected, a connection that is already closed, a window that could not see every
+path (events lost, or a path gone with no close event), or a transport mcpmesh does not model — and
+must never be rendered as private.
 
 ## Holding the device key yourself (`device_key`, #85)
 

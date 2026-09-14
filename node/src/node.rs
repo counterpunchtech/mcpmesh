@@ -357,14 +357,14 @@ impl Node {
     ///
     /// For a connection YOU hold — one from [`connect_protocol`](Self::connect_protocol) or handed
     /// to your [`accept_protocol`](Self::accept_protocol) handler. It **measures**: it samples every
-    /// open path's application-frame counters (STREAM + DATAGRAM, both directions), waits 250ms,
-    /// and reports the path that moved. Any frame over a relay in that window is `Relay`;
-    /// otherwise a moving direct path is `Direct`. Only when nothing moved does it fall back to
-    /// the structural reading mcpmesh's own probes and session watcher use
-    /// (`Path::is_selected()`, or the single open path). A window that ends in `Unknown` on a
-    /// still-open connection is measured again, up to three windows (750ms) in all — a hole-punch
-    /// round can open and abandon probe paths inside one window; only `Unknown` is retried, so a
-    /// relayed window is never traded for a later direct one.
+    /// open path's application-frame counters (STREAM + DATAGRAM, both directions), watches the
+    /// connection's path events for 250ms — a path that closes inside the window is attributed
+    /// from its own final counters — and reports the path that moved. Any frame over a relay in
+    /// that window is `Relay`; otherwise a moving direct path is `Direct`. Only when nothing moved
+    /// does it fall back to the structural reading mcpmesh's own probes and session watcher use
+    /// (`Path::is_selected()`, or the single open path). An idle window whose structural reading
+    /// is `Unknown` is measured again, up to three windows (750ms) in all; nothing else is
+    /// retried, so a window that may have carried relayed frames is never followed by `Direct`.
     ///
     /// Measuring is what makes it reliable on the **accepting** side. iroh 1.0.3 keeps one selected
     /// four-tuple per remote endpoint, not per connection, so the accept side of a second
@@ -374,10 +374,9 @@ impl Node {
     ///
     /// `Unknown` means exactly that, and must never be rendered as private: an idle connection
     /// with several open paths and none selected; a connection that is already closed (iroh
-    /// keeps a closed connection's path list and counters, so they are checked, not trusted);
-    /// frames that moved on a path which closed inside the window, so nothing says which kind it
-    /// was; or a transport mcpmesh does not model. A connection moving data over a direct or
-    /// relay path that stays open through the window answers `Direct` or `Relay`.
+    /// keeps a closed connection's path list and counters, so they are checked, not trusted); a
+    /// window that could not see every path — path events were lost, or a path disappeared with
+    /// no close event; or a transport mcpmesh does not model.
     ///
     /// ```no_run
     /// # async fn f(conn: mcpmesh_node::iroh::endpoint::Connection) {

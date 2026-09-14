@@ -5,12 +5,12 @@
 //! Two full nodes on loopback, relay disabled, paired through the real control API; app-protocol
 //! connections carrying datagrams both ways.
 //!
-//! The `*_stay_selected` tests are the iroh 1.0.3 REPRODUCTION: they read `is_selected()` raw and
-//! are `#[ignore]`d because they FAIL on 1.0.3 by design (run with `--ignored` to re-measure; see
-//! `docs/superpowers/specs/2026-09-14-213-accept-side-path-design.md`). Whether a given run hits
-//! the defect depends on which of the host's addresses each connection settles on, so they are
-//! also inherently timing-based. The `connection_path_*` tests are the regression tests for the
-//! fix and run in the suite.
+//! The `*_stay_selected` tests are the iroh REPRODUCTION (measured on 1.0.3 and 1.2.0): they read
+//! `is_selected()` raw and are `#[ignore]`d because they FAIL there by design (run with
+//! `--ignored` to re-measure; see `docs/superpowers/specs/2026-09-14-213-accept-side-path-design.md`).
+//! Whether a given run hits the defect depends on which of the host's addresses each connection
+//! settles on, so they are also inherently timing-based. The `connection_path_*` tests are the
+//! regression tests for the fix and run in the suite.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -197,7 +197,7 @@ async fn observe(conns: &[(&str, &iroh::endpoint::Connection)], secs: u64) -> Ve
 }
 
 /// One connection: the accept side keeps a selected path (control case).
-#[ignore = "iroh 1.0.3 reproduction: fails by design (#213)"]
+#[ignore = "iroh reproduction (1.0.3, 1.2.0): fails by design (#213)"]
 #[tokio::test(flavor = "multi_thread")]
 async fn single_connection_accept_side_stays_selected() {
     let (a, b) = paired().await;
@@ -212,7 +212,7 @@ async fn single_connection_accept_side_stays_selected() {
 }
 
 /// Two connections dialed by the SAME side (b -> a twice): both accept sides must stay selected.
-#[ignore = "iroh 1.0.3 reproduction: fails by design (#213)"]
+#[ignore = "iroh reproduction (1.0.3, 1.2.0): fails by design (#213)"]
 #[tokio::test(flavor = "multi_thread")]
 async fn two_connections_same_direction_accept_sides_stay_selected() {
     let (a, b) = paired().await;
@@ -242,7 +242,7 @@ async fn two_connections_same_direction_accept_sides_stay_selected() {
 /// Two connections in OPPOSITE directions (b -> a, then a -> b): each node holds one client-side
 /// and one server-side connection to the same remote — the shape a daemon is in when it holds a
 /// mesh session one way and an app-protocol connection the other.
-#[ignore = "iroh 1.0.3 reproduction: fails by design (#213)"]
+#[ignore = "iroh reproduction (1.0.3, 1.2.0): fails by design (#213)"]
 #[tokio::test(flavor = "multi_thread")]
 async fn two_connections_opposite_directions_accept_sides_stay_selected() {
     let (a, b) = paired().await;

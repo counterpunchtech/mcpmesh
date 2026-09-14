@@ -258,3 +258,102 @@ async fn mesh_endpoint_dial(
         .await
         .expect("dial peer for path inspection")
 }
+
+/// #213 review round 3, MUST-FIX 2: a probe of a peer reachable ONLY through a relay reports
+/// `Relay { url }`.
+///
+/// The ping responder drops its connection right after the pong, so by the end of the probe's
+/// settle window the DIALER's connection is closed. A `close_reason()` check inside the structural
+/// `selected_path` turned that into `Unknown` for every relayed peer — losing the relay URL and
+/// emitting a spurious Relay→Unknown frame (measured 10/10). The last path a closed probe
+/// connection used is exactly the answer a probe wants.
+///
+/// Deterministic, not 9-in-10: the peer endpoint has NO IP transport at all
+/// (`clear_ip_transports`), so no direct path can ever form and hole-punching cannot race the
+/// assertion.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_probe_of_a_relay_only_peer_reports_the_relay() {
+    timeout(Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+        let (relay_map, relay_url, _relay_guard) = iroh::test_utils::run_relay_server()
+            .await
+            .expect("run in-process relay");
+
+        let base = || {
+            iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .relay_mode(iroh::RelayMode::Custom(relay_map.clone()))
+                .ca_tls_config(iroh_relay::tls::CaTlsConfig::insecure_skip_verify())
+                .alpns(vec![ALPN_MCP.to_vec(), ALPN_PING.to_vec()])
+        };
+        // The peer speaks ONLY through the relay.
+        let peer_ep = base()
+            .clear_ip_transports()
+            .bind()
+            .await
+            .expect("bind relay-only peer");
+        let our_ep = base().bind().await.expect("bind ours");
+        let peer_id = *peer_ep.id().as_bytes();
+        let our_id = *our_ep.id().as_bytes();
+
+        let peer_store = Arc::new(PeerStore::open(&dir.path().join("peer.redb")).unwrap());
+        peer_store
+            .add(PeerEntry {
+                endpoint_id: our_id,
+                nickname: "us".into(),
+                services: vec![],
+                paired_at: None,
+                user_id: None,
+                last_addr: None,
+            })
+            .unwrap();
+        let our_store = Arc::new(PeerStore::open(&dir.path().join("our.redb")).unwrap());
+        our_store
+            .add(PeerEntry {
+                endpoint_id: peer_id,
+                nickname: "bob".into(),
+                services: vec![],
+                paired_at: None,
+                user_id: None,
+                last_addr: Some(
+                    serde_json::to_string(
+                        &iroh::EndpointAddr::new(iroh::EndpointId::from_bytes(&peer_id).unwrap())
+                            .with_relay_url(relay_url.clone()),
+                    )
+                    .expect("serialize relay addr"),
+                ),
+            })
+            .unwrap();
+
+        std::fs::write(dir.path().join("peer.toml"), "").unwrap();
+        let peer_mesh = assemble(peer_ep, peer_store, dir.path().join("peer.toml"));
+        let _peer_accept = daemon::spawn_accept_loop(
+            peer_mesh.clone(),
+            Arc::new(build_services_audited(
+                &Config::default(),
+                &mcpmesh::audit::AuditSink::disabled(),
+                &MeshLimiters::unlimited(),
+            )),
+        );
+        std::fs::write(dir.path().join("our.toml"), "").unwrap();
+        let mesh = assemble(our_ep, our_store, dir.path().join("our.toml"));
+
+        let expected = mcpmesh_local_api::PeerPath::Relay {
+            url: Some(daemon::sanitize_relay_url(&relay_url)),
+        };
+        // Several probes: each is a fresh dial that the responder closes after its pong, so each
+        // one exercises the closed-connection classification independently.
+        for attempt in 0..3 {
+            let entry = daemon::probe_peer(&mesh, peer_id).await;
+            assert!(
+                entry.reachable,
+                "attempt {attempt}: reachable over the relay"
+            );
+            assert_eq!(
+                entry.path, expected,
+                "attempt {attempt}: a relay-only peer must report Relay with its URL, not Unknown"
+            );
+        }
+    })
+    .await
+    .expect("relay-only probe test timed out");
+}
