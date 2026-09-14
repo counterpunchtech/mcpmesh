@@ -170,6 +170,11 @@ pub(crate) struct RelayPosture {
     pub(crate) urls: Vec<String>,
 }
 
+/// See [`MeshState::identity_gate_hook`] (#221).
+#[cfg(test)]
+pub(crate) type IdentityGateHook =
+    Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>;
+
 /// The mesh half of the daemon: the endpoint, the trust gate + its backing store, the live
 /// invite registry, and the running accept-loop task. Held (behind an `Arc`) inside
 /// [`DaemonState`] so the control API's `register_service` / `peer_add` / `pair` methods can
@@ -480,7 +485,18 @@ pub struct MeshState {
     /// file holding one key while the node PRESENTS another — both answering `Ok` with different
     /// `user_id`s, and the divergence surfacing only at the next restart. The export shares the
     /// lock so it cannot read a half-replaced file.
+    ///
+    /// #221: it is also the lock the #86 gate is checked UNDER. `peer_endorse`, `device_revoke`,
+    /// `user_key_export` and `inviter_ctx`'s `sign_binding` read `adopted_binding` after taking
+    /// it and hold it through reading the key and signing (`handlers::lock_own_user_key`), so an
+    /// `adopt_hook` or `user_key_import` — which write under it — cannot land between the check and
+    /// the signature. Held only across file IO on a blocking thread, never a network await.
     pub(crate) user_key_lock: tokio::sync::Mutex<()>,
+    /// #221 test seam: runs ONCE inside an identity-signing path, after its #86 checks and before
+    /// the key is read — the window an adopt or import must not be able to land in. `None` except
+    /// in a test that installs one.
+    #[cfg(test)]
+    pub(crate) identity_gate_hook: std::sync::Mutex<Option<IdentityGateHook>>,
     /// Embedder-registered ALPNs → their handlers (#67), read by the accept loop's dispatch.
     ///
     /// mcpmesh had built the hard parts of a P2P application platform — identity, pairing, a trust
@@ -667,6 +683,8 @@ impl MeshState {
             probes_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
             org_author_lock: tokio::sync::Mutex::new(()),
             user_key_lock: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            identity_gate_hook: std::sync::Mutex::new(None),
             app_protocols: std::sync::RwLock::new(std::collections::HashMap::new()),
             bound_alpns: std::sync::OnceLock::new(),
             ephemeral_services: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -1213,6 +1231,21 @@ impl MeshState {
             .expect("adopted_binding lock not poisoned") = None;
     }
 
+    /// Fire the #221 test seam, if one is installed. A no-op outside tests.
+    pub(crate) async fn run_identity_gate_hook(&self) {
+        #[cfg(test)]
+        {
+            let hook = self
+                .identity_gate_hook
+                .lock()
+                .expect("identity_gate_hook lock not poisoned")
+                .take();
+            if let Some(hook) = hook {
+                hook().await;
+            }
+        }
+    }
+
     /// Boot (#85 ask 2): record whether it MINTED the user key rather than loading one.
     pub(crate) fn note_user_key_minted_at_boot(&self, created: bool) {
         self.user_key_still_boot_minted
@@ -1334,6 +1367,9 @@ impl MeshState {
     pub(crate) fn inviter_ctx(self: &Arc<Self>) -> crate::pairing::rendezvous::InviterCtx {
         let grant_mesh = self.clone();
         let record_mesh = self.clone();
+        // ONE snapshot, shared by what the ceremony PRESENTS and what `sign_binding` checks it is
+        // still signing for (#221).
+        let self_binding = self.self_binding();
         crate::pairing::rendezvous::InviterCtx {
             // #85 ask 3 — read once at boot, like `presence_mode`. Off unless asked for.
             admit_attested: self.admit_attested_devices(),
@@ -1342,7 +1378,7 @@ impl MeshState {
             store: self.store.clone(),
             invites: self.invites.clone(),
             config_path: self.config_path.clone(),
-            self_binding: self.self_binding(),
+            self_binding: self_binding.clone(),
             grant: Box::new(move |principal, nickname, services| {
                 let mesh = grant_mesh.clone();
                 Box::pin(async move {
@@ -1365,21 +1401,48 @@ impl MeshState {
                 })
             },
             sign_binding: {
-                let path = self.user_key_path.get().cloned();
-                // An ENROLLED device must not enroll a third (#86 gate). Boot always mints a LOCAL
-                // user key, so without this check `sign_binding` would sign with the local key
-                // while we PRESENT the adopted one — issuing bindings for an identity no peer has
-                // ever seen, and silently. The documented limitation was false until this returned
-                // `None`; now the refusal is real and the enrolling device is the one that holds
-                // the key.
-                let adopted = self.adopted_binding.read().ok().and_then(|g| g.clone());
-                Box::new(move |endpoint_id: &[u8; 32]| {
-                    if adopted.is_some() {
-                        return None;
-                    }
-                    let path = path.as_ref()?;
-                    let (user_key, _) = mcpmesh_trust::UserKey::load_or_generate(path).ok()?;
-                    Some(crate::pairing::binding_sig_for(&user_key, endpoint_id))
+                let mesh = self.clone();
+                let presented = self_binding;
+                Box::new(move |endpoint_id: [u8; 32]| {
+                    let mesh = mesh.clone();
+                    let presented = presented.clone();
+                    Box::pin(async move {
+                        // An ENROLLED device must not enroll a third (#86 gate). Boot always mints a
+                        // LOCAL user key, so without this check `sign_binding` would sign with the
+                        // local key while we PRESENT the adopted one — issuing bindings for an
+                        // identity no peer has ever seen, and silently.
+                        //
+                        // #221: checked UNDER `user_key_lock`, held through the key read and the
+                        // signature, so an adopt or import cannot land in between.
+                        let _key_guard = crate::daemon::handlers::lock_own_user_key(
+                            &mesh,
+                            "sign_binding",
+                            "Enroll",
+                        )
+                        .await
+                        .ok()?;
+                        // The ceremony PRESENTS the binding snapshotted when this connection was
+                        // accepted; the key is read NOW. An import or adoption since then means
+                        // the signature would be for a different identity than the `user_pk` the
+                        // reply carries — refused rather than handing the redeemer a binding that
+                        // does not verify under the identity it was told it joined.
+                        let presented = presented?;
+                        if mesh.self_binding().as_ref() != Some(&presented) {
+                            tracing::warn!(
+                                "refusing a self-enrollment: this node's identity changed during \
+                                 the ceremony (#221)"
+                            );
+                            return None;
+                        }
+                        mesh.run_identity_gate_hook().await;
+                        // READ, never `load_or_generate`: a missing key must refuse, not mint an
+                        // identity nobody presented.
+                        let user_key = crate::daemon::handlers::read_user_key(&mesh).await.ok()?;
+                        Some(crate::pairing::binding_sig_for(&user_key, &endpoint_id))
+                    })
+                        as std::pin::Pin<
+                            Box<dyn std::future::Future<Output = Option<String>> + Send>,
+                        >
                 })
             },
         }

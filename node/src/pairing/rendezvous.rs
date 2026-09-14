@@ -484,6 +484,8 @@ pub struct InviterCtx {
     /// #86: sign a device→user binding for another device of THIS person, given that device's
     /// TLS-authenticated endpoint id. `None` when this daemon has no user key — there is then no
     /// identity to enroll into, and a self-enrollment is refused rather than silently completing.
+    /// Also `None` when this node's identity changed since [`self_binding`](Self::self_binding) was
+    /// snapshotted (#221), so the signature always verifies under the `user_pk` the reply presents.
     ///
     /// A hook rather than the key itself, so this module never learns where the key lives.
     pub sign_binding: SignBindingFn,
@@ -513,7 +515,11 @@ pub type AdoptBindingFn = Box<
 pub type AuditTrustFn = Box<dyn Fn(String, Option<String>) + Send + Sync>;
 
 /// See [`InviterCtx::sign_binding`] (#86). `endpoint_id` → the `b64u:` signature, or `None`.
-pub type SignBindingFn = Box<dyn Fn(&[u8; 32]) -> Option<String> + Send + Sync>;
+///
+/// Async (#221): the daemon's implementation re-checks this node's identity under its user-key
+/// lock and reads the key on a blocking thread. It performs no network IO.
+pub type SignBindingFn =
+    Box<dyn Fn([u8; 32]) -> Pin<Box<dyn Future<Output = Option<String>> + Send>> + Send + Sync>;
 
 /// Verify a peer's OPTIONAL presented binding against the TLS-authenticated peer id, returning the
 /// peer's proven `user_id` if — and only if — it presented a binding that verifies. Absent fields →
@@ -841,7 +847,7 @@ pub async fn handle_inviter_side(
                 .await;
                 return Ok(());
             };
-            let sig = match (ctx.sign_binding)(&tls_id) {
+            let sig = match (ctx.sign_binding)(tls_id).await {
                 Some(sig) => sig,
                 None => {
                     let _ = send_reply(
@@ -2275,7 +2281,7 @@ mod tests {
             grant: Box::new(|_, _, _| Box::pin(async { Ok(()) })),
             record_pairing: Box::new(|_| {}),
             audit_trust: Box::new(|_, _| {}),
-            sign_binding: Box::new(|_| None),
+            sign_binding: Box::new(|_| Box::pin(async { None })),
             admit_attested: admit,
             self_endpoint_id: [9u8; 32],
             self_nickname: "us".into(),
@@ -2399,7 +2405,7 @@ mod tests {
             grant: Box::new(|_, _, _| Box::pin(async { Ok(()) })),
             record_pairing: Box::new(|_| {}),
             audit_trust: Box::new(|_, _| {}),
-            sign_binding: Box::new(|_| None),
+            sign_binding: Box::new(|_| Box::pin(async { None })),
             admit_attested: true,
             self_endpoint_id: [9u8; 32],
             self_nickname: "us".into(),
@@ -2475,7 +2481,7 @@ mod tests {
             grant: Box::new(|_, _, _| Box::pin(async { Ok(()) })),
             record_pairing: Box::new(|_| {}),
             audit_trust: Box::new(|_, _| {}),
-            sign_binding: Box::new(|_| None),
+            sign_binding: Box::new(|_| Box::pin(async { None })),
             admit_attested: true,
             self_endpoint_id: [9u8; 32],
             self_nickname: "us".into(),
