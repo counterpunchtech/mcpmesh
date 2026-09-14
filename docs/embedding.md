@@ -271,7 +271,7 @@ match mcpmesh_node::Node::connection_path(&conn).await {
 
 For a connection you hold — from `connect_protocol` or handed to your `accept_protocol` handler. It
 **measures**: it samples every open path's application-frame counters, watches the connection's path
-events for 250ms (a path that closes mid-window is attributed from its final counters), and reports
+events for 250ms (a path that closes mid-window is counted from its final counters), and reports
 the path that moved (any frame over a relay in the window is `Relay`). Only an idle connection falls
 back to the structural reading mcpmesh's own probes and session watcher use (`Path::is_selected()`,
 or the single open path). An idle window reading `Unknown` is measured again, up to three windows
@@ -279,12 +279,24 @@ or the single open path). An idle window reading `Unknown` is measured again, up
 followed by `Direct`.
 
 Do not read `Connection::paths()` + `Path::is_selected()` yourself for this. iroh keeps one selected
-path per *remote endpoint*, not per connection, so on the **accepting** side of a second connection
-to the same peer `is_selected()` can be false on every open path for the connection's whole life
-while every byte flows over it (#213). `Unknown` means "not known" — an idle connection with several
+path per *remote endpoint*, not per connection (measured on iroh 1.0.3 and 1.2.0), so on the
+**accepting** side of a second connection to the same peer `is_selected()` can be false on every open
+path for long stretches while every byte flows over it (#213). `Unknown` means "not known" — an idle connection with several
 open paths and none selected, a connection that is already closed, a window that could not see every
 path (events lost, or a path gone with no close event), or a transport mcpmesh does not model — and
 must never be rendered as private.
+
+**It is best-effort evidence, not a guarantee.** It sees only what iroh's path list and path events
+report. Two gaps are outside anything mcpmesh can observe: noq can send on a newly validated path in
+the sub-millisecond gap before iroh's actor records it, and iroh's own actor can drop a noq path event
+under load, leaving a path that is never listed. Frames in either gap are not attributed to any path,
+so `Direct` means "no relay frames were observed", not "no frame transited a relay".
+
+If your product rule is "never describe a relayed call as private", treat `Direct` as **advisory**:
+gate on it at call setup, then re-check every few seconds for the life of the call (a reading is at
+most 750ms of sampling), and treat any later `Relay` or `Unknown` as the call having become
+not-private. Paths also genuinely change mid-call — a direct path lost to a network change falls back
+to the relay — and only a re-check catches that.
 
 ## Holding the device key yourself (`device_key`, #85)
 

@@ -124,20 +124,34 @@ Recommendation: (a) now, (b) if the upstream fix does not land within a release 
    `close_reason()`: a probe classifies a connection the ping responder closes right after the pong,
    and a close check there made every relayed peer's probe `Unknown` (round-3 review, measured
    10/10) — pinned by `peer_path.rs` `a_probe_of_a_relay_only_peer_reports_the_relay`.
-2. `reach::measured_path` — per window (`PATH_MEASURE_WINDOW`, 250ms): subscribe to
-   `conn.path_events()`, sample every open path's **application frames** (STREAM + DATAGRAM, tx +
-   rx; PINGs/ACKs on a standby relay path do not count), drain events for the whole window, sample
-   again, drain what is already queued. `classify_window` attributes every movement: a path's
-   frames at its later observation (the `after` sample, or its own `Closed { last_stats }`) minus its
-   baseline (zero when it had none). Any relay path moved ⇒ `Relay`; `Lagged`, a moving unmodelled
-   path, or a baseline path absent from `after` with no `Closed` event ⇒ unobservable; else a
-   direct path moved ⇒ `Direct`; nothing moved ⇒ the structural reading. A closed connection
-   (before or after the window) ⇒ unobservable. `combine_windows` answers `Moved`/known `Idle` at
-   once, answers `Unknown` at once on an unobservable window (so a window that may have carried
-   relayed frames is never followed by `Direct`), and retries only `Idle(Unknown)`, up to
-   `PATH_MEASURE_WINDOWS` (3). This is what answers the reporter's production shape (relay
-   enabled, accept side, relay + direct paths, none selected): only the counters know which path
-   noq used.
+2. `reach::measured_path` — per window (`PATH_MEASURE_WINDOW`, 250ms), through the `WindowSource`
+   seam: subscribe to `conn.path_events()`, sample every open path's **application frames** (STREAM
+   + DATAGRAM, tx + rx; PINGs/ACKs on a standby relay path do not count), drain events for the whole
+   window, sample again, drain what is already queued. iroh's `PathEvent` is projected one-to-one
+   into `ObservedEvent` (no policy); `WindowEvent::from_observed` drops only `Selected` and keeps
+   `Lagged` and unrecognised variants. `classify_window` relies on iroh adding a path to the list
+   before sending `Opened` and removing it before sending `Closed`:
+   - a path in `before` moved by (its `after` count or `Closed { last_stats }`) − baseline;
+   - a path with an `Opened` event moved by its whole count;
+   - a `Closed` with no baseline and no `Opened` was removed BEFORE the baseline → ignored
+     (round 4: counting its lifetime read a pre-window close as live traffic);
+   - any relay path moved ⇒ `Relay`; `Lagged`/unrecognised event, a moving unmodelled path, or a
+     path in `before` or `Opened` that is neither in `after` nor `Closed` (round 4: an opened path
+     whose `Closed` has not arrived) ⇒ unobservable; else a direct path moved ⇒ `Direct`; nothing
+     moved ⇒ the structural reading;
+   - the event stream ending while the window is open, or a closed connection ⇒ unobservable.
+
+   `combine_windows` answers `Moved`/known `Idle` at once, answers `Unknown` at once on an
+   unobservable window (so a window that may have carried relayed frames is never followed by
+   `Direct`), and retries only `Idle(Unknown)`, up to `PATH_MEASURE_WINDOWS` (3, compile-time
+   asserted > 1). This is what answers the reporter's production shape (relay enabled, accept side,
+   relay + direct paths, none selected): only the counters know which path noq used.
+
+   **Best-effort, not a guarantee** (documented on `Node::connection_path` and in
+   `docs/embedding.md`, with the advice to treat `Direct` as advisory and re-check during a call):
+   noq can send on a newly validated path before iroh's actor records it, and iroh's actor can drop
+   a noq path event (`remote_state.rs` `Lagged` arm, no recovery). Frames in either gap are
+   attributed to no path.
 
    The round-2 design cross-checked `Connection::stats()` against the per-path sum. Round-3 review
    measured that as unsound: per-path and connection stats are read under separate noq lock
@@ -160,14 +174,19 @@ Mutations run (each restored from a backup copy, not `git checkout`):
 |---|---|
 | drop the single-path rule | `a_single_unselected_path_is_where_the_bytes_go`; `connection_path_reads_direct_on_an_idle_accept_side` |
 | count UDP bytes instead of app frames; add `frame_tx.path_acks` | `keepalives_on_a_standby_relay_path_are_not_application_data` (every non-app counter seeded) |
-| ignore `Closed` events | `a_relay_path_that_closed_mid_window_is_attributed_from_its_closed_event`, `a_relay_path_that_opened_mid_window_and_carried_frames_is_relay` |
-| ignore `Lagged` | `lagged_path_events_make_the_window_unobservable` |
-| ignore a path that vanished with no `Closed` | `a_path_that_vanished_without_a_closed_event_is_unobservable` |
-| retry on `Moved(Direct)` | `only_an_idle_unknown_window_is_retried` |
-| `PATH_MEASURE_WINDOWS = 1` | `only_an_idle_unknown_window_is_retried` (asserts the bound is > 1) |
-| retry after an unobservable window | `only_an_idle_unknown_window_is_retried` |
+| ignore `Closed` events | `a_relay_path_that_closed_mid_window_is_attributed_from_its_closed_event`, `a_relay_path_that_opened_mid_window_and_carried_frames_is_relay`, both scripted-source ordering tests |
+| count a no-baseline, no-`Opened` `Closed` (pre-window close) | `a_close_from_before_the_window_is_not_traffic` |
+| ignore an `Opened` path that disappeared | `a_path_opened_in_the_window_that_disappeared_is_unobservable` |
+| ignore a `before` path that disappeared | `a_path_that_vanished_without_a_closed_event_is_unobservable` |
+| `Lagged` ⇒ `None`; unrecognised ⇒ `None` (in `from_observed`) | `every_path_event_kind_has_an_explicit_policy` |
+| ignore `Lagged`/unrecognised in classification | `lagged_path_events_make_the_window_unobservable`, `every_path_event_kind_has_an_explicit_policy` |
+| subscribe AFTER the baseline sample | `the_subscription_is_taken_before_the_baseline` (scripted source) |
+| no final drain after the last sample | `events_queued_after_the_final_sample_are_drained` (scripted source) |
+| stream end mid-window treated as a shorter window | `an_event_stream_that_ends_early_is_unobservable` |
+| retry on `Moved(Direct)`; retry after an unobservable window | `only_an_idle_unknown_window_is_retried` |
+| `PATH_MEASURE_WINDOWS = 1` | compile error (const assertion) |
 | re-add `close_reason` check to `selected_path` | `a_probe_of_a_relay_only_peer_reports_the_relay` (`Unknown` vs `Relay { url }`) |
-| drop `close_reason` checks from `measure_window` | `connection_path_reads_unknown_on_a_closed_connection` (`Direct` vs `Unknown`) |
+| drop `close_reason` checks from the measured reading | `connection_path_reads_unknown_on_a_closed_connection` (`Direct` vs `Unknown`) |
 | `connection_path` returns `Unknown` | both `connection_path_reads_direct_*` tests |
 
 The two `connection_path_reads_direct_*` integration tests catch their mutations only on a
@@ -175,13 +194,13 @@ multi-address host, where the two connections settle on different tuples: on a s
 runner both accept sides would read `Direct` with or without the fix. **The unit tests are the real
 pin**; the integration tests prove the API reads the accept side of a real connection at all.
 
-Not covered by any test: subscribing to path events AFTER the baseline sample instead of before
-(the race it closes needs a path to close in the microseconds between the two), and draining events
-only at the end of the window instead of during it (a `Lagged` rate question: it degrades busy
-hole-punching connections to `Unknown`, the safe direction). Nor a fixture where the structural
-reading is `Unknown` while the measurement says `Direct` on a **stable** connection (relay + direct,
-none selected): loopback cannot produce it (`boot.rs` #116 note), so that composition is pinned on
-synthetic samples in `classify_window`'s tests.
+Not covered by any test: the `From<iroh::endpoint::PathEvent> for ObservedEvent` projection. iroh
+marks every `PathEvent` variant `#[non_exhaustive]`, so no code outside iroh can construct one
+(E0639, checked); the projection is kept policy-free so a mistake there is a mis-wiring, not a
+policy error. Draining events only at the end of the window instead of during it (a `Lagged` rate
+question, safe direction). A fixture where the structural reading is `Unknown` while the
+measurement says `Direct` on a **stable** connection (relay + direct, none selected): loopback
+cannot produce it (`boot.rs` #116 note), so that composition is pinned on synthetic samples.
 
 A stated residual: attribution is as complete as iroh's own path events. A path whose noq
 `Established`/`Abandoned` event iroh's actor dropped (`remote_state.rs` `Lagged` arm) never enters
