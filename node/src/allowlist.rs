@@ -230,6 +230,19 @@ impl PeerStore {
         }
     }
 
+    /// Is this ROSTER `user_id` a revoked pairing identity (#218 rule 2, #223)?
+    ///
+    /// `org_approve` takes a free-form `user_id`, so a roster can name a user `b64u:x`. Only that
+    /// spelling is looked up — the identity table holds nothing else (`peer_revoke` writes it for
+    /// `b64u:` alone), so any other roster name costs no read and is never refused here.
+    ///
+    /// ONE rule for both directions: the composed gate's rule 2 (inbound) and the outbound dial
+    /// filter (`daemon::dial::dial_refused`) both call this, so they cannot drift apart. Fails
+    /// CLOSED through [`is_user_revoked`](Self::is_user_revoked).
+    pub fn is_roster_user_revoked(&self, roster_user_id: &str) -> bool {
+        roster_user_id.starts_with("b64u:") && self.is_user_revoked(roster_user_id)
+    }
+
     /// What this store alone decides about one endpoint (#218): refused on revocation grounds,
     /// admissible through a live pair row, or neither — in ONE read transaction.
     ///
@@ -665,6 +678,12 @@ impl AllowlistGate {
     /// `user_id` spelled as a pairing identity must not route around `peer_revoke b64u:`.
     pub fn is_user_revoked(&self, user_id: &str) -> bool {
         self.store.is_user_revoked(user_id)
+    }
+
+    /// [`PeerStore::is_roster_user_revoked`] — the composed gate's rule 2 (#218). The outbound dial
+    /// filter calls the same store method, so inbound and outbound share one rule (#223).
+    pub fn is_roster_user_revoked(&self, roster_user_id: &str) -> bool {
+        self.store.is_roster_user_revoked(roster_user_id)
     }
 
     /// The pairing-mode identity an admitted row resolves to (nickname only; groups are a

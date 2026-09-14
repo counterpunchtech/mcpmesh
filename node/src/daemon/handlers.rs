@@ -7135,6 +7135,123 @@ allow = []
         );
     }
 
+    /// A bare endpoint on the app-blob ALPN that COUNTS completed handshakes and serves nothing, so
+    /// whether a fetch dialled it is observable (#223).
+    async fn counting_blob_source() -> (
+        iroh::Endpoint,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let ep = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .alpns(vec![crate::blobs::APP_BLOB_ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (e, c) = (ep.clone(), n.clone());
+        let task = tokio::spawn(async move {
+            while let Some(incoming) = e.accept().await {
+                if incoming.await.is_ok() {
+                    c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        });
+        (ep, n, task)
+    }
+
+    /// A paired row for `ep` carrying its REAL address as the dial hint, so a dial to it on this
+    /// hermetic mesh actually lands — which is what makes a zero count mean "not dialled".
+    fn seed_source_row(mesh: &MeshState, nickname: &str, ep: &iroh::Endpoint) {
+        let addr = ep.addr();
+        assert!(
+            !addr.addrs.is_empty(),
+            "fixture: the source must have a dialable address"
+        );
+        mesh.store
+            .add(PeerEntry {
+                endpoint_id: *ep.id().as_bytes(),
+                nickname: nickname.into(),
+                services: vec![],
+                paired_at: None,
+                user_id: None,
+                last_addr: Some(serde_json::to_string(&addr).unwrap()),
+            })
+            .unwrap();
+    }
+
+    /// Wait (bounded, sleeping) until `n` is non-zero.
+    async fn await_count(n: &std::sync::atomic::AtomicUsize, what: &str) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        while n.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(tokio::time::Instant::now() < deadline, "{what}");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// #223: a `blob_fetch` naming a REVOKED device as an alternate source never contacts it.
+    ///
+    /// `blob_source_addrs` resolved through `protocol_candidates`, which applied no revocation
+    /// filter, so a fetch dialled a device this node had revoked and asked it for the blob. Both
+    /// sources are real, reachable endpoints that count handshakes, named in revoked-first order so
+    /// an unfiltered fetch dials the stolen one before the live one: the LIVE count proves the fetch
+    /// reached its alternates at all, so the stolen count of zero means "filtered", not "never got
+    /// that far". The publisher is an id-only ticket that fails at once on a hermetic mesh.
+    ///
+    /// Deleting the `dial_refused` filter in `protocol_candidates` fails the zero-count assertion
+    /// and the source count.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_blob_fetch_never_dials_a_revoked_alternate_source() {
+        tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            let (dir, mesh, state) = blob_mesh().await;
+            let (stolen_ep, stolen, _t1) = counting_blob_source().await;
+            let (live_ep, live, _t2) = counting_blob_source().await;
+            seed_source_row(&mesh, "stolen", &stolen_ep);
+            seed_source_row(&mesh, "live", &live_ep);
+            mesh.store
+                .revoke(crate::allowlist::RevokedEntry {
+                    endpoint_id: *stolen_ep.id().as_bytes(),
+                    revoked_at: 1,
+                    reason: None,
+                    source: "local".into(),
+                    signer_user_id: None,
+                    issued_at: None,
+                })
+                .unwrap();
+
+            let nowhere = iroh::SecretKey::from_bytes(&[23u8; 32]).public();
+            let ticket = iroh_blobs::ticket::BlobTicket::new(
+                iroh::EndpointAddr::from(nowhere),
+                iroh_blobs::Hash::new(b"revoked-source"),
+                iroh_blobs::BlobFormat::Raw,
+            )
+            .to_string();
+            let err = blob_fetch(
+                &state,
+                ticket,
+                dir.path().join("out.bin").to_string_lossy().into_owned(),
+                vec!["stolen".into(), "live".into()],
+            )
+            .await
+            .expect_err("nobody serves this blob");
+            await_count(&live, "control: the live alternate must be dialled").await;
+            // A stray dial to the stolen source would have landed well within this.
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            assert_eq!(
+                stolen.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "a revoked source must never be contacted by a blob fetch"
+            );
+            assert!(
+                format!("{err:#}").contains("tried 2 sources"),
+                "the publisher and the live alternate only — the revoked one is not a source: \
+                 {err:#}"
+            );
+        })
+        .await
+        .expect("revoked-source test timed out");
+    }
+
     /// The blob control operations fail gracefully (Err, never a panic) in control-only mode — the
     /// `state.mesh()` guard every one shares before touching the app-blob provider.
     #[tokio::test]

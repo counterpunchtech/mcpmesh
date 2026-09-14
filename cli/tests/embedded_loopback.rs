@@ -1987,3 +1987,123 @@ async fn a_per_session_idle_timeout_reaches_the_dial_path() {
     a.shutdown().await;
     b.shutdown().await;
 }
+
+/// #223: `connect_protocol` refuses a peer this node has REVOKED — and the peer never sees an
+/// accept on the app ALPN.
+///
+/// `protocol_candidates` applied no revocation filter, so after `b` revoked `a`, `b` still dialled
+/// `a` on any embedder protocol. `a` has NOT revoked `b`, so `a`'s gate admits the connection and
+/// its handler runs: data flows to the device `b`'s operator cut off. Counting accepts on `a` is
+/// what makes the assertion real — an error on `b`'s side alone could be a dial that failed for any
+/// reason.
+///
+/// The control dial BEFORE the revoke is the other half: it proves `a` is reachable and its gate
+/// admits `b` on this ALPN, so a zero count afterwards can only mean nothing was dialled. Deleting
+/// the `dial_refused` filter in `protocol_candidates` fails the error assertion (the dial connects)
+/// and the count.
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_protocol_refuses_a_revoked_peer_without_dialling_it() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const ALPN: &[u8] = b"app/count/1";
+
+    /// Counts every connection that reaches the handler, then holds it until closed.
+    #[derive(Debug, Clone)]
+    struct Counter(Arc<AtomicUsize>);
+
+    impl mcpmesh_node::iroh::protocol::ProtocolHandler for Counter {
+        async fn accept(
+            &self,
+            conn: mcpmesh_node::iroh::endpoint::Connection,
+        ) -> Result<(), mcpmesh_node::iroh::protocol::AcceptError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            conn.closed().await;
+            Ok(())
+        }
+    }
+
+    let (a_root, b_root) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = NodeBuilder::new(a_root.path())
+        .config(hermetic())
+        .start()
+        .await
+        .expect("node a starts");
+    let b = NodeBuilder::new(b_root.path())
+        .config(hermetic())
+        .start()
+        .await
+        .expect("node b starts");
+    let accepts = Arc::new(AtomicUsize::new(0));
+    a.accept_protocol(ALPN, Arc::new(Counter(accepts.clone())))
+        .expect("register");
+
+    let mut a_ctl = a.control().await.expect("a control");
+    a_ctl
+        .register_service(
+            "notes",
+            BackendSpec::Run {
+                cmd: vec![STUB.into()],
+                env: Default::default(),
+                cwd: None,
+            },
+            vec![],
+        )
+        .await
+        .expect("register notes");
+    let invite = a_ctl.invite(vec!["notes".into()]).await.expect("invite");
+    let mut b_ctl = b.control().await.expect("b control");
+    let paired = timeout(Duration::from_secs(30), b_ctl.pair(&invite.invite_line))
+        .await
+        .expect("pair within 30s")
+        .expect("pair");
+
+    // The CONTROL: before the revoke, b reaches a's handler on this ALPN.
+    let conn = timeout(
+        Duration::from_secs(30),
+        b.connect_protocol(&paired.peer_nickname, ALPN),
+    )
+    .await
+    .expect("connect within 30s")
+    .expect("an unrevoked paired peer connects");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while accepts.load(Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "control: a's handler must see the unrevoked dial, or a zero count below proves nothing"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    conn.close(0u32.into(), b"done");
+
+    // b revokes a.
+    b_ctl
+        .peer_revoke(&paired.peer_nickname, Some("stolen".into()))
+        .await
+        .expect("revoke");
+
+    let a_eid = format!("eid:{}", a.endpoint_id());
+    let mut selectors = vec![paired.peer_nickname.clone(), a_eid];
+    selectors.extend(paired.peer_user_id.clone());
+    for sel in &selectors {
+        let err = timeout(Duration::from_secs(30), b.connect_protocol(sel, ALPN))
+            .await
+            .expect("the refusal is immediate, not a dial timeout")
+            .expect_err("connect_protocol must refuse a revoked peer");
+        assert!(
+            format!("{err:#}").contains("is REVOKED on this node"),
+            "the refusal must be open_session's revocation refusal, for {sel}: {err:#}"
+        );
+    }
+    // Give any stray dial time to land before counting.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        accepts.load(Ordering::SeqCst),
+        1,
+        "a revoked peer must never be dialled on an app ALPN — only the control connection may \
+         have reached a's handler"
+    );
+
+    b.shutdown().await;
+    a.shutdown().await;
+}

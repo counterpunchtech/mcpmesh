@@ -187,10 +187,12 @@ impl ComposedGate {
     /// Is this ROSTER `user_id` a revoked pairing identity (#218)? `org_approve` takes a free-form
     /// `user_id`, so a roster can name a user `b64u:x`; without this, rule 2 would admit a new
     /// rostered device under exactly the string `peer_revoke b64u:x` revoked, with no pair row for
-    /// rule 1 to refuse. Only the `b64u:` spelling is looked up — the identity table holds nothing
-    /// else (`peer_revoke` writes it for `b64u:` alone), so any other roster name costs no read.
+    /// rule 1 to refuse. The rule itself lives in [`PeerStore::is_roster_user_revoked`], which the
+    /// OUTBOUND dial filter calls too (#223) — one definition, so the directions cannot disagree.
+    ///
+    /// [`PeerStore::is_roster_user_revoked`]: crate::allowlist::PeerStore::is_roster_user_revoked
     fn roster_identity_revoked(&self, roster_user_id: Option<&str>) -> bool {
-        roster_user_id.is_some_and(|u| u.starts_with("b64u:") && self.pairs.is_user_revoked(u))
+        roster_user_id.is_some_and(|u| self.pairs.is_roster_user_revoked(u))
     }
 }
 
