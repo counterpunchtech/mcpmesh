@@ -2906,9 +2906,12 @@ pub const ERR_SELF_ENROLL_NOT_OFFERED: i64 = -32052;
 /// confirmed it, while every session from that peer was refused. Now the write path consults the
 /// same table admission does, and answers this instead of `{}`.
 ///
-/// "Revoked" here means exactly what admission means by it: an `eid:` that `peer_revoke` marked
+/// "Revoked" here means what admission means by it, read live: an `eid:` that `peer_revoke` marked
 /// dead (locally or by a signed import, or by the installed roster), or a `b64u:` identity that
-/// `peer_revoke` revoked AND none of whose known devices is still admitted. Remedy: `peer_unrevoke`
+/// `peer_revoke` revoked AND none of whose known devices is still admitted. The second clause is
+/// live state, not a promise: only attested pairing checks the identity table, so a device of a
+/// revoked identity that pairs by ordinary invite (or `peer_introduce`) is admitted, and a grant to
+/// that `b64u:` is then accepted again — a gate gap tracked in #218. Remedy: `peer_unrevoke`
 /// first if the revocation was a mistake; otherwise there is nothing to grant.
 ///
 /// **Numbering:** `-32053`..`-32055` are skipped. They are the SESSION-plane codes

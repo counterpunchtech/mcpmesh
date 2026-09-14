@@ -607,9 +607,14 @@ restores the grant with no re-grant. The fact is not hidden: a `peer_revoke` rev
 here in `revoked`, on the surface that means it, and a roster-revoked device is the roster's own
 `revoked_endpoints` (it is absent from `roster_members` too). Two consequences worth knowing: a `b64u:` entry hides only while **every**
 device of that identity is refused — `peer_unrevoke` on one device (by nickname) leaves the identity
-row but re-admits that device through its pair row, so the grant is live again and shows; and a
-bare roster name (a group, a roster `user_id`) is never hidden by this table — roster membership is
-withdrawn by roster INSTALL, which rebuilds the view. A hidden entry can still be stripped:
+row but re-admits that device through its pair row, so the grant is live again and shows (and so
+does a NEW device of that identity paired by ordinary invite or `peer_introduce` — only attested
+pairing checks the identity revocation, and the accept gate never does; that gap is tracked
+in #218, and `status` reports admission as it is); and a bare roster name (a group, a roster
+`user_id`) is never hidden by this table — roster membership is withdrawn by roster INSTALL, which
+rebuilds the view. The check fails CLOSED per entry: if the store cannot be read, the entry is
+omitted just as the gate would refuse it — so "vanished from `allow`" means "refused right now",
+which is not always "revoked"; the daemon logs the read failure at `warn`. A hidden entry can still be stripped:
 `service_allow_revoke` matches the string literally and does not consult the revocation table, and
 `revoked[].principal` is that exact string. Below 60, join `revoked` against `allow` yourself.
 
@@ -1646,7 +1651,7 @@ Reference: [`cli/src/backends/spawn.rs`](../cli/src/backends/spawn.rs) (`run`),
 | `-32050` | the request was **cancelled on purpose** before it finished — today, a `blob_fetch` that `blob_fetch_cancel` tripped (#172, `api_minor >= 44`). Not a failure: the caller asked for it. Partial chunks stay in the store, and are reclaimed only if this node configured `[blobs].gc_interval` (#80). |
 | `-32051` | this control connection already has 32 requests in flight, so this one was refused without being started (#172, `api_minor >= 44`). **Retryable** — retry after any response lands, or use a second connection. |
 | `-32052` | `pair` — the line is a SELF-ENROLLMENT (`mcpmesh-enroll:`) and you did not set `allow_self_enroll` (#178, `api_minor >= 45`). Decided from the line, **before any dial**: nothing was contacted and the invite is untouched, so the same line works on a retry. Remedy: if the person meant to add another of their own devices, offer that explicitly and retry with `allow_self_enroll: true`; otherwise they pasted the wrong link. |
-| `-32056` | `service_allow_grant` — the principal is **revoked** on this node, so the grant was refused **before anything was written** (#212, `api_minor >= 60`). "Revoked" is what admission means by it: an `eid:` that `peer_revoke` (or a signed import, or the installed roster) marked dead, or a `b64u:` identity `peer_revoke` revoked none of whose known devices is still admitted. Below 60 the grant succeeded and wrote an `allow` entry admission never honoured. Remedy: `peer_unrevoke` first if the revocation was a mistake; otherwise there is nothing to grant. `-32053`..`-32055` are skipped on purpose — they are the session-plane codes below. |
+| `-32056` | `service_allow_grant` — the principal is **revoked** on this node, so the grant was refused **before anything was written** (#212, `api_minor >= 60`). "Revoked" is what admission means by it, read live: an `eid:` that `peer_revoke` (or a signed import, or the installed roster) marked dead, or a `b64u:` identity `peer_revoke` revoked none of whose known devices is still admitted. Below 60 the grant succeeded and wrote an `allow` entry admission never honoured. Remedy: `peer_unrevoke` first if the revocation was a mistake; otherwise there is nothing to grant. `-32053`..`-32055` are skipped on purpose — they are the session-plane codes below. |
 | `-32000` | operation failed — `message` carries the detail. One common instance: the daemon is in control-only mode with no mesh (e.g. `invite`/`pair` before a mesh exists) |
 | `-32055` | *(session only)* peer unreachable |
 | `-32054` | *(session only)* session refused |

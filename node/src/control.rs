@@ -1387,7 +1387,10 @@ pub(crate) fn status_result(state: &DaemonState) -> Result<StatusResult> {
             // `ephemeral` flag per entry, so this whole-map clone on every status call is gone.
             {
                 // One store read serves both the peer list and the allow-display
-                // annotation (fails open on corrupt rows, like `peer_infos`).
+                // annotation (fails open on corrupt rows, like `peer_infos`). The #212
+                // revocation filter inside `service_infos` is the exception: it fails CLOSED
+                // per entry, hiding the entry when the store cannot be read — the gate would
+                // refuse that principal too.
                 let entries = mesh.store.list().unwrap_or_default();
                 (
                     crate::daemon::service_infos(mesh, &entries),

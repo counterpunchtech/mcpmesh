@@ -6706,7 +6706,11 @@ impl std::error::Error for PrincipalRevoked {}
 /// Is `principal` — an `allow`-list entry — one that admission REFUSES on revocation grounds, so a
 /// grant to it admits nobody and `status` must not report it as granted (#212)?
 ///
-/// This answers exactly the question the accept path answers, no wider and no narrower:
+/// This answers the question the accept path answers, from the same tables, re-read LIVE on every
+/// call. It is never wider than admission (nothing it calls revoked is admitted); it can be
+/// narrower in one roster-masked corner — a device paired with `user_id = b64u:x` that is ALSO in
+/// the installed roster resolves to its ROSTER identity, so a `b64u:x` entry never admits it
+/// while the roster is live, yet this predicate reports the entry as honoured.
 ///
 /// - an **`eid:`** is revoked iff its endpoint is in the pairing revocation table
 ///   ([`PeerStore::is_revoked`]) or the installed roster's `revoked_endpoints` — the two sources
@@ -6719,8 +6723,13 @@ impl std::error::Error for PrincipalRevoked {}
 ///   ([`endpoints_for_principal`]) is admitted. The second clause matters: `peer_unrevoke` on ONE
 ///   device (by nickname) lifts that endpoint's row and leaves the identity row, and the gate then
 ///   admits that device through its pair row's `user_id` — so a `b64u:` entry is honoured again
-///   and must show. A revoked identity with every device refused cannot gain a new one either:
-///   attestation refuses it at pairing.
+///   and must show. Note what the identity row does NOT do: only the ATTESTATION branch of
+///   pairing checks it (`rendezvous.rs`, `is_user_revoked`); an ordinary invite redemption and
+///   `peer_introduce` both write a pair row carrying a revoked `b64u:` with no identity check,
+///   and `AllowlistGate::resolve` never consults the identity table. So a freshly paired device
+///   of a revoked identity is ADMITTED, and because this predicate re-reads the live rows the
+///   `b64u:` grant correctly reappears with it. That gate gap is tracked in #218; this
+///   predicate reports admission as it is, not as it should be.
 /// - a **bare** entry (a roster group, a roster `user_id`, a legacy nickname) is never revoked here:
 ///   roster membership is withdrawn by roster INSTALL, which rebuilds the view, not by this table.
 ///
