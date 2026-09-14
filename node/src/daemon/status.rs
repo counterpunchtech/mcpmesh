@@ -498,7 +498,12 @@ mod tests {
         std::fs::write(&config_path, "").unwrap();
         let mesh = hermetic_mesh(config_path).await;
         for i in 0..10u64 {
-            mesh.record_pairing(format!("peer{i}"), format!("code-{i}"), i);
+            mesh.record_pairing(mcpmesh_local_api::RecentPairing {
+                peer_nickname: format!("peer{i}"),
+                sas_code: format!("code-{i}"),
+                paired_at_epoch: i,
+                self_enroll: false,
+            });
         }
         let recent = mesh.recent_pairings();
         assert_eq!(recent.len(), 8, "the ring is capped at 8");

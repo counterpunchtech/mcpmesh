@@ -133,8 +133,8 @@ pub use handlers::unregister_ephemeral;
 pub(crate) use handlers::{
     add_peer, blob_fetch, blob_fetch_cancel, blob_grant, blob_list, blob_publish, blob_republish,
     blob_revoke, blob_unpublish, mint_invite, open_session, peer_diagnostics, peer_services,
-    redeem, register_service, service_allow_grant, service_allow_revoke, set_relays,
-    unregister_service, user_key_export, user_key_import,
+    redeem, register_service, self_enroll_detach, service_allow_grant, service_allow_revoke,
+    set_relays, unregister_service, user_key_export, user_key_import,
 };
 pub(crate) use org_author::{org_approve, org_create, org_join_code, org_revoke};
 pub(crate) use roster_install::{
@@ -816,13 +816,9 @@ impl MeshState {
 
     /// Record a completed inviter-side pairing for the `status` ceremony surface (display-only —
     /// see the [`recent_pairings`](Self::recent_pairings) field doc). Bounded: the OLDEST entry
-    /// is dropped once the ring holds [`RECENT_PAIRINGS_CAP`].
-    pub(crate) fn record_pairing(
-        &self,
-        peer_nickname: String,
-        sas_code: String,
-        paired_at_epoch: u64,
-    ) {
+    /// is dropped once the ring holds [`RECENT_PAIRINGS_CAP`]. The whole row, so the ceremony
+    /// that ran (`self_enroll`, #214) is fixed where it is known and not re-derived here.
+    pub(crate) fn record_pairing(&self, entry: mcpmesh_local_api::RecentPairing) {
         let mut ring = self
             .recent_pairings
             .lock()
@@ -830,16 +826,14 @@ impl MeshState {
         if ring.len() >= RECENT_PAIRINGS_CAP {
             ring.pop_front();
         }
-        ring.push_back(mcpmesh_local_api::RecentPairing {
-            peer_nickname,
-            sas_code,
-            paired_at_epoch,
-        });
+        ring.push_back(entry);
     }
 
     /// Snapshot of the recent inviter-side pairings, NEWEST FIRST (the order `status` renders —
-    /// the code the human is looking for is almost always the latest one).
-    pub(crate) fn recent_pairings(&self) -> Vec<mcpmesh_local_api::RecentPairing> {
+    /// the code the human is looking for is almost always the latest one). `pub` as a test seam
+    /// (#214): the two-node ceremony tests assert which ceremony each row records.
+    #[doc(hidden)]
+    pub fn recent_pairings(&self) -> Vec<mcpmesh_local_api::RecentPairing> {
         self.recent_pairings
             .lock()
             .expect("recent_pairings lock not poisoned")
@@ -1327,9 +1321,7 @@ impl MeshState {
                     grant_service_access(&mesh, &principal, &nickname, &services).await
                 })
             }),
-            record_pairing: Box::new(move |nickname, sas, paired_at| {
-                record_mesh.record_pairing(nickname, sas, paired_at);
-            }),
+            record_pairing: Box::new(move |entry| record_mesh.record_pairing(entry)),
             // #86: sign a binding for ANOTHER DEVICE of this person. Loads the key per call rather
             // than holding it, matching `peer_endorse`. `None` when this daemon has no user key —
             // there is then no identity to enroll into.
@@ -1934,8 +1926,18 @@ mod tests {
         let mesh = super::testutil::hermetic_mesh(dir.path().join("config.toml")).await;
         assert!(mesh.recent_pairings().is_empty(), "no pairings yet");
 
-        mesh.record_pairing("bob".into(), "tango-fig-cabbage".into(), 1000);
-        mesh.record_pairing("carol".into(), "delta-hop-iron".into(), 2000);
+        mesh.record_pairing(mcpmesh_local_api::RecentPairing {
+            peer_nickname: "bob".into(),
+            sas_code: "tango-fig-cabbage".into(),
+            paired_at_epoch: 1000,
+            self_enroll: false,
+        });
+        mesh.record_pairing(mcpmesh_local_api::RecentPairing {
+            peer_nickname: "carol".into(),
+            sas_code: "delta-hop-iron".into(),
+            paired_at_epoch: 2000,
+            self_enroll: false,
+        });
 
         let recent = mesh.recent_pairings();
         assert_eq!(recent.len(), 2);

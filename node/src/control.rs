@@ -890,6 +890,12 @@ pub(crate) async fn handle_request(req: &Value, state: &DaemonState) -> Value {
             })
             .await,
         ),
+        // #214: leave an identity this device was ENROLLED into — the exit `adopt_hook` lacked.
+        Some("self_enroll_detach") => respond(
+            id,
+            "self_enroll_detach",
+            crate::daemon::self_enroll_detach(state).await,
+        ),
         // Read-only: decode + verify a join code and return the fingerprint the operator confirms
         // OUT-OF-BAND before approving. Nothing is signed, installed, or persisted.
         Some("org_join_code") => respond(
@@ -1416,6 +1422,17 @@ pub(crate) fn status_result(state: &DaemonState) -> Result<StatusResult> {
         .mesh()
         .and_then(|mesh| mesh.self_binding())
         .map(|binding| binding.user_pk);
+    // #214: does THIS device hold the key behind that id? An enrolled device presents an ADOPTED
+    // binding (#86) and holds nothing, so `peer_endorse` / `device_revoke` / `invite {as_self}`
+    // all refuse on it and `self_enroll_detach` applies only to it — none of which the id alone
+    // reveals. `false` with no id at all: there is no key to hold. Advisory; every verb re-checks.
+    let self_user_key_held = self_user_id.is_some()
+        && state.mesh().is_some_and(|mesh| {
+            mesh.adopted_binding
+                .read()
+                .expect("adopted_binding lock not poisoned")
+                .is_none()
+        });
     // Recent inviter-side pairing completions (display-only ceremony aids, newest first):
     // a snapshot of the mesh's in-memory ring. Empty in a control-only daemon and after a
     // restart (in-memory by design — not trust data).
@@ -1533,6 +1550,7 @@ pub(crate) fn status_result(state: &DaemonState) -> Result<StatusResult> {
         roster,
         presence,
         self_user_id,
+        self_user_key_held,
         recent_pairings,
         reachability,
         // The EFFECTIVE self-nickname (live — reflects a `set_nickname` immediately);
@@ -1791,6 +1809,9 @@ mod tests {
             "attest_offer",
             "attest_to",
             "org_rotate",
+            // #214: the self-enrollment exit. Parameterless, so it reaches the handler and must
+            // report the missing mesh rather than answer -32601.
+            "self_enroll_detach",
         ] {
             let r = handle_request(&req(method, json!({})), &st).await;
             // Graceful error, never a panic or a success. With empty params, a method whose

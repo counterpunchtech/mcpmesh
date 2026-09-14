@@ -357,6 +357,16 @@ pub struct RecentPairing {
     pub sas_code: String,
     /// When the pairing completed (epoch seconds) — the porcelain renders a friendly age.
     pub paired_at_epoch: u64,
+    /// `true` when the ceremony was a SELF-ENROLLMENT (`invite { as_self: true }`, #86): the
+    /// redeemer became another device of THIS person rather than a peer, so there is no peer row
+    /// behind `peer_nickname` and a SAS mismatch means an impostor now presents your identity —
+    /// the remedy is `device_revoke` of that endpoint, not `peer_remove` (#214). The endpoint is
+    /// on the `self_enroll` audit event, not here — this row stays surface-clean. Set structurally
+    /// by the ceremony that ran, never inferred from the nickname text. Additive
+    /// (`api_minor >= 60`): `#[serde(default, skip_serializing_if = ...)]`, absent = an ordinary
+    /// pairing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub self_enroll: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -379,6 +389,18 @@ pub struct StatusResult {
     /// `#[serde(default, skip_serializing_if = "Option::is_none")]` so an older payload round-trips.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_user_id: Option<String>,
+    /// `true` when THIS device holds the private user key behind `self_user_id` (#214,
+    /// `api_minor >= 60`). `false` when it presents that identity on the strength of an ADOPTED
+    /// enrollment binding (#86) — the key lives on the device that enrolled it — and when it has
+    /// no user key at all (`self_user_id` absent). An enrolled device and a key-holding one
+    /// otherwise report the same `self_user_id`, and three refusals hinge on the difference:
+    /// `peer_endorse`, `device_revoke` and `invite { as_self }` all refuse on an enrolled device,
+    /// and [`Request::SelfEnrollDetach`] applies only there. ADVISORY display data for placing
+    /// those affordances — never an authorization input; the daemon re-checks on every call.
+    /// Additive: `#[serde(default, skip_serializing_if = ...)]`, so it reads `false` from a daemon
+    /// below 60 — guard on `api_minor` before treating that as "enrolled".
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub self_user_key_held: bool,
     /// Recent INVITER-side pairing completions, newest first (display-only pairing-ceremony aids —
     /// see [`RecentPairing`]; in-memory on the daemon, cleared by a restart). Empty on a daemon
     /// that has accepted no pairing since it started. Additive:
@@ -1640,6 +1662,20 @@ pub enum Request {
     /// IMPORT a user key from a recovery phrase (#85 ask 2), so a person's `b64u:` survives the
     /// hardware. Tag `"user_key_import"`.
     UserKeyImport(UserKeyImportParams),
+    /// DETACH this device from an identity it was ENROLLED into (#214) — the inverse of the
+    /// adoption a `pair { allow_self_enroll }` performs (#86). Parameterless. Tag
+    /// `"self_enroll_detach"`.
+    ///
+    /// Drops the adopted device→user binding, live and on disk, so this node goes back to
+    /// presenting its own boot-derived identity. The exit that self-enrollment otherwise lacks: an
+    /// enrolled device holds no user key, so `user_key_import` — the only other verb that clears
+    /// the slot — is not available to it, and a person handed a substituted `mcpmesh-enroll:` line
+    /// was permanently a device of a stranger's identity.
+    ///
+    /// **Local only.** It does not reach any peer: whoever already learned this endpoint as that
+    /// person's device still believes it. Telling THEM is `device_revoke`, issued from the device
+    /// that holds the key. Refused with [`ERR_NOT_ENROLLED`] when nothing is adopted.
+    SelfEnrollDetach,
     /// Pin the org root on a JOINER — WITHOUT a roster (the joiner has none yet; its poll loop
     /// fetches the first one). Records `[identity]` org_id / org_root_pk / user_id / user_key.
     /// `user_key` is a LOCAL path
@@ -1944,6 +1980,19 @@ impl std::fmt::Debug for UserKeyExportResult {
             .field("user_id", &self.user_id)
             .finish()
     }
+}
+
+/// Result of [`Request::SelfEnrollDetach`] (#214).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelfEnrollDetachResult {
+    /// The `b64u:` identity now in effect — this node's own, boot-derived one. What a UI shows to
+    /// confirm the exit took. `None` only when this node has no user key of its own: boot mints
+    /// one, so that is a boot that could NOT load or mint it (logged as a warning there) — the
+    /// same condition under which `status.self_user_id` is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    /// The `b64u:` identity this device has STOPPED presenting — the one it was enrolled into.
+    pub detached_from: String,
 }
 
 /// Result of [`Request::UserKeyImport`] (#85 ask 2).
@@ -2946,6 +2995,23 @@ pub const ERR_PRINCIPAL_REVOKED: i64 = -32056;
 /// other refusal's — it is on the other side of the wire.
 pub const ERR_PAIR_IDENTITY_REVOKED: i64 = -32057;
 
+/// `invite { as_self: true }` on a device that was itself ENROLLED into another identity (#214):
+/// it holds no user key, so there is nothing to sign a binding with.
+///
+/// Refused AT MINT, on the device that can act on it. Before this the mint succeeded and the
+/// refusal surfaced one round trip later on the OTHER machine as the deliberately opaque
+/// [`ERR_INVITE_REFUSED`] — "that invite didn't work, ask for a new one", which is dead-end advice
+/// for a permanent condition. Remedy: enroll from the device that holds the key, or
+/// [`Request::SelfEnrollDetach`] this one first if it should not be enrolled at all.
+/// `StatusResult::self_user_key_held` is the same fact, readable before anyone presses the button.
+pub const ERR_SELF_ENROLL_NO_KEY: i64 = -32056;
+
+/// `self_enroll_detach` on a device with NO adopted binding (#214): there is no enrollment to exit.
+/// Nothing was changed. A UI that greys the affordance out on `self_user_key_held` never sees it;
+/// one that races a concurrent detach or a `user_key_import` (which also clears the slot) can
+/// treat it as "already done".
+pub const ERR_NOT_ENROLLED: i64 = -32057;
+
 /// How many requests one control connection may have in flight at once (#172), after which it
 /// answers [`ERR_TOO_MANY_INFLIGHT`]. Per connection, not per daemon.
 pub const MAX_INFLIGHT: usize = 32;
@@ -3050,7 +3116,22 @@ pub const API_VERSION: &str = "1.61";
 /// refusals — expired line, no live invite, inviter unreachable, id mismatch, name conflict, and
 /// the deliberately-opaque refusal. `ERR_NICKNAME_TAKEN` had been the only coded pairing failure,
 /// so every other one arrived as `-32000` and an embedder could either forward our prose to end
-/// users or substring-match it (#159); to 61 when an IDENTITY revocation (`peer_revoke b64u:`)
+/// users or substring-match it (#159); to 60 with the self-enrollment EXIT and the surface an
+/// embedder needs to ship the ceremony at all (#214): [`Request::SelfEnrollDetach`] drops an
+/// adopted binding (the inverse of `pair { allow_self_enroll }`, and the only exit an enrolled
+/// device has — `user_key_import` needs the phrase of a key it does not hold);
+/// [`RecentPairing::self_enroll`] marks which ceremony produced a SAS row, so the inviter's
+/// mismatch branch can route to `device_revoke` instead of a `peer_remove` of a peer that does not
+/// exist; [`StatusResult::self_user_key_held`] says whether this device holds its key, which is
+/// what `peer_endorse`, `device_revoke` and `invite { as_self }` all refuse without; `device_revoke`
+/// now REFUSES on an enrolled device (a bug: it signed with the local key, self-applied the
+/// revocation and severed sessions, then returned a token no peer would ever accept — a silent
+/// partial success on the stolen-laptop path); and `invite { as_self }` on an enrolled device is
+/// refused at mint with [`ERR_SELF_ENROLL_NO_KEY`] rather than one round trip later, on the other
+/// machine, as the opaque `-32049`. Guard on `>= 60` before offering the detach; the two fields
+/// read `false` from an older daemon, which is wrong for exactly the case each exists to name
+/// (`self_user_key_held` for a key-holder, `self_enroll` for an enrollment row), so guard before
+/// rendering them; to 61 when an IDENTITY revocation (`peer_revoke b64u:`)
 /// began to hold at every site (#218): `pair` answers [`ERR_PAIR_IDENTITY_REVOKED`] when the
 /// inviter has revoked the redeemer's proven `user_id`, `peer_introduce` answers
 /// [`ERR_PRINCIPAL_REVOKED`] for a subject proving one this node revoked, and admission refuses
@@ -3629,6 +3710,87 @@ mod tests {
         let rp = RecentPairing::default();
         assert_eq!(rp.paired_at_epoch, 0);
         assert!(rp.sas_code.is_empty(), "no ceremony produced a code");
+        assert!(
+            !rp.self_enroll,
+            "an unset row is an ordinary pairing (#214)"
+        );
+    }
+
+    /// #214: `RecentPairing.self_enroll` is elided when false (an older client's payload
+    /// round-trips) and rides the wire when true — the field an inviter-side SAS panel routes on,
+    /// instead of the `"(this person's device)"` prose.
+    #[test]
+    fn recent_pairing_self_enroll_is_additive_and_defaults_to_false() {
+        let legacy: RecentPairing = serde_json::from_value(serde_json::json!({
+            "peer_nickname": "bob", "sas_code": "tango-fig-cabbage", "paired_at_epoch": 1
+        }))
+        .unwrap();
+        assert!(
+            !legacy.self_enroll,
+            "an absent self_enroll is an ordinary pairing"
+        );
+
+        let ordinary = RecentPairing {
+            peer_nickname: "bob".into(),
+            sas_code: "tango-fig-cabbage".into(),
+            paired_at_epoch: 1,
+            self_enroll: false,
+        };
+        let v = serde_json::to_value(&ordinary).unwrap();
+        assert!(
+            v.get("self_enroll").is_none(),
+            "false is elided, like every additive bool on this surface: {v}"
+        );
+
+        let enrolled = RecentPairing {
+            self_enroll: true,
+            ..ordinary
+        };
+        let v = serde_json::to_value(&enrolled).unwrap();
+        assert_eq!(v["self_enroll"], true);
+        let back: RecentPairing = serde_json::from_value(v).unwrap();
+        assert_eq!(back, enrolled);
+    }
+
+    /// #214: `StatusResult.self_user_key_held` is additive — absent reads `false` — and the detach
+    /// verb has a parameterless tag plus a result whose `user_id` is optional on the wire.
+    #[test]
+    fn self_user_key_held_and_self_enroll_detach_serialize_additively() {
+        let legacy: StatusResult = serde_json::from_value(serde_json::json!({
+            "stack_version": "0", "services": [], "peers": []
+        }))
+        .unwrap();
+        assert!(
+            !legacy.self_user_key_held,
+            "an older daemon omits the field; it must read false rather than fail the parse"
+        );
+        let v = serde_json::to_value(&legacy).unwrap();
+        assert!(
+            v.get("self_user_key_held").is_none(),
+            "false is elided: {v}"
+        );
+
+        let v = serde_json::to_value(&Request::SelfEnrollDetach).unwrap();
+        assert_eq!(v["method"], "self_enroll_detach");
+        assert!(v.get("params").is_none(), "parameterless: {v}");
+
+        let res = SelfEnrollDetachResult {
+            user_id: Some("b64u:mine".into()),
+            detached_from: "b64u:theirs".into(),
+        };
+        let v = serde_json::to_value(&res).unwrap();
+        assert_eq!(v["user_id"], "b64u:mine");
+        assert_eq!(v["detached_from"], "b64u:theirs");
+        assert_eq!(
+            serde_json::from_value::<SelfEnrollDetachResult>(v).unwrap(),
+            res
+        );
+        let keyless: SelfEnrollDetachResult =
+            serde_json::from_value(serde_json::json!({"detached_from": "b64u:theirs"})).unwrap();
+        assert_eq!(keyless.user_id, None);
+
+        assert_eq!(ERR_SELF_ENROLL_NO_KEY, -32056);
+        assert_eq!(ERR_NOT_ENROLLED, -32057);
     }
 
     /// #150 gate: "an unrecognized value reads as `unknown`" must hold for any VALUE, not just an
@@ -4424,6 +4586,7 @@ mod tests {
             roster: None,
             presence: vec![],
             self_user_id: Some("b64u:selfpk".into()),
+            self_user_key_held: true,
             recent_pairings: vec![],
             reachability: vec![],
             self_nickname: String::new(),
@@ -4436,6 +4599,10 @@ mod tests {
         // The additive identity fields ride the wire when present.
         assert_eq!(v["peers"][0]["user_id"], "b64u:alicepk");
         assert_eq!(v["self_user_id"], "b64u:selfpk");
+        assert_eq!(
+            v["self_user_key_held"], true,
+            "#214: rides the wire when set"
+        );
         assert!(
             v.get("roster").is_none(),
             "an absent roster must not appear on the wire: {v}"
@@ -4498,6 +4665,7 @@ mod tests {
                 },
             ],
             self_user_id: None,
+            self_user_key_held: false,
             recent_pairings: vec![],
             reachability: vec![],
             self_nickname: String::new(),
@@ -4534,10 +4702,12 @@ mod tests {
             roster: None,
             presence: vec![],
             self_user_id: None,
+            self_user_key_held: false,
             recent_pairings: vec![RecentPairing {
                 peer_nickname: "bob".into(),
                 sas_code: "tango-fig-cabbage".into(),
                 paired_at_epoch: 1_800_000_000,
+                self_enroll: false,
             }],
             reachability: vec![],
             self_nickname: String::new(),

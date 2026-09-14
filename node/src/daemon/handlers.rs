@@ -680,6 +680,11 @@ fn adopt_hook(mesh: &Arc<MeshState>) -> crate::pairing::rendezvous::AdoptBinding
     Box::new(move |binding: crate::pairing::rendezvous::SelfBinding| {
         let mesh = mesh.clone();
         Box::pin(async move {
+            // #214: serialized with `self_enroll_detach` and `user_key_import`, the other writers
+            // of this slot and its sidecar. Without it a detach racing an adoption could remove
+            // the file, lose to the adopt's write, then clear the live slot — leaving a sidecar
+            // the next boot re-adopts while `status` reports the exit took.
+            let _guard = mesh.user_key_lock.lock().await;
             let path = mesh.adopted_binding_path();
             let json = serde_json::to_vec(&binding)?;
             blocking("join adopt binding write", move || {
@@ -1317,6 +1322,33 @@ pub(crate) async fn mint_invite(
             "as_self grants nothing: your own devices are not peers of each other. Omit services."
                 .into()
         ));
+    }
+    if as_self {
+        // #214: an ENROLLED device cannot enroll a third — `inviter_ctx`'s `sign_binding` returns
+        // `None` for it — but nothing said so at mint. The refusal surfaced one round trip later,
+        // on the OTHER machine, as the opaque -32049 ("that invite didn't work"), which is
+        // dead-end advice for a permanent condition. Refused HERE, coded, on the device that can
+        // act on it. Checked BEFORE the no-identity case below, and it has to be: an enrolled
+        // device's `self_binding()` is `Some` (the adopted one), so that check cannot see it —
+        // this is the only one that names the condition.
+        if mesh
+            .adopted_binding
+            .read()
+            .expect("adopted_binding lock not poisoned")
+            .is_some()
+        {
+            anyhow::bail!(crate::pairing::rendezvous::PairRefusal::new(
+                mcpmesh_local_api::ERR_SELF_ENROLL_NO_KEY,
+                "this device was enrolled into another device's identity and holds no user key to \
+                 enroll with. Enroll from the device that holds the key, or detach this one first \
+                 if it should not be enrolled at all",
+            ));
+        }
+        // No user key at all means there is no identity to enroll INTO. The redeem arm refuses
+        // this too, but on the other machine; a mint that cannot be redeemed is refused here.
+        if mesh.self_binding().is_none() {
+            anyhow::bail!("this device has no user identity to enroll into");
+        }
     }
     let peer_nickname = validated_alias("peer_nickname", peer_nickname)?;
     // One alias applied to EVERY redeemer of a multi-use invite collides on the second redemption.
@@ -2841,6 +2873,74 @@ pub(crate) async fn user_key_import(
     })
 }
 
+/// `self_enroll_detach` (#214): drop an ADOPTED enrollment binding — the inverse of [`adopt_hook`].
+///
+/// The exit self-enrollment did not have. `adopt_hook` writes the binding to disk and installs it
+/// live, and the only verb that cleared the slot was `user_key_import` — which needs the recovery
+/// phrase of a key an enrolled device by construction does not hold. So a person handed a
+/// substituted `mcpmesh-enroll:` line was a device of a stranger's identity until they deleted the
+/// state root by hand.
+///
+/// Sidecar FIRST, then the live slot. The file is what boot re-reads, so a detach that cleared the
+/// slot and then failed to remove the file would report an exit the next restart silently undid.
+/// `user_key_import` tolerates that as best-effort because its live state is already the right
+/// identity; here the exit IS the verb, so a removal failure leaves the slot set and is the error.
+///
+/// Local only: it changes what this device PRESENTS, not what anyone believes. A peer that already
+/// learned this endpoint as that person's device still has; telling them is `device_revoke`, from
+/// the device that holds the key.
+pub(crate) async fn self_enroll_detach(
+    state: &DaemonState,
+) -> Result<mcpmesh_local_api::SelfEnrollDetachResult> {
+    let mesh = state.mesh_required()?;
+    // Serialized against `user_key_import`, the other writer of this slot and its sidecar.
+    let _guard = mesh.user_key_lock.lock().await;
+    let Some(adopted) = mesh
+        .adopted_binding
+        .read()
+        .expect("adopted_binding lock not poisoned")
+        .clone()
+    else {
+        anyhow::bail!(crate::pairing::rendezvous::PairRefusal::new(
+            mcpmesh_local_api::ERR_NOT_ENROLLED,
+            "this device is not enrolled into another identity: there is no adopted binding to \
+             detach, and it already presents its own",
+        ));
+    };
+    let sidecar = mesh.adopted_binding_path();
+    blocking("join adopted binding remove", move || {
+        match std::fs::remove_file(&sidecar) {
+            Ok(()) => Ok(()),
+            // A binding adopted live but never persisted (a write that failed after the install,
+            // or a fixture) still detaches: what matters is what boot will re-read, and nothing.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(anyhow::anyhow!(
+                "remove the adopted binding at {}: {e}",
+                sidecar.display()
+            )),
+        }
+    })
+    .await??;
+    mesh.set_self_binding_live(None);
+    // Audited like the adoption it undoes (`self_enroll_adopt`), keyed on the identity left.
+    mesh.audit().record(AuditRecord::trust(
+        now_ts(),
+        "self_enroll_detach".into(),
+        Some(adopted.user_pk.clone()),
+        None,
+    ));
+    let user_id = mesh.self_binding().map(|b| b.user_pk);
+    tracing::info!(
+        detached_from = %adopted.user_pk,
+        now = user_id.as_deref().unwrap_or("<no user key>"),
+        "detached from an enrolled identity (#214)"
+    );
+    Ok(mcpmesh_local_api::SelfEnrollDetachResult {
+        user_id,
+        detached_from: adopted.user_pk,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4118,6 +4218,391 @@ mod tests {
         );
     }
 
+    /// #214 fixture: a mesh that holds its OWN key (boot-derived binding + key file) and was then
+    /// ENROLLED into someone else's identity through the real `adopt_hook`, so the sidecar exists
+    /// on disk and the live slot is set — the state every #214 verb exists to act on.
+    async fn enrolled_mesh(
+        dir: &tempfile::TempDir,
+    ) -> (
+        Arc<MeshState>,
+        crate::audit::AuditSink,
+        crate::pairing::rendezvous::SelfBinding,
+    ) {
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        let key_path = dir.path().join("user.key");
+        let (own, _) = mcpmesh_trust::UserKey::load_or_generate(&key_path).unwrap();
+        mesh.set_user_key_path(key_path);
+        mesh.set_self_binding(Some(crate::pairing::rendezvous::SelfBinding {
+            user_pk: mcpmesh_trust::binding::user_id(&own),
+            sig: "b64u:own-sig".into(),
+        }));
+        let audit =
+            crate::audit::AuditSink::new(crate::audit::AuditLog::spawn(dir.path().join("audit")));
+        mesh.set_audit(audit.clone());
+        let adopted = crate::pairing::rendezvous::SelfBinding {
+            user_pk: "b64u:someone-elses-identity".into(),
+            sig: "b64u:their-sig".into(),
+        };
+        adopt_hook(&mesh)(adopted.clone())
+            .await
+            .expect("the hook persists and installs");
+        assert!(
+            mesh.adopted_binding_path().exists(),
+            "precondition: the enrollment is on disk"
+        );
+        (mesh, audit, adopted)
+    }
+
+    /// Drain the live audit ring into a Vec (the ring, not the file, so nothing races the flush).
+    fn drain(rx: &mut tokio::sync::broadcast::Receiver<AuditRecord>) -> Vec<AuditRecord> {
+        let mut recs = Vec::new();
+        while let Ok(r) = rx.try_recv() {
+            recs.push(r);
+        }
+        recs
+    }
+
+    /// #214 ask 1: the exit. Detaching must undo BOTH halves of `adopt_hook` — the sidecar boot
+    /// re-reads and the live slot — audit it, and report the identity now in effect.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn self_enroll_detach_drops_the_binding_removes_the_sidecar_and_audits() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mesh, audit, adopted) = enrolled_mesh(&dir).await;
+        let own_uid = mesh.self_binding.get().cloned().flatten().unwrap().user_pk;
+        assert_eq!(
+            mesh.self_binding().unwrap().user_pk,
+            adopted.user_pk,
+            "precondition: the enrolled device presents the ADOPTED identity"
+        );
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+        let mut rx = audit.subscribe().expect("auditing enabled");
+
+        let out = self_enroll_detach(&state)
+            .await
+            .expect("an enrolled device can detach");
+
+        assert_eq!(
+            out.detached_from, adopted.user_pk,
+            "names the identity left"
+        );
+        assert_eq!(
+            out.user_id.as_deref(),
+            Some(own_uid.as_str()),
+            "and the identity now in effect — this device's own"
+        );
+        assert!(
+            mesh.adopted_binding.read().expect("lock").is_none(),
+            "the live slot must be cleared: `self_user_key_held` and the three gates read it"
+        );
+        assert_eq!(
+            mesh.self_binding().unwrap().user_pk,
+            own_uid,
+            "the boot-derived identity is presented again, without a restart"
+        );
+        assert!(
+            !mesh.adopted_binding_path().exists(),
+            "the sidecar must be GONE, or the next boot silently re-enrolls this device"
+        );
+        let rec = drain(&mut rx)
+            .into_iter()
+            .find(|r| r.event.as_deref() == Some("self_enroll_detach"))
+            .expect("leaving an identity is a trust change an operator asks about later");
+        assert_eq!(rec.target.as_deref(), Some(adopted.user_pk.as_str()));
+        assert!(
+            (mesh.inviter_ctx().sign_binding)(&[7u8; 32]).is_some(),
+            "…and having left, this device can enroll its owner's other devices again"
+        );
+    }
+
+    /// #214 ask 1: nothing adopted → a CODED refusal, and nothing touched. A live-only adoption
+    /// (never persisted) still detaches — what matters is what boot would re-read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn self_enroll_detach_refuses_when_nothing_is_adopted() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        mesh.set_user_key_path(dir.path().join("user.key"));
+        mesh.set_self_binding(Some(crate::pairing::rendezvous::SelfBinding {
+            user_pk: "b64u:own".into(),
+            sig: "b64u:sig".into(),
+        }));
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+
+        let e = self_enroll_detach(&state)
+            .await
+            .expect_err("a device holding its own key has nothing to detach");
+        let code = e
+            .downcast_ref::<crate::pairing::rendezvous::PairRefusal>()
+            .map(|r| r.code());
+        assert_eq!(
+            code,
+            Some(mcpmesh_local_api::ERR_NOT_ENROLLED),
+            "coded, so a UI can treat it as 'already done': {e:#}"
+        );
+        assert_eq!(
+            mesh.self_binding().unwrap().user_pk,
+            "b64u:own",
+            "the refusal must not disturb the identity presented"
+        );
+
+        // Live-only adoption: the slot is set, no sidecar was ever written.
+        mesh.set_self_binding_live(Some(crate::pairing::rendezvous::SelfBinding {
+            user_pk: "b64u:theirs".into(),
+            sig: "b64u:sig".into(),
+        }));
+        let out = self_enroll_detach(&state)
+            .await
+            .expect("a missing sidecar is not a failure to detach");
+        assert_eq!(out.detached_from, "b64u:theirs");
+        assert!(mesh.adopted_binding.read().expect("lock").is_none());
+    }
+
+    /// #214: the three writers of the adopted slot + sidecar — adopt, detach, import — serialize
+    /// on `user_key_lock`. A detach racing an adoption could otherwise remove the sidecar, lose to
+    /// the adopt's write, then clear the live slot: a file the next boot re-adopts under a `status`
+    /// that says the exit took. Pinned by holding the lock and asserting neither completes until
+    /// it is released (bounded waits, never a spin).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn adopt_and_detach_serialize_on_the_user_key_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mesh, _audit, _adopted) = enrolled_mesh(&dir).await;
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+        let binding = crate::pairing::rendezvous::SelfBinding {
+            user_pk: "b64u:third".into(),
+            sig: "b64u:sig".into(),
+        };
+
+        let held = mesh.user_key_lock.lock().await;
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(300),
+            adopt_hook(&mesh)(binding.clone()),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "adopt must wait for the user key lock: {blocked:?}"
+        );
+        let blocked =
+            tokio::time::timeout(Duration::from_millis(300), self_enroll_detach(&state)).await;
+        assert!(
+            blocked.is_err(),
+            "detach must wait for the user key lock: {blocked:?}"
+        );
+        drop(held);
+
+        // Released: both run, in order, to a consistent end state.
+        adopt_hook(&mesh)(binding.clone())
+            .await
+            .expect("adopt proceeds once the lock is free");
+        let out = tokio::time::timeout(Duration::from_secs(10), self_enroll_detach(&state))
+            .await
+            .expect("detach proceeds once the lock is free")
+            .expect("and succeeds");
+        assert_eq!(out.detached_from, "b64u:third");
+        assert!(!mesh.adopted_binding_path().exists());
+        assert!(mesh.adopted_binding.read().expect("lock").is_none());
+    }
+
+    /// #214 ask 3: `status.self_user_key_held` is the one field that tells an enrolled device from
+    /// one holding its key — both report the same `self_user_id` shape. Pinned through every
+    /// transition, because a constant `true` passes any single-state assertion.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn status_reports_whether_this_device_holds_its_user_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        mesh.set_user_key_path(dir.path().join("user.key"));
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+
+        // No user key at all: nothing is held.
+        let status = crate::control::status_result(&state).unwrap();
+        assert!(status.self_user_id.is_none());
+        assert!(
+            !status.self_user_key_held,
+            "with no identity there is no key to hold"
+        );
+
+        mesh.set_self_binding(Some(crate::pairing::rendezvous::SelfBinding {
+            user_pk: "b64u:own".into(),
+            sig: "b64u:sig".into(),
+        }));
+        let status = crate::control::status_result(&state).unwrap();
+        assert_eq!(status.self_user_id.as_deref(), Some("b64u:own"));
+        assert!(
+            status.self_user_key_held,
+            "a device presenting its boot-derived binding holds the key behind it"
+        );
+
+        mesh.set_self_binding_live(Some(crate::pairing::rendezvous::SelfBinding {
+            user_pk: "b64u:theirs".into(),
+            sig: "b64u:sig".into(),
+        }));
+        let status = crate::control::status_result(&state).unwrap();
+        assert_eq!(
+            status.self_user_id.as_deref(),
+            Some("b64u:theirs"),
+            "an enrolled device reports the ADOPTED id — the same shape as a key-holder"
+        );
+        assert!(
+            !status.self_user_key_held,
+            "…which is exactly why this field exists: the key lives on the enrolling device"
+        );
+
+        self_enroll_detach(&state).await.unwrap();
+        let status = crate::control::status_result(&state).unwrap();
+        assert_eq!(status.self_user_id.as_deref(), Some("b64u:own"));
+        assert!(status.self_user_key_held, "held again once detached");
+    }
+
+    /// #214 ask 4 (BUG): `device_revoke` on an ENROLLED device signed with the LOCAL key, applied
+    /// the revocation here, severed sessions, audited it and returned a token no peer would ever
+    /// accept — a silent partial success on the stolen-laptop path. It must refuse with
+    /// `peer_endorse`'s #86 gate, BEFORE any of those side effects.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_enrolled_device_cannot_sign_a_device_revocation_and_nothing_is_applied() {
+        use mcpmesh_local_api::DeviceRevokeParams;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mesh, audit, _adopted) = enrolled_mesh(&dir).await;
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+        let lost = iroh::SecretKey::from_bytes(&[0x77; 32]).public();
+        let lost_bytes = *lost.as_bytes();
+        // The stolen laptop is still paired here — the realistic shape, and what makes a
+        // self-applied revocation observable.
+        mesh.store
+            .add(PeerEntry {
+                endpoint_id: lost_bytes,
+                nickname: "old-laptop".into(),
+                services: vec![],
+                paired_at: None,
+                user_id: None,
+                last_addr: None,
+            })
+            .unwrap();
+        let severed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        mesh.set_sever_observer({
+            let severed = severed.clone();
+            move |_| severed.store(true, std::sync::atomic::Ordering::SeqCst)
+        });
+        let mut rx = audit.subscribe().expect("auditing enabled");
+        let params = || DeviceRevokeParams {
+            endpoint: mcpmesh_net::EndpointId::from_bytes(lost_bytes).principal(),
+            reason: Some("stolen".into()),
+        };
+
+        let e = device_revoke(&state, params())
+            .await
+            .expect_err("an enrolled device must refuse to sign a device revocation");
+        assert!(
+            e.downcast_ref::<crate::control::InvalidParams>().is_some(),
+            "the same shape as peer_endorse's #86 gate (-32602): {e:#}"
+        );
+        assert!(
+            format!("{e:#}").contains("does not hold that user key"),
+            "and the same message shape, saying WHY: {e:#}"
+        );
+        // None of the three side effects happened.
+        assert!(
+            !mesh.store.is_revoked(&lost_bytes),
+            "the revocation must not be self-applied: peers would never act on the token, so this \
+             node acting on it alone is the silent partial success"
+        );
+        assert!(
+            !severed.load(std::sync::atomic::Ordering::SeqCst),
+            "no session may be severed by a refused revocation"
+        );
+        assert!(
+            drain(&mut rx)
+                .iter()
+                .all(|r| r.event.as_deref() != Some("device_revoke")),
+            "a refused revocation must not be audited as one"
+        );
+
+        // The gate is the ADOPTED slot, nothing else: detach, and the same call signs.
+        self_enroll_detach(&state).await.unwrap();
+        let out = device_revoke(&state, params())
+            .await
+            .expect("a device holding its own key signs");
+        assert_eq!(
+            Some(out.user_id.as_str()),
+            crate::control::status_result(&state)
+                .unwrap()
+                .self_user_id
+                .as_deref(),
+            "the token is signed under the identity this node PRESENTS — the one peers pinned"
+        );
+        assert!(mesh.store.is_revoked(&lost_bytes));
+    }
+
+    /// #214 ask 5: `invite { as_self }` on an ENROLLED device is refused AT MINT with its own
+    /// code, on the machine that can act on it — not one round trip later on the other machine as
+    /// the opaque -32049. The enrolled check must come BEFORE the no-identity one: an enrolled
+    /// device's `self_binding()` is `Some` (the adopted one), so the generic message would win.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_enrolled_device_cannot_mint_a_self_invite() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mesh, _audit, _adopted) = enrolled_mesh(&dir).await;
+
+        let e = mint_invite(vec![], None, None, None, true, &mesh)
+            .await
+            .expect_err("an enrolled device holds no key to enroll another with");
+        let code = e
+            .downcast_ref::<crate::pairing::rendezvous::PairRefusal>()
+            .map(|r| r.code());
+        assert_eq!(
+            code,
+            Some(mcpmesh_local_api::ERR_SELF_ENROLL_NO_KEY),
+            "coded, so a UI renders a permanent condition rather than 'ask for a new one': {e:#}"
+        );
+        let msg = format!("{e:#}");
+        assert!(
+            msg.contains("enrolled into another device's identity"),
+            "the SPECIFIC message, not the generic no-identity one: {msg}"
+        );
+        assert_eq!(
+            mesh.invites.count(),
+            0,
+            "a refused mint must leave no outstanding invite"
+        );
+
+        // An ORDINARY invite still mints on an enrolled device — it grants access, not identity.
+        std::fs::write(
+            &mesh.config_path,
+            "[services.notes]\nsocket = \"/run/n.sock\"\nallow = []\n",
+        )
+        .unwrap();
+        mint_invite(vec!["notes".into()], None, None, None, false, &mesh)
+            .await
+            .expect("an ordinary invite is unaffected");
+
+        // Detached, the same device mints a self invite again: the gate is the adopted slot.
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+        self_enroll_detach(&state).await.unwrap();
+        mint_invite(vec![], None, None, None, true, &mesh)
+            .await
+            .expect("a device holding its own key enrolls others");
+
+        // With no identity at all the mint is refused too, uncoded — it was refused on the OTHER
+        // machine before, which is the #159 shape.
+        let dir2 = tempfile::tempdir().unwrap();
+        let config_path = dir2.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let keyless = hermetic_mesh(config_path).await;
+        let e = mint_invite(vec![], None, None, None, true, &keyless)
+            .await
+            .expect_err("no identity to enroll into");
+        assert!(
+            e.downcast_ref::<crate::pairing::rendezvous::PairRefusal>()
+                .is_none()
+                && format!("{e:#}").contains("no user identity to enroll into"),
+            "{e:#}"
+        );
+    }
+
     /// #86: a self-enrollment invite mints IDENTITY, so both guards are refusals, not warnings.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_self_invite_must_be_single_use_and_grant_nothing() {
@@ -4129,6 +4614,11 @@ mod tests {
         )
         .unwrap();
         let mesh = hermetic_mesh(config_path).await;
+        // #214: a self invite needs an identity to enroll INTO, or the mint itself is refused.
+        mesh.set_self_binding(Some(crate::pairing::rendezvous::SelfBinding {
+            user_pk: "b64u:own".into(),
+            sig: "b64u:sig".into(),
+        }));
         let svc = || vec!["notes".to_string()];
 
         // Multi-use: a standing offer to become this person.
@@ -7426,6 +7916,22 @@ pub(crate) async fn device_revoke(
             params.endpoint
         )
     })?;
+    // #86 gate, the one `peer_endorse` has and this verb lacked (#214): an ENROLLED device holds no
+    // authority over the identity it presents. `read_user_key` below reads the LOCAL key boot mints
+    // regardless, so without this the call self-applied the revocation, severed sessions, audited
+    // it and returned a token signed under a `b64u:` no peer has ever paired with — a silent
+    // partial success on the stolen-laptop path. Refused BEFORE any of those side effects.
+    anyhow::ensure!(
+        mesh.adopted_binding
+            .read()
+            .expect("adopted_binding lock not poisoned")
+            .is_none(),
+        crate::control::InvalidParams(
+            "device_revoke: this device was enrolled into another device's identity (#86) and does \
+             not hold that user key. Revoke from the device that does."
+                .into()
+        )
+    );
     let key = read_user_key(mesh).await?;
     let user_id = mcpmesh_trust::binding::user_id(&key);
     let issued_at = crate::util::epoch_now_u64();

@@ -355,6 +355,13 @@ enum IdentityCmd {
         #[arg(long)]
         replace: bool,
     },
+    /// Leave an identity this device was enrolled into (`pair --as-self`), and present its own.
+    ///
+    /// The exit for a device that redeemed a `mcpmesh-enroll:` link it should not have — an
+    /// enrolled device holds no user key, so `identity import` cannot help it. Local only: peers
+    /// who already learned this device as that person's are not told. Telling them is
+    /// `mcpmesh revoke device`, run from the device that holds the key.
+    Detach,
 }
 
 #[derive(Subcommand)]
@@ -737,6 +744,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Some(Cmd::Identity {
             command: IdentityCmd::Import { phrase, replace },
         }) => enrollcmd::run_identity_import(phrase, replace, cli.json),
+        Some(Cmd::Identity {
+            command: IdentityCmd::Detach,
+        }) => enrollcmd::run_identity_detach(cli.json),
         Some(Cmd::Attest {
             command: AttestCmd::Offer,
         }) => enrollcmd::run_attest_offer(cli.json),

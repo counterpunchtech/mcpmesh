@@ -1496,6 +1496,19 @@ async fn self_enrollment_shares_one_identity_and_writes_no_peer_rows() {
             "the result must say this was an ENROLLMENT, not a pairing — a caller cannot otherwise \
              tell the two outcomes apart"
         );
+        // #214 ask 2: the INVITER's ceremony surface says so too — structurally, so its SAS panel
+        // routes a mismatch to `device_revoke` instead of a `peer_remove` of a peer that does not
+        // exist. Through the real accept loop, since the arm that runs the ceremony sets it.
+        let recent = mesh.recent_pairings();
+        assert_eq!(recent.len(), 1, "one ceremony, one row: {recent:?}");
+        assert!(
+            recent[0].self_enroll,
+            "the inviter's SAS row must be marked as a SELF-ENROLLMENT: {recent:?}"
+        );
+        assert_eq!(
+            recent[0].sas_code, result.sas_code,
+            "and carry the same words the enrolled device shows"
+        );
         assert!(
             result.services.is_empty(),
             "an enrollment grants nothing: your own devices are not peers of each other"
@@ -1662,6 +1675,14 @@ async fn both_sides_store_their_own_local_alias_after_a_real_pairing() {
             alices_entry.nickname, "bobs-laptop",
             "the inviter must STORE its peer_nickname, overriding the redeemer's self-claim"
         );
+        // #214 ask 2, the discriminating half: an ORDINARY pairing's row is NOT marked.
+        let recent = mesh.recent_pairings();
+        assert_eq!(recent.len(), 1, "{recent:?}");
+        assert!(
+            !recent[0].self_enroll,
+            "an ordinary pairing must not be presented as an enrollment: {recent:?}"
+        );
+        assert_eq!(recent[0].peer_nickname, "bobs-laptop");
 
         drop(bob_dir);
         std::mem::forget(dir);
