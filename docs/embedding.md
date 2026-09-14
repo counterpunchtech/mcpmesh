@@ -263,7 +263,7 @@ still faces the gate.
 ```rust
 use mcpmesh_local_api::PeerPath;
 match mcpmesh_node::Node::connection_path(&conn).await {
-    PeerPath::Direct => { /* no relay in the loop */ }
+    PeerPath::Direct => { /* no relay frames observed; re-check during the call */ }
     PeerPath::Relay { .. } | PeerPath::Unknown => { /* not private: ask before sending audio */ }
     _ => { /* a variant this version does not know: treat as not-private */ }
 }

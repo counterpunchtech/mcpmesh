@@ -359,7 +359,7 @@ impl Node {
     /// to your [`accept_protocol`](Self::accept_protocol) handler. It **measures**: it samples every
     /// open path's application-frame counters (STREAM + DATAGRAM, both directions), watches the
     /// connection's path events for 250ms — a path that closes inside the window is attributed
-    /// from its own final counters — and reports the path that moved. Any frame over a relay in
+    /// from its own final counters — and reports the path that moved. Any observed relay frame in
     /// that window is `Relay`; otherwise a moving direct path is `Direct`. Only when nothing moved
     /// does it fall back to the structural reading mcpmesh's own probes and session watcher use
     /// (`Path::is_selected()`, or the single open path). An idle window whose structural reading
@@ -387,8 +387,9 @@ impl Node {
     ///
     /// **If your rule is "never call a relayed call private"**, treat `Direct` as advisory: gate
     /// on it at call setup, then re-check periodically for the life of the call (every few
-    /// seconds is cheap — one reading is at most 750ms of sampling and holds no lock), and treat a
-    /// later `Relay` or `Unknown` as the call having become not-private. A path can also genuinely
+    /// seconds is cheap — one reading is at most 750ms of sampling and holds no lock across an
+    /// await), and treat a later `Relay` or `Unknown` as the call having become not-private. A
+    /// path can also genuinely
     /// change mid-call (a direct path lost to a network change falls back to the relay), which
     /// only a re-check will catch.
     ///
@@ -396,7 +397,7 @@ impl Node {
     /// # async fn f(conn: mcpmesh_node::iroh::endpoint::Connection) {
     /// use mcpmesh_local_api::PeerPath;
     /// match mcpmesh_node::Node::connection_path(&conn).await {
-    ///     PeerPath::Direct => { /* private: no confirmation needed */ }
+    ///     PeerPath::Direct => { /* no relay frames observed; re-check during the call */ }
     ///     PeerPath::Relay { .. } | PeerPath::Unknown => { /* ask before sending audio */ }
     ///     _ => { /* a variant this version does not know: treat as not-private */ }
     /// }

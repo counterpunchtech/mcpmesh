@@ -744,8 +744,12 @@ pub(crate) async fn measure_window<S: WindowSource>(source: &S, window: Duration
     let after = source.sample();
     // Events already queued when `after` was taken: a path removed from the list just before the
     // sample has its `Closed` sent just after (`record_abandoned` sends outside its lock).
+    //
+    // `unconstrained`: the stream is backed by a tokio broadcast, whose `recv` is cooperative. With
+    // the task's coop budget spent, a poll returns Pending even with events queued, and a
+    // single-poll drain would stop early — dropping exactly the `Closed` this drain exists for.
     loop {
-        match n0_future::future::now_or_never(events.next()) {
+        match n0_future::future::now_or_never(tokio::task::coop::unconstrained(events.next())) {
             Some(Some(event)) => seen.extend(WindowEvent::from_observed(event)),
             Some(None) => return WindowReading::Unobservable,
             None => break,
@@ -1475,6 +1479,36 @@ mod tests {
         );
     }
 
+    /// #213 round 5: the main success case for a path that opened in the window — it is still in
+    /// `after`, its `Opened` was seen, and its whole count is movement of its own kind. A rule that
+    /// treated every `Opened` path as unaccounted for survived the round-4 suite 27/27.
+    #[test]
+    fn a_path_opened_in_the_window_and_still_open_is_attributed() {
+        let (p0, _, p2) = ids();
+        let before = [(p0, PeerPath::Direct, AppFrames(10))];
+        let opened = [WindowEvent::Opened { id: p2 }];
+
+        let after = [
+            (p0, PeerPath::Direct, AppFrames(10)),
+            (p2, PeerPath::Direct, AppFrames(5)),
+        ];
+        assert_eq!(
+            classify_window(&before, &after, &opened, PeerPath::Unknown),
+            WindowReading::Moved(PeerPath::Direct),
+            "a direct path that opened and carried frames is Direct"
+        );
+
+        let after = [
+            (p0, PeerPath::Direct, AppFrames(10)),
+            (p2, relay(), AppFrames(5)),
+        ];
+        assert_eq!(
+            classify_window(&before, &after, &opened, PeerPath::Direct),
+            WindowReading::Moved(relay()),
+            "a relay path that opened and carried frames is Relay"
+        );
+    }
+
     /// #213 round 4, MUST-FIX 2: a path that OPENED in the window and is neither in `after` nor
     /// `Closed` carried an unknown number of frames — its `Closed` is still in flight.
     #[test]
@@ -1664,6 +1698,101 @@ mod tests {
         assert!(
             matches!(reading, WindowReading::Moved(PeerPath::Relay { .. })),
             "a Closed queued just after the final sample must be drained: {reading:?}"
+        );
+    }
+
+    /// A [`WindowSource`] whose events travel through a REAL `tokio::sync::broadcast`, as iroh's
+    /// `PathEventStream` does (`BroadcastStream` over `Receiver::recv`, which is cooperative).
+    /// A step can spend the task's whole coop budget inside `sample()` before publishing.
+    /// One scripted step: the path list `sample()` returns, the events it publishes afterwards,
+    /// and whether it spends the coop budget first.
+    type BroadcastStep = (Vec<super::PathSample>, Vec<ObservedEvent>, bool);
+
+    struct BroadcastSource {
+        tx: tokio::sync::broadcast::Sender<ObservedEvent>,
+        steps: std::sync::Mutex<std::collections::VecDeque<BroadcastStep>>,
+        /// How many ready polls the burn managed before the budget ran out.
+        burned: std::sync::atomic::AtomicUsize,
+    }
+
+    impl WindowSource for BroadcastSource {
+        fn is_closed(&self) -> bool {
+            false
+        }
+        fn subscribe(&self) -> n0_future::boxed::BoxStream<ObservedEvent> {
+            Box::pin(n0_future::stream::unfold(
+                self.tx.subscribe(),
+                |mut rx| async move {
+                    match rx.recv().await {
+                        Ok(event) => Some((event, rx)),
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            Some((ObservedEvent::Lagged, rx))
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
+                    }
+                },
+            ))
+        }
+        fn sample(&self) -> Vec<super::PathSample> {
+            let (paths, publish, burn) = self.steps.lock().unwrap().pop_front().expect("step");
+            if burn {
+                // Spend the coop budget: every READY poll of a cooperative `recv` costs one unit,
+                // and once the budget is gone the poll returns Pending with messages still queued.
+                const SIDE: usize = 1000;
+                let (side_tx, mut side_rx) = tokio::sync::broadcast::channel::<u8>(SIDE);
+                for _ in 0..SIDE {
+                    side_tx.send(0).unwrap();
+                }
+                let mut polls = 0;
+                while let Some(Ok(_)) = n0_future::future::now_or_never(side_rx.recv()) {
+                    polls += 1;
+                }
+                self.burned
+                    .store(polls, std::sync::atomic::Ordering::Relaxed);
+            }
+            for event in publish {
+                self.tx.send(event).expect("subscribed");
+            }
+            paths
+        }
+        fn fallback(&self) -> PeerPath {
+            PeerPath::Unknown
+        }
+    }
+
+    /// #213 round 5: the final drain must not stop because the task's coop budget is spent. A
+    /// relay path opens, carries frames and closes; its `Opened` and `Closed` are queued right after
+    /// the final sample, on a task with no budget left. A budget-limited single poll reads nothing,
+    /// and the window answers Direct over a relay that carried 60 frames.
+    #[tokio::test(start_paused = true)]
+    async fn the_final_drain_is_not_cut_short_by_the_coop_budget() {
+        let (p0, _, p2) = ids();
+        let (tx, _keep) = tokio::sync::broadcast::channel(16);
+        let source = BroadcastSource {
+            tx,
+            steps: std::sync::Mutex::new(
+                vec![
+                    (vec![(p0, PeerPath::Direct, AppFrames(10))], vec![], false),
+                    (
+                        vec![(p0, PeerPath::Direct, AppFrames(12))],
+                        vec![ObservedEvent::Opened { id: p2 }, relay_closed(p2, 60)],
+                        true,
+                    ),
+                ]
+                .into(),
+            ),
+            burned: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let reading = measure_window(&source, std::time::Duration::from_millis(250)).await;
+        let burned = source.burned.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            burned < 1000,
+            "fixture: the burn must actually exhaust the coop budget (read {burned} of 1000), or \
+             this test measures nothing"
+        );
+        assert!(
+            matches!(reading, WindowReading::Moved(PeerPath::Relay { .. })),
+            "events queued on a budget-exhausted task must still be drained: {reading:?}"
         );
     }
 
