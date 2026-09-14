@@ -2897,6 +2897,31 @@ pub const ERR_TOO_MANY_INFLIGHT: i64 = -32051;
 /// `mcpmesh-invite:` one.
 pub const ERR_SELF_ENROLL_NOT_OFFERED: i64 = -32052;
 
+/// `service_allow_grant` — the principal is REVOKED on this node, so the grant was refused before
+/// anything was written (#212, `api_minor >= 60`).
+///
+/// Admission runs two gates: the revocation table first (`peer_revoke`), then the service's
+/// `allow`. A grant to a revoked principal used to succeed and write a real `allow` entry that the
+/// first gate would never let a session reach — the caller was told "granted" and `status`
+/// confirmed it, while every session from that peer was refused. Now the write path consults the
+/// same table admission does, and answers this instead of `{}`.
+///
+/// "Revoked" here means what admission means by it, read live: an `eid:` that `peer_revoke` marked
+/// dead (locally or by a signed import, or by the installed roster), or a `b64u:` identity that
+/// `peer_revoke` revoked AND none of whose known devices is still admitted. The second clause is
+/// live state, not a promise: only attested pairing checks the identity table, so a device of a
+/// revoked identity that pairs by ordinary invite (or `peer_introduce`) is admitted, and a grant to
+/// that `b64u:` is then accepted again — a gate gap tracked in #218. Remedy: `peer_unrevoke`
+/// first if the revocation was a mistake; otherwise there is nothing to grant.
+///
+/// **Numbering:** `-32053`..`-32055` are skipped. They are the SESSION-plane codes
+/// (`mcpmesh_net::errors`: rate-limited / service refused / unreachable), and `-32053` in particular
+/// is named by number throughout this file and the docs with its rate-limit meaning. Control codes
+/// `-32051` and `-32052` already collide with session codes, which is survivable because the two
+/// planes never share a frame — but a control `-32053` would make "guard on `-32053`" ambiguous on
+/// the page that documents both. The control family continues from `-32056`.
+pub const ERR_PRINCIPAL_REVOKED: i64 = -32056;
+
 /// How many requests one control connection may have in flight at once (#172), after which it
 /// answers [`ERR_TOO_MANY_INFLIGHT`]. Per connection, not per daemon.
 pub const MAX_INFLIGHT: usize = 32;
@@ -2915,7 +2940,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   thirty have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.59";
+pub const API_VERSION: &str = "1.60";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -3001,7 +3026,20 @@ pub const API_VERSION: &str = "1.59";
 /// refusals — expired line, no live invite, inviter unreachable, id mismatch, name conflict, and
 /// the deliberately-opaque refusal. `ERR_NICKNAME_TAKEN` had been the only coded pairing failure,
 /// so every other one arrived as `-32000` and an embedder could either forward our prose to end
-/// users or substring-match it (#159); to 59 with [`Request::PeerHintClear`] — FORGET one peer's
+/// users or substring-match it (#159); to 60 when `services[].allow` on `status` became
+/// REVOCATION-AWARE and `service_allow_grant` began refusing a revoked principal with
+/// [`ERR_PRINCIPAL_REVOKED`] (#212). No shape changed — minor 17's class again. #100 made
+/// `services[].allow` answer from the live registry so it could not report a grant the accept path
+/// refuses, and that claim was one gate short: `peer_revoke` writes only the revocation table, the
+/// registry's `allow` kept the entry, and `status` copied it out unfiltered. An entry whose
+/// principal is revoked — as admission defines it — is now omitted from `allow` (and, index-aligned,
+/// from `allow_display`); for a `peer_revoke` revocation `status.revoked` still lists the principal,
+/// so the fact is not lost, only moved to the surface that means it (a ROSTER-revoked device is
+/// omitted too, and its record is the roster's own `revoked_endpoints` — it is absent from
+/// `roster_members` as well). The write path closed with it: the grant used to succeed and
+/// write an entry admission would never honour. Guard on `>= 60` before treating an `allow` entry's
+/// absence as "not granted" rather than "granted but refused", and before branching on the new
+/// code; below it, join `status.revoked` against `allow` yourself; to 59 with [`Request::PeerHintClear`] — FORGET one peer's
 /// persisted dial hint (#140). An experiment tool and a workaround, not a policy change: nothing
 /// clears a hint automatically. `PeerEntry.last_addr` is the only durable per-peer state on a node's
 /// disk that the dial path reads and the only thing a long-lived pairing carries that a freshly
@@ -3214,7 +3252,7 @@ pub const API_VERSION: &str = "1.59";
 /// its REAL content is a meaning change to `reachable` — the field exists so the new meaning is
 /// observable at all. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 59;
+pub const API_MINOR: u32 = 60;
 
 #[cfg(test)]
 mod tests {

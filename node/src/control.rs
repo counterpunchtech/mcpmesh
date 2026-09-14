@@ -1327,6 +1327,16 @@ fn respond<T: serde::Serialize>(id: Value, method: &str, r: anyhow::Result<T>) -
                 format!("{method} failed: {e}"),
             )
         }
+        Err(e)
+            if e.downcast_ref::<crate::daemon::PrincipalRevoked>()
+                .is_some() =>
+        {
+            error(
+                id,
+                mcpmesh_local_api::ERR_PRINCIPAL_REVOKED,
+                format!("{method} failed: {e}"),
+            )
+        }
         Err(e) => error(id, -32000, format!("{method} failed: {e}")),
     }
 }
@@ -1377,10 +1387,13 @@ pub(crate) fn status_result(state: &DaemonState) -> Result<StatusResult> {
             // `ephemeral` flag per entry, so this whole-map clone on every status call is gone.
             {
                 // One store read serves both the peer list and the allow-display
-                // annotation (fails open on corrupt rows, like `peer_infos`).
+                // annotation (fails open on corrupt rows, like `peer_infos`). The #212
+                // revocation filter inside `service_infos` is the exception: it fails CLOSED
+                // per entry, hiding the entry when the store cannot be read — the gate would
+                // refuse that principal too.
                 let entries = mesh.store.list().unwrap_or_default();
                 (
-                    crate::daemon::service_infos(&mesh.live_services(), &entries),
+                    crate::daemon::service_infos(mesh, &entries),
                     crate::daemon::peer_infos(&mesh.store),
                     roster,
                 )
