@@ -21,7 +21,8 @@ use ed25519_dalek::SigningKey;
 use mcpmesh::allowlist::{AllowlistGate, PeerEntry, PeerStore};
 use mcpmesh::config::Config;
 use mcpmesh::daemon::{
-    MeshState, build_services, install_roster_view_and_sever, spawn_accept_loop,
+    MeshState, build_services, install_roster_view_and_sever, revoke_service_allow,
+    spawn_accept_loop,
 };
 use mcpmesh::pairing::LiveInvites;
 use mcpmesh::roster::gate::{ComposedGate, RosterGate};
@@ -31,7 +32,6 @@ use mcpmesh_trust::roster::sign::mint_signed;
 use mcpmesh_trust::roster::validate::{RosterView, load_installed};
 use mcpmesh_trust::roster::{Roster, RosterDevice, RosterUser, encode_b64u};
 use serde_json::json;
-use tokio::io::AsyncWriteExt;
 use tokio::time::timeout;
 
 const STUB: &str = env!("CARGO_BIN_EXE_echo_mcp_stub");
@@ -187,6 +187,20 @@ fn is_refused(v: &serde_json::Value) -> bool {
     v["error"]["code"] == -32054 && v["id"] == 1
 }
 
+/// After a -32054 refusal the stream must be DONE: a `tools/call` sent on it gets end-of-stream or a
+/// transport error, never a result. Without this, "send -32054, then keep serving the session
+/// anyway" passes every refusal assertion in this file.
+async fn assert_refused_stream_serves_nothing(t: &mut SessionTransport) {
+    let _ = t.send_value(tools_call_frame("after-refusal")).await;
+    let next = timeout(Duration::from_secs(10), t.recv_value())
+        .await
+        .expect("a refused stream must end promptly, not hang");
+    assert!(
+        matches!(next, Ok(None) | Err(_)),
+        "a refused stream must serve NOTHING after its -32054: {next:?}"
+    );
+}
+
 async fn served(conn: &iroh::endpoint::Connection, service: &str) -> serde_json::Value {
     let mut t = open_session(conn, service).await;
     first_reply(&mut t).await
@@ -212,12 +226,14 @@ async fn a_principal_that_loses_access_is_refused_on_its_open_connection() {
 
         f.set_user_id(None);
 
-        let after = served(&conn, "private").await;
+        let mut after_t = open_session(&conn, "private").await;
+        let after = first_reply(&mut after_t).await;
         assert!(
             is_refused(&after),
             "a stream on the SAME connection must be authorized against the CURRENT principal — \
              `b64u:OLD` no longer belongs to this device: {after}"
         );
+        assert_refused_stream_serves_nothing(&mut after_t).await;
         let still = served(&conn, "echo").await;
         assert!(
             is_served(&still),
@@ -323,11 +339,13 @@ async fn an_endpoint_that_stops_resolving_is_refused_per_stream() {
 
         assert!(f.store.remove("alice").unwrap(), "setup: row removed");
 
-        let after = served(&conn, "echo").await;
+        let mut after_t = open_session(&conn, "echo").await;
+        let after = first_reply(&mut after_t).await;
         assert!(
             is_refused(&after),
             "an unresolvable endpoint must not be served on its open connection: {after}"
         );
+        assert_refused_stream_serves_nothing(&mut after_t).await;
         assert!(conn.close_reason().is_none());
 
         // Re-adding the row restores service on the SAME connection (resolution is per stream).
@@ -339,8 +357,12 @@ async fn an_endpoint_that_stops_resolving_is_refused_per_stream() {
 }
 
 /// The principal is resolved when the stream's `initialize` ARRIVES, not when the stream was
-/// accepted. A dialer can open a stream with a partial `initialize` (no newline) BEFORE a rewrite
-/// and complete it AFTER; resolving at accept time would authorize it against the old principal.
+/// accepted. A dialer can open a stream BEFORE a rewrite and send `initialize` AFTER; resolving at
+/// accept time would authorize it against the old principal.
+///
+/// Deterministic: the stream opens with a non-JSON line and the test waits for its -32700 reply,
+/// which proves the server has accepted the stream and its session task is reading — before the
+/// rewrite, with no sleep.
 #[tokio::test]
 async fn a_stream_opened_before_the_rewrite_is_resolved_at_initialize() {
     timeout(Duration::from_secs(90), async {
@@ -349,27 +371,68 @@ async fn a_stream_opened_before_the_rewrite_is_resolved_at_initialize() {
         assert!(is_served(&served(&conn, "echo").await), "setup");
 
         let (mut send, recv) = conn.open_bi().await.unwrap();
-        let mut line = serde_json::to_vec(&initialize_frame("private")).unwrap();
-        let tail = line.split_off(line.len() / 2);
-        send.write_all(&line).await.unwrap();
-        send.flush().await.unwrap();
-        // Bounded wait for the server to accept the stream on the half-frame (localhost: well
-        // under this; the mutation check proves the window is actually crossed).
-        tokio::time::sleep(Duration::from_millis(750)).await;
+        send.write_all(b"garbage\n").await.unwrap();
+        let mut t = SessionTransport::new(recv, send, MAX_FRAME_BYTES);
+        let violation = first_reply(&mut t).await;
+        assert_eq!(
+            violation["error"]["code"], -32700,
+            "setup: the session task must be reading this stream before the rewrite: {violation}"
+        );
 
         f.set_user_id(None);
 
-        send.write_all(&tail).await.unwrap();
-        send.write_all(b"\n").await.unwrap();
-        let mut t = SessionTransport::new(recv, send, MAX_FRAME_BYTES);
+        t.send_value(initialize_frame("private")).await.unwrap();
         let reply = first_reply(&mut t).await;
         assert!(
             is_refused(&reply),
-            "a stream whose initialize completed after the rewrite must see the new principal: {reply}"
+            "a stream whose initialize arrived after the rewrite must see the new principal: {reply}"
         );
     })
     .await
-    .expect("half-frame test timed out");
+    .expect("opened-before-rewrite test timed out");
+}
+
+/// A revoke reaches a session by the principal it was ADMITTED as (#222 review).
+///
+/// A session to `private` is admitted as `b64u:OLD`. The device's row is then rewritten to
+/// `b64u:NEW` (no sever). `service_allow_revoke {private, "b64u:OLD"}` must still cut that session:
+/// the store no longer maps `b64u:OLD` to any endpoint, so a sever keyed only on the CURRENT
+/// principal→endpoint mapping cuts nothing and the next `tools/call` is served as `b64u:OLD`.
+#[tokio::test]
+async fn a_revoke_severs_a_session_by_the_principal_it_was_admitted_as() {
+    timeout(Duration::from_secs(90), async {
+        let f = fixture(Some(OLD), OLD).await;
+        let conn = dial(&f).await;
+
+        let mut session = open_session(&conn, "private").await;
+        assert!(is_served(&first_reply(&mut session).await), "setup");
+        session
+            .send_value(tools_call_frame("before"))
+            .await
+            .unwrap();
+        let before = first_reply(&mut session).await;
+        assert_eq!(before["result"]["peer_user"], OLD, "setup: {before}");
+
+        f.set_user_id(Some(NEW));
+
+        revoke_service_allow(&f.mesh, "private".into(), OLD.into())
+            .await
+            .expect("revoke succeeds");
+
+        timeout(Duration::from_secs(5), conn.closed())
+            .await
+            .expect("the revoke must SEVER the connection carrying a session admitted as b64u:OLD");
+        let _ = session.send_value(tools_call_frame("after")).await;
+        let next = timeout(Duration::from_secs(5), session.recv_value())
+            .await
+            .expect("the severed session must end promptly");
+        assert!(
+            !matches!(next, Ok(Some(_))),
+            "a session admitted as the revoked principal must not answer after the revoke: {next:?}"
+        );
+    })
+    .await
+    .expect("admitted-as revoke test timed out");
 }
 
 fn mint_view(root: &SigningKey, serial: u64, devices: &[([u8; 32], &str)]) -> RosterView {

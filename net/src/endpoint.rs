@@ -355,7 +355,7 @@ pub async fn run_mesh_connection(
     //    once its `initialize` has arrived. Before #222 the identity resolved above was cloned into
     //    every session, so a principal change that does not sever (a re-pair rewriting `user_id`,
     //    a device re-assigned, a group change) never reached an already-open connection.
-    let tracker = registration.roster_tracker(roster_user.is_some());
+    let tracker = registration.tracker(roster_user.is_some());
     while let Ok((send, recv)) = conn.accept_bi().await {
         let gate = gate.clone();
         let services = services.clone();
@@ -379,7 +379,7 @@ pub async fn run_mesh_connection(
 ///
 /// The roster discriminator is read on BOTH sides of `resolve` and promoted into the connection's
 /// registry entry before the session may be served — see
-/// [`RosterTracker`](crate::registry::RosterTracker). Reading it on both sides means `resolve` can
+/// [`ConnTracker`](crate::registry::ConnTracker). Reading it on both sides means `resolve` can
 /// only return a roster identity neither read observed if the roster view changed TWICE between the
 /// reads (rostered, then not — two installs, or an install plus a degraded-state flip). The
 /// connection-level check reads it once, after `resolve`, so a single change can slip between its
@@ -391,12 +391,14 @@ pub async fn run_mesh_connection(
 ///
 /// Sync on purpose: no lock or redb read transaction can be held across an `.await`. The work is
 /// the same class the connection-level check already does on the executor — in-memory `RwLock`
-/// reads of the roster view plus, for `ComposedGate`, two redb READ transactions
-/// (`is_revoked` + `resolve` on the peer store) — and the blob provider does the same per request.
+/// reads of the roster view plus redb READ transactions on the peer store. For `ComposedGate` that
+/// is ONE for a rostered peer (`pairs.is_revoked`, then the roster answers) and THREE for a
+/// pairing peer (`pairs.is_revoked`, then `AllowlistGate::resolve`'s own `is_revoked` + `resolve`);
+/// a promotion adds `should_sever_now`'s. The blob provider does the same per request.
 fn resolve_session_principal(
     remote: &EndpointId,
     gate: &dyn TrustGate,
-    tracker: &crate::registry::RosterTracker,
+    tracker: &crate::registry::ConnTracker,
 ) -> Option<PeerIdentity> {
     let roster_before = gate.roster_user(remote);
     let identity = gate.resolve(remote)?;
@@ -433,6 +435,23 @@ fn caller_admits(identity: &PeerIdentity, allow: &[String]) -> bool {
     admitted
 }
 
+/// The admit recheck `run_session` runs UNDER the registry lock (#222 review): does the LIVE
+/// registry still admit `identity` to `name`? `true` without re-evaluating when nothing was swapped
+/// since `snapshot` was taken; otherwise the swapped-in registry decides (a revoke that landed
+/// between the snapshot and the admit refuses; an unrelated grant does not).
+fn still_admits(
+    live: &LiveServices,
+    snapshot: &Arc<Services>,
+    name: &str,
+    identity: &PeerIdentity,
+) -> bool {
+    let now = live.get();
+    Arc::ptr_eq(&now, snapshot)
+        || now
+            .get(name)
+            .is_some_and(|e| caller_admits(identity, &e.allow))
+}
+
 /// Drive one accepted session: enforce framing on the first frame, select a
 /// service, then attach the backend or refuse.
 async fn run_session(
@@ -441,7 +460,7 @@ async fn run_session(
     remote: &EndpointId,
     gate: &dyn TrustGate,
     services: &LiveServices,
-    tracker: &crate::registry::RosterTracker,
+    tracker: &crate::registry::ConnTracker,
 ) -> anyhow::Result<()> {
     let mut transport = SessionTransport::new(recv, send, MAX_FRAME_BYTES);
     let mut strikes = Strikes::default();
@@ -467,7 +486,8 @@ async fn run_session(
     // has since changed. The principal is resolved per session through the connection-level gate
     // and is the identity the backend's env/`_meta` injection receives, so the backend always sees
     // the principal the session was authorized as.
-    let services = services.get();
+    let live = services;
+    let services = live.get();
     let identity = resolve_session_principal(remote, gate, tracker);
     let allowed: Vec<String> = match &identity {
         Some(identity) => services
@@ -481,8 +501,27 @@ async fn run_session(
     };
     // Paired with the identity so a selection WITHOUT a resolved principal is unrepresentable (an
     // empty `allowed` already refuses; this keeps a future change there from reaching a backend).
-    match (select_service(&mut init, &allowed), identity) {
-        (ServiceDecision::Selected(name), Some(identity)) => {
+    if let (ServiceDecision::Selected(name), Some(identity)) =
+        (select_service(&mut init, &allowed), identity)
+    {
+        // Record what this session is admitted AS on the connection's registry entry, so a revoke
+        // of that principal severs it even after the store has re-mapped the device to another
+        // principal (#222 review). Under the registry lock, the admit is re-checked against the
+        // LIVE registry: a revoke swaps before it severs (#99), so a swap this session's snapshot
+        // missed is seen here and the session is refused instead of escaping the sever.
+        let eid = identity.endpoint.principal();
+        let principals: Vec<String> = mcpmesh_local_api::principal_set(
+            Some(&eid),
+            identity.user_id.as_deref(),
+            &identity.groups,
+        )
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let admitted = tracker.admit_session(principals, || {
+            still_admits(live, &services, &name, &identity)
+        });
+        if let Some(_admitted) = admitted {
             let backend = services
                 .get(&name)
                 .expect("selected from registry")
@@ -491,31 +530,29 @@ async fn run_session(
             // Hand off: the backend owns the transport and its teardown. The
             // gate-resolved identity is threaded through `run` (per-caller), not
             // baked into the shared backend — it drives the backend's
-            // env/`_meta` injection. Every admitted session has a resolved
-            // identity post-gate.
+            // env/`_meta` injection. `_admitted` is held until the session ends, then
+            // un-records its principals.
             let peer = identity.name.clone();
-            backend
+            return backend
                 .run(Some(identity), init, transport)
                 .await
-                .map_err(|e| e.context(format!("session for peer {peer}")))
-        }
-        _ => {
-            // Unknown or unauthorized (or no longer resolvable) — identical wording either way.
-            // Echo the initialize `id` when present.
-            let id = init.get("id").cloned().unwrap_or(Value::Null);
-            // Best-effort teardown: the refusal decision (-32054) is final, but a
-            // peer that already vanished must not turn a NORMAL refusal into a
-            // warn!("session ended with error"). Write + finish are advisory —
-            // same treatment `recv_frame` gives its own teardown writes.
-            let _ = transport
-                .send_value(synthesized(id, ERR_SERVICE, MSG_SERVICE))
-                .await;
-            // Finish the stream so the refusal frame flushes to the peer before
-            // the write half closes (a bare drop abandons buffered data).
-            let _ = transport.shutdown().await;
-            Ok(())
+                .map_err(|e| e.context(format!("session for peer {peer}")));
         }
     }
+    // Unknown or unauthorized (or no longer resolvable, or revoked under the admit recheck) —
+    // identical wording either way. Echo the initialize `id` when present.
+    let id = init.get("id").cloned().unwrap_or(Value::Null);
+    // Best-effort teardown: the refusal decision (-32054) is final, but a
+    // peer that already vanished must not turn a NORMAL refusal into a
+    // warn!("session ended with error"). Write + finish are advisory —
+    // same treatment `recv_frame` gives its own teardown writes.
+    let _ = transport
+        .send_value(synthesized(id, ERR_SERVICE, MSG_SERVICE))
+        .await;
+    // Finish the stream so the refusal frame flushes to the peer before
+    // the write half closes (a bare drop abandons buffered data).
+    let _ = transport.shutdown().await;
+    Ok(())
 }
 
 /// Read the next MCP frame, enforcing the framing-violation protocol.
@@ -694,6 +731,44 @@ mod tests {
                 })
                 .collect(),
         )
+    }
+
+    /// #222 review: the admit recheck. The snapshot a session was selected under is still live →
+    /// admitted without re-evaluating; a swap that REVOKED this principal → refused; a swap that
+    /// changed something unrelated → admitted.
+    #[test]
+    fn still_admits_rereads_a_swapped_registry_and_only_that() {
+        let alice = PeerIdentity {
+            endpoint: EndpointId::from_bytes([1u8; 32]),
+            name: "alice".into(),
+            user_id: Some("b64u:OLD".into()),
+            groups: vec![],
+        };
+        let snapshot = Arc::new(registry(&[("private", &["b64u:OLD"])]));
+        let live = LiveServices::new(snapshot.clone());
+        assert!(still_admits(&live, &snapshot, "private", &alice));
+
+        // Same snapshot, even for a service it does not admit: nothing swapped, nothing to recheck.
+        assert!(still_admits(&live, &snapshot, "absent", &alice));
+
+        live.store(Arc::new(
+            snapshot
+                .with_allow_replaced("private", vec![])
+                .expect("present"),
+        ));
+        assert!(
+            !still_admits(&live, &snapshot, "private", &alice),
+            "a revoke swapped in after the snapshot must refuse the admit"
+        );
+
+        live.store(Arc::new(registry(&[
+            ("private", &["b64u:OLD"]),
+            ("other", &[]),
+        ])));
+        assert!(
+            still_admits(&live, &snapshot, "private", &alice),
+            "an unrelated swap must not refuse a still-admitted principal"
+        );
     }
 
     /// #94: replacing ONE service's allow leaves every other entry untouched — and reuses the

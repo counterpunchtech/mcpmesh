@@ -319,8 +319,20 @@ them directly, which is within the trust boundary.
 `service_allow_revoke` and `peer_remove` take effect **now**, on peers that are already connected:
 
 - **New sessions are refused.** The daemon resolves every session against the live service
-  registry, so a peer that holds an open connection is re-evaluated on its very next session.
-- **In-flight sessions are cut.** The revoke closes the principal's live mesh connections.
+  registry AND the live principal (#222): the caller's identity is re-resolved from the peer store
+  and roster when each session's `initialize` arrives, so a peer that holds an open connection is
+  re-evaluated on its very next session — including after a re-pair, a device re-assignment, or a
+  roster group change that did not close its connection.
+- **In-flight sessions are cut.** The revoke closes every live mesh connection whose device the
+  principal names NOW, and every connection carrying a live session that was ADMITTED as that
+  principal (#222) — so a session admitted as `b64u:OLD` is still cut by a revoke of `b64u:OLD`
+  after its device has been re-bound to `b64u:NEW`.
+
+An endpoint that stops resolving altogether (its pair row deleted without a revoke) is refused per
+session, not per connection: its already-open connection stays up and every new session on it is
+refused with `-32054`, exactly like an unauthorized service. The per-session behaviour depends on
+the ACCEPTING node's version — a node older than the release carrying #222 authorizes every session
+on a connection against the principal resolved when that connection was accepted.
 
 Before 0.11.0 both waited for the peer to disconnect on its own. The verb returned success
 immediately but a connected peer kept opening admitted sessions for the entire lifetime of its
@@ -1503,6 +1515,12 @@ person = os.environ.get("MCPMESH_PEER_USER")  # may be absent, and may change �
 > It also spans three namespaces (a bare roster handle, `b64u:…`, `eid:…`), so a bare handle can
 > collide with a group name or an attacker-chosen literal in a `caller`-keyed store. Key on
 > `MCPMESH_PEER_EID`; consult `MCPMESH_PEER_USER` for policy.
+>
+> It is also **per session, not per connection** (#222). The accepting node resolves the caller's
+> identity when each session starts, so two sessions from the same device — even concurrent ones on
+> one QUIC connection — can carry different `MCPMESH_PEER_USER` values (and, for a `socket` backend,
+> different `_meta["mcpmesh/peer"]`) if the device was re-bound between them. Each session keeps the
+> identity it started with.
 
 
 ### `socket` backend — the caller's identity in `_meta`
