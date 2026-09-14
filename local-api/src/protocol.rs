@@ -363,7 +363,7 @@ pub struct RecentPairing {
     /// the remedy is `device_revoke` of that endpoint, not `peer_remove` (#214). The endpoint is
     /// on the `self_enroll` audit event, not here — this row stays surface-clean. Set structurally
     /// by the ceremony that ran, never inferred from the nickname text. Additive
-    /// (`api_minor >= 60`): `#[serde(default, skip_serializing_if = ...)]`, absent = an ordinary
+    /// (`api_minor >= 62`): `#[serde(default, skip_serializing_if = ...)]`, absent = an ordinary
     /// pairing.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub self_enroll: bool,
@@ -390,7 +390,7 @@ pub struct StatusResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_user_id: Option<String>,
     /// `true` when THIS device holds the private user key behind `self_user_id` (#214,
-    /// `api_minor >= 60`). `false` when it presents that identity on the strength of an ADOPTED
+    /// `api_minor >= 62`). `false` when it presents that identity on the strength of an ADOPTED
     /// enrollment binding (#86) — the key lives on the device that enrolled it — and when it has
     /// no user key at all (`self_user_id` absent). An enrolled device and a key-holding one
     /// otherwise report the same `self_user_id`, and three refusals hinge on the difference:
@@ -398,7 +398,7 @@ pub struct StatusResult {
     /// and [`Request::SelfEnrollDetach`] applies only there. ADVISORY display data for placing
     /// those affordances — never an authorization input; the daemon re-checks on every call.
     /// Additive: `#[serde(default, skip_serializing_if = ...)]`, so it reads `false` from a daemon
-    /// below 60 — guard on `api_minor` before treating that as "enrolled".
+    /// below 62 — guard on `api_minor` before treating that as "enrolled".
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub self_user_key_held: bool,
     /// Recent INVITER-side pairing completions, newest first (display-only pairing-ceremony aids —
@@ -2996,17 +2996,6 @@ pub const ERR_PRINCIPAL_REVOKED: i64 = -32056;
 /// other refusal's — it is on the other side of the wire.
 pub const ERR_PAIR_IDENTITY_REVOKED: i64 = -32057;
 
-/// `invite { as_self: true }` on a device that was itself ENROLLED into another identity (#214):
-/// it holds no user key, so there is nothing to sign a binding with.
-///
-/// Refused AT MINT, on the device that can act on it. Before this the mint succeeded and the
-/// refusal surfaced one round trip later on the OTHER machine as the deliberately opaque
-/// [`ERR_INVITE_REFUSED`] — "that invite didn't work, ask for a new one", which is dead-end advice
-/// for a permanent condition. Remedy: enroll from the device that holds the key, or
-/// [`Request::SelfEnrollDetach`] this one first if it should not be enrolled at all.
-/// `StatusResult::self_user_key_held` is the same fact, readable before anyone presses the button.
-pub const ERR_SELF_ENROLL_NO_KEY: i64 = -32056;
-
 /// `self_enroll_detach` on a device with NO adopted binding in effect (#214): there is no live
 /// enrollment to exit, and nothing live was changed. A STALE enrollment file left on disk (by a
 /// boot that declined a binding that did not verify for this endpoint) is removed first, so the
@@ -3018,7 +3007,18 @@ pub const ERR_SELF_ENROLL_NO_KEY: i64 = -32056;
 /// the slot) — and can treat it as "already done". (It also never cleans a boot-declined file,
 /// which is harmless: boot declines it again on every start.) Offering it on `!self_user_key_held`
 /// alone also offers it to a node with no user key at all, which gets this code.
-pub const ERR_NOT_ENROLLED: i64 = -32057;
+pub const ERR_NOT_ENROLLED: i64 = -32058;
+
+/// `invite { as_self: true }` on a device that was itself ENROLLED into another identity (#214):
+/// it holds no user key, so there is nothing to sign a binding with.
+///
+/// Refused AT MINT, on the device that can act on it. Before this the mint succeeded and the
+/// refusal surfaced one round trip later on the OTHER machine as the deliberately opaque
+/// [`ERR_INVITE_REFUSED`] — "that invite didn't work, ask for a new one", which is dead-end advice
+/// for a permanent condition. Remedy: enroll from the device that holds the key, or
+/// [`Request::SelfEnrollDetach`] this one first if it should not be enrolled at all.
+/// `StatusResult::self_user_key_held` is the same fact, readable before anyone presses the button.
+pub const ERR_SELF_ENROLL_NO_KEY: i64 = -32059;
 
 /// How many requests one control connection may have in flight at once (#172), after which it
 /// answers [`ERR_TOO_MANY_INFLIGHT`]. Per connection, not per daemon.
@@ -3038,7 +3038,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   thirty have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.61";
+pub const API_VERSION: &str = "1.62";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -3124,7 +3124,7 @@ pub const API_VERSION: &str = "1.61";
 /// refusals — expired line, no live invite, inviter unreachable, id mismatch, name conflict, and
 /// the deliberately-opaque refusal. `ERR_NICKNAME_TAKEN` had been the only coded pairing failure,
 /// so every other one arrived as `-32000` and an embedder could either forward our prose to end
-/// users or substring-match it (#159); to 60 with the self-enrollment EXIT and the surface an
+/// users or substring-match it (#159); to 62 with the self-enrollment EXIT and the surface an
 /// embedder needs to ship the ceremony at all (#214): [`Request::SelfEnrollDetach`] drops an
 /// adopted binding (the inverse of `pair { allow_self_enroll }`, and the only exit an enrolled
 /// device has — `user_key_import` needs the phrase of a key it does not hold);
@@ -3136,7 +3136,7 @@ pub const API_VERSION: &str = "1.61";
 /// revocation and severed sessions, then returned a token no peer would ever accept — a silent
 /// partial success on the stolen-laptop path); and `invite { as_self }` on an enrolled device is
 /// refused at mint with [`ERR_SELF_ENROLL_NO_KEY`] rather than one round trip later, on the other
-/// machine, as the opaque `-32049`. Guard on `>= 60` before offering the detach; the two fields
+/// machine, as the opaque `-32049`. Guard on `>= 62` before offering the detach; the two fields
 /// read `false` from an older daemon, which is wrong for exactly the case each exists to name
 /// (`self_user_key_held` for a key-holder, `self_enroll` for an enrollment row), so guard before
 /// rendering them. Crate-level, this one is a MINOR release of `mcpmesh-node` (0.53 → 0.54), not a
@@ -3382,7 +3382,7 @@ pub const API_VERSION: &str = "1.61";
 /// its REAL content is a meaning change to `reachable` — the field exists so the new meaning is
 /// observable at all. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 61;
+pub const API_MINOR: u32 = 62;
 
 #[cfg(test)]
 mod tests {
@@ -3800,8 +3800,8 @@ mod tests {
             serde_json::from_value(serde_json::json!({"detached_from": "b64u:theirs"})).unwrap();
         assert_eq!(keyless.user_id, None);
 
-        assert_eq!(ERR_SELF_ENROLL_NO_KEY, -32056);
-        assert_eq!(ERR_NOT_ENROLLED, -32057);
+        assert_eq!(ERR_NOT_ENROLLED, -32058);
+        assert_eq!(ERR_SELF_ENROLL_NO_KEY, -32059);
     }
 
     /// #150 gate: "an unrecognized value reads as `unknown`" must hold for any VALUE, not just an

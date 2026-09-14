@@ -683,7 +683,7 @@ impl ControlClient {
     ///
     /// Local only: peers who already learned this endpoint as that person's device are not told —
     /// that is `device_revoke`, from the device holding the key. Refused with `ERR_NOT_ENROLLED`
-    /// when nothing is adopted. `api_minor >= 60`.
+    /// when nothing is adopted. `api_minor >= 62`.
     pub async fn self_enroll_detach(
         &mut self,
     ) -> Result<crate::protocol::SelfEnrollDetachResult, ClientError> {

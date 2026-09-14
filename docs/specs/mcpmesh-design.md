@@ -423,7 +423,7 @@ The platform reserves JSON-RPC server-error codes **-32050…-32069** — a band
 | `-32054` | Unknown or unauthorized service (deliberately indistinguishable) |
 | `-32055` | Peer unreachable / session severed pre-response (synthesized caller-side by the proxy, §8) |
 
-The **control plane** (`mcpmesh-local/1`, `docs/local-protocol.md`) numbers its own refusals independently and never shares a frame with this band, but its family walked up into it: `-32050`..`-32052` are control codes too, and as of `-32056` (#212) control-plane codes **continue from `-32056` upward**. The next session-plane code must therefore not be `-32056`; allocate session codes so the two tables in `docs/local-protocol.md` stay unambiguous by number.
+The **control plane** (`mcpmesh-local/1`, `docs/local-protocol.md`) numbers its own refusals independently and never shares a frame with this band, but its family walked up into it: `-32050`..`-32052` are control codes too, and as of `-32056` (#212) control-plane codes **continue from `-32056` upward** (`-32057` #218, `-32058`/`-32059` #214). The next session-plane code must therefore not be any of `-32056`..`-32059`; allocate session codes so the two tables in `docs/local-protocol.md` stay unambiguous by number.
 
 Every platform- or proxy-synthesized JSON-RPC error MUST carry `error.data.source = "mcpmesh"`; an error without that member originates from the proxied server. Code values alone are never the discriminator — JSON-RPC gives the whole -32000…-32099 band to the (proxied) server implementation, so the platform guarantees only its own band plus the marker. Errors originating in the proxied MCP server pass through untouched.
 
