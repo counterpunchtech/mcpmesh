@@ -676,6 +676,21 @@ impl ControlClient {
         .await
     }
 
+    /// DETACH this device from an identity it was enrolled into (#214) — the inverse of
+    /// `pair_opts(.., allow_self_enroll: true)`. Drops the adopted binding live and on disk; the
+    /// node goes back to presenting its own identity (imported, else boot-derived), returned as
+    /// `user_id`.
+    ///
+    /// Local only: peers who already learned this endpoint as that person's device are not told —
+    /// that is `device_revoke`, from the device holding the key. Refused with `ERR_NOT_ENROLLED`
+    /// when nothing is adopted. `api_minor >= 62`.
+    pub async fn self_enroll_detach(
+        &mut self,
+    ) -> Result<crate::protocol::SelfEnrollDetachResult, ClientError> {
+        self.request_typed(Request::SelfEnrollDetach, "self_enroll_detach result")
+            .await
+    }
+
     /// INSPECT a join code without approving it (#66): what it claims, and the fingerprint that
     /// decides whether to believe it. Read-only — nothing is signed or installed.
     ///
@@ -1128,6 +1143,7 @@ mod tests {
             roster: None,
             presence: vec![],
             self_user_id: None,
+            self_user_key_held: false,
             recent_pairings: vec![],
             reachability: vec![],
             self_nickname: String::new(),

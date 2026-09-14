@@ -239,6 +239,8 @@ impl<'de> serde::Deserialize<'de> for RefusalCode {
 ///
 /// One type rather than a marker struct per condition: `respond` downcasts once and reads `.code`,
 /// so adding the seventh onboarding condition is a constant plus a call site, not another arm.
+/// Scoped to the ceremony family, not the `pair` verb: `invite { as_self }` and
+/// `self_enroll_detach` raise one too (#214).
 ///
 /// The point is that an embedder can decide PER CASE whether to render our prose or replace it.
 /// Before this, `ERR_NICKNAME_TAKEN` was the only coded pairing failure, so the choice was
@@ -448,10 +450,10 @@ pub type GrantBackFn = Box<
         + Sync,
 >;
 
-/// The ceremony-surface hook: `(peer_nickname, sas_code, paired_at_epoch)` → park the completed
-/// pairing where `status` can show the inviter's human the short authentication code. Display-only
-/// state, never a trust input.
-pub type RecordPairingFn = Box<dyn Fn(String, String, u64) + Send + Sync>;
+/// The ceremony-surface hook: park the completed pairing where `status` can show the inviter's
+/// human the short authentication code. Display-only state, never a trust input. The whole row,
+/// so the arm that ran the ceremony sets `self_enroll` (#214) — the ring must not infer it.
+pub type RecordPairingFn = Box<dyn Fn(mcpmesh_local_api::RecentPairing) + Send + Sync>;
 
 /// Everything the inviter-side rendezvous needs from the daemon hosting it — the narrow seam that
 /// keeps this module free of daemon state. The daemon assembles one per accepted pair connection
@@ -864,8 +866,16 @@ pub async fn handle_inviter_side(
             let sas = short_auth_code(&invite.inviter_id, &tls_id, &hello.secret);
             tracing::info!(code = %sas, "enrolled another device of this person (#86)");
             // Recorded on the ceremony surface like any pairing, so the inviter's human can read
-            // the SAS off `status` and compare it — the check that makes this safe.
-            (ctx.record_pairing)("(this person's device)".into(), sas.clone(), epoch_now());
+            // the SAS off `status` and compare it — the check that makes this safe. Marked as an
+            // ENROLLMENT structurally (#214): the row has no peer behind it, and a mismatch here
+            // means an impostor now presents this identity, so the inviter's UI must route it to
+            // `device_revoke`, not the `peer_remove` an ordinary mismatch gets.
+            (ctx.record_pairing)(mcpmesh_local_api::RecentPairing {
+                peer_nickname: "(this person's device)".into(),
+                sas_code: sas.clone(),
+                paired_at_epoch: epoch_now(),
+                self_enroll: true,
+            });
             let _ = send_reply(
                 &mut send,
                 &PairReply::Ok {
@@ -1065,7 +1075,12 @@ pub async fn handle_inviter_side(
             // can read it via `mcpmesh status` and compare it with the redeemer's (who got the
             // same words in its PairResult). Display-only ceremony state, lost on restart by
             // design; NOT trust data.
-            (ctx.record_pairing)(nickname, sas, now);
+            (ctx.record_pairing)(mcpmesh_local_api::RecentPairing {
+                peer_nickname: nickname,
+                sas_code: sas,
+                paired_at_epoch: now,
+                self_enroll: false,
+            });
 
             // The pairing is now durable + authorized + audited, so the reply is best-effort:
             // reply with OUR identity (both fields from the redeemed invite — no extra daemon
@@ -2258,7 +2273,7 @@ mod tests {
             config_path: dir.path().join("config.toml"),
             self_binding: None,
             grant: Box::new(|_, _, _| Box::pin(async { Ok(()) })),
-            record_pairing: Box::new(|_, _, _| {}),
+            record_pairing: Box::new(|_| {}),
             audit_trust: Box::new(|_, _| {}),
             sign_binding: Box::new(|_| None),
             admit_attested: admit,
@@ -2382,7 +2397,7 @@ mod tests {
             config_path: dir.path().join("config.toml"),
             self_binding: None,
             grant: Box::new(|_, _, _| Box::pin(async { Ok(()) })),
-            record_pairing: Box::new(|_, _, _| {}),
+            record_pairing: Box::new(|_| {}),
             audit_trust: Box::new(|_, _| {}),
             sign_binding: Box::new(|_| None),
             admit_attested: true,
@@ -2458,7 +2473,7 @@ mod tests {
             config_path: dir.path().join("config.toml"),
             self_binding: None,
             grant: Box::new(|_, _, _| Box::pin(async { Ok(()) })),
-            record_pairing: Box::new(|_, _, _| {}),
+            record_pairing: Box::new(|_| {}),
             audit_trust: Box::new(|_, _| {}),
             sign_binding: Box::new(|_| None),
             admit_attested: true,

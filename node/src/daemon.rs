@@ -133,8 +133,8 @@ pub use handlers::unregister_ephemeral;
 pub(crate) use handlers::{
     add_peer, blob_fetch, blob_fetch_cancel, blob_grant, blob_list, blob_publish, blob_republish,
     blob_revoke, blob_unpublish, mint_invite, open_session, peer_diagnostics, peer_services,
-    redeem, register_service, service_allow_grant, service_allow_revoke, set_relays,
-    unregister_service, user_key_export, user_key_import,
+    redeem, register_service, self_enroll_detach, service_allow_grant, service_allow_revoke,
+    set_relays, unregister_service, user_key_export, user_key_import,
 };
 pub(crate) use org_author::{org_approve, org_create, org_join_code, org_revoke};
 pub(crate) use roster_install::{
@@ -816,13 +816,9 @@ impl MeshState {
 
     /// Record a completed inviter-side pairing for the `status` ceremony surface (display-only —
     /// see the [`recent_pairings`](Self::recent_pairings) field doc). Bounded: the OLDEST entry
-    /// is dropped once the ring holds [`RECENT_PAIRINGS_CAP`].
-    pub(crate) fn record_pairing(
-        &self,
-        peer_nickname: String,
-        sas_code: String,
-        paired_at_epoch: u64,
-    ) {
+    /// is dropped once the ring holds [`RECENT_PAIRINGS_CAP`]. The whole row, so the ceremony
+    /// that ran (`self_enroll`, #214) is fixed where it is known and not re-derived here.
+    pub(crate) fn record_pairing(&self, entry: mcpmesh_local_api::RecentPairing) {
         let mut ring = self
             .recent_pairings
             .lock()
@@ -830,16 +826,14 @@ impl MeshState {
         if ring.len() >= RECENT_PAIRINGS_CAP {
             ring.pop_front();
         }
-        ring.push_back(mcpmesh_local_api::RecentPairing {
-            peer_nickname,
-            sas_code,
-            paired_at_epoch,
-        });
+        ring.push_back(entry);
     }
 
     /// Snapshot of the recent inviter-side pairings, NEWEST FIRST (the order `status` renders —
-    /// the code the human is looking for is almost always the latest one).
-    pub(crate) fn recent_pairings(&self) -> Vec<mcpmesh_local_api::RecentPairing> {
+    /// the code the human is looking for is almost always the latest one). `pub` as a test seam
+    /// (#214): the two-node ceremony tests assert which ceremony each row records.
+    #[doc(hidden)]
+    pub fn recent_pairings(&self) -> Vec<mcpmesh_local_api::RecentPairing> {
         self.recent_pairings
             .lock()
             .expect("recent_pairings lock not poisoned")
@@ -1226,20 +1220,12 @@ impl MeshState {
     /// A clone of this daemon's self-sovereign pairing identity, or `None` when unset (control-only /
     /// test daemon) or when this daemon has no user key. The pairing handlers present it to peers.
     pub(crate) fn self_binding(&self) -> Option<crate::pairing::rendezvous::SelfBinding> {
-        // An IMPORTED key wins over everything (#85 ask 2). It is the most recent explicit act, and
-        // unlike an adoption it means this device HOLDS the key — so it also supersedes any earlier
-        // enrollment, which `user_key_import` clears rather than leaving to out-rank it here.
-        if let Some(imported) = self
-            .imported_binding
-            .read()
-            .expect("imported_binding lock not poisoned")
-            .clone()
-        {
-            return Some(imported);
-        }
-        // An ADOPTED binding wins over the boot-derived one (#86): this device was enrolled into
-        // another device's identity, so presenting the locally-derived one would resolve it to a
-        // stranger again — the exact symptom the issue reports.
+        // The most recent explicit act wins. An ADOPTED binding outranks everything (#86, #214):
+        // this device was enrolled into another device's identity, so presenting its own — imported
+        // or boot-derived — would resolve it to a stranger again. An import CLEARS this slot
+        // (`set_imported_binding`), so the two never both apply; an adoption after an import does
+        // not clear the imported slot but outranks it, so `self_enroll_detach` falls back to the
+        // identity whose key is actually on disk rather than the pre-import boot one.
         if let Some(adopted) = self
             .adopted_binding
             .read()
@@ -1247,6 +1233,16 @@ impl MeshState {
             .clone()
         {
             return Some(adopted);
+        }
+        // An IMPORTED key wins over the boot-derived one (#85 ask 2): the `OnceLock` cannot be
+        // reset, and the key file on disk is now the imported one.
+        if let Some(imported) = self
+            .imported_binding
+            .read()
+            .expect("imported_binding lock not poisoned")
+            .clone()
+        {
+            return Some(imported);
         }
         self.self_binding.get().cloned().flatten()
     }
@@ -1327,9 +1323,7 @@ impl MeshState {
                     grant_service_access(&mesh, &principal, &nickname, &services).await
                 })
             }),
-            record_pairing: Box::new(move |nickname, sas, paired_at| {
-                record_mesh.record_pairing(nickname, sas, paired_at);
-            }),
+            record_pairing: Box::new(move |entry| record_mesh.record_pairing(entry)),
             // #86: sign a binding for ANOTHER DEVICE of this person. Loads the key per call rather
             // than holding it, matching `peer_endorse`. `None` when this daemon has no user key —
             // there is then no identity to enroll into.
@@ -1934,8 +1928,18 @@ mod tests {
         let mesh = super::testutil::hermetic_mesh(dir.path().join("config.toml")).await;
         assert!(mesh.recent_pairings().is_empty(), "no pairings yet");
 
-        mesh.record_pairing("bob".into(), "tango-fig-cabbage".into(), 1000);
-        mesh.record_pairing("carol".into(), "delta-hop-iron".into(), 2000);
+        mesh.record_pairing(mcpmesh_local_api::RecentPairing {
+            peer_nickname: "bob".into(),
+            sas_code: "tango-fig-cabbage".into(),
+            paired_at_epoch: 1000,
+            self_enroll: false,
+        });
+        mesh.record_pairing(mcpmesh_local_api::RecentPairing {
+            peer_nickname: "carol".into(),
+            sas_code: "delta-hop-iron".into(),
+            paired_at_epoch: 2000,
+            self_enroll: false,
+        });
 
         let recent = mesh.recent_pairings();
         assert_eq!(recent.len(), 2);

@@ -535,6 +535,28 @@ pub fn run_identity_import(
     Ok(())
 }
 
+/// `mcpmesh identity detach` (#214): leave an identity this device was enrolled into.
+pub fn run_identity_detach(json: bool) -> anyhow::Result<()> {
+    let out = with_daemon(async move |mut client| Ok(client.self_enroll_detach().await?))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "user_id": out.user_id, "detached_from": out.detached_from })
+        );
+        return Ok(());
+    }
+    println!("Detached this device from identity {}.", out.detached_from);
+    match out.user_id {
+        Some(id) => println!("It now presents its own identity, {id}."),
+        None => println!("It has no user key of its own to present."),
+    }
+    println!(
+        "  → Anyone who already paired with this device as that person still believes it. Run"
+    );
+    println!("    `mcpmesh revoke device` from the device that holds that identity's key.");
+    Ok(())
+}
+
 /// `mcpmesh revoke peer <peer>` (#85 ask 4).
 pub fn run_revoke_peer(peer: String, reason: Option<String>, json: bool) -> anyhow::Result<()> {
     let p = peer.clone();

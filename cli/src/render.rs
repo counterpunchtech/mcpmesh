@@ -1077,6 +1077,7 @@ mod tests {
             roster: None,
             presence: Vec::new(),
             self_user_id: None,
+            self_user_key_held: false,
             recent_pairings: Vec::new(),
             reachability: Vec::new(),
             self_nickname: String::new(),
@@ -1651,11 +1652,13 @@ mod tests {
                 peer_nickname: "bob".into(),
                 sas_code: "tango-fig-cabbage".into(),
                 paired_at_epoch: 1_000_000,
+                self_enroll: false,
             },
             RecentPairing {
                 peer_nickname: "carol".into(),
                 sas_code: "anchor-bean-cable".into(),
                 paired_at_epoch: 1_000_000 - 5 * 60,
+                self_enroll: false,
             },
         ];
         let lines = recent_pairing_lines(&pairings, 1_000_010);
@@ -1675,6 +1678,7 @@ mod tests {
             peer_nickname: "bob".into(),
             sas_code: "tango-fig-cabbage".into(),
             paired_at_epoch: 100,
+            self_enroll: false,
         }];
         let rendered = recent_pairing_lines(&pairings, 200).join("\n");
         assert!(

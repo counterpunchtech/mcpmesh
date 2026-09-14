@@ -170,6 +170,7 @@ mod tests {
             roster: None,
             presence: vec![],
             self_user_id: None,
+            self_user_key_held: false,
             recent_pairings: vec![],
             reachability: vec![],
             self_nickname: String::new(),
