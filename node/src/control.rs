@@ -1327,6 +1327,16 @@ fn respond<T: serde::Serialize>(id: Value, method: &str, r: anyhow::Result<T>) -
                 format!("{method} failed: {e}"),
             )
         }
+        Err(e)
+            if e.downcast_ref::<crate::daemon::PrincipalRevoked>()
+                .is_some() =>
+        {
+            error(
+                id,
+                mcpmesh_local_api::ERR_PRINCIPAL_REVOKED,
+                format!("{method} failed: {e}"),
+            )
+        }
         Err(e) => error(id, -32000, format!("{method} failed: {e}")),
     }
 }
@@ -1380,7 +1390,7 @@ pub(crate) fn status_result(state: &DaemonState) -> Result<StatusResult> {
                 // annotation (fails open on corrupt rows, like `peer_infos`).
                 let entries = mesh.store.list().unwrap_or_default();
                 (
-                    crate::daemon::service_infos(&mesh.live_services(), &entries),
+                    crate::daemon::service_infos(mesh, &entries),
                     crate::daemon::peer_infos(&mesh.store),
                     roster,
                 )

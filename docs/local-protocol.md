@@ -179,7 +179,7 @@ Methods split into two groups by audience:
 | `device_revocation_import` | `{token}` — apply a peer's signed revocation. Honoured **only** from a `user_id` you already pair with, and **only** for a device you already know is theirs. An endpoint you have never seen is **refused**, not recorded — see the note below. A replayed older token is a no-op. | `{endpoint, user_id, applied, severed}` |
 | `peer_rename` | `{to, user_id?, nickname?}` — rename a person by `user_id`, else a provisional contact by `nickname` | `{}` (ack) |
 | `set_nickname` | `{nickname}` — rename **this node** live (#37, `api_minor >= 2`): validated (trimmed non-empty, no `/`), persisted to `[identity].nickname` under the daemon's own config lock (no lost-update window against a concurrent grant/registration), and effective for FUTURE invites/presentations immediately — no restart. Display-only: peers keep the nickname they stored at pairing time until a re-invite | `{}` (ack) |
-| `service_allow_grant` | `{service, principal}` — grant a stable principal (`b64u:`/`eid:`) access to ONE service's allow WITHOUT (re)pairing (#44), under the daemon's config lock + hot-reload. The per-peer "sharing on" toggle. Works on EPHEMERAL registrations too, mutating their in-memory allow (#55, `api_minor >= 11`). Idempotent; a name in neither the config nor the ephemeral registry → `-32040`. **When the edit lands only in the ephemeral overlay (nothing changes on disk), the registry is updated in place rather than rebuilt from `config.toml` — so the verb no longer picks up unrelated hand-edits to the config file as a side effect (#94). Use `register_service` or a daemon restart to apply config edits.** | `{}` (ack) |
+| `service_allow_grant` | `{service, principal}` — grant a stable principal (`b64u:`/`eid:`) access to ONE service's allow WITHOUT (re)pairing (#44), under the daemon's config lock + hot-reload. The per-peer "sharing on" toggle. Works on EPHEMERAL registrations too, mutating their in-memory allow (#55, `api_minor >= 11`). Idempotent; a name in neither the config nor the ephemeral registry → `-32040`; a **revoked** principal → `-32056`, refused before anything is written (#212, `api_minor >= 60` — below that the grant succeeded and minted an entry admission never honoured; see [`status.revoked`](#statusresult)). The revocation check runs first, so a revoked principal on an unknown service answers `-32056`, not `-32040`. **When the edit lands only in the ephemeral overlay (nothing changes on disk), the registry is updated in place rather than rebuilt from `config.toml` — so the verb no longer picks up unrelated hand-edits to the config file as a side effect (#94). Use `register_service` or a daemon restart to apply config edits.** | `{}` (ack) |
 | `service_allow_revoke` | `{service, principal}` — remove ONE allow entry from ONE service WITHOUT unpairing (#44): the peer's `PeerEntry` identity is untouched. **`principal` is matched as an EXACT STRING, never resolved — so any literal in the list is a valid target, including a BARE entry** (a legacy nickname from a pre-#38 config, a roster group name). See the note below (#149). **Immediate at `api_minor >= 10`** — see "Revocation is immediate" below. Works on EPHEMERAL registrations too (#69, `api_minor >= 11`). Idempotent; an absent principal is a clean no-op, a name in neither the config nor the ephemeral registry → `-32040`. **Same overlay-only fast path as `service_allow_grant`: when nothing changes on disk the registry is updated in place rather than rebuilt, so unrelated `config.toml` hand-edits are not applied as a side effect (#94).** | `{}` (ack) |
 | `unregister_service` | `{name}` — remove a service registration (#50), the mirror of `register_service`: drops the whole `[services.<name>]` entry (allow included) + any ephemeral registration, then hot-reloads. Idempotent; unknown name → clean no-op. In-flight sessions finish; no new ones admitted. | `{}` (ack) |
 | `peer_diagnostics` | `{peer}` — dump the DURABLE state this node stores for one peer (#140, `api_minor >= 33`): the persisted dial hint verbatim, whether it is actually usable (an unparseable or id-mismatched hint is silently discarded at every dial), the addresses inside it, the pairing stamp, and the live reachability row. **The one verb that deliberately carries transport vocabulary** — see the note below. Read-only: probes nothing, dials nothing, writes nothing. | `PeerDiagnosticsResult` |
@@ -595,6 +595,23 @@ and can sign a binding over a fresh endpoint id at will.
 
 Present because a revocation is otherwise invisible: a peer that has been cut off simply stops
 working, and neither side can distinguish that from a network fault.
+
+**`services[].allow` is revocation-aware (`api_minor >= 60`, #212).** An entry whose principal is
+revoked — as admission defines it, the same predicate `service_allow_grant` refuses on with `-32056`
+— is **omitted** from `allow` (and, index-aligned, from `allow_display`), even though the entry is
+still in `config.toml` and in the live registry. That closes the gap #100 left: `status` answered
+from the live registry so it could not report a grant the accept path refuses, but `peer_revoke`
+writes only the revocation table and never strips an `allow`, so a revoked peer showed as granted
+while every session from it was refused. The entry is deliberately NOT stripped: `peer_unrevoke`
+restores the grant with no re-grant. The fact is not hidden: a `peer_revoke` revocation is reported
+here in `revoked`, on the surface that means it, and a roster-revoked device is the roster's own
+`revoked_endpoints` (it is absent from `roster_members` too). Two consequences worth knowing: a `b64u:` entry hides only while **every**
+device of that identity is refused — `peer_unrevoke` on one device (by nickname) leaves the identity
+row but re-admits that device through its pair row, so the grant is live again and shows; and a
+bare roster name (a group, a roster `user_id`) is never hidden by this table — roster membership is
+withdrawn by roster INSTALL, which rebuilds the view. A hidden entry can still be stripped:
+`service_allow_revoke` matches the string literally and does not consult the revocation table, and
+`revoked[].principal` is that exact string. Below 60, join `revoked` against `allow` yourself.
 
 ### Device attestation (#85 ask 3)
 
@@ -1629,6 +1646,7 @@ Reference: [`cli/src/backends/spawn.rs`](../cli/src/backends/spawn.rs) (`run`),
 | `-32050` | the request was **cancelled on purpose** before it finished — today, a `blob_fetch` that `blob_fetch_cancel` tripped (#172, `api_minor >= 44`). Not a failure: the caller asked for it. Partial chunks stay in the store, and are reclaimed only if this node configured `[blobs].gc_interval` (#80). |
 | `-32051` | this control connection already has 32 requests in flight, so this one was refused without being started (#172, `api_minor >= 44`). **Retryable** — retry after any response lands, or use a second connection. |
 | `-32052` | `pair` — the line is a SELF-ENROLLMENT (`mcpmesh-enroll:`) and you did not set `allow_self_enroll` (#178, `api_minor >= 45`). Decided from the line, **before any dial**: nothing was contacted and the invite is untouched, so the same line works on a retry. Remedy: if the person meant to add another of their own devices, offer that explicitly and retry with `allow_self_enroll: true`; otherwise they pasted the wrong link. |
+| `-32056` | `service_allow_grant` — the principal is **revoked** on this node, so the grant was refused **before anything was written** (#212, `api_minor >= 60`). "Revoked" is what admission means by it: an `eid:` that `peer_revoke` (or a signed import, or the installed roster) marked dead, or a `b64u:` identity `peer_revoke` revoked none of whose known devices is still admitted. Below 60 the grant succeeded and wrote an `allow` entry admission never honoured. Remedy: `peer_unrevoke` first if the revocation was a mistake; otherwise there is nothing to grant. `-32053`..`-32055` are skipped on purpose — they are the session-plane codes below. |
 | `-32000` | operation failed — `message` carries the detail. One common instance: the daemon is in control-only mode with no mesh (e.g. `invite`/`pair` before a mesh exists) |
 | `-32055` | *(session only)* peer unreachable |
 | `-32054` | *(session only)* session refused |
@@ -1750,6 +1768,10 @@ things:
   and the caller learned which ceremony had run from `enrolled_as_self` afterwards. A consumer that
   does not offer device enrollment should require `>= 45` rather than pair without the guard.
   `user_key_export` / `user_key_import` (#85) are `api_minor >= 48`.
+  `status`'s `services[].allow` omitting entries whose principal is revoked, and
+  `service_allow_grant` refusing one with `-32056` (#212), are `api_minor >= 60` — a **behaviour**
+  change with no shape change: below it an absent entry means "not granted", at 60 it can also mean
+  "granted but refused", and `status.revoked` tells you which.
   `BlobFetchParams.from` (#83) is `api_minor >= 47` — additive and absent-tolerant, so guard only
   before sending it.
   The roster-mode embedding surface (#66, #93) is `api_minor >= 46`: the `org_create` /

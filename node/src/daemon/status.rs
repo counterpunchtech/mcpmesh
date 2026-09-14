@@ -165,9 +165,10 @@ fn display_principal(principal: &str, peers: &[crate::allowlist::PeerEntry]) -> 
 }
 
 pub(crate) fn service_infos(
-    live: &mcpmesh_net::Services,
+    mesh: &MeshState,
     peers: &[crate::allowlist::PeerEntry],
 ) -> Vec<ServiceInfo> {
+    let live = mesh.live_services();
     // #100: the LIVE registry decides which services exist and what each admits — it is what the
     // accept path authorizes from. Reading config instead reported a hand-added service that had
     // not been reloaded as though it were servable.
@@ -176,21 +177,37 @@ pub(crate) fn service_infos(
     // `ephemeral` flag are looked up from config / the ephemeral map as metadata for a name the
     // registry has already admitted. Ephemeral is checked first: it wins for a duplicate name,
     // matching `build_services_with_ephemeral`.
+    //
+    // #212: the registry's `allow` is the SECOND gate. `peer_revoke` writes only the revocation
+    // table and never touches an entry, so copying `allow` out unfiltered reported grants the
+    // first gate refuses before any service authz runs — #100's property, one gate short. Filter
+    // through the same predicate the grant path refuses on, so the two surfaces agree; the entry
+    // itself is untouched (unrevoking restores it with no re-grant), and a `peer_revoke` principal
+    // still appears in `status.revoked`, so nothing is hidden — it is reported on the surface that
+    // means it. (A roster-revoked device is filtered too; its record is the roster's
+    // `revoked_endpoints`.)
+    let roster = mesh.roster.view();
     let mut out: Vec<ServiceInfo> = live
         .iter()
-        .map(|(name, entry)| ServiceInfo {
-            name: name.clone(),
-            allow: entry.allow.clone(),
-            allow_display: entry
+        .map(|(name, entry)| {
+            let allow: Vec<String> = entry
                 .allow
                 .iter()
-                .map(|p| display_principal(p, peers))
-                .collect(),
-            backend: match entry.kind {
-                mcpmesh_net::ServiceKind::Socket => BackendKind::Socket,
-                _ => BackendKind::Run,
-            },
-            ephemeral: entry.ephemeral,
+                .filter(|p| {
+                    !super::handlers::principal_is_revoked(&mesh.store, roster.as_deref(), p)
+                })
+                .cloned()
+                .collect();
+            ServiceInfo {
+                name: name.clone(),
+                allow_display: allow.iter().map(|p| display_principal(p, peers)).collect(),
+                allow,
+                backend: match entry.kind {
+                    mcpmesh_net::ServiceKind::Socket => BackendKind::Socket,
+                    _ => BackendKind::Run,
+                },
+                ephemeral: entry.ephemeral,
+            }
         })
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -496,6 +513,215 @@ mod tests {
         assert_eq!(status.recent_pairings.len(), 8);
         assert_eq!(status.recent_pairings[0].sas_code, "code-9");
         assert_eq!(status.recent_pairings[0].paired_at_epoch, 9);
+    }
+
+    /// #212: `services[].allow` must not report a grant the accept path refuses on REVOCATION
+    /// grounds — #100's property, with the second gate accounted for.
+    ///
+    /// The fixture seeds BOTH sides of the boundary in one allow: a device that will be revoked, a
+    /// device that stays live, and the revoked device's `b64u:` identity. Revocation is driven
+    /// through the REAL `peer_revoke` verb, so the table is written exactly as the gate reads it;
+    /// the assertion is on the real `status_result`, and on the live registry staying untouched —
+    /// this is a projection, not a strip.
+    ///
+    /// Deleting the filter in `service_infos` fails the first `assert_eq!` after the revoke: the
+    /// revoked `eid:` reappears in `allow`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn status_hides_an_allow_entry_whose_principal_is_revoked() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let mallory_eid = mcpmesh_net::EndpointId::from_bytes([3u8; 32]).principal();
+        let alice_eid = mcpmesh_net::EndpointId::from_bytes([9u8; 32]).principal();
+        std::fs::write(
+            &config_path,
+            format!(
+                "[services.kb]\nsocket = \"/run/kb.sock\"\n\
+                 allow = [\"{mallory_eid}\", \"{alice_eid}\", \"b64u:mallory\"]\n"
+            ),
+        )
+        .unwrap();
+        let mesh = hermetic_mesh(config_path.clone()).await;
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+        for (bytes, nickname, user_id) in [
+            ([3u8; 32], "mallory", Some("b64u:mallory")),
+            ([9u8; 32], "alice", None),
+        ] {
+            mesh.store
+                .add(PeerEntry {
+                    endpoint_id: bytes,
+                    nickname: nickname.into(),
+                    services: Vec::new(),
+                    paired_at: None,
+                    user_id: user_id.map(str::to_owned),
+                    last_addr: None,
+                })
+                .unwrap();
+        }
+        let kb = |st: &mcpmesh_local_api::StatusResult| {
+            st.services
+                .iter()
+                .find(|s| s.name == "kb")
+                .cloned()
+                .expect("kb service in status")
+        };
+
+        // Before: every entry shows — the fixture discriminates.
+        let before = kb(&crate::control::status_result(&state).unwrap());
+        assert_eq!(
+            before.allow,
+            vec![
+                mallory_eid.clone(),
+                alice_eid.clone(),
+                "b64u:mallory".to_string()
+            ]
+        );
+        assert_eq!(before.allow_display, vec!["mallory", "alice", "mallory"]);
+
+        // Revoke the DEVICE by nickname: only that `eid:` is refused. The person is not revoked —
+        // another of their devices would still be admitted through the `b64u:` — so it stays.
+        crate::daemon::peer_revoke(
+            &state,
+            mcpmesh_local_api::PeerRevokeParams {
+                peer: "mallory".into(),
+                reason: Some("stolen".into()),
+            },
+        )
+        .await
+        .unwrap();
+        let after_device = kb(&crate::control::status_result(&state).unwrap());
+        assert_eq!(
+            after_device.allow,
+            vec![alice_eid.clone(), "b64u:mallory".to_string()],
+            "a revoked eid: must not be reported as granted"
+        );
+        assert_eq!(
+            after_device.allow_display,
+            vec!["alice", "mallory"],
+            "allow_display stays index-aligned with the filtered allow"
+        );
+
+        // Revoke the PERSON: the identity row lands, every known device is refused, and no new
+        // device can attest — so the `b64u:` entry is honoured by nothing and goes too.
+        crate::daemon::peer_revoke(
+            &state,
+            mcpmesh_local_api::PeerRevokeParams {
+                peer: "b64u:mallory".into(),
+                reason: None,
+            },
+        )
+        .await
+        .unwrap();
+        let status = crate::control::status_result(&state).unwrap();
+        let after_user = kb(&status);
+        assert_eq!(after_user.allow, vec![alice_eid.clone()]);
+        assert_eq!(after_user.allow_display, vec!["alice"]);
+
+        // The fact is not lost, only moved to the surface that means it…
+        let revoked: Vec<&str> = status
+            .revoked
+            .iter()
+            .map(|r| r.principal.as_str())
+            .collect();
+        assert!(
+            revoked.contains(&mallory_eid.as_str()) && revoked.contains(&"b64u:mallory"),
+            "status.revoked must still name both, got {revoked:?}"
+        );
+        // …and the live registry is untouched: a projection, not a strip. Unrevoking must restore
+        // the grant without anyone re-granting it.
+        let live = mesh.live_services();
+        let entry = live.get("kb").expect("kb is live");
+        assert_eq!(
+            entry.allow,
+            vec![
+                mallory_eid.clone(),
+                alice_eid.clone(),
+                "b64u:mallory".to_string()
+            ],
+            "the filter must not mutate the registry"
+        );
+        assert_eq!(
+            crate::config::Config::load(&config_path).unwrap().services["kb"]
+                .allow
+                .len(),
+            3,
+            "…nor the config"
+        );
+    }
+
+    /// #212: a `b64u:` entry hides only while admission refuses EVERY device it names. `peer_unrevoke`
+    /// by nickname lifts one device's row and leaves the identity row; the gate then admits that
+    /// device through its pair row's `user_id`, so the grant is honoured again and must show.
+    ///
+    /// Deleting the "every device refused" clause in `principal_is_revoked` fails this: the
+    /// identity row alone would keep hiding a grant a live session gets.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_user_grant_reappears_once_one_of_their_devices_is_admitted_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[services.kb]\nsocket = \"/run/kb.sock\"\nallow = [\"b64u:mallory\"]\n",
+        )
+        .unwrap();
+        let mesh = hermetic_mesh(config_path.clone()).await;
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+        for (bytes, nickname) in [([3u8; 32], "mallory-laptop"), ([4u8; 32], "mallory-phone")] {
+            mesh.store
+                .add(PeerEntry {
+                    endpoint_id: bytes,
+                    nickname: nickname.into(),
+                    services: Vec::new(),
+                    paired_at: None,
+                    user_id: Some("b64u:mallory".into()),
+                    last_addr: None,
+                })
+                .unwrap();
+        }
+        let kb_allow = || {
+            crate::control::status_result(&state)
+                .unwrap()
+                .services
+                .into_iter()
+                .find(|s| s.name == "kb")
+                .expect("kb service in status")
+                .allow
+        };
+        assert_eq!(kb_allow(), vec!["b64u:mallory".to_string()]);
+
+        crate::daemon::peer_revoke(
+            &state,
+            mcpmesh_local_api::PeerRevokeParams {
+                peer: "b64u:mallory".into(),
+                reason: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            kb_allow().is_empty(),
+            "both devices and the identity are refused — nothing is granted"
+        );
+
+        // Lift ONE device. The identity row stays (`status.revoked` still lists it), but the
+        // phone's pair row now resolves with `user_id = b64u:mallory`, and `caller_admits` matches
+        // that against the allow — so the grant is live for the phone and must be reported.
+        crate::daemon::peer_unrevoke(
+            &state,
+            mcpmesh_local_api::PeerUnrevokeParams {
+                peer: "mallory-phone".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            mesh.store.is_user_revoked("b64u:mallory"),
+            "fixture: the identity row must survive a per-device unrevoke"
+        );
+        assert_eq!(
+            kb_allow(),
+            vec!["b64u:mallory".to_string()],
+            "a grant one admitted device gets must show"
+        );
     }
 }
 
