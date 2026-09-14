@@ -545,6 +545,78 @@ mod tests {
         assert!(g.resolve(&[3u8; 32].into()).is_none()); // revocation wins via dyn too
     }
 
+    /// #218: rule 1 refuses a pair row whose IDENTITY is revoked — and it has to be rule 1, not the
+    /// rule-3 fallthrough. [2;32] is BOTH rostered (active, alice) and paired with a row carrying
+    /// `user_id = b64u:mallory`, so a gate that only learned about identity revocation inside
+    /// `AllowlistGate::resolve` would never reach it: rule 2 returns alice's roster identity first.
+    /// Consulted through `&dyn TrustGate`, the production path.
+    ///
+    /// Deleting the `identity_revoked` clause in `AllowlistGate::is_revoked` fails the first
+    /// two assertions (rule 2 resolves the endpoint to `alice`).
+    #[test]
+    fn composed_rule_1_refuses_a_rostered_endpoint_whose_pair_identity_is_revoked() {
+        use crate::allowlist::{AllowlistGate, PeerEntry, PeerStore, RevokedEntry};
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(PeerStore::open(&dir.path().join("state.redb")).unwrap());
+        for (b, uid) in [(2u8, "b64u:mallory"), (4u8, "b64u:alice")] {
+            store
+                .add(PeerEntry {
+                    endpoint_id: [b; 32],
+                    nickname: format!("p-{b}"),
+                    services: vec![],
+                    paired_at: None,
+                    user_id: Some(uid.into()),
+                    last_addr: None,
+                })
+                .unwrap();
+        }
+        store
+            .revoke_user(
+                "b64u:mallory",
+                &RevokedEntry {
+                    endpoint_id: [0u8; 32],
+                    revoked_at: 1,
+                    reason: None,
+                    source: "local".into(),
+                    signer_user_id: None,
+                    issued_at: None,
+                },
+            )
+            .unwrap();
+        let roster = Arc::new(RosterGate::empty());
+        roster.install(view_with(&[(2u8, "alice")], &[])); // [2;32] ACTIVE in the roster
+        let composed = ComposedGate::new(roster, Arc::new(AllowlistGate::new(store.clone())));
+        let g: &dyn TrustGate = &composed;
+
+        assert!(
+            g.is_revoked(&[2u8; 32].into()),
+            "rule 1 must see the pair row's revoked identity"
+        );
+        assert!(
+            g.resolve(&[2u8; 32].into()).is_none(),
+            "…and refuse before rule 2 hands out the roster identity"
+        );
+        assert!(g.should_sever_now(&[2u8; 32].into(), Some("alice")));
+        // The live identity's row is untouched by mallory's revocation.
+        assert_eq!(
+            g.resolve(&[4u8; 32].into())
+                .expect("alice's row resolves")
+                .name,
+            "p-4"
+        );
+        assert!(!g.is_revoked(&[4u8; 32].into()));
+
+        // The inverse: lifting the identity revocation hands [2;32] back to rule 2.
+        assert!(store.unrevoke_user("b64u:mallory").unwrap());
+        assert!(!g.is_revoked(&[2u8; 32].into()));
+        assert_eq!(
+            g.resolve(&[2u8; 32].into()).expect("resolves again").name,
+            "alice",
+            "the roster masks the pair entry once nothing refuses it"
+        );
+    }
+
     #[test]
     fn should_sever_now_selects_revoked_and_dropped_through_dyn() {
         use std::sync::Arc;

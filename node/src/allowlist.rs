@@ -217,6 +217,25 @@ impl PeerStore {
         }
     }
 
+    /// Is this stored row's IDENTITY revoked (#218) — does it carry a `user_id` that
+    /// [`is_user_revoked`](Self::is_user_revoked) refuses?
+    ///
+    /// THE row-level revocation question, asked by every gate entry point and by the two paths
+    /// that write such a row (invite redemption, `peer_introduce`). Until #218 only attestation
+    /// asked it: `peer_revoke b64u:` wrote the identity table and endpoint-revoked the devices it
+    /// knew, and a fresh invite then landed a row for a NEW device with the same `user_id` that
+    /// nothing consulted. A row with no `user_id` (legacy, `internal peer add`, a binding-less
+    /// pairing) has no identity to revoke and answers `false`.
+    ///
+    /// The `user_id` is compared as the store keys it: the `b64u:` rendering `verify_presented`
+    /// returns and `peer_revoke` was given (it only accepts a `b64u:` that matched a row, so the two
+    /// spellings cannot diverge). Fails CLOSED through `is_user_revoked`.
+    pub fn is_identity_revoked(&self, e: &PeerEntry) -> bool {
+        e.user_id
+            .as_deref()
+            .is_some_and(|uid| self.is_user_revoked(uid))
+    }
+
     /// Revoke a `b64u:` IDENTITY — every device of that person, including ones we have never seen.
     pub fn revoke_user(&self, user_id: &str, e: &RevokedEntry) -> Result<()> {
         let bytes = serde_json::to_vec(e)?;
@@ -541,6 +560,22 @@ impl AllowlistGate {
     pub fn new(store: Arc<PeerStore>) -> Self {
         Self { store }
     }
+
+    /// Does this endpoint's pair row carry a REVOKED identity (#218)? The second half of "is it
+    /// revoked" — [`PeerStore::is_revoked`] is the endpoint table, this is the identity table
+    /// reached through the row. Fails CLOSED: an unreadable row answers `true`, the same answer
+    /// `resolve` gives that row. A missing row is `false` — there is no identity to be revoked,
+    /// and `resolve` refuses it on its own grounds.
+    fn identity_revoked(&self, endpoint: &EndpointId) -> bool {
+        match self.store.resolve(endpoint.as_bytes()) {
+            Ok(Some(e)) => self.store.is_identity_revoked(&e),
+            Ok(None) => false,
+            Err(e) => {
+                tracing::warn!(%e, "peer store read failed; treating the endpoint as REVOKED (fail-closed)");
+                true
+            }
+        }
+    }
 }
 
 impl TrustGate for AllowlistGate {
@@ -559,6 +594,12 @@ impl TrustGate for AllowlistGate {
             return None;
         }
         match self.store.resolve(endpoint.as_bytes()) {
+            // (1b) …and so does an IDENTITY revocation on the row's `user_id` (#218). `peer_revoke
+            // b64u:` endpoint-revokes the devices it knows about, so this only ever bites a row
+            // written AFTER the revocation — which is precisely the row a fresh invite lands for
+            // the person's next device, and the one the operator meant to refuse. One more redb
+            // read, taken only for a row that carries a `user_id`.
+            Ok(Some(e)) if self.store.is_identity_revoked(&e) => None,
             Ok(Some(e)) => Some(PeerIdentity {
                 endpoint: *endpoint,
                 user_id: e.user_id, // self-sovereign user_id from a verified pairing binding (else None)
@@ -575,9 +616,11 @@ impl TrustGate for AllowlistGate {
 
     /// The check-register recheck (#85 ask 4) — closes the same TOCTOU window #54 closed for
     /// roster revocation: a connection that registers just after a revoke must self-close rather
-    /// than run to completion on a decision that was true when it was accepted.
+    /// than run to completion on a decision that was true when it was accepted. Both tables (#218):
+    /// this is also `ComposedGate`'s rule 1, which must refuse a rostered endpoint whose pair row
+    /// carries a revoked identity before rule 2 resolves it through the roster.
     fn is_revoked(&self, endpoint: &EndpointId) -> bool {
-        self.store.is_revoked(endpoint.as_bytes())
+        self.store.is_revoked(endpoint.as_bytes()) || self.identity_revoked(endpoint)
     }
 
     /// Sever an EXISTING session on revocation, immediately.
@@ -586,7 +629,7 @@ impl TrustGate for AllowlistGate {
     /// sessions are long-lived by design, so "eventually" can mean days. `roster_user` is
     /// irrelevant here: a pairing revocation applies whether or not the endpoint is also rostered.
     fn should_sever_now(&self, endpoint: &EndpointId, _roster_user: Option<&str>) -> bool {
-        self.store.is_revoked(endpoint.as_bytes())
+        self.store.is_revoked(endpoint.as_bytes()) || self.identity_revoked(endpoint)
     }
 }
 
@@ -993,6 +1036,99 @@ mod tests {
             "unrevoking restores the peer, since the pair row survived"
         );
         assert!(!store.unrevoke(&eid).unwrap(), "idempotent");
+    }
+
+    /// #218: an IDENTITY revocation beats a live pair row carrying that `user_id`, at every gate
+    /// entry point — the issue's own reproduction. `peer_revoke b64u:mallory` writes the identity
+    /// table; a fresh redeem (or an introduce) then lands a row for a NEW device with
+    /// `user_id = b64u:mallory`, and `resolve` used to answer `Some` off the pair row alone, so the
+    /// identity revocation was void the moment a new invite was minted.
+    ///
+    /// Both sides of the boundary are seeded in one store: two of mallory's devices (revoked
+    /// identity, no ENDPOINT revocation — the stand-in for the fresh redeem) and alice's (live).
+    /// The inverse is pinned too: `unrevoke_user` restores EVERY device of the identity.
+    ///
+    /// Deleting the `is_identity_revoked` check in `AllowlistGate::resolve` fails the first
+    /// `is_none`; deleting it in `AllowlistGate::is_revoked` fails the `is_revoked` /
+    /// `should_sever_now` assertions.
+    #[test]
+    fn a_revoked_identity_is_refused_even_with_a_live_pair_row() {
+        use mcpmesh_net::TrustGate;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(PeerStore::open(&dir.path().join("p.redb")).unwrap());
+        let gate = AllowlistGate::new(store.clone());
+        let row = |bytes: [u8; 32], nickname: &str, user_id: &str| PeerEntry {
+            endpoint_id: bytes,
+            nickname: nickname.into(),
+            services: vec![],
+            paired_at: None,
+            user_id: Some(user_id.into()),
+            last_addr: None,
+        };
+        let (laptop, phone, alice): (EndpointId, EndpointId, EndpointId) =
+            ([5u8; 32].into(), [6u8; 32].into(), [9u8; 32].into());
+
+        // The person is revoked FIRST, then the rows land — the order of the failing sequence.
+        store
+            .revoke_user(
+                "b64u:mallory",
+                &RevokedEntry {
+                    endpoint_id: [0u8; 32],
+                    revoked_at: 1_754_300_000,
+                    reason: Some("left the team".into()),
+                    source: "local".into(),
+                    signer_user_id: None,
+                    issued_at: None,
+                },
+            )
+            .unwrap();
+        store
+            .add(row([5u8; 32], "mallory-laptop", "b64u:mallory"))
+            .unwrap();
+        store
+            .add(row([6u8; 32], "mallory-phone", "b64u:mallory"))
+            .unwrap();
+        store.add(row([9u8; 32], "alice", "b64u:alice")).unwrap();
+        for id in [&laptop, &phone] {
+            assert!(
+                !store.is_revoked(id.as_bytes()),
+                "fixture: no ENDPOINT revocation — the identity row alone must carry this"
+            );
+        }
+
+        assert!(
+            gate.resolve(&laptop).is_none(),
+            "a row whose user_id is revoked must not resolve"
+        );
+        assert!(
+            gate.resolve(&phone).is_none(),
+            "…for every device carrying that identity"
+        );
+        assert!(
+            gate.is_revoked(&laptop),
+            "the check-register recheck must see it too — the TOCTOU close (#54)"
+        );
+        assert!(
+            gate.should_sever_now(&phone, None),
+            "and a LIVE session from such a device must be severed"
+        );
+        let a = gate
+            .resolve(&alice)
+            .expect("an unrevoked identity's row still resolves");
+        assert_eq!(a.user_id.as_deref(), Some("b64u:alice"));
+        assert!(!gate.is_revoked(&alice));
+
+        // The inverse: lifting the IDENTITY revocation restores admission for every device.
+        assert!(store.unrevoke_user("b64u:mallory").unwrap());
+        for (id, name) in [(&laptop, "mallory-laptop"), (&phone, "mallory-phone")] {
+            let p = gate
+                .resolve(id)
+                .expect("unrevoking the identity restores its devices");
+            assert_eq!(p.name, name);
+            assert_eq!(p.user_id.as_deref(), Some("b64u:mallory"));
+            assert!(!gate.is_revoked(id));
+            assert!(!gate.should_sever_now(id, None));
+        }
     }
 
     /// A revocation must survive a restart.

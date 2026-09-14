@@ -63,6 +63,13 @@ const MAX_PAIR_FRAME: usize = 64 * 1024;
 /// secret: a specific reason would be a redemption oracle an attacker could probe. The specific [`Redeem`] variant is logged SERVER-side only. A malformed frame and an
 /// id mismatch get their own reasons — neither is a secret oracle.
 const REASON_REFUSED: &str = "pairing refused";
+
+/// The reason on an [`RefusalCode::IdentityRevoked`] refusal (#218). Names the remedy and the
+/// non-remedy: a redeemer's first instinct is to ask for another invite, and that is refused the
+/// same way.
+const REASON_IDENTITY_REVOKED: &str = "your identity is revoked on the inviter; a fresh invite \
+                                       will not help — the inviter has to lift the revocation \
+                                       (peer_unrevoke)";
 const REASON_MALFORMED: &str = "malformed request";
 const REASON_ID_MISMATCH: &str = "id mismatch";
 
@@ -119,9 +126,9 @@ fn collision_refusal(nickname: &str, invite_survived: bool) -> PairReply {
 /// Daemon-to-daemon only; the control API sees the mapped
 /// [`ERR_NICKNAME_TAKEN`](mcpmesh_local_api::ERR_NICKNAME_TAKEN) instead.
 ///
-/// **Deliberately narrow.** It rides only the nickname-collision refusal, which is already
-/// distinguishable and already sent exclusively to a caller that proved possession of a live
-/// secret. The generic [`REASON_REFUSED`] path gains NO code: it withholds
+/// **Deliberately narrow.** It rides only refusals that are already distinguishable and already
+/// sent exclusively to a caller that proved possession of a live secret: the nickname collision,
+/// and (#218) a revoked identity. The generic [`REASON_REFUSED`] path gains NO code: it withholds
 /// unknown-vs-expired-vs-wrong-secret on purpose, and labelling it would build the redemption
 /// oracle that reason exists to prevent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -135,6 +142,12 @@ enum RefusalCode {
     /// same collision with the invite already BURNED, and deliberately sends no code: an embedder
     /// branching on one would tell the user to retry an invite that is gone.
     NicknameTaken,
+    /// The redeemer's PROVEN `user_id` is one the inviter has revoked (`peer_revoke b64u:`), so no
+    /// row is written and no grant is made (#218). Sent after the burn, to a caller that proved a
+    /// live secret AND a binding for that identity — it learns nothing it did not already hold.
+    /// The remedy is the inviter's `peer_unrevoke`, never a fresh invite, which is why the redeemer
+    /// maps it to its own control code rather than [`ERR_INVITE_REFUSED`]'s "ask for another".
+    IdentityRevoked,
     /// A refusal kind this node predates. Never sent — only reached on receive.
     Unknown,
 }
@@ -157,6 +170,7 @@ impl<'de> serde::Deserialize<'de> for RefusalCode {
             fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Self::Value, E> {
                 Ok(match s {
                     "nickname_taken" => RefusalCode::NicknameTaken,
+                    "identity_revoked" => RefusalCode::IdentityRevoked,
                     _ => RefusalCode::Unknown,
                 })
             }
@@ -975,6 +989,40 @@ pub async fn handle_inviter_side(
                     .or_else(|| existing.and_then(|e| e.user_id)),
                 last_addr,
             };
+            // IDENTITY REVOCATION (#218) — refused BEFORE the row and BEFORE the grant, on the
+            // `user_id` the row would actually carry (the merge above: freshly verified, else the
+            // already-proven stored one — a binding-less re-pair by a revoked person's known device
+            // is the same case). Attestation has asked this since #85 ask 3; ordinary redemption
+            // did not, so `peer_revoke b64u:` was void the moment a fresh invite was minted: the
+            // person's next device landed a row and a `services[].allow` grant that the gate then
+            // refused — the caller told "paired", every session refused. Same store predicate
+            // the gate uses on the way in (`is_identity_revoked` over `is_user_revoked`).
+            //
+            // After the burn, like the post-redeem collision guard: the caller proved a live secret
+            // AND a binding for this identity, so the coded truth discloses nothing it did not
+            // hold, and there is no invite-preserving remedy on this side to protect. A revoked
+            // person holding a live invite is the invite you want gone.
+            if let Some(uid) = entry.user_id.clone() {
+                let store = ctx.store.clone();
+                let revoked = tokio::task::spawn_blocking(move || store.is_user_revoked(&uid))
+                    .await
+                    .context("join identity revocation check")?;
+                if revoked {
+                    tracing::warn!(
+                        nickname = %nickname,
+                        "pairing refused: the redeemer's identity is revoked (invite consumed)"
+                    );
+                    let _ = send_reply(
+                        &mut send,
+                        &PairReply::Refused {
+                            reason: REASON_IDENTITY_REVOKED.into(),
+                            code: Some(RefusalCode::IdentityRevoked),
+                        },
+                    )
+                    .await;
+                    return Ok(());
+                }
+            }
             // The redeemer's STABLE principal, captured BEFORE the entry moves into the store:
             // the verified `b64u:` user_id when a binding was presented (or already proven),
             // else the `eid:` device principal of the TLS-AUTHENTICATED endpoint (#38).
@@ -1478,6 +1526,12 @@ fn refusal_error(reason: &str, code: Option<RefusalCode>) -> anyhow::Error {
     let msg = format!("pairing refused: {reason}");
     match code {
         Some(RefusalCode::NicknameTaken) => anyhow::Error::new(NicknameTaken(msg)),
+        // #218: the inviter revoked THIS identity. Its own code, because the remedy every other
+        // refusal implies — a fresh invite — is exactly what does not help here.
+        Some(RefusalCode::IdentityRevoked) => anyhow::Error::new(PairRefusal::new(
+            mcpmesh_local_api::ERR_PAIR_IDENTITY_REVOKED,
+            msg,
+        )),
         // #159: branchable as "that invite did not work" WITHOUT saying why. The inviter answers
         // one reason for unknown / expired / wrong secret on purpose — telling them apart is a
         // redemption oracle — so this code carries exactly as much as the prose already did.
@@ -1606,6 +1660,56 @@ mod tests {
         }
     }
 
+    /// #218: the identity-revocation refusal is coded on the pairing wire (`identity_revoked`),
+    /// survives the round trip, and the REDEEMER maps it to its OWN control code — never to
+    /// `-32049`, whose documented remedy ("ask for a fresh invite") is the one thing that does not
+    /// help. The real send site is pinned end to end by
+    /// `a_revoked_identity_cannot_redeem_until_the_inviter_unrevokes_it` in
+    /// `cli/tests/pairing_rendezvous.rs`; this pins the two mappings that test rides on.
+    ///
+    /// Deleting the `IdentityRevoked` arm in `refusal_error` fails the `code()` assertion
+    /// (it falls through to `-32049`); deleting the `"identity_revoked"` arm in the deserializer
+    /// fails the round trip (`Unknown`).
+    #[test]
+    fn the_identity_revoked_refusal_is_coded_and_maps_to_its_own_control_code() {
+        let wire = serde_json::to_value(PairReply::Refused {
+            reason: REASON_IDENTITY_REVOKED.into(),
+            code: Some(RefusalCode::IdentityRevoked),
+        })
+        .unwrap();
+        assert_eq!(wire["code"], "identity_revoked", "got {wire}");
+
+        let reply: PairReply = serde_json::from_value(wire).unwrap();
+        let PairReply::Refused { code, reason } = reply else {
+            panic!("expected a refusal");
+        };
+        assert_eq!(code, Some(RefusalCode::IdentityRevoked));
+        let e = refusal_error(&reason, code);
+        let refusal = e
+            .downcast_ref::<PairRefusal>()
+            .unwrap_or_else(|| panic!("must be the coded PairRefusal, got: {e:#}"));
+        assert_eq!(
+            refusal.code(),
+            mcpmesh_local_api::ERR_PAIR_IDENTITY_REVOKED,
+            "its own code, not the opaque -32049"
+        );
+        assert!(
+            e.to_string().contains("peer_unrevoke") && e.to_string().contains("fresh invite"),
+            "the message names the remedy and the non-remedy: {e:#}"
+        );
+
+        // The neighbours are untouched: a kind this node predates, and no code at all, still
+        // degrade to the opaque refusal.
+        for code in [Some(RefusalCode::Unknown), None] {
+            let e = refusal_error("r", code);
+            assert_eq!(
+                e.downcast_ref::<PairRefusal>().expect("PairRefusal").code(),
+                mcpmesh_local_api::ERR_INVITE_REFUSED,
+                "{code:?}"
+            );
+        }
+    }
+
     /// #147: the serialized wire SHAPE of a coded and an uncoded refusal — the `snake_case`
     /// rendering and `skip_serializing_if` eliding the key rather than sending `null`.
     ///
@@ -1616,7 +1720,7 @@ mod tests {
     /// `cli/tests/pairing_rendezvous.rs`. A mutation stamping the code at that send site passed
     /// THIS test.
     #[test]
-    fn only_the_collision_refusal_is_coded() {
+    fn the_opaque_refusal_carries_no_code() {
         let coded = serde_json::to_value(PairReply::Refused {
             reason: reason_nickname_taken("bob", true),
             code: Some(RefusalCode::NicknameTaken),
