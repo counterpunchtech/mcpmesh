@@ -378,9 +378,21 @@ pub async fn run_mesh_connection(
 /// (-32054 on that stream), since the connection-level 401 has no per-stream form.
 ///
 /// The roster discriminator is read on BOTH sides of `resolve` and promoted into the connection's
-/// registry entry before the session may be served — see [`RosterTracker`](crate::registry::RosterTracker). Reading it on both
-/// sides narrows the window where `resolve` sees a roster identity that neither read observed to two
-/// roster installs landing between them. A failed promotion refuses the session (fail closed).
+/// registry entry before the session may be served — see
+/// [`RosterTracker`](crate::registry::RosterTracker). Reading it on both sides means `resolve` can
+/// only return a roster identity neither read observed if the roster view changed TWICE between the
+/// reads (rostered, then not — two installs, or an install plus a degraded-state flip). The
+/// connection-level check reads it once, after `resolve`, so a single change can slip between its
+/// two reads — harmless now that its identity authorizes no session.
+///
+/// A failed promotion refuses the session (fail closed) — including the benign race where the
+/// roster dropped the device between the two reads and `resolve` fell through to a still-valid pair
+/// identity; the next session resolves cleanly.
+///
+/// Sync on purpose: no lock or redb read transaction can be held across an `.await`. The work is
+/// the same class the connection-level check already does on the executor — in-memory `RwLock`
+/// reads of the roster view plus, for `ComposedGate`, two redb READ transactions
+/// (`is_revoked` + `resolve` on the peer store) — and the blob provider does the same per request.
 fn resolve_session_principal(
     remote: &EndpointId,
     gate: &dyn TrustGate,
