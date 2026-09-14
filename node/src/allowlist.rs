@@ -236,6 +236,29 @@ impl PeerStore {
             .is_some_and(|uid| self.is_user_revoked(uid))
     }
 
+    /// Is this endpoint REFUSED on revocation grounds — by the endpoint table, or by the identity
+    /// its stored row carries (#218)? The one endpoint-keyed question every site that means
+    /// "revoked" asks: the gate's check-register recheck and sever, and every OUTBOUND dial
+    /// filter (#85 ask 4 made revocation two-way; an identity revocation that only bit inbound
+    /// would hand a request to a device the gate refuses).
+    ///
+    /// A missing row is not refused by this — there is no identity to be revoked, and a caller
+    /// that needs the row refuses its absence on its own terms. Fails CLOSED: an unreadable row
+    /// answers `true`, like both reads it composes.
+    pub fn is_refused(&self, endpoint_id: &[u8; 32]) -> bool {
+        if self.is_revoked(endpoint_id) {
+            return true;
+        }
+        match self.resolve(endpoint_id) {
+            Ok(Some(e)) => self.is_identity_revoked(&e),
+            Ok(None) => false,
+            Err(e) => {
+                tracing::warn!(%e, "peer store read failed; treating the endpoint as REVOKED (fail-closed)");
+                true
+            }
+        }
+    }
+
     /// Revoke a `b64u:` IDENTITY — every device of that person, including ones we have never seen.
     pub fn revoke_user(&self, user_id: &str, e: &RevokedEntry) -> Result<()> {
         let bytes = serde_json::to_vec(e)?;
@@ -560,22 +583,6 @@ impl AllowlistGate {
     pub fn new(store: Arc<PeerStore>) -> Self {
         Self { store }
     }
-
-    /// Does this endpoint's pair row carry a REVOKED identity (#218)? The second half of "is it
-    /// revoked" — [`PeerStore::is_revoked`] is the endpoint table, this is the identity table
-    /// reached through the row. Fails CLOSED: an unreadable row answers `true`, the same answer
-    /// `resolve` gives that row. A missing row is `false` — there is no identity to be revoked,
-    /// and `resolve` refuses it on its own grounds.
-    fn identity_revoked(&self, endpoint: &EndpointId) -> bool {
-        match self.store.resolve(endpoint.as_bytes()) {
-            Ok(Some(e)) => self.store.is_identity_revoked(&e),
-            Ok(None) => false,
-            Err(e) => {
-                tracing::warn!(%e, "peer store read failed; treating the endpoint as REVOKED (fail-closed)");
-                true
-            }
-        }
-    }
 }
 
 impl TrustGate for AllowlistGate {
@@ -595,10 +602,10 @@ impl TrustGate for AllowlistGate {
         }
         match self.store.resolve(endpoint.as_bytes()) {
             // (1b) …and so does an IDENTITY revocation on the row's `user_id` (#218). `peer_revoke
-            // b64u:` endpoint-revokes the devices it knows about, so this only ever bites a row
-            // written AFTER the revocation — which is precisely the row a fresh invite lands for
-            // the person's next device, and the one the operator meant to refuse. One more redb
-            // read, taken only for a row that carries a `user_id`.
+            // b64u:` endpoint-revokes the devices it knows about as well, so this bites the rows
+            // (1) cannot see: one written AFTER the revocation (the person's next device), and a
+            // known device whose endpoint row a per-device `peer_unrevoke` lifted while the
+            // identity row stands. One more redb read, taken only for a row carrying a `user_id`.
             Ok(Some(e)) if self.store.is_identity_revoked(&e) => None,
             Ok(Some(e)) => Some(PeerIdentity {
                 endpoint: *endpoint,
@@ -620,7 +627,7 @@ impl TrustGate for AllowlistGate {
     /// this is also `ComposedGate`'s rule 1, which must refuse a rostered endpoint whose pair row
     /// carries a revoked identity before rule 2 resolves it through the roster.
     fn is_revoked(&self, endpoint: &EndpointId) -> bool {
-        self.store.is_revoked(endpoint.as_bytes()) || self.identity_revoked(endpoint)
+        self.store.is_refused(endpoint.as_bytes())
     }
 
     /// Sever an EXISTING session on revocation, immediately.
@@ -629,7 +636,7 @@ impl TrustGate for AllowlistGate {
     /// sessions are long-lived by design, so "eventually" can mean days. `roster_user` is
     /// irrelevant here: a pairing revocation applies whether or not the endpoint is also rostered.
     fn should_sever_now(&self, endpoint: &EndpointId, _roster_user: Option<&str>) -> bool {
-        self.store.is_revoked(endpoint.as_bytes()) || self.identity_revoked(endpoint)
+        self.store.is_refused(endpoint.as_bytes())
     }
 }
 

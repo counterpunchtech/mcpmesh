@@ -3046,7 +3046,9 @@ pub const API_VERSION: &str = "1.61";
 /// began to hold at every site (#218): `pair` answers [`ERR_PAIR_IDENTITY_REVOKED`] when the
 /// inviter has revoked the redeemer's proven `user_id`, `peer_introduce` answers
 /// [`ERR_PRINCIPAL_REVOKED`] for a subject proving one this node revoked, and admission refuses
-/// any stored row carrying a revoked `user_id`. Below 61 only device attestation consulted the
+/// any stored row carrying a revoked `user_id` — as does every OUTBOUND dial (`open_session`,
+/// `peer_services`, `peer_diagnostics`), which answers the same "REVOKED" refusal an
+/// endpoint-revoked device gets. Below 61 only device attestation consulted the
 /// identity table: a fresh invite (or an introduction) landed a row for the person's next device,
 /// the caller was told "paired", and the row's `services[].allow` grant was honoured — which is
 /// also why minor 60's "a `b64u:` hides only while EVERY device is refused" no longer holds: a

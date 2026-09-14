@@ -2145,7 +2145,9 @@ async fn pairing_exchanges_and_stores_each_sides_verified_user_id() {
 /// identity lets the same phone redeem a fresh invite, and the gate admits it AND the laptop.
 ///
 /// Deleting the `is_user_revoked` check ahead of the store write in `handle_inviter_side` fails
-/// the first `expect_err`: the redeem succeeds and `kb`'s allow gains mallory.
+/// the first `expect_err`: the redeem succeeds and `kb`'s allow gains mallory. Narrowing the pair
+/// ALPN pre-check in `accept.rs` to the endpoint table fails the laptop's `-32045` assertion: it
+/// reaches the handler and is told `-32057` instead.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_revoked_identity_cannot_redeem_until_the_inviter_unrevokes_it() {
     timeout(Duration::from_secs(90), async {
@@ -2285,7 +2287,60 @@ async fn a_revoked_identity_cannot_redeem_until_the_inviter_unrevokes_it() {
             "a refused redeem writes no dial-back row on the phone either"
         );
 
-        // ---- Lift the IDENTITY: the burned line stays burned, a fresh one pairs the phone ----
+        // ---- A KNOWN device of the revoked identity is closed BEFORE the handshake ----
+        // The laptop's endpoint row is lifted per-device, the identity row stands. The pair ALPN's
+        // pre-check asks the gate (`is_revoked`, both tables since #218), so the laptop is closed
+        // with the no-live-invite reason exactly as an endpoint-revoked device is — it never
+        // presents its secret, learns nothing, and burns nothing. Only a device with NO row (the
+        // phone above) reaches the handler, proves the secret, and is told `-32057`.
+        mcpmesh::daemon::peer_unrevoke(
+            &state,
+            mcpmesh_local_api::PeerUnrevokeParams {
+                peer: "mallory".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            !store.is_revoked(&laptop_id) && store.is_user_revoked(&mallory_uid),
+            "fixture: the laptop's endpoint row is lifted, the identity row stands"
+        );
+        let laptop = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .secret_key(iroh::SecretKey::from_bytes(&[0xA1; 32]))
+            .relay_mode(iroh::RelayMode::Disabled)
+            .alpns(vec![ALPN_MCP.to_vec()])
+            .bind()
+            .await
+            .expect("bind the laptop");
+        assert_eq!(*laptop.id().as_bytes(), laptop_id);
+        let laptop_redeem = |invite: Invite| {
+            let (pk, sig) = mcpmesh_trust::binding::present(&mallory_uk, &laptop_id);
+            redeem_invite(
+                laptop.clone(),
+                "mallory-laptop".into(),
+                invite.encode(),
+                None,
+                SelfEnroll::Refuse,
+                None,
+                Arc::new(PeerStore::open(&mallory_dir.path().join("laptop.redb")).unwrap()),
+                Some(SelfBinding { user_pk: pk, sig }),
+                None,
+            )
+        };
+        let laptops = mint([33u8; 32]);
+        invites.mint(laptops.clone()).await.unwrap();
+        let e = laptop_redeem(laptops.clone())
+            .await
+            .expect_err("a known device of a revoked identity must not pair");
+        assert_eq!(
+            e.downcast_ref::<mcpmesh::pairing::rendezvous::PairRefusal>()
+                .map(|r| r.code()),
+            Some(mcpmesh_local_api::ERR_INVITE_NOT_LIVE),
+            "closed before the handshake, like an endpoint-revoked device — not -32057: {e:#}"
+        );
+        assert!(kb_allow().is_empty(), "no grant: {:?}", kb_allow());
+
+        // ---- Lift the IDENTITY: the burned line stays burned, the laptop's line survived ----
         mcpmesh::daemon::peer_unrevoke(
             &state,
             mcpmesh_local_api::PeerUnrevokeParams {
@@ -2294,6 +2349,9 @@ async fn a_revoked_identity_cannot_redeem_until_the_inviter_unrevokes_it() {
         )
         .await
         .unwrap();
+        laptop_redeem(laptops)
+            .await
+            .expect("the pre-handshake close consumed nothing, so the same line pairs the laptop");
         let e = redeem(first)
             .await
             .expect_err("the refused redeem consumed the invite");
@@ -2302,6 +2360,11 @@ async fn a_revoked_identity_cannot_redeem_until_the_inviter_unrevokes_it() {
                 .map(|r| r.code()),
             Some(mcpmesh_local_api::ERR_PAIR_IDENTITY_REVOKED),
             "…and the refusal is no longer about the identity: {e:#}"
+        );
+        assert_eq!(
+            kb_allow(),
+            vec![mallory_uid.clone()],
+            "only the laptop's redeem granted"
         );
         let second = mint([32u8; 32]);
         invites.mint(second.clone()).await.unwrap();

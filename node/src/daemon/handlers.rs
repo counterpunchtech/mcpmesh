@@ -1836,7 +1836,7 @@ pub(crate) async fn resolve_peer_endpoint(mesh: &Arc<MeshState>, peer: &str) -> 
         // test for this guard, not by review. A direct device principal is the most precise way to
         // reach a revoked machine, so of the three selectors it is the one that most needed it.
         anyhow::ensure!(
-            !mesh.store.is_revoked(&eid),
+            !mesh.store.is_refused(&eid),
             "peer '{peer}' is REVOKED on this node"
         );
         return Ok(eid);
@@ -1861,7 +1861,7 @@ pub(crate) async fn resolve_peer_endpoint(mesh: &Arc<MeshState>, peer: &str) -> 
     // declared stolen. Checked here rather than at each caller — this is the one resolver they
     // share.
     anyhow::ensure!(
-        !mesh.store.is_revoked(&eid),
+        !mesh.store.is_refused(&eid),
         "peer '{peer}' is REVOKED on this node"
     );
     Ok(eid)
@@ -6424,6 +6424,113 @@ allow = []
             resolve_peer_endpoint(&mesh, "stolen-laptop").await.is_ok(),
             "unrevoking must restore the outbound path too"
         );
+    }
+
+    /// #218: an IDENTITY revocation blocks the OUTBOUND direction for every device carrying it, on
+    /// the endpoint table's own terms — including a device whose endpoint row was lifted by a
+    /// per-device `peer_unrevoke`. The gate refuses that device inbound on the identity alone, so a
+    /// dial that still went out would be #85 ask 4's backwards verb again: the claim "not on any of
+    /// their machines" enforced one way, and the request handed over the other.
+    ///
+    /// Fixture: two devices of `b64u:mallory`, revoked as a person, then the laptop lifted by
+    /// nickname — its endpoint row is gone (asserted), the identity row stands (asserted). The
+    /// phone keeps its endpoint row, so the `b64u:` race has nothing to fall back on. The inverse:
+    /// `peer_unrevoke` on the identity restores the outbound path for both.
+    ///
+    /// Each outbound site reverted to `PeerStore::is_revoked` fails exactly one group: the `eid:`
+    /// arm of `resolve_peer_endpoint` (the `eid:` resolve), its tail (the nickname and `b64u:`
+    /// resolves), `refuse_if_revoked` (the nickname and `eid:` session dials), the `hinted_addrs`
+    /// filter (the `b64u:` race).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_revoked_identity_is_refused_on_the_outbound_path_even_after_a_device_unrevoke() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+        let (laptop, phone) = ([5u8; 32], [6u8; 32]);
+        let laptop_eid = mcpmesh_net::EndpointId::from_bytes(laptop).principal();
+        for (eid, nickname) in [(laptop, "mallory-laptop"), (phone, "mallory-phone")] {
+            mesh.store
+                .add(PeerEntry {
+                    endpoint_id: eid,
+                    nickname: nickname.into(),
+                    services: vec!["notes".into()],
+                    paired_at: None,
+                    user_id: Some("b64u:mallory".into()),
+                    last_addr: None,
+                })
+                .unwrap();
+        }
+        let unrevoke = |peer: &str| {
+            peer_unrevoke(
+                &state,
+                mcpmesh_local_api::PeerUnrevokeParams { peer: peer.into() },
+            )
+        };
+        peer_revoke(
+            &state,
+            mcpmesh_local_api::PeerRevokeParams {
+                peer: "b64u:mallory".into(),
+                reason: None,
+            },
+        )
+        .await
+        .unwrap();
+        unrevoke("mallory-laptop").await.unwrap();
+        assert!(
+            !mesh.store.is_revoked(&laptop),
+            "fixture: the laptop's endpoint row is lifted"
+        );
+        assert!(
+            mesh.store.is_user_revoked("b64u:mallory"),
+            "fixture: the identity row stands"
+        );
+        assert!(
+            mesh.gate.resolve(&laptop.into()).is_none(),
+            "fixture: the gate refuses the laptop inbound"
+        );
+
+        for sel in ["mallory-laptop", laptop_eid.as_str()] {
+            let e = resolve_peer_endpoint(&mesh, sel)
+                .await
+                .expect_err("a device of a revoked identity must not be resolved for a dial");
+            assert!(format!("{e:#}").contains("REVOKED"), "{sel}: {e:#}");
+            let e = match crate::daemon::dial::dial_service(&mesh, sel, "notes").await {
+                Ok(_) => panic!("dial_service must refuse a device of a revoked identity ({sel})"),
+                Err(e) => e,
+            };
+            assert!(format!("{e:#}").contains("REVOKED"), "{sel}: {e:#}");
+        }
+        // By identity: the shared resolver picks the first device (the laptop), and the session
+        // dial RACES both — so the race filter must drop the laptop too (the phone is still
+        // endpoint-revoked, leaving nothing). Bounded: a race that wrongly kept the laptop would
+        // dial an unreachable id.
+        let e = resolve_peer_endpoint(&mesh, "b64u:mallory")
+            .await
+            .expect_err("resolving by identity must refuse the laptop");
+        assert!(format!("{e:#}").contains("REVOKED"), "{e:#}");
+        let raced = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::daemon::dial::dial_service(&mesh, "b64u:mallory", "notes"),
+        )
+        .await
+        .expect("the refusal is immediate, not a dial timeout");
+        let e = match raced {
+            Ok(_) => panic!("the person race must refuse every device of a revoked identity"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{e:#}").contains("every device of that peer is REVOKED"),
+            "{e:#}"
+        );
+
+        unrevoke("b64u:mallory").await.unwrap();
+        for sel in ["mallory-laptop", "mallory-phone", "b64u:mallory"] {
+            resolve_peer_endpoint(&mesh, sel).await.unwrap_or_else(|e| {
+                panic!("unrevoking the identity restores the outbound path ({sel}): {e:#}")
+            });
+        }
     }
 
     /// #212: `service_allow_grant` to a REVOKED principal is refused with a coded error BEFORE
