@@ -355,14 +355,16 @@ impl Node {
 
     /// Is this connection's application data going over a relay or over a direct IP path (#213)?
     ///
-    /// The reading mcpmesh trusts for its own sessions, for a connection YOU hold — one from
-    /// [`connect_protocol`](Self::connect_protocol) or handed to your
-    /// [`accept_protocol`](Self::accept_protocol) handler. It **measures**: it samples every open
-    /// path's application-frame counters (STREAM + DATAGRAM, both directions), waits
-    /// [`PATH_MEASURE_WINDOW`](crate::daemon::reach::PATH_MEASURE_WINDOW) (250ms), and reports
-    /// the path that moved. Any frame over a relay in that window is `Relay`; otherwise a moving
-    /// direct path is `Direct`. Only when nothing moved does it fall back to the structural
-    /// reading (`Path::is_selected()`, or the single open path).
+    /// For a connection YOU hold — one from [`connect_protocol`](Self::connect_protocol) or handed
+    /// to your [`accept_protocol`](Self::accept_protocol) handler. It **measures**: it samples every
+    /// open path's application-frame counters (STREAM + DATAGRAM, both directions), waits 250ms,
+    /// and reports the path that moved. Any frame over a relay in that window is `Relay`;
+    /// otherwise a moving direct path is `Direct`. Only when nothing moved does it fall back to
+    /// the structural reading mcpmesh's own probes and session watcher use
+    /// (`Path::is_selected()`, or the single open path). A window that ends in `Unknown` on a
+    /// still-open connection is measured again, up to three windows (750ms) in all — a hole-punch
+    /// round can open and abandon probe paths inside one window; only `Unknown` is retried, so a
+    /// relayed window is never traded for a later direct one.
     ///
     /// Measuring is what makes it reliable on the **accepting** side. iroh 1.0.3 keeps one selected
     /// four-tuple per remote endpoint, not per connection, so the accept side of a second
@@ -370,12 +372,15 @@ impl Node {
     /// connection's whole life while every byte flows over it. This does not read that flag as
     /// the truth about the traffic; the counters are.
     ///
-    /// `Unknown` means exactly that: an idle connection with several open paths and none
-    /// selected, a teardown snapshot, or a transport mcpmesh does not model. Never render it as
-    /// private. A connection that is carrying data during the window never answers `Unknown`.
+    /// `Unknown` means exactly that, and must never be rendered as private: an idle connection
+    /// with several open paths and none selected; a connection that is already closed (iroh
+    /// keeps a closed connection's path list and counters, so they are checked, not trusted);
+    /// frames that moved on a path which closed inside the window, so nothing says which kind it
+    /// was; or a transport mcpmesh does not model. A connection moving data over a direct or
+    /// relay path that stays open through the window answers `Direct` or `Relay`.
     ///
     /// ```no_run
-    /// # async fn f(node: &mcpmesh_node::Node, conn: iroh::endpoint::Connection) {
+    /// # async fn f(conn: mcpmesh_node::iroh::endpoint::Connection) {
     /// use mcpmesh_local_api::PeerPath;
     /// match mcpmesh_node::Node::connection_path(&conn).await {
     ///     PeerPath::Direct => { /* private: no confirmation needed */ }

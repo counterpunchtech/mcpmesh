@@ -347,3 +347,50 @@ async fn connection_path_reads_direct_on_an_idle_accept_side() {
         "every idle reading on the accept sides must be Direct: {r:?}"
     );
 }
+
+/// #213 review: a CLOSED connection answers `Unknown`. iroh keeps a closed connection's path list
+/// populated (`PathStateSender::close` marks the state closed and leaves the list alone) and its
+/// counters readable, so without an explicit check a teardown snapshot reads `Direct` — on both
+/// the side that closed and the side that was closed on.
+#[tokio::test(flavor = "multi_thread")]
+async fn connection_path_reads_unknown_on_a_closed_connection() {
+    let (a, b) = paired().await;
+    let client = b.dial().await;
+    let server = a.accepted().await;
+    // Live first, so the assertion below is about closing and not about a connection that never
+    // read Direct.
+    let p = pump(&client);
+    let live = Node::connection_path(&server).await;
+    p.abort();
+    assert_eq!(
+        live,
+        mcpmesh_local_api::PeerPath::Direct,
+        "precondition: live reads Direct"
+    );
+
+    client.close(0u32.into(), b"done");
+    // Bounded, sleeping wait for the close to reach the accept side.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while server.close_reason().is_none() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        server.close_reason().is_some(),
+        "the close must reach the accept side"
+    );
+    let paths = server.paths().iter().count();
+    println!("closed accept side still lists {paths} path(s)");
+
+    assert_eq!(
+        Node::connection_path(&server).await,
+        mcpmesh_local_api::PeerPath::Unknown,
+        "a closed connection must not read as Direct"
+    );
+    assert_eq!(
+        Node::connection_path(&client).await,
+        mcpmesh_local_api::PeerPath::Unknown,
+        "the side that closed must not read as Direct either"
+    );
+    a.node.shutdown().await;
+    b.node.shutdown().await;
+}

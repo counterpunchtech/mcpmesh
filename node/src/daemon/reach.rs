@@ -348,12 +348,20 @@ where
 /// `path_watcher.rs` `record_selected`). `is_selected()` is false on its only open path while
 /// every byte flows over it.
 ///
-/// So [`classify_paths`] adds the one inference that cannot lie: a connection with exactly ONE
-/// open path sends everything on it, selected or not — QUIC has nowhere else to send. Several
-/// open paths and none selected is genuinely ambiguous (all are `Backup`, noq may use any) and
-/// stays `Unknown`, never a guess. See [`measured_path`] for the reading that resolves that case
-/// by measurement.
+/// So [`classify_paths`] adds one inference: a connection with exactly ONE open path sends
+/// everything on it, selected or not. "Open path" here means iroh's list of the connection's
+/// validated paths, which is complete unless iroh's actor lagged (`remote_state.rs`
+/// `handle_path_event`'s `Lagged` arm drops the event with no recovery). Several open paths and
+/// none selected is genuinely ambiguous (all are `Backup`, noq may use any) and stays `Unknown`,
+/// never a guess. See [`measured_path`] for the reading that resolves that case by measurement.
+///
+/// A CLOSED connection answers `Unknown`: iroh keeps the closed connection's path list populated
+/// (`path_watcher.rs` `PathStateSender::close` marks the state closed and leaves `list` alone),
+/// so without this a teardown snapshot would still read `Direct`.
 pub(crate) fn selected_path(conn: &iroh::endpoint::Connection) -> mcpmesh_local_api::PeerPath {
+    if conn.close_reason().is_some() {
+        return mcpmesh_local_api::PeerPath::Unknown;
+    }
     let paths = conn.paths();
     classify_paths(
         paths
@@ -406,6 +414,9 @@ fn path_kind(addr: &iroh::TransportAddr) -> mcpmesh_local_api::PeerPath {
 /// which is the idle case the structural rule covers), short enough for a call-setup gate.
 pub(crate) const PATH_MEASURE_WINDOW: Duration = Duration::from_millis(250);
 
+/// How many [`PATH_MEASURE_WINDOW`]s [`measured_path`] will spend before accepting `Unknown`.
+pub(crate) const PATH_MEASURE_WINDOWS: usize = 3;
+
 /// Application frames (STREAM + DATAGRAM, sent and received) a path has carried so far.
 ///
 /// Only those two frame types are counted, on purpose: iroh keeps a standby relay path alive
@@ -415,13 +426,23 @@ pub(crate) const PATH_MEASURE_WINDOW: Duration = Duration::from_millis(250);
 pub(crate) struct AppFrames(pub(crate) u64);
 
 impl AppFrames {
+    /// One path's application frames so far.
     pub(crate) fn of(stats: &iroh::endpoint::PathStats) -> Self {
-        Self(
-            stats.frame_tx.stream
-                + stats.frame_tx.datagram
-                + stats.frame_rx.stream
-                + stats.frame_rx.datagram,
-        )
+        Self::of_frames(&stats.frame_tx, &stats.frame_rx)
+    }
+
+    /// The whole connection's application frames so far — every path it ever had, including
+    /// ones already abandoned and discarded (noq folds those into `partial_stats`).
+    pub(crate) fn of_connection(stats: &iroh::endpoint::ConnectionStats) -> Self {
+        Self::of_frames(&stats.frame_tx, &stats.frame_rx)
+    }
+
+    fn of_frames(tx: &iroh::endpoint::FrameStats, rx: &iroh::endpoint::FrameStats) -> Self {
+        Self(tx.stream + tx.datagram + rx.stream + rx.datagram)
+    }
+
+    fn since(self, then: Self) -> u64 {
+        self.0.saturating_sub(then.0)
     }
 }
 
@@ -434,34 +455,58 @@ pub(crate) type PathSample = (
 
 /// Where a connection's application data went during a measurement window (#213).
 ///
-/// `before`/`after` are per-path samples taken `PATH_MEASURE_WINDOW` apart: `(kind, frames)`
-/// keyed by path id. A path that moved application frames in the window carried user data, so:
+/// `before`/`after` are per-path samples taken `PATH_MEASURE_WINDOW` apart; `total` is the
+/// CONNECTION's aggregate application-frame count at the same two instants (every path it ever
+/// had, including ones abandoned since). A path that moved application frames in the window
+/// carried user data, so, in order:
 ///
 /// - any relay path moved → `Relay` (the privacy claim is false the moment ONE frame transits a
 ///   relay, whatever the direct path carried);
+/// - the connection moved more frames than the sampled paths account for → `Unknown`: a path
+///   carried data and closed inside the window, and nothing says which kind it was;
+/// - a path of a kind mcpmesh does not model moved → `Unknown`;
 /// - otherwise a direct path moved → `Direct`;
 /// - nothing moved (idle, or the connection just opened) → `fallback`, the structural reading.
 ///
-/// A path present in one sample only is ignored: it opened or closed mid-window and the
-/// structural reading is the honest answer for it.
+/// A path with no baseline (it opened inside the window) counts as moved when its counter is
+/// above zero. On the mismatched accept side every path is `Backup` and noq sends on any
+/// validated one (`noq-proto` `scheduling_info`), and the dial hint makes "direct first, relay
+/// later" the common order — so a relay path that opened mid-window and carried 99 frames must
+/// read `Relay`, not be skipped.
 pub(crate) fn classify_traffic(
     before: &[PathSample],
     after: &[PathSample],
+    total: (AppFrames, AppFrames),
     fallback: mcpmesh_local_api::PeerPath,
 ) -> mcpmesh_local_api::PeerPath {
     let mut direct_moved = false;
+    let mut unmodelled_moved = false;
+    let mut relay_moved: Option<mcpmesh_local_api::PeerPath> = None;
+    let mut attributed = 0u64;
     for (id, kind, now) in after {
-        let Some((_, _, then)) = before.iter().find(|(b, _, _)| b == id) else {
-            continue;
-        };
-        if now.0 <= then.0 {
+        let then = before
+            .iter()
+            .find(|(b, _, _)| b == id)
+            .map(|(_, _, then)| *then)
+            .unwrap_or_default();
+        let delta = now.since(then);
+        if delta == 0 {
             continue;
         }
+        attributed += delta;
         match kind {
-            mcpmesh_local_api::PeerPath::Relay { .. } => return kind.clone(),
+            mcpmesh_local_api::PeerPath::Relay { .. } => {
+                relay_moved.get_or_insert_with(|| kind.clone());
+            }
             mcpmesh_local_api::PeerPath::Direct => direct_moved = true,
-            _ => {}
+            _ => unmodelled_moved = true,
         }
+    }
+    if let Some(relay) = relay_moved {
+        return relay;
+    }
+    if total.1.since(total.0) > attributed || unmodelled_moved {
+        return mcpmesh_local_api::PeerPath::Unknown;
     }
     if direct_moved {
         mcpmesh_local_api::PeerPath::Direct
@@ -492,14 +537,43 @@ fn sample_traffic(conn: &iroh::endpoint::Connection) -> Vec<PathSample> {
 /// false on every open path for the life of a connection (see [`selected_path`]). It is also the
 /// only reading that stays honest when such a connection holds a relay path AND a direct path:
 /// with neither selected noq may send on either, and only the counters know which it did.
+///
+/// A window that ends in `Unknown` on a still-open connection is measured again, up to
+/// [`PATH_MEASURE_WINDOWS`] windows in all: a hole-punch round opens and abandons probe paths
+/// inside a single window, and the frames that rode one of them are unattributable for exactly
+/// that window. Only an `Unknown` is retried — a `Direct` or `Relay` reading is never traded for
+/// a later one — so the retry cannot turn a relayed window into a direct answer.
+///
+/// A connection that is already closed — before or after a window — answers `Unknown`
+/// (see [`selected_path`]): counters and path lists outlive the connection in iroh.
 pub(crate) async fn measured_path(
     conn: &iroh::endpoint::Connection,
     window: Duration,
 ) -> mcpmesh_local_api::PeerPath {
-    let before = sample_traffic(conn);
-    tokio::time::sleep(window).await;
-    let after = sample_traffic(conn);
-    classify_traffic(&before, &after, selected_path(conn))
+    let mut path = mcpmesh_local_api::PeerPath::Unknown;
+    for _ in 0..PATH_MEASURE_WINDOWS {
+        if conn.close_reason().is_some() {
+            return mcpmesh_local_api::PeerPath::Unknown;
+        }
+        let before = sample_traffic(conn);
+        let total_before = AppFrames::of_connection(&conn.stats());
+        tokio::time::sleep(window).await;
+        if conn.close_reason().is_some() {
+            return mcpmesh_local_api::PeerPath::Unknown;
+        }
+        let after = sample_traffic(conn);
+        let total_after = AppFrames::of_connection(&conn.stats());
+        path = classify_traffic(
+            &before,
+            &after,
+            (total_before, total_after),
+            selected_path(conn),
+        );
+        if path != mcpmesh_local_api::PeerPath::Unknown {
+            break;
+        }
+    }
+    path
 }
 
 /// Render a relay URL for the wire WITHOUT its userinfo (#64 review).
@@ -1013,6 +1087,9 @@ mod tests {
             (p0, PeerPath::Direct, AppFrames(10)),
             (p1, relay(), AppFrames(4)),
         ];
+        // The connection total is the sum over its paths; `t(a, b)` is a window that moved from
+        // `a` to `b` frames in aggregate.
+        let t = |a: u64, b: u64| (AppFrames(a), AppFrames(b));
 
         // Only the direct path moved: Direct, even though the structural reading says Unknown
         // (the #213 accept side with a standby relay path and nothing selected).
@@ -1021,7 +1098,7 @@ mod tests {
             (p1, relay(), AppFrames(4)),
         ];
         assert_eq!(
-            classify_traffic(&before, &after, PeerPath::Unknown),
+            classify_traffic(&before, &after, t(14, 16), PeerPath::Unknown),
             PeerPath::Direct
         );
 
@@ -1030,27 +1107,135 @@ mod tests {
             (p0, PeerPath::Direct, AppFrames(12)),
             (p1, relay(), AppFrames(5)),
         ];
-        assert_eq!(classify_traffic(&before, &after, PeerPath::Direct), relay());
+        assert_eq!(
+            classify_traffic(&before, &after, t(14, 17), PeerPath::Direct),
+            relay()
+        );
 
         // Nothing moved (idle): the fallback, whatever it is — including Unknown.
         assert_eq!(
-            classify_traffic(&before, &before, PeerPath::Unknown),
+            classify_traffic(&before, &before, t(14, 14), PeerPath::Unknown),
             PeerPath::Unknown
         );
         assert_eq!(
-            classify_traffic(&before, &before, PeerPath::Direct),
+            classify_traffic(&before, &before, t(14, 14), PeerPath::Direct),
             PeerPath::Direct
         );
+    }
 
-        // A path that appeared mid-window has no baseline and is ignored, not treated as moved.
+    /// #213 review: a path with NO baseline is one that opened inside the window. Skipping it
+    /// answered Direct while 99 frames went over a relay that opened mid-window — realistic on
+    /// the mismatched accept side, where every path is Backup, noq sends on any validated one,
+    /// and the dial hint makes "direct first, relay later" the common order. The false-Direct
+    /// direction is the one the reporter's product rule forbids.
+    #[test]
+    fn a_relay_path_that_opened_mid_window_and_carried_frames_is_relay() {
+        use iroh::endpoint::PathId;
+        let p0 = PathId::ZERO;
         let p2 = PathId::from(2u32);
+        let before = [(p0, PeerPath::Direct, AppFrames(10))];
         let after = [
-            (p0, PeerPath::Direct, AppFrames(10)),
-            (p1, relay(), AppFrames(4)),
+            (p0, PeerPath::Direct, AppFrames(12)),
             (p2, relay(), AppFrames(99)),
         ];
         assert_eq!(
-            classify_traffic(&before, &after, PeerPath::Unknown),
+            classify_traffic(
+                &before,
+                &after,
+                (AppFrames(10), AppFrames(111)),
+                PeerPath::Direct
+            ),
+            relay(),
+            "99 frames over a relay that opened mid-window must read Relay"
+        );
+        // A baseline-less path that carried NOTHING is not movement.
+        let after = [
+            (p0, PeerPath::Direct, AppFrames(12)),
+            (p2, relay(), AppFrames(0)),
+        ];
+        assert_eq!(
+            classify_traffic(
+                &before,
+                &after,
+                (AppFrames(10), AppFrames(12)),
+                PeerPath::Unknown
+            ),
+            PeerPath::Direct
+        );
+    }
+
+    /// #213 review: the connection's aggregate counter sums EVERY path it ever had, so frames the
+    /// sampled paths cannot account for went over a path that closed inside the window — and
+    /// nothing says which kind it was. That is Unknown, not the Direct the surviving path shows.
+    #[test]
+    fn frames_on_a_path_that_closed_mid_window_are_unknown() {
+        use iroh::endpoint::PathId;
+        let p0 = PathId::ZERO;
+        let p1 = PathId::from(1u32);
+        let before = [
+            (p0, PeerPath::Direct, AppFrames(10)),
+            (p1, relay(), AppFrames(4)),
+        ];
+        // p1 is gone from `after`; the aggregate moved 3 but p0 accounts for only 2.
+        let after = [(p0, PeerPath::Direct, AppFrames(12))];
+        assert_eq!(
+            classify_traffic(
+                &before,
+                &after,
+                (AppFrames(14), AppFrames(17)),
+                PeerPath::Direct
+            ),
+            PeerPath::Unknown,
+            "one unattributed frame is enough: it may have transited a relay"
+        );
+        // Fully attributed movement with a path that closed idle is still Direct.
+        assert_eq!(
+            classify_traffic(
+                &before,
+                &after,
+                (AppFrames(14), AppFrames(16)),
+                PeerPath::Unknown
+            ),
+            PeerPath::Direct
+        );
+        // A relay that visibly moved outranks the unattributed remainder: Relay is the stronger,
+        // still-true claim.
+        let after = [
+            (p0, PeerPath::Direct, AppFrames(12)),
+            (p1, relay(), AppFrames(5)),
+        ];
+        assert_eq!(
+            classify_traffic(
+                &before,
+                &after,
+                (AppFrames(14), AppFrames(40)),
+                PeerPath::Direct
+            ),
+            relay()
+        );
+    }
+
+    /// #213 review: a moving path of a transport mcpmesh does not model is not silently Direct.
+    #[test]
+    fn a_moving_unmodelled_path_is_unknown() {
+        use iroh::endpoint::PathId;
+        let p0 = PathId::ZERO;
+        let p1 = PathId::from(1u32);
+        let before = [
+            (p0, PeerPath::Direct, AppFrames(10)),
+            (p1, PeerPath::Unknown, AppFrames(0)),
+        ];
+        let after = [
+            (p0, PeerPath::Direct, AppFrames(12)),
+            (p1, PeerPath::Unknown, AppFrames(3)),
+        ];
+        assert_eq!(
+            classify_traffic(
+                &before,
+                &after,
+                (AppFrames(10), AppFrames(15)),
+                PeerPath::Direct
+            ),
             PeerPath::Unknown
         );
     }
@@ -1058,19 +1243,68 @@ mod tests {
     /// #213: only STREAM and DATAGRAM frames count as application data. iroh keeps a standby
     /// relay path alive with PINGs and ACKs, so counting packets or bytes would report every
     /// hole-punched connection as relayed — the exact #64 regression, measured a second way.
+    ///
+    /// EVERY other frame counter is seeded non-zero (review: seeding only ping/acks let a
+    /// `+ path_acks` mutation survive), then the two application counters are zeroed.
     #[test]
     fn keepalives_on_a_standby_relay_path_are_not_application_data() {
+        fn every_counter(v: u64) -> iroh::endpoint::FrameStats {
+            let mut f = iroh::endpoint::FrameStats::default();
+            f.acks = v;
+            f.path_acks = v;
+            f.ack_frequency = v;
+            f.crypto = v;
+            f.connection_close = v;
+            f.data_blocked = v;
+            f.datagram = v;
+            f.handshake_done = 1;
+            f.immediate_ack = v;
+            f.max_data = v;
+            f.max_stream_data = v;
+            f.max_streams_bidi = v;
+            f.max_streams_uni = v;
+            f.new_connection_id = v;
+            f.path_new_connection_id = v;
+            f.new_token = v;
+            f.path_challenge = v;
+            f.path_response = v;
+            f.ping = v;
+            f.reset_stream = v;
+            f.retire_connection_id = v;
+            f.path_retire_connection_id = v;
+            f.stream_data_blocked = v;
+            f.streams_blocked_bidi = v;
+            f.streams_blocked_uni = v;
+            f.stop_sending = v;
+            f.stream = v;
+            f.observed_addr = v;
+            f.path_abandon = v;
+            f.path_status_available = v;
+            f.path_status_backup = v;
+            f.max_path_id = v;
+            f.paths_blocked = v;
+            f.path_cids_blocked = v;
+            f.add_address = v;
+            f.reach_out = v;
+            f.remove_address = v;
+            f
+        }
         let mut idle = iroh::endpoint::PathStats::default();
-        idle.frame_tx.ping = 7;
-        idle.frame_tx.acks = 30;
-        idle.frame_rx.acks = 30;
-        idle.frame_tx.path_challenge = 2;
+        idle.frame_tx = every_counter(3);
+        idle.frame_rx = every_counter(5);
+        idle.frame_tx.stream = 0;
+        idle.frame_tx.datagram = 0;
+        idle.frame_rx.stream = 0;
+        idle.frame_rx.datagram = 0;
         idle.udp_tx.bytes = 4096;
         idle.udp_tx.datagrams = 40;
+        idle.udp_rx.bytes = 4096;
+        idle.udp_rx.datagrams = 40;
+        idle.lost_packets = 2;
         assert_eq!(
             AppFrames::of(&idle),
             AppFrames(0),
-            "keepalive traffic is not app data"
+            "no non-application counter may leak into the reading"
         );
 
         let mut busy = idle;
@@ -1081,6 +1315,16 @@ mod tests {
             AppFrames(5),
             "stream + datagram, both directions"
         );
+
+        // The connection aggregate counts the same two frame kinds and nothing else.
+        let mut conn = iroh::endpoint::ConnectionStats::default();
+        conn.frame_tx = every_counter(7);
+        conn.frame_rx = every_counter(11);
+        conn.frame_tx.stream = 1;
+        conn.frame_tx.datagram = 2;
+        conn.frame_rx.stream = 4;
+        conn.frame_rx.datagram = 8;
+        assert_eq!(AppFrames::of_connection(&conn), AppFrames(15));
     }
 
     /// #128 AND #123, in one test, because they are the same coupling from two sides.

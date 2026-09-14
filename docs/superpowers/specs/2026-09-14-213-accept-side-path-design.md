@@ -114,20 +114,31 @@ Recommendation: (a) now, (b) if the upstream fix does not land within a release 
 
 ## 5. The shipped fix (this branch)
 
-1. `reach::classify_paths` — the structural rule gains the one inference that cannot lie: a
-   connection with **exactly one open path** sends everything on it, selected or not. Several
-   open, none selected stays `Unknown`. `reach::selected_path` (probes, `path_watch`) now uses it.
+1. `reach::classify_paths` — the structural rule gains one inference: a connection with
+   **exactly one open path** sends everything on it, selected or not. Several open, none selected
+   stays `Unknown`. `reach::selected_path` (probes, `path_watch`) now uses it, and answers
+   `Unknown` for a closed connection (`close_reason().is_some()`), because iroh keeps a closed
+   connection's path list populated (`path_watcher.rs` `PathStateSender::close`).
 2. `reach::measured_path` — samples every open path's **application frames** (STREAM + DATAGRAM,
-   tx + rx; PINGs/ACKs on a standby relay path do not count) over `PATH_MEASURE_WINDOW` (250ms).
-   Any relay path that moved ⇒ `Relay`; else a direct path moved ⇒ `Direct`; nothing moved ⇒
-   the structural reading. This is what answers the reporter's production shape (relay enabled,
-   accept side, relay + direct paths, none selected): only the counters know which path noq used.
+   tx + rx; PINGs/ACKs on a standby relay path do not count) and the connection's aggregate
+   (`Connection::stats()`, every path it ever had) over `PATH_MEASURE_WINDOW` (250ms). Any relay
+   path that moved ⇒ `Relay` (a path with no baseline counts as moved when its counter is above
+   zero — it opened mid-window); aggregate movement the sampled paths do not account for ⇒
+   `Unknown` (a path carried frames and closed mid-window); a moving unmodelled path ⇒ `Unknown`;
+   else a direct path moved ⇒ `Direct`; nothing moved ⇒ the structural reading. An `Unknown`
+   window on a still-open connection is measured again, up to `PATH_MEASURE_WINDOWS` (3) windows —
+   a hole-punch round abandons probe paths inside one window and their frames are unattributable
+   for that window (measured: one `Unknown` at t+0.50s on the dialing side without the retry);
+   only `Unknown` is retried. This is what
+   answers the reporter's production shape (relay enabled, accept side, relay + direct paths, none
+   selected): only the counters know which path noq used.
 3. `Node::connection_path(&Connection) -> PeerPath` (async, additive) — `measured_path` with the
    default window. Documented in `docs/embedding.md`.
 
-Soundness of the single-path rule: QUIC cannot send on a path the connection does not have, and
-`conn.paths()` is iroh's list of the connection's open paths (`record_opened` on `Established`,
-`record_abandoned` on `Abandoned`). The only lag is event delivery inside iroh's actor, which is
+Soundness of the single-path rule: "open path" is iroh's list of the connection's validated paths
+(`record_opened` on `Established`, `record_abandoned` on `Abandoned`), which is complete unless
+iroh's actor lagged — `remote_state.rs` `handle_path_event`'s `Lagged` arm drops the event with no
+recovery, so a path can in principle be missing from the list. Event delivery lag is otherwise
 inside the 250ms window for the measured reading and inside `PATH_SETTLE` for probes.
 
 Mutations run (each restored from a backup copy, not `git checkout`):
@@ -140,8 +151,15 @@ Mutations run (each restored from a backup copy, not `git checkout`):
 | `connection_path` structural-only (no window) | `connection_path_reads_direct_on_a_busy_accept_side` (`Unknown` at t+4.96s: the hole-punch round's transient probe paths) |
 | `connection_path` returns `Unknown` | both `connection_path_*` tests |
 
-Not covered: a fixture where the structural reading is `Unknown` while the measurement says
-`Direct` on a **stable** connection (relay + direct, none selected). Loopback cannot produce it
-(`boot.rs` #116 note: no relay path is opened on loopback even with an in-process relay), so the
-composition is pinned on synthetic samples in `classify_traffic`'s test and the busy integration
-test pins that the API measures rather than snapshots.
+The two integration tests catch their mutations only on a multi-address host, where the two
+connections settle on different tuples: the structural-only mutation survived 1 of 2 runs, and on a
+single-address CI runner both accept sides would read `Direct` with or without the fix. **The unit
+tests are the real pin**; the integration tests prove the API reads the accept side of a real
+connection at all. Not covered anywhere: a fixture where the structural reading is `Unknown` while
+the measurement says `Direct` on a **stable** connection (relay + direct, none selected). Loopback
+cannot produce it (`boot.rs` #116 note: no relay path is opened on loopback even with an in-process
+relay), so that composition is pinned on synthetic samples in `classify_traffic`'s tests.
+
+Review round 2 (same branch): baseline-less paths count as moved; unattributed aggregate movement
+⇒ `Unknown`; moving unmodelled path ⇒ `Unknown`; closed connection ⇒ `Unknown` (structural and
+measured); the keepalive test seeds every non-application frame counter.

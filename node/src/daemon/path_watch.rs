@@ -47,7 +47,9 @@ pub(crate) const PATH_CHANGE_SETTLE: Duration = Duration::from_millis(600);
 pub(crate) fn decide(observed: &PeerPath, cached: Option<&PeerPath>) -> Option<PeerPath> {
     // `Unknown` is never worth emitting: it means "we do not know", and pushing it would replace a
     // consumer's correct belief with an absence of one. A connection tearing down reports Unknown
-    // routinely, and its path is about to stop mattering anyway.
+    // routinely (`reach::selected_path` answers it once `close_reason()` is set — iroh keeps the
+    // closed path list populated, so it has to be checked), and its path is about to stop
+    // mattering anyway.
     if matches!(observed, PeerPath::Unknown) {
         return None;
     }

@@ -117,7 +117,9 @@ pub enum PeerPath {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         url: Option<String>,
     },
-    /// Not known: never probed, no selected path, or a transport mcpmesh does not model.
+    /// Not known: never probed, several open paths with none selected, a closed connection, or a
+    /// transport mcpmesh does not model. (A single open path is reported by its kind whether or
+    /// not iroh calls it selected — #213.)
     ///
     /// `#[serde(other)]` makes this the landing spot for a `kind` a client has never heard of. That
     /// is what actually buys wire-additivity: `#[non_exhaustive]` only protects the Rust `match`,

@@ -42,8 +42,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub use config::Config;
 /// The pinned iroh, re-exported (#67).
 ///
-/// [`Node::accept_protocol`](node::Node::accept_protocol) and
-/// [`Node::connect_protocol`](node::Node::connect_protocol) name iroh types in their signatures,
+/// [`Node::accept_protocol`](node::Node::accept_protocol),
+/// [`Node::connect_protocol`](node::Node::connect_protocol) and
+/// [`Node::connection_path`](node::Node::connection_path) name iroh types in their signatures,
 /// so an embedder needs them in scope. Use THIS path — never your own `iroh` dependency: a
 /// version mismatch is a different crate to the type system and breaks the build with an
 /// `expected Connection, found Connection`.
