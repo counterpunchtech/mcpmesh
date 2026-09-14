@@ -2469,6 +2469,88 @@ mod tests {
         }
     }
 
+    /// #223 (review): `attest_to` must not dial a node this node has REVOKED — attesting hands it
+    /// this person's identity binding. `redeem_invite` checks before its dial; this had no check.
+    ///
+    /// The offering node is a real endpoint that counts handshakes, so the CONTROL (the same offer,
+    /// unrevoked) proves the dial lands; the refusal carries `ERR_PRINCIPAL_REVOKED`, like
+    /// redemption's. Deleting the check fails the code assertion and the zero count.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn attesting_to_a_revoked_node_is_refused_before_the_dial() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        tokio::time::timeout(std::time::Duration::from_secs(90), async {
+            let offering = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .relay_mode(iroh::RelayMode::Disabled)
+                .alpns(vec![mcpmesh_net::ALPN_PAIR.to_vec()])
+                .bind()
+                .await
+                .unwrap();
+            let dials = Arc::new(AtomicUsize::new(0));
+            let (e, c) = (offering.clone(), dials.clone());
+            let _accept = tokio::spawn(async move {
+                while let Some(incoming) = e.accept().await {
+                    if let Ok(conn) = incoming.await {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        conn.close(0u32.into(), b"test");
+                    }
+                }
+            });
+            let offer = AttestOffer {
+                node_id: *offering.id().as_bytes(),
+                node_addr_json: serde_json::to_string(&offering.addr()).unwrap(),
+            }
+            .encode()
+            .unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let store =
+                Arc::new(crate::allowlist::PeerStore::open(&dir.path().join("s.redb")).unwrap());
+            let binding = || {
+                Some(SelfBinding {
+                    user_pk: "b64u:me".into(),
+                    sig: "sig".into(),
+                })
+            };
+            let me = || async {
+                iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+                    .relay_mode(iroh::RelayMode::Disabled)
+                    .bind()
+                    .await
+                    .unwrap()
+            };
+
+            store
+                .revoke(crate::allowlist::RevokedEntry {
+                    endpoint_id: *offering.id().as_bytes(),
+                    revoked_at: 1,
+                    reason: None,
+                    source: "local".into(),
+                    signer_user_id: None,
+                    issued_at: None,
+                })
+                .unwrap();
+            let e = attest_to(me().await, offer.clone(), store.clone(), binding(), None)
+                .await
+                .expect_err("attesting to a revoked node must be refused");
+            assert_eq!(
+                e.downcast_ref::<PairRefusal>().map(|r| r.code()),
+                Some(mcpmesh_local_api::ERR_PRINCIPAL_REVOKED),
+                "{e:#}"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            assert_eq!(dials.load(Ordering::SeqCst), 0, "nothing may be contacted");
+
+            // The control: lifted, the same offer is dialled.
+            store.unrevoke(offering.id().as_bytes()).unwrap();
+            let _ = attest_to(me().await, offer, store, binding(), None).await;
+            assert!(
+                dials.load(Ordering::SeqCst) > 0,
+                "control: an unrevoked offering node is dialled"
+            );
+        })
+        .await
+        .expect("attest revocation test timed out");
+    }
+
     /// A hello with NO binding is refused — the arm that has no other coverage.
     #[test]
     fn an_attestation_without_a_binding_is_refused() {
@@ -2576,6 +2658,20 @@ pub async fn attest_to(
         "this device has no user key, so it has nothing to attest — import your recovery phrase \
          first (`mcpmesh identity import`)",
     )?;
+    // #223, as `redeem_invite` does it: BEFORE the dial. Attesting sends this person's user key
+    // binding to the offering node, and a node this node has REVOKED must not receive it.
+    let (s, id) = (store.clone(), offer.node_id);
+    let refused = tokio::task::spawn_blocking(move || s.is_refused(&id))
+        .await
+        .context("join attesting peer revocation check")?;
+    if refused {
+        bail!(PairRefusal::new(
+            mcpmesh_local_api::ERR_PRINCIPAL_REVOKED,
+            "the offering node is revoked on this node, so attesting to it would hand your identity \
+             binding to a device you declared compromised — nothing was contacted. Lift the \
+             revocation first (peer_unrevoke) if it was a mistake",
+        ));
+    }
     let addr: iroh::EndpointAddr = serde_json::from_str(&offer.node_addr_json)
         .context("attestation offer carries an unusable address")?;
     // #203, same as `redeem_invite`: an offer's addresses are the remote party's claim, dialled

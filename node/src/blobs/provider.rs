@@ -1062,12 +1062,28 @@ impl AppBlobs {
         alternates: &[iroh::EndpointAddr],
     ) -> Result<Vec<iroh::EndpointAddr>> {
         let ticket: BlobTicket = ticket_str.parse().context("parse blob ticket")?;
-        Ok(Self::sources(&ticket, alternates))
+        Ok(Self::sources(&ticket, alternates, true))
+    }
+
+    /// The endpoint id a ticket names as its publisher — source 0 of a fetch — so a caller can
+    /// decide whether it may be dialled before [`fetch_from_sources`](Self::fetch_from_sources)
+    /// does (#223).
+    pub(crate) fn ticket_publisher(ticket_str: &str) -> Result<[u8; 32]> {
+        let ticket: BlobTicket = ticket_str.parse().context("parse blob ticket")?;
+        Ok(*ticket.addr().id.as_bytes())
     }
 
     /// The ordered set of endpoints a fetch will try: the ticket's publisher, then the caller's
     /// alternates, deduplicated by endpoint id.
-    fn sources(ticket: &BlobTicket, alternates: &[iroh::EndpointAddr]) -> Vec<iroh::EndpointAddr> {
+    ///
+    /// `with_publisher: false` leaves the publisher out (#223: the daemon's verb passes it for a
+    /// publisher this node has REVOKED). It still seeds the dedup set, so an alternate naming the
+    /// same endpoint cannot bring it back.
+    fn sources(
+        ticket: &BlobTicket,
+        alternates: &[iroh::EndpointAddr],
+        with_publisher: bool,
+    ) -> Vec<iroh::EndpointAddr> {
         // The publisher first, then the caller's alternates.
         let mut sources: Vec<iroh::EndpointAddr> = Vec::with_capacity(1 + alternates.len());
         // #203: the ticket is a REMOTE party's claim and this is source 0 of a real dial, so it
@@ -1075,7 +1091,9 @@ impl AppBlobs {
         // already filtered — they resolve through `stored_dial_addr` — and source 0 was not, which
         // is the FOURTH site of this shape after the invite, the attestation offer, and the roster
         // announce. Found by review, not by the audit that fixed the other three.
-        sources.push(crate::daemon::dial::dialable_only(ticket.addr().clone()));
+        if with_publisher {
+            sources.push(crate::daemon::dial::dialable_only(ticket.addr().clone()));
+        }
         // The ticket's address is already source 0. An alternate naming the SAME endpoint would
         // otherwise be dialled twice for one timeout each — natural when a caller names the
         // publisher to reach their OTHER devices, since a person expands to all of them.
@@ -1094,8 +1112,22 @@ impl AppBlobs {
         ticket_str: &str,
         alternates: &[iroh::EndpointAddr],
     ) -> Result<Hash> {
+        self.fetch_from_sources(ticket_str, alternates, true).await
+    }
+
+    /// [`fetch_from`](Self::fetch_from), optionally WITHOUT dialling the ticket's publisher (#223).
+    ///
+    /// `blob_fetch` passes `with_publisher: false` for a publisher this node has revoked: the
+    /// ticket is the remote party's claim, and a fetch is a dial like any other. With no publisher
+    /// and no alternates the fetch fails as any exhausted fetch does ("no source to try").
+    pub(crate) async fn fetch_from_sources(
+        &self,
+        ticket_str: &str,
+        alternates: &[iroh::EndpointAddr],
+        with_publisher: bool,
+    ) -> Result<Hash> {
         let ticket: BlobTicket = ticket_str.parse().context("parse blob ticket")?;
-        let sources = Self::sources(&ticket, alternates);
+        let sources = Self::sources(&ticket, alternates, with_publisher);
         let total = sources.len();
 
         // #82 ask 2: consume the progress stream instead of dropping it on the floor. Same

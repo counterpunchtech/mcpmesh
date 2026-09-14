@@ -898,6 +898,14 @@ async fn probe_once(
 ) -> Result<(String, Vec<String>, iroh::endpoint::Connection, u64)> {
     let id = iroh::EndpointId::from_bytes(&endpoint_id)
         .map_err(|e| anyhow::anyhow!("invalid endpoint id: {e}"))?;
+    // #223: never PING a device this node revoked. `reachability_of` probes every stored row, and a
+    // revocation keeps the row, so every `status` poll used to dial the device the operator had
+    // declared compromised — announcing this node, and its address, to whoever holds it.
+    let m = mesh.clone();
+    let refused = tokio::task::spawn_blocking(move || super::dial::dial_refused(&m, &endpoint_id))
+        .await
+        .map_err(|e| anyhow::anyhow!("join probe revocation check: {e}"))?;
+    anyhow::ensure!(!refused, "peer is REVOKED on this node; not probed");
     // Attach the pairing-persisted `last_addr` hint, exactly as `dial::dial_service` does
     // (issue #27): a just-paired peer is reachable at the address the handshake PROVED, so the
     // probe must not sit waiting on discovery to resolve the bare id. Without this the redeemer's
