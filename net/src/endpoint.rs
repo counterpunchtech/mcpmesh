@@ -317,14 +317,16 @@ pub async fn run_mesh_connection(
     // 1. Accept-time trust gate — before any MCP traffic. `remote_id()` on a
     //    handshake-complete connection returns the peer id directly.
     let remote: EndpointId = conn.remote_id().into();
-    let Some(identity) = gate.resolve(&remote) else {
+    //    This resolve gates ACCEPTING the connection only; its identity is NOT kept — every
+    //    session re-resolves (#222, see `resolve_session_principal`).
+    if gate.resolve(&remote).is_none() {
         // Default-deny: refuse the stranger with a QUIC application close code
         // BEFORE opening any stream. No MCP frame is ever exchanged. The
         // EndpointId is deliberately NOT logged (surface-leak discipline).
         conn.close(CLOSE_UNAUTHORIZED.into(), b"unauthorized");
         tracing::debug!("refused unresolved peer (QUIC 401)");
         return;
-    };
+    }
     // CHECK-register the connection so a roster install that swapped the view between the
     // `resolve` above and here cannot leave a to-be-severed session live (the TOCTOU close — see the
     // registry module doc's three-case argument). The recheck runs UNDER the registry lock,
@@ -335,10 +337,10 @@ pub async fn run_mesh_connection(
     // time (`None` for a pairing-only peer) — NOT `identity.user_id`, which since the self-sovereign
     // device→user binding is also `Some` for a paired peer and would wrongly sever it. A `true` means
     // the endpoint must be severed per the live gate → self-close (QUIC 401) with no session and no
-    // registry entry. The returned RAII `_registration` is held for the whole accept_bi loop below
+    // registry entry. The returned RAII `registration` is held for the whole accept_bi loop below
     // and DEREGISTERS the connection when this fn returns (deregister-on-close, no leak).
     let roster_user = gate.roster_user(&remote);
-    let Some(_registration) = registry.register_checked(&conn, roster_user.clone(), |eid| {
+    let Some(registration) = registry.register_checked(&conn, roster_user.clone(), |eid| {
         gate.should_sever_now(eid, roster_user.as_deref())
     }) else {
         conn.close(CLOSE_UNAUTHORIZED.into(), b"unauthorized");
@@ -347,19 +349,53 @@ pub async fn run_mesh_connection(
     };
     // 2. Sessions: one bi-stream each; a connection may carry several.
     //    `accept_bi()` yields `(send, recv)`.
+    //
+    //    Nothing that feeds authorization is captured per connection (#222): each session
+    //    re-resolves the principal — and re-reads the live registry (#54) — inside `run_session`,
+    //    once its `initialize` has arrived. Before #222 the identity resolved above was cloned into
+    //    every session, so a principal change that does not sever (a re-pair rewriting `user_id`,
+    //    a device re-assigned, a group change) never reached an already-open connection.
+    let tracker = registration.roster_tracker(roster_user.is_some());
     while let Ok((send, recv)) = conn.accept_bi().await {
-        // Read the LIVE registry PER SESSION (#54): a revoke landing between two sessions on
-        // this same connection is honored by the second one. Before this, each connection carried
-        // an `Arc<Services>` captured when the accept loop was spawned, so a revoked peer kept
-        // opening admitted sessions until it happened to disconnect.
-        let services = services.get();
-        let identity = identity.clone();
+        let gate = gate.clone();
+        let services = services.clone();
+        let tracker = tracker.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_session(recv, send, &identity, &services).await {
-                tracing::warn!(peer = %identity.name, %e, "session ended with error");
+            if let Err(e) = run_session(recv, send, &remote, &*gate, &services, &tracker).await {
+                tracing::warn!(%e, "session ended with error");
             }
         });
     }
+}
+
+/// Resolve the principal ONE session is authorized as, at the moment its `initialize` arrived
+/// (#222).
+///
+/// Through the SAME gate the connection-level check uses, so a re-pair rewriting `user_id`, a device
+/// re-assigned to another user, or a roster update moving a user between groups reaches the very
+/// next session on an already-open connection — none of those sever. `None` means the endpoint no
+/// longer resolves at all; the caller refuses the session exactly as an unauthorized service
+/// (-32054 on that stream), since the connection-level 401 has no per-stream form.
+///
+/// The roster discriminator is read on BOTH sides of `resolve` and promoted into the connection's
+/// registry entry before the session may be served — see [`RosterTracker`](crate::registry::RosterTracker). Reading it on both
+/// sides narrows the window where `resolve` sees a roster identity that neither read observed to two
+/// roster installs landing between them. A failed promotion refuses the session (fail closed).
+fn resolve_session_principal(
+    remote: &EndpointId,
+    gate: &dyn TrustGate,
+    tracker: &crate::registry::RosterTracker,
+) -> Option<PeerIdentity> {
+    let roster_before = gate.roster_user(remote);
+    let identity = gate.resolve(remote)?;
+    let roster_user = roster_before.or_else(|| gate.roster_user(remote));
+    if !tracker.admit_roster_user(roster_user.as_deref(), |eid| {
+        gate.should_sever_now(eid, roster_user.as_deref())
+    }) {
+        tracing::debug!("refused a session whose roster promotion rechecked as severed");
+        return None;
+    }
+    Some(identity)
 }
 
 /// Does this service's `allow` list admit the resolved caller? The flat authorization namespace
@@ -390,11 +426,10 @@ fn caller_admits(identity: &PeerIdentity, allow: &[String]) -> bool {
 async fn run_session(
     recv: iroh::endpoint::RecvStream,
     send: iroh::endpoint::SendStream,
-    // Peer identity is resolved by the gate and threaded here: it is matched
-    // against each service's `allow` to compute the caller's admitted set, and
-    // the `_meta["mcpmesh/peer"]` injection reads it too.
-    identity: &PeerIdentity,
-    services: &Services,
+    remote: &EndpointId,
+    gate: &dyn TrustGate,
+    services: &LiveServices,
+    tracker: &crate::registry::RosterTracker,
 ) -> anyhow::Result<()> {
     let mut transport = SessionTransport::new(recv, send, MAX_FRAME_BYTES);
     let mut strikes = Strikes::default();
@@ -413,13 +448,29 @@ async fn run_session(
     // the user_id (`identity.user_id`, present for roster callers and bound pairing peers),
     // and group — so a roster caller named only by its user_id is admitted. The roster's
     // flat-namespace disjointness rule guarantees a group and a user_id never collide.
-    let allowed: Vec<String> = services
-        .iter()
-        .filter(|(_, e)| caller_admits(identity, &e.allow))
-        .map(|(name, _)| name.clone())
-        .collect();
-    match select_service(&mut init, &allowed) {
-        ServiceDecision::Selected(name) => {
+    //
+    // BOTH inputs are read HERE, after `initialize` arrived — not when the stream was accepted. A
+    // dialer can open a stream with a partial frame and complete it later; a snapshot taken at
+    // accept would authorize that session against a principal (#222) or an allow list (#54) that
+    // has since changed. The principal is resolved per session through the connection-level gate
+    // and is the identity the backend's env/`_meta` injection receives, so the backend always sees
+    // the principal the session was authorized as.
+    let services = services.get();
+    let identity = resolve_session_principal(remote, gate, tracker);
+    let allowed: Vec<String> = match &identity {
+        Some(identity) => services
+            .iter()
+            .filter(|(_, e)| caller_admits(identity, &e.allow))
+            .map(|(name, _)| name.clone())
+            .collect(),
+        // No longer resolvable: nothing is admitted, so `select_service` refuses with the same
+        // -32054 an unauthorized service gets (no existence oracle, no connection close).
+        None => Vec::new(),
+    };
+    // Paired with the identity so a selection WITHOUT a resolved principal is unrepresentable (an
+    // empty `allowed` already refuses; this keeps a future change there from reaching a backend).
+    match (select_service(&mut init, &allowed), identity) {
+        (ServiceDecision::Selected(name), Some(identity)) => {
             let backend = services
                 .get(&name)
                 .expect("selected from registry")
@@ -430,10 +481,14 @@ async fn run_session(
             // baked into the shared backend — it drives the backend's
             // env/`_meta` injection. Every admitted session has a resolved
             // identity post-gate.
-            backend.run(Some(identity.clone()), init, transport).await
+            let peer = identity.name.clone();
+            backend
+                .run(Some(identity), init, transport)
+                .await
+                .map_err(|e| e.context(format!("session for peer {peer}")))
         }
-        ServiceDecision::Refuse => {
-            // Unknown or unauthorized — identical wording either way.
+        _ => {
+            // Unknown or unauthorized (or no longer resolvable) — identical wording either way.
             // Echo the initialize `id` when present.
             let id = init.get("id").cloned().unwrap_or(Value::Null);
             // Best-effort teardown: the refusal decision (-32054) is final, but a
