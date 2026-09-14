@@ -3007,10 +3007,17 @@ pub const ERR_PAIR_IDENTITY_REVOKED: i64 = -32057;
 /// `StatusResult::self_user_key_held` is the same fact, readable before anyone presses the button.
 pub const ERR_SELF_ENROLL_NO_KEY: i64 = -32056;
 
-/// `self_enroll_detach` on a device with NO adopted binding (#214): there is no enrollment to exit.
-/// Nothing was changed. A UI that greys the affordance out on `self_user_key_held` never sees it;
-/// one that races a concurrent detach or a `user_key_import` (which also clears the slot) can
-/// treat it as "already done".
+/// `self_enroll_detach` on a device with NO adopted binding in effect (#214): there is no live
+/// enrollment to exit, and nothing live was changed. A STALE enrollment file left on disk (by a
+/// boot that declined a binding that did not verify for this endpoint) is removed first, so the
+/// next boot will not re-adopt it, and the message says when that happened. A removal that fails
+/// is not this code: it is an uncoded `-32000` naming the file.
+///
+/// A UI that offers the detach only when `self_user_id` is present and `self_user_key_held` is
+/// `false` does not send it except in a race — a concurrent detach, or an import (which also clears
+/// the slot) — and can treat it as "already done". (It also never cleans a boot-declined file,
+/// which is harmless: boot declines it again on every start.) Offering it on `!self_user_key_held`
+/// alone also offers it to a node with no user key at all, which gets this code.
 pub const ERR_NOT_ENROLLED: i64 = -32057;
 
 /// How many requests one control connection may have in flight at once (#172), after which it

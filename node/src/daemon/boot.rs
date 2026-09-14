@@ -2001,6 +2001,84 @@ mod tests {
         super::shutdown_booted(booted).await;
     }
 
+    /// #214: import X → adopt Y → RESTART → detach, on one state root. Live and post-restart must
+    /// agree at every step: after the restart the enrolled Y is presented and the key is not held,
+    /// and a detach falls back to X — the key `user.key` holds — not to a fresh stranger.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn import_then_adopt_survives_a_restart_and_detach_restores_the_imported_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::paths::NodePaths::under_root(dir.path());
+        std::fs::create_dir_all(paths.config_path.parent().unwrap()).unwrap();
+        std::fs::write(&paths.config_path, "[network]\nrelay_mode = \"disabled\"\n").unwrap();
+
+        let (x, _) =
+            mcpmesh_trust::keys::UserKey::load_or_generate(&dir.path().join("x.key")).unwrap();
+        let x_uid = mcpmesh_trust::binding::user_id(&x);
+        let (y, _) =
+            mcpmesh_trust::keys::UserKey::load_or_generate(&dir.path().join("y.key")).unwrap();
+        let y_uid = mcpmesh_trust::binding::user_id(&y);
+
+        // First boot: import X, then adopt a REAL binding for Y over this endpoint (boot verifies).
+        let booted = super::boot_node(paths.clone(), None, BootOverrides::default())
+            .await
+            .expect("boots");
+        {
+            let state = &booted.state;
+            let mesh = state.mesh_required().expect("mesh").clone();
+            let phrase = crate::pairing::recovery::encode(&x.signing_key().to_bytes());
+            let out = crate::daemon::user_key_import(state, phrase, false)
+                .await
+                .expect("import on a fresh root needs no replace");
+            assert_eq!(out.user_id, x_uid);
+            let binding = crate::pairing::rendezvous::SelfBinding {
+                user_pk: y_uid.clone(),
+                sig: crate::pairing::binding_sig_for(&y, mesh.endpoint.id().as_bytes()),
+            };
+            crate::daemon::handlers::adopt_hook(&mesh)(binding)
+                .await
+                .expect("adopt");
+            assert_eq!(mesh.self_binding().unwrap().user_pk, y_uid, "live: Y");
+        }
+        super::shutdown_booted(booted).await;
+
+        // Restart on the same root. The redb lock is released by shutdown, but give it a bounded,
+        // sleeping retry rather than trusting the drop to have landed.
+        let mut booted = None;
+        for _ in 0..50 {
+            match super::boot_node(paths.clone(), None, BootOverrides::default()).await {
+                Ok(b) => {
+                    booted = Some(b);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+            }
+        }
+        let booted = booted.expect("the root boots again");
+        let state = &booted.state;
+        let mesh = state.mesh_required().expect("mesh").clone();
+        assert_eq!(
+            mesh.self_binding().unwrap().user_pk,
+            y_uid,
+            "after a restart the enrollment still wins — live and post-restart agree"
+        );
+        let status = crate::control::status_result(state).unwrap();
+        assert_eq!(status.self_user_id.as_deref(), Some(y_uid.as_str()));
+        assert!(!status.self_user_key_held, "enrolled: the key is not held");
+
+        let out = crate::daemon::self_enroll_detach(state)
+            .await
+            .expect("detach");
+        assert_eq!(out.detached_from, y_uid);
+        assert_eq!(
+            out.user_id.as_deref(),
+            Some(x_uid.as_str()),
+            "detach restores the IMPORTED identity, which is what user.key holds after a restart"
+        );
+        let status = crate::control::status_result(state).unwrap();
+        assert!(status.self_user_key_held);
+        super::shutdown_booted(booted).await;
+    }
+
     /// #63 gate: `rate_limit_per_min = 0` on a service must be a STARTUP ERROR.
     ///
     /// `RateLimiter::per_minute` floors at 1, so `0` silently became 1 request/minute — the most
