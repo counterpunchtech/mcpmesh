@@ -3039,7 +3039,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   thirty have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.62";
+pub const API_VERSION: &str = "1.63";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -3125,7 +3125,18 @@ pub const API_VERSION: &str = "1.62";
 /// refusals — expired line, no live invite, inviter unreachable, id mismatch, name conflict, and
 /// the deliberately-opaque refusal. `ERR_NICKNAME_TAKEN` had been the only coded pairing failure,
 /// so every other one arrived as `-32000` and an embedder could either forward our prose to end
-/// users or substring-match it (#159); to 62 with the self-enrollment EXIT and the surface an
+/// users or substring-match it (#159); to 63 when the identity gates began to hold under the
+/// user-key lock (#221, #219) — no type changed: `user_key_export` REFUSES (`-32602`) on an
+/// enrolled device, where through 62 it returned the recovery phrase of the local key boot minted,
+/// an identity no peer has paired with; `user_key_import`'s `replace` guard now protects a key an
+/// earlier import wrote within the same daemon lifetime, where through 62 a second import without
+/// `replace` silently discarded the first; `peer_endorse` refuses when no user key is on disk
+/// instead of minting one; and `peer_endorse`, `device_revoke`, `user_key_export` and the
+/// self-enrollment signature check the enrollment gate under the lock an adoption or import writes
+/// under, so neither can land between the check and the signature. Guard on `>= 63` before
+/// offering `user_key_export` on a device whose `self_user_key_held` is false. Crate-level a MINOR
+/// release of `mcpmesh-node` (0.54 → 0.55): `pairing::rendezvous::SignBindingFn` became async; to
+/// 62 with the self-enrollment EXIT and the surface an
 /// embedder needs to ship the ceremony at all (#214): [`Request::SelfEnrollDetach`] drops an
 /// adopted binding (the inverse of `pair { allow_self_enroll }`, and the only exit an enrolled
 /// device has — `user_key_import` needs the phrase of a key it does not hold);
@@ -3383,7 +3394,7 @@ pub const API_VERSION: &str = "1.62";
 /// its REAL content is a meaning change to `reachable` — the field exists so the new meaning is
 /// observable at all. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 62;
+pub const API_MINOR: u32 = 63;
 
 #[cfg(test)]
 mod tests {
