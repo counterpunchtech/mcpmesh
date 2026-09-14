@@ -377,7 +377,14 @@ pub struct MeshState {
     ///
     /// A key this node minted itself and has never presented to anyone is not an identity worth
     /// protecting; a key it loaded from disk might be.
-    pub(crate) user_key_minted_at_boot: std::sync::OnceLock<bool>,
+    ///
+    /// **"Is the key ON DISK still the one boot minted"**, not "did boot mint one" (#221). It was a
+    /// set-once `OnceLock` no import cleared, so a second import in the same daemon lifetime found
+    /// it still `true` and silently discarded the first imported key under `replace: false`. An
+    /// import clears it ([`note_user_key_replaced`](Self::note_user_key_replaced)); nothing sets it
+    /// back but boot. Read and written under `user_key_lock`. Unset (`false`) fails CLOSED: the
+    /// guard applies.
+    user_key_still_boot_minted: std::sync::atomic::AtomicBool,
     /// A user key RESTORED from a recovery phrase (#85 ask 2), overriding the boot-derived binding.
     ///
     /// **Separate from [`adopted_binding`](Self::adopted_binding), and the distinction is
@@ -644,7 +651,7 @@ impl MeshState {
             roster_addr_book: std::sync::OnceLock::new(),
             self_binding: std::sync::OnceLock::new(),
             user_key_path: std::sync::OnceLock::new(),
-            user_key_minted_at_boot: std::sync::OnceLock::new(),
+            user_key_still_boot_minted: std::sync::atomic::AtomicBool::new(false),
             imported_binding: std::sync::RwLock::new(None),
             adopted_binding: std::sync::RwLock::new(None),
             recent_pairings: std::sync::Mutex::new(std::collections::VecDeque::new()),
@@ -1204,6 +1211,25 @@ impl MeshState {
             .adopted_binding
             .write()
             .expect("adopted_binding lock not poisoned") = None;
+    }
+
+    /// Boot (#85 ask 2): record whether it MINTED the user key rather than loading one.
+    pub(crate) fn note_user_key_minted_at_boot(&self, created: bool) {
+        self.user_key_still_boot_minted
+            .store(created, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// An import wrote a key over the file (#221): what is on disk now is a real identity, and the
+    /// `replace` guard must defend it for the rest of this lifetime.
+    pub(crate) fn note_user_key_replaced(&self) {
+        self.user_key_still_boot_minted
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Is the user key on disk still the one this boot minted (#85 ask 2, #221)?
+    pub(crate) fn user_key_still_boot_minted(&self) -> bool {
+        self.user_key_still_boot_minted
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Install the resolved `UserKey` path (#65). Set once, at boot, like `self_binding`.

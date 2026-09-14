@@ -2810,7 +2810,10 @@ pub(crate) async fn user_key_import(
     //
     // Unset (a control-only or test daemon that never resolved a key) is treated as "not minted
     // here", which fails CLOSED: the guard applies, and the caller can still pass `replace`.
-    let minted_here = *mesh.user_key_minted_at_boot.get().unwrap_or(&false);
+    //
+    // "Still" (#221): an earlier import in this lifetime cleared it, so the key it wrote is
+    // defended like a loaded one. Read under `user_key_lock`, which every writer of the key holds.
+    let minted_here = mesh.user_key_still_boot_minted();
     let protects = existed && !minted_here;
     anyhow::ensure!(
         !protects || replace,
@@ -2892,6 +2895,9 @@ pub(crate) async fn user_key_import(
         }
         return Err(e);
     }
+    // #221: the key on disk is now a real identity. Cleared only once the write has landed — a
+    // failed write left the boot-minted key in place, still worth nothing.
+    mesh.note_user_key_replaced();
 
     // LIVE: the identity this node presents changes now, not at the next restart. A
     // restart-required answer would leave it presenting the OLD identity while its operator
@@ -4190,7 +4196,7 @@ mod tests {
         // Model a node whose key was LOADED, not minted this boot — the case the replace guard
         // defends, and the one an import has to survive.
         let (existing, _) = mcpmesh_trust::UserKey::load_or_generate(&key_path).unwrap();
-        let _ = mesh.user_key_minted_at_boot.set(false);
+        mesh.note_user_key_minted_at_boot(false);
         let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
 
         // Precondition: before the import this device holds its own key and can enroll.
@@ -4346,6 +4352,127 @@ mod tests {
         assert!(
             !msg.contains(&local_id),
             "the refusal must not leak the local user_id either: {msg}"
+        );
+    }
+
+    /// #221: the `replace` guard must protect an IMPORTED key, not only a loaded one.
+    ///
+    /// The guard reads "is the key on disk still the one boot minted". That was a set-once flag
+    /// that no import cleared, so within one daemon lifetime: boot mints B, import X is allowed
+    /// (B was boot-minted — right), and then import Z with `replace: false` ALSO succeeded,
+    /// discarding X — the user's restored identity — with `replaced: false` and no refusal.
+    ///
+    /// Fixture discriminates: B, X and Z are three distinct keys, and X is read back from disk.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_import_without_replace_is_refused_and_keeps_the_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        let key_path = dir.path().join("user.key");
+        // Boot: mint B, and record that it was minted this lifetime.
+        let (b, created) = mcpmesh_trust::UserKey::load_or_generate(&key_path).unwrap();
+        assert!(created, "fixture: boot MINTED the key");
+        mesh.set_user_key_path(key_path.clone());
+        mesh.note_user_key_minted_at_boot(true);
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+
+        let (x, _) = mcpmesh_trust::UserKey::load_or_generate(&dir.path().join("x.key")).unwrap();
+        let (z, _) = mcpmesh_trust::UserKey::load_or_generate(&dir.path().join("z.key")).unwrap();
+        let x_uid = mcpmesh_trust::binding::user_id(&x);
+        assert_ne!(
+            mcpmesh_trust::binding::user_id(&b),
+            x_uid,
+            "fixture: B != X"
+        );
+        assert_ne!(
+            mcpmesh_trust::binding::user_id(&z),
+            x_uid,
+            "fixture: Z != X"
+        );
+        let phrase = |k: &mcpmesh_trust::UserKey| {
+            crate::pairing::recovery::encode(&k.signing_key().to_bytes())
+        };
+
+        // CONTROL: the first import over a boot-minted key needs no replace (the new-laptop path).
+        let out = user_key_import(&state, phrase(&x), false)
+            .await
+            .expect("importing over a key boot minted seconds ago needs no replace");
+        assert_eq!(out.user_id, x_uid);
+        assert!(
+            !out.replaced,
+            "a boot-minted key is not a real identity discarded"
+        );
+
+        // THE assertion: X is now a real identity, and replace=false must defend it.
+        let e = user_key_import(&state, phrase(&z), false)
+            .await
+            .expect_err("a second import without replace must not discard the first imported key");
+        assert!(
+            format!("{e:#}").contains("Pass replace to do it anyway"),
+            "the refusal must be the replace guard's: {e:#}"
+        );
+        assert_eq!(
+            std::fs::read(&key_path).unwrap(),
+            x.signing_key().to_bytes().to_vec(),
+            "X must still be the key on disk"
+        );
+        assert_eq!(
+            mesh.self_binding().unwrap().user_pk,
+            x_uid,
+            "and still presented"
+        );
+
+        // With replace, it goes through and says it discarded something.
+        let out = user_key_import(&state, phrase(&z), true).await.unwrap();
+        assert!(
+            out.replaced,
+            "replacing X discarded a real identity, and must say so"
+        );
+    }
+
+    /// #221: the same guard across an enrollment. Import X, adopt Y (which does not touch the
+    /// key), import Z with `replace: false` — X is the key on disk and must be defended.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn import_adopt_import_without_replace_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        let key_path = dir.path().join("user.key");
+        mcpmesh_trust::UserKey::load_or_generate(&key_path).unwrap();
+        mesh.set_user_key_path(key_path.clone());
+        mesh.note_user_key_minted_at_boot(true);
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+        let (x, _) = mcpmesh_trust::UserKey::load_or_generate(&dir.path().join("x.key")).unwrap();
+        let (z, _) = mcpmesh_trust::UserKey::load_or_generate(&dir.path().join("z.key")).unwrap();
+        let phrase = |k: &mcpmesh_trust::UserKey| {
+            crate::pairing::recovery::encode(&k.signing_key().to_bytes())
+        };
+
+        user_key_import(&state, phrase(&x), false).await.unwrap();
+        let y = crate::pairing::rendezvous::SelfBinding {
+            user_pk: "b64u:Y-someone-elses".into(),
+            sig: "b64u:sig".into(),
+        };
+        adopt_hook(&mesh)(y.clone()).await.unwrap();
+
+        user_key_import(&state, phrase(&z), false)
+            .await
+            .expect_err("X is on disk under the enrollment; replace=false must defend it");
+        assert_eq!(
+            std::fs::read(&key_path).unwrap(),
+            x.signing_key().to_bytes().to_vec(),
+            "X must still be the key on disk"
+        );
+        assert_eq!(
+            mesh.self_binding().unwrap().user_pk,
+            y.user_pk,
+            "and a refused import changes nothing live: still enrolled as Y"
+        );
+        assert!(
+            mesh.adopted_binding_path().exists(),
+            "the enrollment file is untouched"
         );
     }
 
@@ -4636,7 +4763,7 @@ mod tests {
     async fn an_import_that_cannot_remove_the_enrollment_file_changes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let (mesh, _audit, adopted) = enrolled_mesh(&dir).await;
-        let _ = mesh.user_key_minted_at_boot.set(true);
+        mesh.note_user_key_minted_at_boot(true);
         let sidecar = mesh.adopted_binding_path();
         std::fs::remove_file(&sidecar).unwrap();
         std::fs::create_dir(&sidecar).unwrap();
@@ -4683,7 +4810,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let (mesh, _audit, adopted) = enrolled_mesh(&dir).await;
-        let _ = mesh.user_key_minted_at_boot.set(true);
+        mesh.note_user_key_minted_at_boot(true);
         let (x, _) = mcpmesh_trust::UserKey::load_or_generate(&dir.path().join("x.key")).unwrap();
         let phrase = crate::pairing::recovery::encode(&x.signing_key().to_bytes());
         let sidecar = mesh.adopted_binding_path();
@@ -4724,7 +4851,7 @@ mod tests {
         std::fs::create_dir(&key_path).unwrap();
         std::fs::write(key_path.join("pin"), b"x").unwrap();
         mesh.set_user_key_path(key_path.clone());
-        let _ = mesh.user_key_minted_at_boot.set(true);
+        mesh.note_user_key_minted_at_boot(true);
         let adopted = crate::pairing::rendezvous::SelfBinding {
             user_pk: "b64u:Y".into(),
             sig: "b64u:sig".into(),
@@ -4765,7 +4892,7 @@ mod tests {
             user_pk: "b64u:boot".into(),
             sig: "b64u:sig".into(),
         }));
-        let _ = mesh.user_key_minted_at_boot.set(true);
+        mesh.note_user_key_minted_at_boot(true);
         let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
 
         // Import X.

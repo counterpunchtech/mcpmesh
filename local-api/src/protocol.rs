@@ -2004,8 +2004,9 @@ pub struct UserKeyImportResult {
     /// the definitive answer, and the only one that distinguishes "restored the wrong key" from
     /// "peers have not seen me yet".
     pub user_id: String,
-    /// `true` when this discarded a REAL identity — a user key the node had loaded from disk,
-    /// rather than one it minted at this boot and had never presented to anyone.
+    /// `true` when this discarded a REAL identity — a user key the node had loaded from disk, or
+    /// one an earlier import in this daemon's lifetime wrote (#221), rather than one it minted at
+    /// this boot and had never presented to anyone.
     ///
     /// The distinction is the useful one: a fresh node always has a key on disk before an import
     /// can run (its own boot mints one), so "a file existed" would be `true` for every recovery on
