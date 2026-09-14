@@ -29,7 +29,7 @@ async-trait = "0.1"
 tempfile = "3"
 assert_cmd = "2"
 rustix = { version = "1", features = ["process"] }
-iroh = "=1.0.3"  # keep default features: tls-ring supplies the rustls CryptoProvider the presets install. 1.0.3 adds live Endpoint::insert_relay/remove_relay (#53).
+iroh = "=1.2.0"  # keep default features: tls-ring supplies the rustls CryptoProvider the presets install. 1.0.3 adds live Endpoint::insert_relay/remove_relay (#53).
 iroh-gossip = "=0.101.0"   # roster + presence topics (spec §10, roster mode only); iroh "1" — no iroh bump
 iroh-blobs  = "=0.103.0"   # roster-blob fetch ONLY (spec §4.3/§9); iroh ^1.0.0 — the pinned version
 # The `Bytes` payload type the gossip broadcast/receive API speaks + the `StreamExt::next` the
