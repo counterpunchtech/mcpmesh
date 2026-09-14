@@ -387,16 +387,17 @@ pub struct MeshState {
     /// set-once `OnceLock` no import cleared, so a second import in the same daemon lifetime found
     /// it still `true` and silently discarded the first imported key under `replace: false`. An
     /// import clears it ([`note_user_key_replaced`](Self::note_user_key_replaced)); nothing sets it
-    /// back but boot. Read and written under `user_key_lock`. Unset (`false`) fails CLOSED: the
-    /// guard applies.
+    /// back but boot. Set by boot before serving; read and cleared under `user_key_lock`. Unset
+    /// (`false`) fails CLOSED: the guard applies.
     user_key_still_boot_minted: std::sync::atomic::AtomicBool,
     /// A user key RESTORED from a recovery phrase (#85 ask 2), overriding the boot-derived binding.
     ///
     /// **Separate from [`adopted_binding`](Self::adopted_binding), and the distinction is
     /// load-bearing.** That field does not mean "the binding to present" — it means *this device
-    /// was enrolled into someone else's identity and holds no authority over it*, and two other
-    /// sites gate on exactly that reading: `peer_endorse` refuses, and `sign_binding` returns
-    /// `None` so `invite --as-self` cannot enroll a third device.
+    /// was enrolled into someone else's identity and holds no authority over it*, and the #86 gate
+    /// (`handlers::lock_own_user_key`) reads exactly that: `peer_endorse`, `device_revoke` and
+    /// `user_key_export` refuse, and `sign_binding` returns `None` so `invite --as-self` cannot
+    /// enroll a third device.
     ///
     /// An IMPORT is the opposite situation: the device now holds that user key. Reusing the
     /// adopted slot for it made a freshly-recovered machine unable to endorse or to enroll its
@@ -488,7 +489,8 @@ pub struct MeshState {
     ///
     /// #221: it is also the lock the #86 gate is checked UNDER. `peer_endorse`, `device_revoke`,
     /// `user_key_export` and `inviter_ctx`'s `sign_binding` read `adopted_binding` after taking
-    /// it and hold it through reading the key and signing (`handlers::lock_own_user_key`), so an
+    /// it and hold it through reading the key and signing — or, for the export, building the
+    /// phrase (`handlers::lock_own_user_key`), so an
     /// `adopt_hook` or `user_key_import` — which write under it — cannot land between the check and
     /// the signature. Held only across file IO on a blocking thread, never a network await.
     pub(crate) user_key_lock: tokio::sync::Mutex<()>,

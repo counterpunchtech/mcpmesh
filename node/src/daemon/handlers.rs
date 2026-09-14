@@ -4782,6 +4782,12 @@ mod tests {
     /// `adopted_binding` before queueing for the lock saw "not enrolled" and signs anyway. The
     /// settle delay only makes that mutation MORE likely to be caught; correct code passes at any
     /// timing, since it cannot read the slot until the lock is released.
+    /// The #86 gate's coded (-32602) refusal, and not some other failure.
+    fn is_gate_refusal<T>(r: Result<T>) -> bool {
+        matches!(r, Err(e) if e.downcast_ref::<crate::control::InvalidParams>().is_some()
+            && format!("{e:#}").contains("does not hold that user key"))
+    }
+
     async fn refused_when_an_adoption_holds_the_lock_at_start(
         mesh: &Arc<MeshState>,
         run: std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>,
@@ -4816,7 +4822,7 @@ mod tests {
                     subject: subject.to_string(),
                     subject_user_id: None,
                 };
-                endorse_peer(&state, params).await.is_err()
+                is_gate_refusal(endorse_peer(&state, params).await)
             }),
         )
         .await;
@@ -4838,7 +4844,7 @@ mod tests {
                     endpoint: mcpmesh_net::EndpointId::from_bytes(*lost.as_bytes()).principal(),
                     reason: None,
                 };
-                device_revoke(&state, params).await.is_err()
+                is_gate_refusal(device_revoke(&state, params).await)
             }),
         )
         .await;
@@ -4858,7 +4864,7 @@ mod tests {
         let (mesh, _own, state) = key_holding_mesh(&dir).await;
         let refused = refused_when_an_adoption_holds_the_lock_at_start(
             &mesh,
-            Box::pin(async move { user_key_export(&state).await.is_err() }),
+            Box::pin(async move { is_gate_refusal(user_key_export(&state).await) }),
         )
         .await;
         assert!(
