@@ -1312,6 +1312,16 @@ pub async fn redeem_invite(
     // which on Linux is localhost. The identity check below is unaffected: TLS still authenticates
     // whoever answers, and this only removes destinations that cannot be a peer at all.
     let addr = crate::daemon::dial::dialable_only(addr);
+    // #223 review: the revocation check above is on `inviter_id`, but the dial goes to the id INSIDE
+    // the address. A line whose two disagree would pass that check for a live id and dial a revoked
+    // one — and the post-handshake address-swap defense below runs only after the handshake has
+    // already told that endpoint who we are. Refused before any packet, with the same code.
+    if *addr.id.as_bytes() != invite.inviter_id {
+        bail!(PairRefusal::new(
+            mcpmesh_local_api::ERR_INVITER_MISMATCH,
+            "inviter id mismatch — refusing (address-swap defense)",
+        ));
+    }
     // #159: unreachable is its own condition — the invite is untouched, so the remedy is "check
     // they are running and retry the same line", not "get a new one".
     let conn = endpoint
@@ -2469,6 +2479,104 @@ mod tests {
         }
     }
 
+    /// #223 (review, item 8): an offer / invite whose embedded address names a DIFFERENT endpoint
+    /// than the id the revocation check read is refused BEFORE the dial. The address's endpoint is a
+    /// real, counting listener, so an unrefused dial would complete a handshake with it — which
+    /// already identifies this node to it, before the post-handshake address-swap check ever runs.
+    ///
+    /// Deleting the pre-dial id check in `attest_to` fails the attest zero count (and its message
+    /// then comes from the post-handshake check); deleting it in `redeem_invite` fails that count.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mismatched_address_id_is_refused_before_the_dial() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        tokio::time::timeout(std::time::Duration::from_secs(90), async {
+            let decoy = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .relay_mode(iroh::RelayMode::Disabled)
+                .alpns(vec![mcpmesh_net::ALPN_PAIR.to_vec()])
+                .bind()
+                .await
+                .unwrap();
+            let dials = Arc::new(AtomicUsize::new(0));
+            let (e, c) = (decoy.clone(), dials.clone());
+            let _accept = tokio::spawn(async move {
+                while let Some(incoming) = e.accept().await {
+                    if let Ok(conn) = incoming.await {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        conn.close(0u32.into(), b"test");
+                    }
+                }
+            });
+            let claimed = iroh::SecretKey::from_bytes(&[44u8; 32]).public();
+            assert_ne!(claimed, decoy.id(), "fixture: the two ids must differ");
+            let decoy_addr = serde_json::to_string(&decoy.addr()).unwrap();
+            let me = || async {
+                iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+                    .relay_mode(iroh::RelayMode::Disabled)
+                    .bind()
+                    .await
+                    .unwrap()
+            };
+            let store = || {
+                Arc::new(
+                    crate::allowlist::PeerStore::open(
+                        &tempfile::tempdir().unwrap().keep().join("s.redb"),
+                    )
+                    .unwrap(),
+                )
+            };
+
+            let offer = AttestOffer {
+                node_id: *claimed.as_bytes(),
+                node_addr_json: decoy_addr.clone(),
+            }
+            .encode()
+            .unwrap();
+            let binding = Some(SelfBinding {
+                user_pk: "b64u:me".into(),
+                sig: "sig".into(),
+            });
+            let e = attest_to(me().await, offer, store(), binding, None)
+                .await
+                .expect_err("a mismatched offer must be refused");
+            assert!(format!("{e:#}").contains("peer id mismatch"), "{e:#}");
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            assert_eq!(
+                dials.load(Ordering::SeqCst),
+                0,
+                "attest_to must not dial the decoy"
+            );
+
+            let mut invite = sample_invite_for(claimed, 9_999_999_999);
+            invite.inviter_addr_json = decoy_addr;
+            let e = redeem_invite(
+                me().await,
+                "me".into(),
+                invite.encode(),
+                None,
+                SelfEnroll::Refuse,
+                None,
+                store(),
+                None,
+                None,
+            )
+            .await
+            .expect_err("a mismatched invite must be refused");
+            assert_eq!(
+                e.downcast_ref::<PairRefusal>().map(|r| r.code()),
+                Some(mcpmesh_local_api::ERR_INVITER_MISMATCH),
+                "{e:#}"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            assert_eq!(
+                dials.load(Ordering::SeqCst),
+                0,
+                "redeem_invite must not dial the decoy"
+            );
+        })
+        .await
+        .expect("mismatch test timed out");
+    }
+
     /// #223 (review): `attest_to` must not dial a node this node has REVOKED — attesting hands it
     /// this person's identity binding. `redeem_invite` checks before its dial; this had no check.
     ///
@@ -2677,6 +2785,13 @@ pub async fn attest_to(
     // #203, same as `redeem_invite`: an offer's addresses are the remote party's claim, dialled
     // before storage.
     let addr = crate::daemon::dial::dialable_only(addr);
+    // #223 review: the revocation check above is on `offer.node_id`; the dial goes to `addr.id`. An
+    // offer whose two disagree must not dial at all — the post-handshake check below runs only after
+    // the handshake has already reached, and identified us to, whatever `addr.id` names.
+    anyhow::ensure!(
+        addr.id.as_bytes() == &offer.node_id,
+        "peer id mismatch — refusing (address-swap defense)"
+    );
     let conn = endpoint
         .connect(addr, mcpmesh_net::ALPN_PAIR)
         .await

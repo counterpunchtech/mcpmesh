@@ -446,7 +446,7 @@ async fn boot_node(
     // bootstrap is fine). The accept loop's gossip/blob arms dispatch to these handles. A pure-pairing
     // daemon spawns NEITHER (`None`) — no gossip at all.
     let (gossip, blobs, roster_topic, presence_topic) =
-        compose_roster_transport(&endpoint, &roster, &cfg, roster_mode, &our_id).await;
+        compose_roster_transport(&endpoint, &roster, &store, &cfg, roster_mode, &our_id).await;
     let mesh = MeshState::new(
         endpoint,
         gate,
@@ -1267,6 +1267,7 @@ pub(crate) fn alpns_for(roster_mode: bool) -> Vec<Vec<u8>> {
 async fn compose_roster_transport(
     endpoint: &iroh::Endpoint,
     roster: &Arc<RosterGate>,
+    store: &Arc<PeerStore>,
     cfg: &Config,
     roster_mode: bool,
     our_id: &iroh::EndpointId,
@@ -1295,15 +1296,13 @@ async fn compose_roster_transport(
     // Bootstrap from the installed roster's device endpoints (excluding ourselves). BOTH the roster
     // and presence topics bootstrap from the SAME peer set — the swarm forms as peers
     // arrive, so an empty bootstrap is fine (subscribe does not block on a neighbor).
-    let bootstrap: Vec<iroh::EndpointId> = roster
-        .view()
-        .map(|v| {
-            v.device_endpoints()
-                .filter(|d| *d != our_id.as_bytes())
-                .filter_map(|d| iroh::EndpointId::from_bytes(d).ok())
-                .collect()
-        })
-        .unwrap_or_default();
+    let (store_c, view, me) = (store.clone(), roster.view(), *our_id.as_bytes());
+    let bootstrap: Vec<iroh::EndpointId> = blocking("join gossip bootstrap filter", move || {
+        gossip_bootstrap(&store_c, view.as_deref(), &me)
+    })
+    .await
+    // Fails CLOSED: a join error bootstraps from nobody, which the swarm tolerates (see above).
+    .unwrap_or_default();
     let roster_topic = match transport::subscribe(
         &gossip,
         transport::roster_topic_bytes(&org_id),
@@ -1330,6 +1329,31 @@ async fn compose_roster_transport(
             }
         };
     (Some(gossip), Some(blobs), roster_topic, presence_topic)
+}
+
+/// The gossip BOOTSTRAP set (#223): the installed roster's device endpoints, minus ourselves, minus
+/// every device the OUTBOUND revocation predicate refuses.
+///
+/// `device_endpoints()` already drops the roster's own `revoked_endpoints`, but it keeps a device
+/// this node `peer_revoke`d and every device of a roster user spelled as a revoked `b64u:` identity
+/// — so gossip dialled exactly the devices `open_session` refuses. Takes the store and view rather
+/// than a predicate, so no caller can hand it a permissive one. Blocking (redb).
+///
+/// Filters only the set WE hand gossip. The neighbours gossip learns from the swarm and dials on
+/// its own are #229.
+pub(crate) fn gossip_bootstrap(
+    store: &PeerStore,
+    view: Option<&mcpmesh_trust::roster::validate::RosterView>,
+    our_id: &[u8; 32],
+) -> Vec<iroh::EndpointId> {
+    let Some(v) = view else {
+        return Vec::new();
+    };
+    v.device_endpoints()
+        .filter(|d| *d != our_id)
+        .filter(|d| !crate::daemon::dial::refused_by(store, Some(v), d))
+        .filter_map(|d| iroh::EndpointId::from_bytes(d).ok())
+        .collect()
 }
 
 #[cfg(test)]

@@ -392,7 +392,7 @@ pub(crate) async fn blob_fetch(
     let work = async {
         // #83: resolve the caller's alternate sources to dialable addresses BEFORE the fetch, so a
         // name that resolves to nobody is a clean error rather than a silent skip mid-transfer.
-        let alternates = crate::daemon::dial::blob_source_addrs(mesh, &from).await?;
+        let sources = crate::daemon::dial::blob_source_addrs(mesh, &from).await?;
         // #223: the ticket's publisher is source 0 of a real dial, and it is a REMOTE claim — a
         // ticket naming a device this node revoked must not make the fetch contact it. The
         // alternates were filtered above; this is the same predicate for the one source they skip.
@@ -409,8 +409,19 @@ pub(crate) async fn blob_fetch(
             );
         }
         let hash = provider
-            .fetch_from_sources(&ticket, &alternates, !publisher_refused)
+            .fetch_from_sources(&ticket, &sources.addrs, !publisher_refused)
             .await
+            .map_err(|e| {
+                // The caller NAMED these sources, so a failed fetch says why they were not tried —
+                // otherwise the only trace is a daemon log line the caller cannot see (#223).
+                match sources.skipped_revoked {
+                    0 => e,
+                    n => e.context(format!(
+                        "{n} named source{} skipped: revoked on this node",
+                        if n == 1 { "" } else { "s" }
+                    )),
+                }
+            })
             .context("fetch blob")?;
         // #80: pin the fetched blob across the EXPORT. It is in the store and in no scope — the
         // fetch creates no tag — so on a collecting node a sweep between the transfer completing
@@ -1595,6 +1606,19 @@ pub(crate) async fn peer_services(
 ) -> Result<mcpmesh_local_api::PeerServicesResult> {
     let mesh = state.mesh_required()?;
     let endpoint_id = resolve_peer_endpoint(mesh, &peer).await?;
+    // #223: this verb DIALS (a probe), so it asks the full outbound predicate — roster-revoked
+    // endpoints and roster devices under a revoked `b64u:` identity too. Checked HERE rather than
+    // in the shared resolver: `peer_diagnostics` and `peer_hint_clear` share it and dial nothing,
+    // and refusing a roster-revoked device there blocked legitimate operator actions. Before the
+    // cached probe, since a fresh cache entry would otherwise answer without any dial check.
+    let m = mesh.clone();
+    anyhow::ensure!(
+        !blocking("join peer_services revocation check", move || {
+            crate::daemon::dial::dial_refused(&m, &endpoint_id)
+        })
+        .await?,
+        "peer '{peer}' is REVOKED on this node"
+    );
     let entry = crate::daemon::reach::probe_peer_cached(mesh, endpoint_id).await;
     anyhow::ensure!(
         entry.reachable,
@@ -1908,7 +1932,7 @@ pub(crate) async fn resolve_peer_endpoint(mesh: &Arc<MeshState>, peer: &str) -> 
         // test for this guard, not by review. A direct device principal is the most precise way to
         // reach a revoked machine, so of the three selectors it is the one that most needed it.
         anyhow::ensure!(
-            !refused(mesh, eid).await?,
+            !store_refused(mesh, eid).await?,
             "peer '{peer}' is REVOKED on this node"
         );
         return Ok(eid);
@@ -1928,27 +1952,21 @@ pub(crate) async fn resolve_peer_endpoint(mesh: &Arc<MeshState>, peer: &str) -> 
     .context("join peer resolve for peer_services")??;
     let eid = eid
         .with_context(|| format!("no paired peer '{peer}' — 'mcpmesh status' lists your peers"))?;
-    // #85 ask 4: this feeds `peer_services` and `peer_diagnostics`, both of which DIAL. Revocation
-    // was inbound-only in the first cut, so those still reached out to a device the operator had
-    // declared stolen. Checked here rather than at each caller — this is the one resolver they
-    // share.
+    // #85 ask 4: this feeds `peer_services` (which DIALS), `peer_diagnostics` and `peer_hint_clear`
+    // (which do not — see `peer_diagnostics_never_dials`). The store revocation check here is #85's
+    // and predates the split; the full outbound predicate (#223) is asked by `peer_services` alone,
+    // because it is the only one of the three that reaches the device.
     anyhow::ensure!(
-        !refused(mesh, eid).await?,
+        !store_refused(mesh, eid).await?,
         "peer '{peer}' is REVOKED on this node"
     );
     Ok(eid)
 }
 
-/// [`dial_refused`](crate::daemon::dial::dial_refused) on the blocking pool (#223) — the
-/// outbound predicate, so an `eid:` naming a roster device under a revoked `b64u:` identity, or a
-/// roster-revoked endpoint, is refused here as on every other dial path. It used to be
-/// `PeerStore::is_refused` alone, which answers `Unpaired` for both.
-async fn refused(mesh: &Arc<MeshState>, eid: [u8; 32]) -> Result<bool> {
-    let m = mesh.clone();
-    crate::util::blocking("join peer revocation check", move || {
-        crate::daemon::dial::dial_refused(&m, &eid)
-    })
-    .await
+/// `PeerStore::is_refused` on the blocking pool — redb reads never run on a runtime worker.
+async fn store_refused(mesh: &Arc<MeshState>, eid: [u8; 32]) -> Result<bool> {
+    let store = mesh.store.clone();
+    crate::util::blocking("join peer revocation check", move || store.is_refused(&eid)).await
 }
 
 /// Handle an `unregister_service` control request/// Handle an `unregister_service` control request (#50): remove the whole `[services.<name>]`
@@ -7226,7 +7244,8 @@ allow = []
     /// that far". The publisher is an id-only ticket that fails at once on a hermetic mesh.
     ///
     /// Deleting the `dial_refused` filter in `protocol_candidates` fails the zero-count assertion
-    /// and the source count.
+    /// and the source count; dropping the `skipped_revoked` context in `blob_fetch` fails the
+    /// "named source skipped" assertion.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_blob_fetch_never_dials_a_revoked_alternate_source() {
         tokio::time::timeout(std::time::Duration::from_secs(120), async {
@@ -7273,6 +7292,11 @@ allow = []
                 format!("{err:#}").contains("tried 2 sources"),
                 "the publisher and the live alternate only — the revoked one is not a source: \
                  {err:#}"
+            );
+            // …and the caller, who NAMED `stolen`, is told why it was not tried (#223 review).
+            assert!(
+                format!("{err:#}").contains("1 named source skipped: revoked on this node"),
+                "{err:#}"
             );
         })
         .await
