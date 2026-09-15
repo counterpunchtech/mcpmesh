@@ -3167,8 +3167,10 @@ pub const API_VERSION: &str = "1.65";
 /// longer dials a revoked device it learned from the swarm and an embedder protocol dial to one
 /// fails "rejected locally"; and `peer_revoke`, `device_revoke`, `device_revocation_import`,
 /// `org_revoke` and `roster_install` close connections this node OPENED to a device they revoke —
-/// an `open_session` pipe ends and a held `connect_protocol` connection closes with code 401, where
-/// through 64 both ran until the peer hung up. `severed` still counts only accepted connections.
+/// an `open_session` pipe ends and this node closes a held `connect_protocol` connection with code
+/// 401, where through 64 both ran until the peer hung up. `peer_remove` and a roster drop that
+/// revokes nothing refuse no dial and close nothing outbound. `severed` counts the ACCEPTED
+/// connections a revoke cut, exactly as through 64; the dialled connections it closes are not in it.
 /// Guard on `>= 65` before relying on an outbound session ending when its peer is revoked; to
 /// 62 with the self-enrollment EXIT and the surface an
 /// embedder needs to ship the ceremony at all (#214): [`Request::SelfEnrollDetach`] drops an

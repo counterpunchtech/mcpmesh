@@ -98,7 +98,7 @@ pub fn install_roster_view_and_sever(
         b"roster revoked",
         |eid, roster_user| mcpmesh_net::should_sever(eid, roster_user, &revoked, &active_devices),
     );
-    // (c) #229: close this node's OUTBOUND connections (and any other registered one) to devices
+    // (c) #229: close the connections this node DIALLED (the hook registry is outbound-only) to devices
     //     the new roster makes refused. Async (the refusal reads are redb, on the blocking pool)
     //     and this function is sync, so it is spawned; the gate is already swapped, so a dial racing
     //     it is refused at `before_connect` or at its `after_handshake` re-check. Every production

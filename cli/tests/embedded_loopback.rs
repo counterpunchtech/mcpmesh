@@ -2300,3 +2300,57 @@ async fn a_local_revoke_ends_an_outbound_open_session() {
     b.shutdown().await;
     a.shutdown().await;
 }
+
+/// #229 review: `peer_revoke`'s `severed` counts a live INBOUND session on a booted node.
+///
+/// The hook registry first tracked inbound connections too, and `sever_principals` runs its close
+/// pass before principal resolution. That pass closed the inbound session, its handler unwound and
+/// dropped its `Registration` while resolution sat on the blocking pool, and the inbound sever then
+/// counted nothing — `severed` read `0` for a session it had in fact cut, nondeterministically.
+/// Five runs, because a single run passes by luck often enough to hide it.
+///
+/// Mutation: registering inbound connections in `after_handshake` again fails at least one run.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_revoke_counts_the_inbound_session_it_severs() {
+    let mut seen = Vec::new();
+    for _ in 0..5 {
+        let (a, b, _ar, _br, paired) = paired_pair().await;
+        let mut a_ctl = a.control().await.expect("a control");
+        let session_ctl = b.control().await.expect("b session control");
+        let (reader, mut writer) = session_ctl
+            .open_session(paired.peer_nickname.clone(), "notes".into())
+            .await
+            .expect("open_session");
+        let mut lines = reader.into_inner();
+        let mut line = String::new();
+        writer
+            .write_all(
+                (json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+                    .to_string()
+                    + "\n")
+                    .as_bytes(),
+            )
+            .await
+            .expect("send initialize");
+        timeout(Duration::from_secs(10), lines.read_line(&mut line))
+            .await
+            .expect("initialize reply within 10s")
+            .expect("read initialize reply");
+        assert!(
+            line.contains("\"result\""),
+            "control: b holds a live session on a before the revoke: {line}"
+        );
+
+        let out = a_ctl
+            .peer_revoke(&format!("eid:{}", b.endpoint_id()), None)
+            .await
+            .expect("revoke b by eid");
+        seen.push(out.severed);
+        b.shutdown().await;
+        a.shutdown().await;
+    }
+    assert!(
+        seen.iter().all(|s| *s == 1),
+        "severed must count the one live inbound session every time: {seen:?}"
+    );
+}

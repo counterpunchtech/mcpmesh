@@ -1193,7 +1193,7 @@ impl MeshState {
         let _ = self.peer_hooks.set(h);
     }
 
-    /// Close every live connection — OUTBOUND ones included — to a device this node now refuses to
+    /// Close every live connection this node DIALLED to a device it now refuses to
     /// dial (#229). Every revoke path calls it AFTER its write. Returns how many were closed; `0` on
     /// a mesh with no hooks installed.
     pub(crate) async fn close_refused_peer_conns(&self) -> usize {

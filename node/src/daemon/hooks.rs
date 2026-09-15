@@ -27,14 +27,22 @@
 //! dials run in the Dialer's own `JoinSet`, not on the gossip actor loop, so an awaiting hook never
 //! stalls the actor (iroh-gossip#155).
 //!
-//! **One registry for every outbound sever.** `open_session`, embedder `connect_protocol`
-//! connections and gossip links all land here; [`close_refused`] is what the revoke paths call. The
-//! #215 MCP connection cache's own `close_to` is superseded by it.
+//! **One registry for every OUTBOUND sever.** Connections this node DIALS — `open_session`,
+//! embedder `connect_protocol` connections, gossip links it opened — land here; [`close_refused`] is
+//! what the revoke paths call. INBOUND connections are not registered: the accept loop's
+//! `ConnRegistry` already tracks and severs them, and counts them in `severed`. This registry will
+//! supersede the #215 MCP connection cache's own close-on-revoke once that lands on top of it.
 //!
-//! **Cost to a stranger.** Registration happens after the handshake and before any gate, so an
-//! unpaired peer that completes a QUIC handshake costs one map entry and one parked watcher task
-//! until its connection closes — which the accept loop's gate does at once. No blocking read runs
-//! for an inbound connection.
+//! **Cost.** Nothing runs for an inbound connection, so a stranger's handshake costs this module
+//! nothing. Each outbound non-pair dial costs two blocking-pool hops (`before_connect`, and the
+//! re-check in `after_handshake`) plus one parked watcher task for the connection's life.
+//!
+//! **No timeout.** Neither hook bounds its store read. A wedged redb store (a stuck fsync, a
+//! filesystem hang) therefore stalls EVERY non-pair dial this node makes — gossip's included —
+//! until the read returns; each caller's own dial timeout still applies around it. Refusing on a
+//! timeout would be the fail-closed choice but would turn a slow disk into a node-wide dial outage,
+//! and passing on one would dial a device the store may say is revoked; neither is better than
+//! waiting, so it waits.
 //!
 //! [`dial_refused`]: super::dial::dial_refused
 //! [`PeerStore::is_refused`]: crate::allowlist::PeerStore::is_refused
@@ -68,7 +76,12 @@ impl DialGate {
         Self { store, roster }
     }
 
-    /// [`refused_by`](super::dial::refused_by) on the blocking pool. A join failure refuses.
+    /// [`refused_by`](super::dial::refused_by) on the blocking pool. A read error refuses (inside
+    /// `refused_by`); a join failure refuses too.
+    ///
+    /// The join-failure arm is unpinned by a test: `refused_by` has no panicking path to trigger
+    /// without adding a test-only seam into the one revocation predicate, and `util::blocking` —
+    /// which maps a panicked task to `Err` — is shared with every other blocking call site.
     async fn refuses(&self, id: [u8; 32]) -> bool {
         let gate = self.clone();
         crate::util::blocking("join dial hook revocation check", move || {
@@ -79,7 +92,7 @@ impl DialGate {
     }
 }
 
-/// Every live non-pairing connection of this endpoint, both directions, by remote endpoint id.
+/// Every live non-pairing connection this endpoint DIALLED, by remote endpoint id.
 ///
 /// Bounded by live connections: each entry is removed by a watcher on the connection's own close.
 #[derive(Default)]
@@ -157,9 +170,15 @@ pub(crate) async fn close_refused(conns: &PeerConns, gate: &DialGate) -> usize {
     .await
     {
         Ok(r) => r,
+        // Two failure shapes, deliberately different:
+        // - a store READ ERROR is not seen here — `refused_by` answers it as refused (fail closed,
+        //   like the gate), so every registered connection that read failed for IS closed. Losing
+        //   outbound connections to a device whose revocation state cannot be read is the same
+        //   trade the gate makes inbound;
+        // - a JOIN failure (the blocking task panicked or was cancelled) closes NOTHING: there is
+        //   no answer for any id, and closing all of them would turn one panic into a node-wide
+        //   disconnect. New dials to a refused device are still vetoed by `before_connect`.
         Err(e) => {
-            // Not fail-closed: closing EVERY connection on a join failure would turn a panicked
-            // read into a node-wide disconnect. The dial veto still refuses new dials.
             tracing::warn!(%e, "revoke close pass failed; connections to refused devices stay open");
             return 0;
         }
@@ -170,7 +189,8 @@ pub(crate) async fn close_refused(conns: &PeerConns, gate: &DialGate) -> usize {
     conns.close_ids(&refused)
 }
 
-/// Proof that [`MeshHooks::arm`] ran. Only `arm` constructs it.
+/// Proof that [`MeshHooks::arm`] ran — on SOME instance; it does not name which. Only `arm`
+/// constructs it.
 pub(crate) struct Armed(());
 
 /// The hooks `build_endpoint` installs. Cloning shares the cell and the registry.
@@ -240,7 +260,12 @@ impl EndpointHooks for MeshHooks {
     }
 
     async fn after_handshake(&self, conn: &Connection) -> AfterHandshakeOutcome {
-        if conn.alpn() == ALPN_PAIR {
+        // OUTBOUND only, and never pairing. Inbound connections are the accept loop's: its gate
+        // refuses them with its own codes and `ConnRegistry` severs them (and COUNTS them, in
+        // `severed`). Registering them here too let the close pass cut an inbound session before
+        // the inbound sever could count it, so `severed` read 0 for a session it had cut (#229
+        // review).
+        if conn.side() != Side::Client || conn.alpn() == ALPN_PAIR {
             return AfterHandshakeOutcome::Accept;
         }
         let id = *conn.remote_id().as_bytes();
@@ -257,9 +282,8 @@ impl EndpointHooks for MeshHooks {
             closed.await;
             conns.remove(&id, key);
         });
-        // Outbound only: a dial that passed `before_connect` and was revoked while its
-        // handshake ran. Inbound connections are the gate's to refuse, with its own codes.
-        if conn.side() == Side::Client && self.refuses(id).await {
+        // A dial that passed `before_connect` and was revoked while its handshake ran.
+        if self.refuses(id).await {
             self.conns.remove(&id, key);
             return AfterHandshakeOutcome::Reject {
                 error_code: mcpmesh_net::CLOSE_UNAUTHORIZED.into(),
@@ -502,13 +526,13 @@ mod tests {
         }
     }
 
-    /// Every handshake-completed non-pair connection is registered, in BOTH directions, and the
+    /// Every OUTBOUND non-pair connection is registered, inbound and pairing ones are not, and the
     /// registry drains once the connections close — bounded memory.
     ///
-    /// Mutation: removing the close watcher leaves entries behind; removing the registration fails
-    /// the "while open" count.
+    /// Mutations: removing the close watcher leaves entries behind; removing the registration fails
+    /// the "while open" count; registering inbound connections fails the inbound count.
     #[tokio::test(flavor = "multi_thread")]
-    async fn the_registry_tracks_open_connections_and_drains_when_they_close() {
+    async fn the_registry_tracks_outbound_connections_and_drains_when_they_close() {
         let (store, _tmp) = store();
         let hooks = MeshHooks::new();
         hooks.arm(DialGate::new(store, Arc::new(RosterGate::empty())));
@@ -527,14 +551,17 @@ mod tests {
             "each outbound non-pair connection is registered; the pair one is not"
         );
 
-        // Inbound: the holder dials BACK into `a` (which accepts nothing, so the handshake
-        // completes and `a` then drops the incoming connection).
+        // Inbound: a plain endpoint dials INTO `a`. The accept loop's `ConnRegistry` owns inbound
+        // connections, so this registry must NOT count it — registering it here too made `severed`
+        // undercount (#229 review).
         let (a2, _) = (a.clone(), ());
+        let accepted = Arc::new(tokio::sync::Notify::new());
+        let acc2 = accepted.clone();
         tokio::spawn(async move {
             while let Some(inc) = a2.accept().await {
                 if let Ok(c) = inc.await {
-                    tokio::time::sleep(Duration::from_millis(300)).await;
-                    c.close(0u32.into(), b"bye");
+                    acc2.notify_one();
+                    c.closed().await;
                 }
             }
         });
@@ -544,15 +571,14 @@ mod tests {
             .await
             .unwrap();
         let inbound = dial(&back, &a, ALPN_MCP).await.expect("inbound dial");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while hooks.conns().len() != N + 1 {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "an INBOUND non-pair connection is registered too: {}",
-                hooks.conns().len()
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        tokio::time::timeout(Duration::from_secs(10), accepted.notified())
+            .await
+            .expect("control: `a` completed the inbound handshake (after_handshake ran)");
+        assert_eq!(
+            hooks.conns().len(),
+            N,
+            "an INBOUND connection must not be registered — only the {N} outbound ones"
+        );
 
         for c in open.drain(..) {
             c.close(0u32.into(), b"done");

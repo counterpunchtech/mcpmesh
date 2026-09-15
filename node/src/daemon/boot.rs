@@ -411,8 +411,9 @@ async fn boot_node(
     }
     let gate: Arc<dyn TrustGate> = Arc::new(ComposedGate::new(roster.clone(), pairs));
     // #229: ARM the dial hook as soon as its inputs exist — before `compose_roster_transport` below
-    // subscribes gossip with its bootstrap set, the first gated dial this boot makes (it takes the
-    // `Armed` proof, so that order is enforced by the compiler).
+    // subscribes gossip with its bootstrap set, the first gated dial this boot makes. It takes the
+    // `Armed` proof, so subscribing before ANY arm fails to compile; that it is THIS endpoint's hooks
+    // is by construction here (one `hooks` value), not by the type.
     let armed = hooks.arm(crate::daemon::hooks::DialGate::new(
         store.clone(),
         roster.clone(),
@@ -1290,7 +1291,8 @@ async fn compose_roster_transport(
     // come from nowhere but the plan, whose `GossipBootstrap` only `bootstrap::for_roster` builds.
     plan: Option<RosterTransportPlan>,
     // #229: subscribing dials the bootstrap set through the endpoint hook, which refuses every
-    // gated dial until armed. Requiring the proof makes "gossip before arm" fail to compile.
+    // gated dial until armed. Requiring the proof makes "gossip before any arm" fail to compile; the
+    // proof is not bound to a particular `MeshHooks`.
     _armed: &crate::daemon::hooks::Armed,
 ) -> (
     Option<iroh_gossip::net::Gossip>,
