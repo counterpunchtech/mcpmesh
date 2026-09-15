@@ -410,10 +410,10 @@ async fn boot_node(
         }
     }
     let gate: Arc<dyn TrustGate> = Arc::new(ComposedGate::new(roster.clone(), pairs));
-    // #229: ARM the dial hook as soon as its inputs exist — before `plan_roster_transport` /
-    // `compose_roster_transport` below subscribe gossip with its bootstrap set, which is the first
-    // gated dial this boot makes. Armed any later, those bootstrap dials would be refused.
-    hooks.arm(crate::daemon::hooks::DialGate::new(
+    // #229: ARM the dial hook as soon as its inputs exist — before `compose_roster_transport` below
+    // subscribes gossip with its bootstrap set, the first gated dial this boot makes (it takes the
+    // `Armed` proof, so that order is enforced by the compiler).
+    let armed = hooks.arm(crate::daemon::hooks::DialGate::new(
         store.clone(),
         roster.clone(),
     ));
@@ -457,7 +457,7 @@ async fn boot_node(
     // daemon spawns NEITHER (`None`) — no gossip at all.
     let plan = plan_roster_transport(&roster, &store, &cfg, roster_mode, &our_id).await;
     let (gossip, blobs, roster_topic, presence_topic) =
-        compose_roster_transport(&endpoint, plan).await;
+        compose_roster_transport(&endpoint, plan, &armed).await;
     let mesh = MeshState::new(
         endpoint,
         gate,
@@ -1289,6 +1289,9 @@ async fn compose_roster_transport(
     // #223 review: the only input besides the endpoint. No roster, no store: the bootstrap set can
     // come from nowhere but the plan, whose `GossipBootstrap` only `bootstrap::for_roster` builds.
     plan: Option<RosterTransportPlan>,
+    // #229: subscribing dials the bootstrap set through the endpoint hook, which refuses every
+    // gated dial until armed. Requiring the proof makes "gossip before arm" fail to compile.
+    _armed: &crate::daemon::hooks::Armed,
 ) -> (
     Option<iroh_gossip::net::Gossip>,
     Option<crate::roster::transport::RosterBlobs>,
@@ -1400,8 +1403,8 @@ pub(crate) mod bootstrap {
     /// `b64u:` identity — so gossip dialled exactly the devices `open_session` refuses. Takes the
     /// store and view rather than a predicate, so no caller can hand it a permissive one. Blocking.
     ///
-    /// Filters only the set WE hand gossip. The neighbours gossip learns from the swarm and dials
-    /// on its own are #229.
+    /// Filters only the set WE hand gossip. The neighbours gossip learns from the swarm and dials on
+    /// its own are refused by the endpoint hook instead (#229, `hooks::MeshHooks`).
     pub(crate) fn gossip_bootstrap(
         store: &PeerStore,
         view: Option<&mcpmesh_trust::roster::validate::RosterView>,

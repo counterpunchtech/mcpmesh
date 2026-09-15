@@ -150,6 +150,9 @@ pub(crate) async fn close_refused(conns: &PeerConns, gate: &DialGate) -> usize {
     conns.close_ids(&refused)
 }
 
+/// Proof that [`MeshHooks::arm`] ran. Only `arm` constructs it.
+pub(crate) struct Armed(());
+
 /// The hooks `build_endpoint` installs. Cloning shares the cell and the registry.
 #[derive(Clone, Default)]
 pub(crate) struct MeshHooks {
@@ -173,10 +176,14 @@ impl MeshHooks {
     }
 
     /// Install the gate. Once only; a second call is ignored (and logged), never a swap.
-    pub(crate) fn arm(&self, gate: DialGate) {
+    ///
+    /// Returns the [`Armed`] proof the gossip composition requires, so boot cannot subscribe gossip
+    /// (and dial its bootstrap set) on an endpoint whose hook still refuses everything.
+    pub(crate) fn arm(&self, gate: DialGate) -> Armed {
         if self.gate.set(gate).is_err() {
             tracing::warn!("endpoint dial hook armed twice; keeping the first gate");
         }
+        Armed(())
     }
 
     pub(crate) fn conns(&self) -> Arc<PeerConns> {
