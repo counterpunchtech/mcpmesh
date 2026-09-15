@@ -3138,6 +3138,20 @@ pub const API_VERSION: &str = "1.63";
 /// under, so neither can land between the check and the signature. Guard on `>= 63` before
 /// offering `user_key_export` on a device whose `self_user_key_held` is false. Crate-level a MINOR
 /// release of `mcpmesh-node` (0.54 → 0.55): `pairing::rendezvous::SignBindingFn` became async; to
+/// 64 when revocation began to hold on the OUTBOUND dial paths (#223) — no type changed:
+/// `peer_services` refuses (`-32000`, "is REVOKED on this node") a device the installed roster
+/// revoked and a roster device whose roster `user_id` is a revoked `b64u:` identity, where through
+/// 63 it checked only this node's own revocation tables; the reachability probe no longer dials a
+/// revoked peer and COMMITS NOTHING for it — no `reachability` frame with `source: "probe"`, and
+/// its `status.reachability` row is not refreshed (never probed reads `age_secs` absent), where
+/// through 63 every stale read dialled it and recorded `reachable: false`; `blob_fetch` never dials
+/// a revoked ticket publisher or named `from` source, and when the fetch then fails its message
+/// says how many named sources were skipped; `pair` refuses with `-32047` BEFORE dialling an invite
+/// whose embedded address names a different endpoint than its `inviter_id`, and `attest_to` refuses
+/// an offer shaped the same way and one naming a node this node revoked. `peer_diagnostics` and
+/// `peer_hint_clear` are unchanged — they dial nothing. Guard on `>= 64` before reading a missing
+/// probe frame for a revoked peer as "no change". Crate-level a MINOR release of `mcpmesh-node`
+/// (0.55 → 0.56): `roster::distribute::DistributionHost` gained the required `dial_refused`; to
 /// 62 with the self-enrollment EXIT and the surface an
 /// embedder needs to ship the ceremony at all (#214): [`Request::SelfEnrollDetach`] drops an
 /// adopted binding (the inverse of `pair { allow_self_enroll }`, and the only exit an enrolled
@@ -3396,7 +3410,7 @@ pub const API_VERSION: &str = "1.63";
 /// its REAL content is a meaning change to `reachable` — the field exists so the new meaning is
 /// observable at all. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 63;
+pub const API_MINOR: u32 = 64;
 
 #[cfg(test)]
 mod tests {
