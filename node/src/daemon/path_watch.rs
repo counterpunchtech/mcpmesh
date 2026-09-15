@@ -631,29 +631,85 @@ mod tests {
         (mesh, conn, eid, (dir, server, client))
     }
 
+    /// How long the #225 tests give a watcher's initial reading. An already-Direct reading returns
+    /// on `settle`'s first poll, so this only has to cover task scheduling — and it stays well
+    /// under the ~5s at which iroh sometimes emits a later `Selected` on a loopback connection.
+    const INITIAL_READING_WAIT: Duration = Duration::from_millis(1500);
+
+    /// Drain the events already queued on a test-side `path_events()` subscription; `true` if any
+    /// was a `Selected`.
+    async fn saw_selected(events: &mut iroh::endpoint::PathEventStream) -> bool {
+        use n0_future::StreamExt as _;
+        let mut selected = false;
+        while let Ok(Some(event)) = tokio::time::timeout(Duration::ZERO, events.next()).await {
+            selected |= matches!(event, iroh::endpoint::PathEvent::Selected { .. });
+        }
+        selected
+    }
+
     /// #225: a watcher that subscribes AFTER the path was selected must still report it.
     ///
     /// `path_events()` does not replay, so before the fix a watcher attached to a session whose
     /// relay->direct move had already happened received no `Selected` event and pushed nothing, for
     /// the life of the session. That was `live_path_events.rs` timing out at 120s under load: the
-    /// dial side subscribes only after the dial returns, and the punch won the race. Here the race
-    /// is not left to luck — the path is Direct before `spawn` is called, every time.
+    /// dial side subscribes only after the dial returns, and the punch won the race.
+    ///
+    /// The path is Direct before `spawn` is called, every time. What would otherwise be luck is a
+    /// LATER `Selected` event (iroh sometimes emits one ~5s in) driving the frame through the event
+    /// arm instead. So the test subscribes to the same connection's events BEFORE spawning, and
+    /// refuses a frame that arrived after a `Selected` it could have come from.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_path_selected_before_the_watcher_subscribes_is_still_pushed() {
         let (mesh, conn, eid, _guards) = an_already_direct_connection("frank").await;
         let mut rx = mesh.reach_bcast.subscribe();
+        let mut events = conn.path_events();
 
         let _watcher = spawn(mesh.clone(), eid, &conn);
 
-        let frame = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        let frame = tokio::time::timeout(INITIAL_READING_WAIT, rx.recv())
             .await
             .expect(
                 "a watcher attached to an already-Direct session must push its path — with no \
                  initial reading it waits for a Selected event that already happened",
             )
             .expect("broadcast channel alive");
+        assert!(
+            !saw_selected(&mut events).await,
+            "a Selected event arrived before the frame, so the frame proves nothing about the \
+             initial reading"
+        );
         assert_eq!(frame.peer.path, PeerPath::Direct);
         assert_eq!(frame.source, mcpmesh_local_api::ReachabilitySource::Session);
+    }
+
+    /// The INITIAL reading is deduplicated too: a second watcher on a session whose path is
+    /// already reported pushes nothing. Without this, every session opened to a peer would re-push
+    /// the path a consumer already holds.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_watcher_on_an_already_reported_path_emits_nothing() {
+        let (mesh, conn, eid, _guards) = an_already_direct_connection("ivan").await;
+        let mut rx = mesh.reach_bcast.subscribe();
+        let mut events = conn.path_events();
+
+        let _first = spawn(mesh.clone(), eid, &conn);
+        let frame = tokio::time::timeout(INITIAL_READING_WAIT, rx.recv())
+            .await
+            .expect("precondition: the first watcher's initial reading pushes the path")
+            .expect("broadcast channel alive");
+        assert_eq!(frame.peer.path, PeerPath::Direct);
+
+        let _second = spawn(mesh.clone(), eid, &conn);
+        let second = tokio::time::timeout(INITIAL_READING_WAIT, rx.recv()).await;
+        assert!(
+            !saw_selected(&mut events).await,
+            "a Selected event arrived during the test, so silence would not isolate the initial \
+             reading"
+        );
+        assert!(
+            second.is_err(),
+            "the second watcher's initial reading found the path unchanged and must push nothing, \
+             got {second:?}"
+        );
     }
 
     /// The initial reading and a later `Selected` for the SAME path must not both emit: the event
