@@ -46,6 +46,11 @@
 //! every registered connection to a newly refused device on the revoke verbs and roster installs; a
 //! connection closed that way reads as dead here.
 //!
+//! The hand-out check covers REUSE only. A session that dials for itself after waiting — its leader
+//! failed, or the shared connection had no stream credit — does not ask again; on a booted node
+//! #229's `before_connect` veto refuses that dial, and on an endpoint without the hooks (a mesh a
+//! test assembles by hand) nothing does.
+//!
 //! [`WeakConnectionHandle`]: iroh::endpoint::WeakConnectionHandle
 
 use std::collections::HashMap;
