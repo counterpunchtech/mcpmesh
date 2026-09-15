@@ -623,6 +623,14 @@ when this node applied it, the surviving local `nickname` if there is one, and a
 - `"local"` — *your* decision about someone else's device.
 - `"signed"` — a statement the device's **owner** issued about their own, with the verified
   `signer_user_id`. Only this one is evidence that the person themselves declared the device dead.
+- `"roster"` (`api_minor >= 64`, #223) — the installed roster's `revoked_endpoints`: your org's
+  decision, not yours. `revoked_at_epoch` is `0` (a roster carries no per-device time).
+- `"roster_identity"` (`api_minor >= 64`, #223) — a roster device whose roster `user_id` is a
+  `b64u:` identity you revoked; `reason` names that identity, and its own `b64u:` row is listed too.
+  `revoked_at_epoch` is that identity revocation's.
+
+These are exactly the devices this node refuses to dial, so a `reachability` row for one is never
+refreshed — match rows against this list. Treat an unknown `source` as a revocation.
 
 A row whose `principal` is a **`b64u:`** rather than an `eid:` is a revoked **identity** — every
 device of that person, including ones this node has never seen. `peer_revoke` on a `b64u:` records
@@ -754,7 +762,8 @@ been probed — render that as "checking…", not "offline".
 
 A peer this node has **revoked** is never probed (`api_minor >= 64`, #223): no dial, nothing
 committed, no `reachability` frame. Its row keeps whatever was measured before the revocation — or
-reads as never probed — so check `status.revoked` before rendering it.
+reads as never probed — so check `status.revoked` (which from 64 also lists roster refusals)
+before rendering it.
 
 Under the hood the daemon measures reachability with a trust-gated, peer-facing probe over the
 `mcpmesh/ping/1` ALPN: it dials the peer, and a **paired** peer answers one pong carrying its
@@ -1706,7 +1715,7 @@ Reference: [`cli/src/backends/spawn.rs`](../cli/src/backends/spawn.rs) (`run`),
 | `-32044` | `pair` — the invite line's own expiry has passed, checked before dialing (#159, `api_minor >= 36`). Ask for a fresh invite. |
 | `-32045` | `pair` — the inviter has **no outstanding invite at all**; its accept gate closed the dial (#159). The safe union of "expired, already used, or cancelled" — see the note below on why it is not split further. Ask for a fresh invite. |
 | `-32046` | `pair` — the inviter's machine could not be dialed (#159). The invite is untouched: check they are online and retry the SAME line. |
-| `-32047` | `pair` — **the address-swap defense fired**: the machine that answered is not the endpoint the invite names (#159). **Do not render this as "try again"** — get the invite again through a channel you trust. |
+| `-32047` | `pair` — **the address-swap defense fired**: the machine that answered is not the endpoint the invite names (#159), or — `api_minor >= 64`, #223 — the invite's embedded address names a different endpoint than its inviter id, refused before anything is dialled. **Do not render this as "try again"** — get the invite again through a channel you trust. |
 | `-32048` | `pair` — the invite asks to be called a name this node already uses for a different peer (#159). The redeemer-side mirror of `-32043`. Ask for an invite suggesting a different name. |
 | `-32049` | `pair` — the inviter refused and the cause is **deliberately withheld** (#159). Ask for a fresh invite. |
 | `-32050` | the request was **cancelled on purpose** before it finished — today, a `blob_fetch` that `blob_fetch_cancel` tripped (#172, `api_minor >= 44`). Not a failure: the caller asked for it. Partial chunks stay in the store, and are reclaimed only if this node configured `[blobs].gc_interval` (#80). |
@@ -1869,7 +1878,9 @@ things:
   revoked `b64u:` identity (through 63 only this node's own revocation tables were checked); the
   reachability probe never dials a revoked peer and commits nothing for it — no `source: "probe"`
   frame, no refreshed `status.reachability` row; `blob_fetch` never dials a revoked publisher or
-  named source; `pair` refuses an invite whose address names a different endpoint than its inviter
+  named source; `status.revoked` also lists roster refusals (`source` `"roster"` /
+  `"roster_identity"`), so a reachability row the probe no longer refreshes can be matched to its
+  revocation; `pair` refuses an invite whose address names a different endpoint than its inviter
   id with `-32047` before dialling; `attest_to` refuses a revoked or id-mismatched offer before
   dialling. `peer_diagnostics` and `peer_hint_clear` are unchanged. (Crate-level a MINOR release of
   `mcpmesh-node`: `roster::distribute::DistributionHost` gained the required `dial_refused`.)

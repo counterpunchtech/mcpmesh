@@ -445,8 +445,9 @@ async fn boot_node(
     // from the installed roster's device endpoints (the swarm forms as peers arrive — an empty
     // bootstrap is fine). The accept loop's gossip/blob arms dispatch to these handles. A pure-pairing
     // daemon spawns NEITHER (`None`) — no gossip at all.
+    let plan = plan_roster_transport(&roster, &store, &cfg, roster_mode, &our_id).await;
     let (gossip, blobs, roster_topic, presence_topic) =
-        compose_roster_transport(&endpoint, &roster, &store, &cfg, roster_mode, &our_id).await;
+        compose_roster_transport(&endpoint, plan).await;
     let mesh = MeshState::new(
         endpoint,
         gate,
@@ -1266,11 +1267,9 @@ pub(crate) fn alpns_for(roster_mode: bool) -> Vec<Vec<u8>> {
 /// [`subscribe`]: crate::roster::transport::subscribe
 async fn compose_roster_transport(
     endpoint: &iroh::Endpoint,
-    roster: &Arc<RosterGate>,
-    store: &Arc<PeerStore>,
-    cfg: &Config,
-    roster_mode: bool,
-    our_id: &iroh::EndpointId,
+    // #223 review: the only input besides the endpoint. No roster, no store: the bootstrap set can
+    // come from nowhere but the plan, whose `GossipBootstrap` only `bootstrap::for_roster` builds.
+    plan: Option<RosterTransportPlan>,
 ) -> (
     Option<iroh_gossip::net::Gossip>,
     Option<crate::roster::transport::RosterBlobs>,
@@ -1278,31 +1277,14 @@ async fn compose_roster_transport(
     Option<crate::roster::transport::RosterGossip>,
 ) {
     use crate::roster::transport;
-    if !roster_mode {
-        return (None, None, None, None);
-    }
-    // The org_id anchors the topic derivation: config's pinned org_id, else the loaded roster view's.
-    let Some(org_id) = cfg
-        .identity
-        .org_id
-        .clone()
-        .or_else(|| roster.view().map(|v| v.org_id().to_string()))
-    else {
-        tracing::warn!("roster mode but no org_id known; gossip distribution disabled");
+    let Some(RosterTransportPlan { org_id, bootstrap }) = plan else {
         return (None, None, None, None);
     };
     let gossip = transport::spawn_gossip(endpoint);
     let blobs = transport::RosterBlobs::new(endpoint);
-    // Bootstrap from the installed roster's device endpoints (excluding ourselves). BOTH the roster
-    // and presence topics bootstrap from the SAME peer set — the swarm forms as peers
-    // arrive, so an empty bootstrap is fine (subscribe does not block on a neighbor).
-    let (store_c, view, me) = (store.clone(), roster.view(), *our_id.as_bytes());
-    let bootstrap: Vec<iroh::EndpointId> = blocking("join gossip bootstrap filter", move || {
-        gossip_bootstrap(&store_c, view.as_deref(), &me)
-    })
-    .await
-    // Fails CLOSED: a join error bootstraps from nobody, which the swarm tolerates (see above).
-    .unwrap_or_default();
+    // BOTH the roster and presence topics bootstrap from the SAME peer set — the swarm forms as
+    // peers arrive, so an empty bootstrap is fine (subscribe does not block on a neighbor).
+    let bootstrap = bootstrap.into_ids();
     let roster_topic = match transport::subscribe(
         &gossip,
         transport::roster_topic_bytes(&org_id),
@@ -1331,29 +1313,107 @@ async fn compose_roster_transport(
     (Some(gossip), Some(blobs), roster_topic, presence_topic)
 }
 
-/// The gossip BOOTSTRAP set (#223): the installed roster's device endpoints, minus ourselves, minus
-/// every device the OUTBOUND revocation predicate refuses.
+/// What [`compose_roster_transport`] subscribes with, decided before anything is spawned (#223).
+pub(crate) struct RosterTransportPlan {
+    pub(crate) org_id: String,
+    pub(crate) bootstrap: bootstrap::GossipBootstrap,
+}
+
+/// The roster-mode transport PLAN: `None` for a pure-pairing daemon or when no org_id is resolvable
+/// (distribution disabled, with a warning), else the topic anchor and the FILTERED bootstrap set.
 ///
-/// `device_endpoints()` already drops the roster's own `revoked_endpoints`, but it keeps a device
-/// this node `peer_revoke`d and every device of a roster user spelled as a revoked `b64u:` identity
-/// — so gossip dialled exactly the devices `open_session` refuses. Takes the store and view rather
-/// than a predicate, so no caller can hand it a permissive one. Blocking (redb).
-///
-/// Filters only the set WE hand gossip. The neighbours gossip learns from the swarm and dials on
-/// its own are #229.
-pub(crate) fn gossip_bootstrap(
-    store: &PeerStore,
-    view: Option<&mcpmesh_trust::roster::validate::RosterView>,
-    our_id: &[u8; 32],
-) -> Vec<iroh::EndpointId> {
-    let Some(v) = view else {
-        return Vec::new();
+/// Split from the spawn so a test can assert the bootstrap set the daemon actually subscribes with.
+pub(crate) async fn plan_roster_transport(
+    roster: &Arc<RosterGate>,
+    store: &Arc<PeerStore>,
+    cfg: &Config,
+    roster_mode: bool,
+    our_id: &iroh::EndpointId,
+) -> Option<RosterTransportPlan> {
+    if !roster_mode {
+        return None;
+    }
+    // The org_id anchors the topic derivation: config's pinned org_id, else the loaded roster view's.
+    let Some(org_id) = cfg
+        .identity
+        .org_id
+        .clone()
+        .or_else(|| roster.view().map(|v| v.org_id().to_string()))
+    else {
+        tracing::warn!("roster mode but no org_id known; gossip distribution disabled");
+        return None;
     };
-    v.device_endpoints()
-        .filter(|d| *d != our_id)
-        .filter(|d| !crate::daemon::dial::refused_by(store, Some(v), d))
-        .filter_map(|d| iroh::EndpointId::from_bytes(d).ok())
-        .collect()
+    Some(RosterTransportPlan {
+        org_id,
+        bootstrap: bootstrap::for_roster(roster, store, our_id).await,
+    })
+}
+
+/// The gossip bootstrap set, as a type only this module can build (#223 review).
+///
+/// The first fix filtered a helper while the call site stayed free to pass `device_endpoints()`
+/// unfiltered — and reverting it to that passed every test. `GossipBootstrap`'s field is private to
+/// this module, so the only way to obtain one is [`gossip_bootstrap`] / [`for_roster`].
+pub(crate) mod bootstrap {
+    use std::sync::Arc;
+
+    use crate::allowlist::PeerStore;
+    use crate::roster::gate::RosterGate;
+
+    /// A bootstrap set that has been through the outbound revocation filter.
+    pub(crate) struct GossipBootstrap(Vec<iroh::EndpointId>);
+
+    impl GossipBootstrap {
+        #[cfg(test)]
+        pub(crate) fn ids(&self) -> &[iroh::EndpointId] {
+            &self.0
+        }
+        pub(crate) fn into_ids(self) -> Vec<iroh::EndpointId> {
+            self.0
+        }
+    }
+
+    /// The gossip BOOTSTRAP set (#223): the installed roster's device endpoints, minus ourselves,
+    /// minus every device the OUTBOUND revocation predicate refuses.
+    ///
+    /// `device_endpoints()` already drops the roster's own `revoked_endpoints`, but it keeps a
+    /// device this node `peer_revoke`d and every device of a roster user spelled as a revoked
+    /// `b64u:` identity — so gossip dialled exactly the devices `open_session` refuses. Takes the
+    /// store and view rather than a predicate, so no caller can hand it a permissive one. Blocking.
+    ///
+    /// Filters only the set WE hand gossip. The neighbours gossip learns from the swarm and dials
+    /// on its own are #229.
+    pub(crate) fn gossip_bootstrap(
+        store: &PeerStore,
+        view: Option<&mcpmesh_trust::roster::validate::RosterView>,
+        our_id: &[u8; 32],
+    ) -> GossipBootstrap {
+        let Some(v) = view else {
+            return GossipBootstrap(Vec::new());
+        };
+        GossipBootstrap(
+            v.device_endpoints()
+                .filter(|d| *d != our_id)
+                .filter(|d| !crate::daemon::dial::refused_by(store, Some(v), d))
+                .filter_map(|d| iroh::EndpointId::from_bytes(d).ok())
+                .collect(),
+        )
+    }
+
+    /// [`gossip_bootstrap`] over the live roster gate, on the blocking pool. A join error
+    /// bootstraps from nobody — fail CLOSED, and the swarm tolerates an empty bootstrap.
+    pub(crate) async fn for_roster(
+        roster: &Arc<RosterGate>,
+        store: &Arc<PeerStore>,
+        our_id: &iroh::EndpointId,
+    ) -> GossipBootstrap {
+        let (store, view, me) = (store.clone(), roster.view(), *our_id.as_bytes());
+        crate::util::blocking("join gossip bootstrap filter", move || {
+            gossip_bootstrap(&store, view.as_deref(), &me)
+        })
+        .await
+        .unwrap_or_else(|_| GossipBootstrap(Vec::new()))
+    }
 }
 
 #[cfg(test)]

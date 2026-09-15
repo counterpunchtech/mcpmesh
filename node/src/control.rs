@@ -1347,6 +1347,58 @@ fn respond<T: serde::Serialize>(id: Value, method: &str, r: anyhow::Result<T>) -
     }
 }
 
+/// The `status.revoked` rows the installed ROSTER contributes (#223): its `revoked_endpoints`
+/// (`source: "roster"`), and each active roster device whose roster `user_id` is a revoked `b64u:`
+/// identity (`source: "roster_identity"`, the identity in `reason`). The same two roster clauses
+/// `dial_refused` applies, read from the same view. Empty without a roster.
+fn roster_revocations(
+    mesh: &crate::daemon::MeshState,
+    rows: &[crate::allowlist::PeerEntry],
+) -> Vec<mcpmesh_local_api::RevokedEndpoint> {
+    let Some(view) = mesh.roster.view() else {
+        return Vec::new();
+    };
+    let nickname = |id: &[u8; 32]| {
+        rows.iter()
+            .find(|e| &e.endpoint_id == id)
+            .map(|e| e.nickname.clone())
+    };
+    let mut out: Vec<mcpmesh_local_api::RevokedEndpoint> = view
+        .revoked_endpoints()
+        .map(|id| mcpmesh_local_api::RevokedEndpoint {
+            principal: mcpmesh_net::EndpointId::from_bytes(*id).principal(),
+            revoked_at_epoch: 0,
+            source: "roster".into(),
+            signer_user_id: None,
+            reason: None,
+            nickname: nickname(id),
+        })
+        .collect();
+    for id in view.device_endpoints() {
+        let Some(d) = view.resolve(id) else { continue };
+        if !mesh.store.is_roster_user_revoked(&d.user_id) {
+            continue;
+        }
+        let revoked_at_epoch = mesh
+            .store
+            .list_revoked_users()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|(uid, _)| uid == &d.user_id)
+            .map(|(_, r)| r.revoked_at)
+            .unwrap_or(0);
+        out.push(mcpmesh_local_api::RevokedEndpoint {
+            principal: mcpmesh_net::EndpointId::from_bytes(*id).principal(),
+            revoked_at_epoch,
+            source: "roster_identity".into(),
+            signer_user_id: None,
+            reason: Some(format!("device of revoked identity {}", d.user_id)),
+            nickname: nickname(id),
+        });
+    }
+    out
+}
+
 /// Map a `()`-returning control verb's success to the empty-object result the wire always carried
 /// (`serde_json::to_value(())` would yield `null`, not `{}`).
 fn unit((): ()) -> Value {
@@ -1539,7 +1591,21 @@ pub(crate) fn status_result(state: &DaemonState) -> Result<StatusResult> {
                             nickname: None,
                         }),
                 )
-                .collect()
+                // …plus what the ROSTER makes this node refuse (#223 review). Every device listed
+                // here is one `dial_refused` refuses, so its reachability row is never refreshed
+                // again; leaving the roster half out made that row look merely stale.
+                .chain(roster_revocations(mesh, &rows))
+                .fold(
+                    Vec::new(),
+                    |mut acc: Vec<mcpmesh_local_api::RevokedEndpoint>, r| {
+                        // A device revoked by this node AND by the roster is one row: the local one,
+                        // which came first and carries the operator's own reason.
+                        if !acc.iter().any(|x| x.principal == r.principal) {
+                            acc.push(r);
+                        }
+                        acc
+                    },
+                )
         })
         .unwrap_or_default();
     Ok(StatusResult {

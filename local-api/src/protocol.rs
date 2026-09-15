@@ -548,7 +548,10 @@ pub struct RevokedEndpoint {
     /// `"local"` — this operator's own decision about someone else's device — or `"signed"`, a
     /// statement the device's OWNER issued about their own. Two different claims, and an operator
     /// reading this list needs to tell them apart: only the second is evidence that the person
-    /// themselves declared the device dead.
+    /// themselves declared the device dead. From `api_minor >= 64` (#223) also `"roster"` — the
+    /// installed roster's `revoked_endpoints`, with `revoked_at_epoch` 0 — and `"roster_identity"`,
+    /// a roster device whose roster `user_id` is a revoked `b64u:` identity (named in `reason`).
+    /// Treat an unknown value as a revocation.
     pub source: String,
     /// For `"signed"`: the verified `b64u:` that signed it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2892,7 +2895,9 @@ pub const ERR_INVITE_NOT_LIVE: i64 = -32045;
 pub const ERR_INVITER_UNREACHABLE: i64 = -32046;
 
 /// **The address-swap defense fired**: the TLS-authenticated peer is not the endpoint the invite
-/// names (#159).
+/// names (#159) — or, from `api_minor >= 64` (#223), the invite's embedded address names a
+/// different endpoint than its `inviter_id`, refused BEFORE dialling so the named endpoint never
+/// sees a handshake.
 ///
 /// The one refusal here that must NOT be rendered as "try again". Something answered in place of
 /// the machine the invite identifies — a substituted address, or a forged invite. An embedder that
@@ -3041,7 +3046,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   thirty have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.63";
+pub const API_VERSION: &str = "1.64";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -3144,7 +3149,11 @@ pub const API_VERSION: &str = "1.63";
 /// 63 it checked only this node's own revocation tables; the reachability probe no longer dials a
 /// revoked peer and COMMITS NOTHING for it — no `reachability` frame with `source: "probe"`, and
 /// its `status.reachability` row is not refreshed (never probed reads `age_secs` absent), where
-/// through 63 every stale read dialled it and recorded `reachable: false`; `blob_fetch` never dials
+/// through 63 every stale read dialled it and committed whatever came back — including
+/// `reachable: true` from a revoked device that still pairs this node, since that device answers
+/// the ping; `status.revoked` also lists roster refusals (`source: "roster"` for the roster's
+/// `revoked_endpoints`, `"roster_identity"` for a roster device under a revoked `b64u:` user), so a
+/// row that probe no longer refreshes can be matched to its revocation; `blob_fetch` never dials
 /// a revoked ticket publisher or named `from` source, and when the fetch then fails its message
 /// says how many named sources were skipped; `pair` refuses with `-32047` BEFORE dialling an invite
 /// whose embedded address names a different endpoint than its `inviter_id`, and `attest_to` refuses
@@ -3419,6 +3428,13 @@ mod tests {
     /// #64: the path field's wire shape, and its ADDITIVE default. A row from an older daemon has
     /// no `path` key at all and must land on `Unknown` — never on `Direct`, which would invent a
     /// privacy guarantee that daemon never made.
+    /// #223 review: `API_VERSION` is the string form of `API_MINOR`, and a bump that edited only one
+    /// of them shipped once. Pinned so it cannot again.
+    #[test]
+    fn api_version_is_the_string_form_of_api_minor() {
+        assert_eq!(API_VERSION, format!("1.{API_MINOR}"));
+    }
+
     #[test]
     fn peer_path_tags_and_defaults_to_unknown() {
         let tagged = |p: PeerPath| serde_json::to_value(p).unwrap();
