@@ -145,7 +145,7 @@ the dial falls through to a fresh connection.
   (`decide` already suppresses duplicates against the cache, so a per-session watcher would only
   cost tasks). **Sever did NOT reach these connections** (corrected in review):
   `ConnRegistry::sever_matching` holds only connections this node ACCEPTED. As built, #229's
-  endpoint hooks register every non-pairing connection in both directions and close those to a
+  endpoint hooks register every non-pairing OUTBOUND connection and close those to a
   newly refused device on the revoke verbs and roster installs, which covers the cached MCP
   connection; see "As built".
 - **Racing dials**: consulted before `race_dial`; the winner is recorded. A race in flight while
