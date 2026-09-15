@@ -3,8 +3,9 @@
 Date: 2026-09-14
 Issue: #215 (`Long-lived node reaches 6.3 GB and 70% of a core on macOS: iroh#4390's unbounded
 pending_open_paths, unfixed in every released iroh`)
-Release: 0.54.0 (**MINOR** — see Versioning). Nothing in this document is shipped yet; it is the
-design and the judgement the reply to #215 rests on.
+Release: 0.58.0 (**MINOR** — see Versioning). Written as the design the reply to #215 rests on;
+what shipped differs, and **"As built" near the end is the authoritative description** — option B
+was built and removed, and revocation of the shared connection is #229's close pass.
 
 ## The problem, restated in our terms
 
@@ -254,6 +255,13 @@ Every claim above that reads "exactly K = 1" is the design, not the build. What 
   row with no pong — since #225 at the moment the session opens — and `peer_services` answered `[]`
   from it for up to a TTL. The field marks whether a row carries a pong, and `peer_services` treats
   a reachable row without one as stale.
+- **A superseded probe keeps its pong** (final review). The probe `peer_services` starts routinely
+  loses the commit race to the watcher's first reading, which takes a later ticket; the Superseded
+  arm used to return the watcher's pong-less row and discard the pong (`[]` in 9 runs of 10). It now
+  merges `meta`/`services`/`pong_at` into that row under the same lock, leaving `probed_at` and the
+  tickets the winner's. A probe that fetches no pong (throttled) returns the pong-less row, and
+  `peer_services` refuses on it, retryably, rather than answering `[]`. `ReachEntry` became
+  `#[non_exhaustive]` in the same break that added `pong_at`.
 - **Revocation — three guards.** (1) The dial paths ask `dial_refused` before the cache
   (`refuse_if_revoked`; `hinted_addrs` for a race). (2) The cache asks it again at the moment it hands
   a connection out, which covers a session that passed (1) and then waited on another caller's dial
@@ -275,7 +283,8 @@ Every claim above that reads "exactly K = 1" is the design, not the build. What 
 
 `API_MINOR` 66: no request/response shape changed, but two meanings did — a connection-level event
 ends every session to that device at once, and `peer_services` requires a row that carries a pong.
-`ReachEntry` (pub, in `mcpmesh-node`) gained `pong_at`, which breaks code constructing it. Beyond
+`ReachEntry` (pub, in `mcpmesh-node`) gained `pong_at` and became `#[non_exhaustive]`, which breaks
+code constructing it — a MINOR release, 0.57 → 0.58. Beyond
 those, the observable topology changes — N sessions to a peer become one connection — and #210's
 precedent is that an observable behaviour change for existing deployments goes out as MINOR with
 release notes that say so, rather than as a PATCH that reads as routine. The release notes must

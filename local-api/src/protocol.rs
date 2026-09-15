@@ -3179,11 +3179,16 @@ pub const API_VERSION: &str = "1.66";
 /// when sessions to one peer began SHARING one QUIC connection (#215) — no type in this file
 /// changed; two meanings did. A connection-level event (the peer closing, an idle timeout, a
 /// revoke's close pass) now ends EVERY `open_session` pipe to that device at once, not one. And
-/// `peer_services` answers only from a cached row that carries a pong: a live session's path watcher
-/// writes a reachable row with none, and through 65 this verb answered `[]` from it for up to a TTL,
-/// indistinguishable from "offers you nothing". Guard on `>= 66` before treating an empty
-/// `peer_services` answer as "offers nothing". Crate-level: `mcpmesh_node::daemon::ReachEntry` gained
-/// the pub field `pong_at`; to
+/// `peer_services` answers only from a pong: a live session's path watcher writes a reachable row
+/// with no services in it, and through 65 this verb answered `[]` from that row for up to a TTL,
+/// indistinguishable from "offers you nothing". From 66 an empty list means the peer's pong named no
+/// services, and a probe that fetched no pong fails retryably ("could not be fetched just now")
+/// rather than answering `[]`. Guard on `>= 66` before treating an empty `peer_services` answer as
+/// "offers nothing". A peer that dies without closing its connection changes `open_session`'s
+/// failure shape too: a session to it opens at once on the still-open shared connection and ends
+/// (EOF) at the idle timeout, where through 65 it failed at open with `-32055`. Crate-level, a
+/// MINOR release of `mcpmesh-node` (0.57 → 0.58): `daemon::ReachEntry` gained the pub field
+/// `pong_at` and became `#[non_exhaustive]`; to
 /// 62 with the self-enrollment EXIT and the surface an
 /// embedder needs to ship the ceremony at all (#214): [`Request::SelfEnrollDetach`] drops an
 /// adopted binding (the inverse of `pair { allow_self_enroll }`, and the only exit an enrolled
