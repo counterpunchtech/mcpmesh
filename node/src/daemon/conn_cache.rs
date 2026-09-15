@@ -115,8 +115,13 @@ impl McpConnCache {
         Self::default()
     }
 
+    /// The map, recovering from a poisoned lock the way `DialLead::drop` does: it is plain data, so
+    /// the value behind the poison is still coherent, and a panic in one caller must not turn every
+    /// later `open_session` into a panic too.
     fn map(&self) -> MutexGuard<'_, HashMap<[u8; 32], Slot>> {
-        self.inner.lock().expect("conn cache lock not poisoned")
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// The live connection to `peer`, if the cache holds one that still upgrades and is not closed.
@@ -217,7 +222,7 @@ impl McpConnCache {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<(SessionTransport, Connection)>>,
         R: Fn([u8; 32]) -> RFut,
-        RFut: std::future::Future<Output = bool>,
+        RFut: std::future::Future<Output = Result<bool>>,
     {
         let mut leader_failure: Option<Arc<str>> = None;
         let claimed = self.claim_loop(peers, refused, dial, &mut leader_failure);
@@ -244,7 +249,7 @@ impl McpConnCache {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<(SessionTransport, Connection)>>,
         R: Fn([u8; 32]) -> RFut,
-        RFut: std::future::Future<Output = bool>,
+        RFut: std::future::Future<Output = Result<bool>>,
     {
         let mut dial = Some(dial);
         let mut peers = peers.to_vec();
@@ -256,23 +261,39 @@ impl McpConnCache {
                 // rest of a person's devices stay reachable; with none left, the session is refused.
                 // The connection itself is left for the revoke paths to close — other sessions on
                 // it are theirs to end, not this caller's.
-                Claim::Live(peer, _) if refused(peer).await => {
-                    peers.retain(|p| *p != peer);
-                    anyhow::ensure!(
-                        !peers.is_empty(),
-                        "the device this session would reuse a connection to is REVOKED on this node"
-                    );
-                }
-                Claim::Live(peer, conn) => match self.open_on(peer, &conn).await {
-                    Stream::Open(t) => return Ok(Opened::Reused(t)),
-                    // The entry was forgotten; the next claim leads.
-                    Stream::Stale => {}
-                    Stream::Saturated => {
-                        let dial = dial.take().expect("a caller dials at most once");
-                        let (transport, conn) = dial().await?;
-                        return Ok(Opened::Fresh(transport, conn));
+                //
+                // A check that could not run refuses this reuse (fail closed) and says so, rather than
+                // calling a device it knows nothing about revoked.
+                Claim::Live(peer, conn) => {
+                    match refused(peer).await {
+                        Ok(false) => {}
+                        Ok(true) => {
+                            peers.retain(|p| *p != peer);
+                            anyhow::ensure!(
+                                !peers.is_empty(),
+                                "the device this session would reuse a connection to is REVOKED \
+                                 on this node"
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            return Err(e.context(
+                                "the revocation check failed, so this session does not reuse the \
+                                 cached connection",
+                            ));
+                        }
                     }
-                },
+                    match self.open_on(peer, &conn).await {
+                        Stream::Open(t) => return Ok(Opened::Reused(t)),
+                        // The entry was forgotten; the next claim leads.
+                        Stream::Stale => {}
+                        Stream::Saturated => {
+                            let dial = dial.take().expect("a caller dials at most once");
+                            let (transport, conn) = dial().await?;
+                            return Ok(Opened::Fresh(transport, conn));
+                        }
+                    }
+                }
                 Claim::Wait(mut rx) => {
                     // Ok: the leader failed and said why. Err: it settled, or was cancelled.
                     // Either way, look again.
@@ -604,8 +625,8 @@ pub(crate) mod testpeer {
 mod tests {
     /// The `refused` predicate for tests that drive `session_on` directly over devices nothing
     /// revokes.
-    async fn never_refused(_: [u8; 32]) -> bool {
-        false
+    async fn never_refused(_: [u8; 32]) -> anyhow::Result<bool> {
+        Ok(false)
     }
     use std::sync::atomic::Ordering;
 
@@ -858,7 +879,7 @@ mod tests {
     }
 
     /// A leader that FAILS must not strand its waiters: the slot is cleared on drop and the waiter
-    /// dials for itself. Mutation: remove the slot removal in `DialGuard::drop` → the follower
+    /// dials for itself. Mutation: remove the slot removal in `DialLead::drop` → the follower
     /// waits forever (bounded here by the timeout).
     #[tokio::test(flavor = "multi_thread")]
     async fn a_failed_leader_releases_its_waiters() {
@@ -918,7 +939,7 @@ mod tests {
     /// A leader CANCELLED mid-dial — its `open_session` control connection dropped, its future
     /// with it — must not strand its waiters either. Same `Drop` path as a failed leader, pinned
     /// separately because the module doc claims both and a cancelled future never reaches the
-    /// `Err` arm. Mutation: remove the slot removal in `DialGuard::drop` → the follower waits out
+    /// `Err` arm. Mutation: remove the slot removal in `DialLead::drop` → the follower waits out
     /// the 10s bound.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_cancelled_leader_releases_its_waiters() {
@@ -1228,6 +1249,42 @@ mod tests {
             1,
             "nothing new reached the revoked device"
         );
+    }
+
+    /// A revocation check that FAILS (a join error on the blocking pool) refuses the reuse and says
+    /// the check failed — never that a device nobody revoked is REVOKED. Mutation: fold the error
+    /// into `Ok(true)` → the message claims revocation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_revocation_check_refuses_reuse_without_calling_the_device_revoked() {
+        use crate::daemon::dial::{DIAL_TIMEOUT, connect_with_timeout};
+        let dir = tempfile::tempdir().unwrap();
+        let me = dialer_principal();
+        let peer = loopback_peer(dir.path(), 71, dialer_id(), &[("echo", &[me.as_str()])]).await;
+        let mesh = dialer_mesh(dir.path(), &peer).await;
+        let (endpoint, addr) = (mesh.endpoint.clone(), peer.addr.clone());
+        let _first = mesh
+            .conn_cache
+            .session_on(&[peer.id], DIAL_TIMEOUT, never_refused, || async move {
+                connect_with_timeout(&endpoint, addr, "echo", DIAL_TIMEOUT, None).await
+            })
+            .await
+            .expect("first session caches a connection");
+
+        let err = match mesh
+            .conn_cache
+            .session_on(
+                &[peer.id],
+                DIAL_TIMEOUT,
+                |_| async { Err(anyhow::anyhow!("join error")) },
+                || async { unreachable!("a live connection is claimed, nothing dials") },
+            )
+            .await
+        {
+            Ok(_) => panic!("a failed check must refuse the reuse"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(err.contains("revocation check failed"), "{err}");
+        assert!(!err.contains("REVOKED"), "must not claim revocation: {err}");
     }
 
     /// `peer_revoke` closes the session THIS node opened to the device, not only the ones it

@@ -415,14 +415,14 @@ async fn race_or_reuse(
     Ok(opened_session(mesh, opened))
 }
 
-/// [`dial_refused`] on the blocking pool, for the connection cache's hand-out check. Fails CLOSED
-/// on a join error, like every revocation read.
-async fn refused_now(mesh: Arc<MeshState>, id: [u8; 32]) -> bool {
+/// [`dial_refused`] on the blocking pool, for the connection cache's hand-out check. A join error is
+/// an `Err`, which the cache treats as a refusal (fail closed) and reports as a failed check — not
+/// as a revocation, since nothing says the device was revoked.
+async fn refused_now(mesh: Arc<MeshState>, id: [u8; 32]) -> Result<bool> {
     crate::util::blocking("join reuse revocation check", move || {
         dial_refused(&mesh, &id)
     })
     .await
-    .unwrap_or(true)
 }
 
 /// A session from the cache: a reused stream as is, a fresh connection with its path watcher.
