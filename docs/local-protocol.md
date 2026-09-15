@@ -184,7 +184,7 @@ Methods split into two groups by audience:
 | `unregister_service` | `{name}` — remove a service registration (#50), the mirror of `register_service`: drops the whole `[services.<name>]` entry (allow included) + any ephemeral registration, then hot-reloads. Idempotent; unknown name → clean no-op. In-flight sessions finish; no new ones admitted. | `{}` (ack) |
 | `peer_diagnostics` | `{peer}` — dump the DURABLE state this node stores for one peer (#140, `api_minor >= 33`): the persisted dial hint verbatim, whether it is actually usable (an unparseable or id-mismatched hint is silently discarded at every dial), the addresses inside it, the pairing stamp, and the live reachability row. **The one verb that deliberately carries transport vocabulary** — see the note below. Read-only: probes nothing, dials nothing, writes nothing. | `PeerDiagnosticsResult` |
 | `peer_hint_clear` | `{peer}` — FORGET this node's persisted dial hint(s) for a peer (#140, `api_minor >= 59`). An experiment tool, **not** a policy change: nothing clears a hint automatically. `PeerEntry.last_addr` is the only durable per-peer state on this node's disk **that the dial path reads**, and the only such state a long-lived pairing carries that a freshly paired identity does not — nothing rewrites it for a RELAY-ONLY connection, since `observed_for` declines to store a relay URL and "learned nothing" means leave alone. A `b64u:` user_id clears **every** device of that person (the racing dial path attaches a hint per device, so clearing one would leave the pairing still addressing from stored state). Idempotent (`cleared: 0` when there was none); an unknown peer — including an `eid:` this node never paired with — is an error (`-32000`), never a silent success. Audited as a `trust` event keyed on the `eid:`. **Not harmless:** with `[network] relay_mode = "disabled"` there is no discovery at all and the hint was the only way to reach that peer, so clearing it makes the peer unreachable until you re-pair. There is no `peer_hint_set` — the removed hints come back in `forgotten`, which is the only undo. | `{cleared, forgotten}` |
-| `peer_services` | `{peer}` — discover which services a paired `peer` (nickname / `eid:` / `b64u:`) CURRENTLY grants you (#52): dials the peer over `mcpmesh/ping/1` and returns `{services:[…]}` — the names whose allow admits YOUR principal (only yours, never the peer's full registry). Refuses a REVOKED peer before dialling; from `api_minor >= 64` (#223) that includes a device the installed roster revoked and a roster device under a revoked `b64u:` identity. **Reuses a reachability-cache entry younger than ~20s rather than always dialing (#89)** — an unconditional probe collided with the `mcpmesh/ping/1` rate limiter, and a refused probe is reported as unreachable, so polling this verb faster than ~1/s made a healthy peer appear offline. Freshness is now the same contract `status` gives. **Answered from the LIVE service registry — the same one the accept path authorizes from (#100, `api_minor >= 17`). A service present in `config.toml` but not yet loaded is NOT reported: it would be refused on connect, which a caller cannot distinguish from a network failure. `status` likewise lists only live services.** | `{services:[…]}` |
+| `peer_services` | `{peer}` — discover which services a paired `peer` (nickname / `eid:` / `b64u:`) CURRENTLY grants you (#52): dials the peer over `mcpmesh/ping/1` and returns `{services:[…]}` — the names whose allow admits YOUR principal (only yours, never the peer's full registry). Refuses a REVOKED peer before dialling; from `api_minor >= 64` (#223) that includes a device the installed roster revoked and a roster device under a revoked `b64u:` identity. **Reuses a reachability-cache entry younger than ~20s rather than always dialing (#89)** — but only one that carries a pong (`api_minor >= 66`, #215): a reachable row written by a live session's path watcher carries none, and through 65 this verb answered `[]` from it for up to ~20s after a session opened, indistinguishable from "offers you nothing" — an unconditional probe collided with the `mcpmesh/ping/1` rate limiter, and a refused probe is reported as unreachable, so polling this verb faster than ~1/s made a healthy peer appear offline. Freshness is now the same contract `status` gives. **Answered from the LIVE service registry — the same one the accept path authorizes from (#100, `api_minor >= 17`). A service present in `config.toml` but not yet loaded is NOT reported: it would be refused on connect, which a caller cannot distinguish from a network failure. `status` likewise lists only live services.** | `{services:[…]}` |
 | `set_relays` | `{relay_urls}` — set this node's CUSTOM relay set LIVE (#53, `api_minor >= 9`): each URL must parse as an iroh relay URL (empty list → error; disable relays via a `relay_mode="disabled"` restart). When the node is already `relay_mode="custom"`, the daemon diffs against the running endpoint and applies the delta with iroh's live `insert_relay`/`remove_relay` — **no restart, no dropped peer sessions** — then persists `[network] relay_mode="custom" relay_urls=[…]` under the config lock. Idempotent (an unchanged set → `changed:false`, no writes). When the node is currently `default`/`disabled`, iroh cannot live-transition the relay MODE: the config is persisted but `restart_required:true` is returned (apply on next start). | `{changed, restart_required}` |
 | `set_app_metadata` | `{metadata}` — attach this node's opaque app metadata (#39, `api_minor >= 4`, roster mode): a ≤256-byte blob the daemon never interprets, folded **signed** into each presence heartbeat so paired roster peers see it in their `status` presence (`PresencePeer.meta`) — no per-peer session. `""` clears it. In-memory (lost on restart; re-set on startup). Over-cap → error. In pairing mode it is carried on the `mcpmesh/ping/1` reachability probe pong instead (#40), surfacing as `PeerReachability.meta` (near-real-time when a peer reads `status` — the probe cache has a ~20s TTL). | `{}` (ack) |
 | `open_session` | `{peer, service}` — `peer` is a **nickname, a stable `b64u:` user_id** (#30, racing a person's devices), **or an `eid:<hex>` device principal** (#41, targeting that EXACT authenticated endpoint — no nickname ambiguity) | *no response frame — see [Sessions](#sessions)* |
@@ -861,6 +861,48 @@ pipe**. The client sends:
 the mesh and, from that point, every byte in each direction is the remote MCP session verbatim —
 `initialize`, `tools/list`, `tools/call`, and so on, in the same newline-framed JSON. The client
 pumps its consumer's stdin/stdout against this connection until either side closes.
+
+### One connection per peer (#215, `api_minor >= 66`)
+
+Sessions to the same peer share ONE QUIC connection, each as its own bi-stream — the accept side
+has multiplexed sessions this way since 0.1.0; the dial side now uses it. The connection lives
+exactly as long as some session holds it: no idle connection is kept warm, and nothing about
+keepalives or idle timeouts changes. A second session to a connected peer opens without a handshake.
+
+**Not every session shares it**, so do not read this as "always one connection":
+
+- A session that sets `idle_timeout_secs` dials its **own** connection — the timeout is a property
+  of the connection — and plain sessions never join it.
+- A shared connection has a stream limit, set by the **peer** (QUIC `max_concurrent_bidi_streams`,
+  100 by default). A session opened past it waits at most ~1 s for a stream, then dials a connection
+  of its own that is not shared and closes with that session.
+- The reachability probe does not use the shared connection. It dials `mcpmesh/ping/1` once per
+  ~20 s TTL while something polls `status`/`subscribe`/`peer_services`, exactly as before — that pong
+  is the only source of a peer's `meta` and `services` — so a polled peer briefly has a second
+  connection.
+
+**What sharing changes for you:**
+
+- **One connection-level event ends every session on it.** The peer closing it, an idle timeout, or
+  a local revoke closing it (`peer_revoke`, `device_revoke`, `device_revocation_import`,
+  `org_revoke`, `roster_install` — see `api_minor` 65) ends all of your pipes to that device at
+  once, where each used to end alone.
+- **A peer that dies without closing** — a crash, power loss, a cut network — leaves the shared
+  connection open on this side until the idle timeout (30 s by default). An `open_session` in that
+  window no longer fails at open with `-32055`: it opens at once on the dead connection and then
+  ends (your client sees EOF) when the idle timeout fires. The transport exposes no last-received
+  timestamp to tell a quiet connection from a dead one, so the daemon does not guess. **Hold the
+  session loosely and re-dial on EOF**, as below.
+- **Revocation still applies to every session.** This node refuses to hand a shared connection to a
+  session whose device it now refuses to dial, even when the revocation closed nothing.
+
+**Authorization is still decided by the peer, per stream.** The peer resolves your principals and
+its allow lists for each session, so a second session on a shared connection is admitted or refused
+exactly as a new connection would be (#222). A peer running **mcpmesh 0.53.2 or older** resolves
+*who you are* once per connection instead: a session opened on a shared connection after you lost a
+principal (a roster group, a user binding) is admitted with the principals you had when that
+connection was accepted, and sharing stretches that window from one session to the connection's
+lifetime.
 
 ### What happens when a session drops (#167)
 

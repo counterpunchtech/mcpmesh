@@ -8,6 +8,7 @@ connection to it (K = 1), and the reachability probe stops dialling while that c
 > **As built (review):** not every session shares the connection (`idle_timeout_secs`, stream-limit
 > overflow). **Task 9 (option B) was implemented and then removed** — the probe dials ping exactly as
 > before. See the design doc's "As built" section; this plan records the original intent.
+> Revocation of cached connections is #229's close pass; this plan's pre-#229 helpers were dropped.
 
 **Architecture:** A dial-side cache on `MeshState` keyed by peer endpoint id, holding a
 `WeakConnectionHandle` per peer for the `mcpmesh/mcp/1` ALPN only. `dial_service_with_idle_timeout`

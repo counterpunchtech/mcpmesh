@@ -143,13 +143,11 @@ the dial falls through to a fresh connection.
   `accept_protocol`/`connect_protocol` are untouched. Not a breaking API change.
 - **`path_watch`**: today one watcher per session; under A one per *connection* is enough
   (`decide` already suppresses duplicates against the cache, so a per-session watcher would only
-  cost tasks). **Sever does NOT reach these connections** (corrected in review):
-  `ConnRegistry::sever_matching` holds only connections this node ACCEPTED, so a revoke has never
-  cut sessions this node opened to the revoked device. Under A that gap also leaves a warm
-  connection the next dial could reuse. As built, the revocation verbs (`peer_revoke`,
-  `device_revoke`, `device_revocation_import`) additionally close and forget the cached outbound
-  connection (`sever_revoked` → `McpConnCache::close_to`), and the racing path consults the cache
-  only after `hinted_addrs` has dropped revoked devices.
+  cost tasks). **Sever did NOT reach these connections** (corrected in review):
+  `ConnRegistry::sever_matching` holds only connections this node ACCEPTED. As built, #229's
+  endpoint hooks register every non-pairing connection in both directions and close those to a
+  newly refused device on the revoke verbs and roster installs, which covers the cached MCP
+  connection; see "As built".
 - **Racing dials**: consulted before `race_dial`; the winner is recorded. A race in flight while
   another session is dialling the same peer can still produce two connections briefly; the second
   to land is not pooled and dies with its session. Acceptable — it is the transient case, not the
@@ -236,10 +234,13 @@ Written here so the release notes cannot overclaim:
 
 ## As built — corrections from adversarial review
 
-Every claim above that reads "exactly K = 1" is the design, not the build. What ships:
+Every claim above that reads "exactly K = 1" is the design, not the build. What ships, on top of
+#222, #223 and #229:
 
-- **Shared connection per peer for plain sessions**, single-flight per device (a `b64u:` race waits
-  on a dial in flight to any of its devices), weak handles, stale entries skipped.
+- **Shared connection per peer for plain sessions** (`node/src/daemon/conn_cache.rs`): weak handles,
+  keyed by device, `ALPN_MCP` only. Single-flight per device — a `b64u:` race and an `eid:` dial to
+  one of the same devices wait on each other rather than dialling side by side. A closed or
+  non-upgrading entry is skipped and replaced by a fresh dial.
 - **Not shared:** `idle_timeout_secs` sessions (own connection); a session past the peer's
   `max_concurrent_bidi_streams` (own uncached connection after `REUSE_OPEN_TIMEOUT` = 1 s).
 - **B was removed.** The first build read reachability off the live connection and carried the
@@ -249,29 +250,36 @@ Every claim above that reads "exactly K = 1" is the design, not the build. What 
   pong is never newer than that), and a longer pong window would reintroduce stale services. So the
   probe dials `mcpmesh/ping/1` exactly as before, and **every K reduction in this change comes from
   session connection reuse**: a polled peer is still at K = 2 for ≤ 3.6 s once per TTL.
-- **`ReachEntry.pong_at` stays.** Independent of B: a live session's path watcher seeds a reachable
-  row with no pong, and `peer_services` answered `[]` from it for up to a TTL. The field marks
-  whether a row carries a pong, and `peer_services` treats a reachable row without one as stale.
-- **Revocation.** `ConnRegistry` holds only accepted connections, so the revocation verbs now also
-  close and forget the cached outbound connection (`sever_revoked`), and the racing path consults
-  the cache only after `hinted_addrs` drops revoked devices.
-- **Relies on #222.** Per-stream allow resolution was always there, but the accepting side resolves
-  the caller's principals once per connection through 0.53.x. #215 ships after #222; a peer still
-  on ≤ 0.53.x keeps the frozen-principal behaviour for streams on a reused connection.
+- **`ReachEntry.pong_at` stays.** Independent of B: a live session's path watcher writes a reachable
+  row with no pong — since #225 at the moment the session opens — and `peer_services` answered `[]`
+  from it for up to a TTL. The field marks whether a row carries a pong, and `peer_services` treats
+  a reachable row without one as stale.
+- **Revocation — three guards.** (1) The dial paths ask `dial_refused` before the cache
+  (`refuse_if_revoked`; `hinted_addrs` for a race). (2) The cache asks it again at the moment it hands
+  a connection out, which covers a session that passed (1) and then waited on another caller's dial
+  while the device was revoked, and a revocation written without a revoke verb. (3) #229's close
+  pass, run by `sever_principals` and roster installs, closes the cached connection; a closed
+  connection reads as dead to the cache. The pre-#229 `close_to` / `sever_revoked` helper that did
+  (3) for the cache alone was dropped when #229 landed. For a raced dial, (1)'s ordering and (2)
+  cover each other — either alone keeps a revoked device's connection from being reused — so they
+  are pinned only together.
+- **#222 landed.** The accepting side resolves the caller's principals per stream, so a reused
+  connection is authorized exactly as a fresh one. A peer still on mcpmesh ≤ 0.53.2 resolves them
+  once per connection, and against it sharing stretches a lost principal's window from one session
+  to the shared connection's lifetime.
 - **Peer death without close:** a new session opens instantly on the dead connection and ends at
   the idle timeout instead of failing at open. noq/iroh expose no last-receive timestamp, so this is
   documented rather than detected.
 
-## Versioning: MINOR (0.54.0)
+## Versioning: MINOR
 
-`API_MINOR` bump (60 on this branch; renumbered at rebase): no request/response shape changed, but
-two meanings did — `peer_services` requires a row that carries a pong, and a revoke also ends
-sessions this node opened. `ReachEntry` (pub, in `mcpmesh-node`) gained `pong_at`, which
-breaks code constructing it. Beyond those, the
-observable topology changes — N sessions to a peer become one connection, and one connection-level
-event ends all of them — and #210's precedent is that an observable behaviour change for existing
-deployments goes out as MINOR with release notes that say so, rather than as a PATCH that reads as
-routine. The release notes must carry the path-id concentration trade explicitly.
+`API_MINOR` 66: no request/response shape changed, but two meanings did — a connection-level event
+ends every session to that device at once, and `peer_services` requires a row that carries a pong.
+`ReachEntry` (pub, in `mcpmesh-node`) gained `pong_at`, which breaks code constructing it. Beyond
+those, the observable topology changes — N sessions to a peer become one connection — and #210's
+precedent is that an observable behaviour change for existing deployments goes out as MINOR with
+release notes that say so, rather than as a PATCH that reads as routine. The release notes must
+carry the path-id concentration trade explicitly.
 
 ## Testing (for the implementing change, not this document)
 
