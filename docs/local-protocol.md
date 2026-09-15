@@ -173,7 +173,7 @@ Methods split into two groups by audience:
 | `peer_remove` | `{nickname}` | `{}` (ack) |
 | `org_rotate` | `{new_key_path?}` — **rotate the org root** (#93 ask c, `api_minor >= 53`). Publishes a roster signed by the SUCCESSOR and cross-signed by the current root, so members re-anchor as they receive it — including members that were offline when you ran it, because the bridge rides every later roster. A member **two** rotations behind needs a fresh `org_join`. **Not escrow**: a LOST root cannot sign a bridge. | `{org_id, serial, new_root_pk, old_root_fingerprint, new_root_fingerprint}` |
 | `attest_offer` | `{}` — mint a `mcpmesh-attest:` line telling another **device of you** where to dial (#85 ask 3, `api_minor >= 52`). Carries nothing secret: the node's id and address, both of which an invite line already carries in the clear. It exists because a machine restored from a recovery phrase holds no rows and so cannot find anyone. Refused unless `[identity].admit_attested_devices` is on — an offer this node would not honour is worse than none. | `{offer}` |
-| `peer_revoke` | `{peer, reason?}` — a nickname, `eid:`, `b64u:`, or (in roster mode) a roster **group name**, which revokes every device in it — mark this device **dead on this node** (#85 ask 4, `api_minor >= 51`). Blocks the **outbound** direction too: this node will not dial a revoked endpoint, so `open_session`, `peer_services` and `peer_diagnostics` all refuse it. A revoked device is also refused on the otherwise gate-exempt pair ALPN, so it cannot burn an invite or re-append itself to an allow list. **Not `peer_remove`**: removal is routine and re-pairable, revocation is a compromise claim that **outlives the pair row**, so it cannot be undone by a fresh pairing. Live sessions are **severed immediately** (#54), not left to end on their own. A `b64u:` revokes every device you know of that person's. A name matching nothing is an **error**, never an empty success. | `{revoked: [eid], severed}` |
+| `peer_revoke` | `{peer, reason?}` — a nickname, `eid:`, `b64u:`, or (in roster mode) a roster **group name**, which revokes every device in it — mark this device **dead on this node** (#85 ask 4, `api_minor >= 51`). Blocks the **outbound** direction too: this node will not dial a revoked endpoint, so `open_session`, `peer_services` and `peer_diagnostics` all refuse it. A revoked device is also refused on the otherwise gate-exempt pair ALPN, so it cannot burn an invite or re-append itself to an allow list. **Not `peer_remove`**: removal is routine and re-pairable, revocation is a compromise claim that **outlives the pair row**, so it cannot be undone by a fresh pairing. Live sessions are **severed immediately** (#54), not left to end on their own — from `api_minor >= 65` (#229) that includes connections this node OPENED to the device (`open_session` sessions, embedder `connect_protocol` connections, gossip links), which `severed` does not count (it counts the accepted connections cut, as before). A `b64u:` revokes every device you know of that person's. A name matching nothing is an **error**, never an empty success. | `{revoked: [eid], severed}` |
 | `peer_unrevoke` | `{peer}` — lift a local revocation. Idempotent. Restores the peer only because revocation never deleted its pair row. Accepts a bare `eid:` too, so a revoke-then-unpair cannot leave a revocation permanently unliftable. **A nickname or `eid:` under a standing IDENTITY revocation re-admits nothing** (#218, `api_minor >= 61`): it lifts that device's endpoint revocation and reports it in `unrevoked`, but the gate still refuses the device on the `b64u:` its row carries — unrevoke the `b64u:` to restore every device of the person. | `{unrevoked: [eid]}` |
 | `device_revoke` | `{endpoint, reason?}` — sign a **portable** revocation of one of **your own** devices with your user key. The direction local revocation cannot express: your peers cannot discover your laptop was stolen. Also applies it here. Requires a user key **that this device holds**: on a device ENROLLED into another identity (#86) it is refused with `-32602` before anything is applied, severed or audited (`api_minor >= 62`, #214) — through 61 it signed under the LOCAL key boot mints, applied the revocation here and returned a token no peer would accept, a silent partial success. Revoke from the device that holds the key. | `{token, endpoint, user_id}` |
 | `device_revocation_import` | `{token}` — apply a peer's signed revocation. Honoured **only** from a `user_id` you already pair with, and **only** for a device you already know is theirs. An endpoint you have never seen is **refused**, not recorded — see the note below. A replayed older token is a no-op. | `{endpoint, user_id, applied, severed}` |
@@ -351,6 +351,14 @@ well-behaved peer one reconnect.
   connections by endpoint id with no protocol discriminator, so a revoke closes that peer's live
   gossip and blob connections too. Each of those carries its own gate, so this costs availability
   (a presence blip, an aborted blob transfer), never authorization; the peer reconnects.
+- **Connections this node DIALLED are closed only for a device it now refuses** (`api_minor >= 65`,
+  #229). A `peer_revoke`, `device_revoke`, `device_revocation_import`, or a roster install that
+  revokes a device also closes this node's outbound `open_session` sessions, `connect_protocol`
+  connections and gossip links to it, and refuses every new dial to it on every protocol but
+  pairing. Only a device the node now REFUSES is affected: `peer_remove`, withdrawing a principal from
+  one service's `allow`, and a roster install that drops a device without revoking it refuse no dial,
+  so they leave this node's outbound connections to it open. `severed` counts the ACCEPTED
+  connections a revoke cut, as it did through 64; the dialled connections it closes are not in it.
 - **Ephemeral services are covered as of `api_minor >= 11`** (#55/#69). Both verbs resolve the
   service ephemeral-first, then config, so a grant or revoke against an ephemeral registration
   mutates its in-memory allow and takes effect immediately, like any other service. Before that
@@ -1885,6 +1893,15 @@ things:
   id with `-32047` before dialling; `attest_to` refuses a revoked or id-mismatched offer before
   dialling. `peer_diagnostics` and `peer_hint_clear` are unchanged. (Crate-level a MINOR release of
   `mcpmesh-node`: `roster::distribute::DistributionHost` gained the required `dial_refused`.)
+  Revocation holding on EVERY outbound connection (#229) is `api_minor >= 65` — behaviour changes
+  with no shape change: the node's endpoint refuses to dial a revoked device on every protocol but
+  pairing, including gossip neighbours learned from the swarm and embedder app protocols; and
+  `peer_revoke`, `device_revoke`, `device_revocation_import`, `org_revoke` and `roster_install` now
+  close connections this node OPENED to a device they revoke — an `open_session` pipe ends, and a
+  held `connect_protocol` connection is closed by this node with code 401. `peer_remove` and a
+  roster drop that revokes nothing leave outbound connections open. `severed` counts the ACCEPTED
+  connections a revoke cut, as through 64; the dialled ones it closes are not in it. Guard on
+  `>= 65` before relying on an outbound session ending when you revoke its peer.
   `BlobFetchParams.from` (#83) is `api_minor >= 47` — additive and absent-tolerant, so guard only
   before sending it.
   The roster-mode embedding surface (#66, #93) is `api_minor >= 46`: the `org_create` /

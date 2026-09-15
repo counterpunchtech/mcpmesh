@@ -254,7 +254,10 @@ async fn boot_node(
     // work. (0.44.0 shipped this parse after `build_endpoint` with a comment claiming otherwise;
     // the gate caught the comment.)
     let local_disc = local_discovery(&cfg.network)?;
-    let endpoint = build_endpoint(secret, &cfg.network, roster_mode).await?;
+    // #229: the endpoint hooks. UNARMED here, so every gated ALPN fails closed until the store and
+    // roster gate exist (step 3, below). Nothing dials between this bind and that arm.
+    let hooks = crate::daemon::hooks::MeshHooks::new();
+    let endpoint = build_endpoint(secret, &cfg.network, roster_mode, Some(hooks.clone())).await?;
     let our_id = endpoint.id();
 
     // #68: local (mDNS) peer discovery, off unless `[network].local_discovery` asks for it.
@@ -407,6 +410,14 @@ async fn boot_node(
         }
     }
     let gate: Arc<dyn TrustGate> = Arc::new(ComposedGate::new(roster.clone(), pairs));
+    // #229: ARM the dial hook as soon as its inputs exist — before `compose_roster_transport` below
+    // subscribes gossip with its bootstrap set, the first gated dial this boot makes. It takes the
+    // `Armed` proof, so subscribing before ANY arm fails to compile; that it is THIS endpoint's hooks
+    // is by construction here (one `hooks` value), not by the type.
+    let armed = hooks.arm(crate::daemon::hooks::DialGate::new(
+        store.clone(),
+        roster.clone(),
+    ));
 
     // 4. Rate/concurrency limiters, built once from config and shared across every
     //    backend + the accept loop. Installed on the mesh AFTER it is built (below).
@@ -447,7 +458,7 @@ async fn boot_node(
     // daemon spawns NEITHER (`None`) — no gossip at all.
     let plan = plan_roster_transport(&roster, &store, &cfg, roster_mode, &our_id).await;
     let (gossip, blobs, roster_topic, presence_topic) =
-        compose_roster_transport(&endpoint, plan).await;
+        compose_roster_transport(&endpoint, plan, &armed).await;
     let mesh = MeshState::new(
         endpoint,
         gate,
@@ -467,6 +478,8 @@ async fn boot_node(
     // #67: record what the endpoint ACTUALLY bound, so registering a custom protocol re-advertises
     // this exact set rather than a recomputation that can disagree with it.
     mesh.set_bound_alpns(alpns_for(roster_mode));
+    // #229: the revoke paths close this node's OUTBOUND connections through the hooks' registry.
+    mesh.set_peer_hooks(hooks);
     mesh.set_audit(audit.clone());
     mesh.set_limits(limiters.clone());
     // Seed the live relay posture from the boot `[network]` so the `set_relays` verb (#53) diffs
@@ -894,6 +907,7 @@ pub(crate) async fn build_endpoint(
     secret: iroh::SecretKey,
     net: &crate::config::NetworkCfg,
     roster_mode: bool,
+    hooks: Option<crate::daemon::hooks::MeshHooks>,
 ) -> Result<iroh::Endpoint> {
     let builder = match net_plan(net)? {
         NetPlan::Hermetic => iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
@@ -946,6 +960,12 @@ pub(crate) async fn build_endpoint(
     let alpns = alpns_for(roster_mode);
     let builder = apply_relay_only(builder, net);
     let builder = apply_transport_config(builder, net)?;
+    // #229: the outbound revocation veto + the per-peer connection registry. Installed on EVERY
+    // booted endpoint; `None` only for test fixtures that assemble a mesh by hand.
+    let builder = match hooks {
+        Some(h) => builder.hooks(h),
+        None => builder,
+    };
     builder
         .secret_key(secret)
         .alpns(alpns)
@@ -1270,6 +1290,10 @@ async fn compose_roster_transport(
     // #223 review: the only input besides the endpoint. No roster, no store: the bootstrap set can
     // come from nowhere but the plan, whose `GossipBootstrap` only `bootstrap::for_roster` builds.
     plan: Option<RosterTransportPlan>,
+    // #229: subscribing dials the bootstrap set through the endpoint hook, which refuses every
+    // gated dial until armed. Requiring the proof makes "gossip before any arm" fail to compile; the
+    // proof is not bound to a particular `MeshHooks`.
+    _armed: &crate::daemon::hooks::Armed,
 ) -> (
     Option<iroh_gossip::net::Gossip>,
     Option<crate::roster::transport::RosterBlobs>,
@@ -1381,8 +1405,8 @@ pub(crate) mod bootstrap {
     /// `b64u:` identity — so gossip dialled exactly the devices `open_session` refuses. Takes the
     /// store and view rather than a predicate, so no caller can hand it a permissive one. Blocking.
     ///
-    /// Filters only the set WE hand gossip. The neighbours gossip learns from the swarm and dials
-    /// on its own are #229.
+    /// Filters only the set WE hand gossip. The neighbours gossip learns from the swarm and dials on
+    /// its own are refused by the endpoint hook instead (#229, `hooks::MeshHooks`).
     pub(crate) fn gossip_bootstrap(
         store: &PeerStore,
         view: Option<&mcpmesh_trust::roster::validate::RosterView>,
@@ -1443,7 +1467,7 @@ mod lookup_wiring_tests {
         };
 
         for (label, net, seed) in [("n0", n0, 91u8), ("custom", custom, 94u8)] {
-            let ep = build_endpoint(iroh::SecretKey::from_bytes(&[seed; 32]), &net, false)
+            let ep = build_endpoint(iroh::SecretKey::from_bytes(&[seed; 32]), &net, false, None)
                 .await
                 .unwrap_or_else(|e| panic!("build the {label} endpoint: {e}"));
             let dbg = format!("{:?}", ep.address_lookup().expect("address lookup"));
@@ -1481,7 +1505,7 @@ mod lookup_wiring_tests {
         }
 
         let net = crate::config::NetworkCfg::default();
-        let ours = build_endpoint(iroh::SecretKey::from_bytes(&[92u8; 32]), &net, false)
+        let ours = build_endpoint(iroh::SecretKey::from_bytes(&[92u8; 32]), &net, false, None)
             .await
             .expect("build the n0-default endpoint");
         let theirs = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
@@ -2301,7 +2325,7 @@ mod tests {
         // stays because it is what would bite if a bump moved either number, and
         // `iroh_transport_defaults_are_what_the_docs_claim` is what would tell us it had.
         for (idle, keep) in [(5, 5), (4, 5)] {
-            let e = build_endpoint(key(), &net(idle, keep), false)
+            let e = build_endpoint(key(), &net(idle, keep), false, None)
                 .await
                 .expect_err("a keepalive that cannot arrive in time must be refused at boot");
             let msg = format!("{e:#}");
@@ -2313,7 +2337,7 @@ mod tests {
         }
 
         // The valid ordering binds.
-        let ep = build_endpoint(key(), &net(30, 5), false)
+        let ep = build_endpoint(key(), &net(30, 5), false, None)
             .await
             .expect("keepalive below the timeout is the working configuration");
         ep.close().await;
@@ -2453,7 +2477,7 @@ mod tests {
         };
         assert_eq!(net.idle_timeout_secs, None);
         assert_eq!(net.keep_alive_secs, None);
-        let ep = build_endpoint(iroh::SecretKey::from_bytes(&[20u8; 32]), &net, false)
+        let ep = build_endpoint(iroh::SecretKey::from_bytes(&[20u8; 32]), &net, false, None)
             .await
             .expect("an unconfigured node still binds");
         ep.close().await;
@@ -2468,7 +2492,7 @@ mod tests {
             idle_timeout_secs: Some(0),
             ..Default::default()
         };
-        let ep = build_endpoint(iroh::SecretKey::from_bytes(&[21u8; 32]), &net, false)
+        let ep = build_endpoint(iroh::SecretKey::from_bytes(&[21u8; 32]), &net, false, None)
             .await
             .expect("0 = no idle timeout is a valid QUIC configuration");
         ep.close().await;
@@ -2486,7 +2510,7 @@ mod tests {
             relay_only: false,
             ..Default::default()
         };
-        let ep = build_endpoint(iroh::SecretKey::from_bytes(&[9u8; 32]), &net, false)
+        let ep = build_endpoint(iroh::SecretKey::from_bytes(&[9u8; 32]), &net, false, None)
             .await
             .expect("custom relay+discovery endpoint binds offline");
         ep.close().await;

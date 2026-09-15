@@ -3046,7 +3046,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   thirty have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.64";
+pub const API_VERSION: &str = "1.65";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -3162,6 +3162,16 @@ pub const API_VERSION: &str = "1.64";
 /// `peer_hint_clear` are unchanged — they dial nothing. Guard on `>= 64` before reading a missing
 /// probe frame for a revoked peer as "no change". Crate-level a MINOR release of `mcpmesh-node`
 /// (0.55 → 0.56): `roster::distribute::DistributionHost` gained the required `dial_refused`; to
+/// 65 when revocation began to hold on EVERY outbound connection (#229) — no type changed: the
+/// node's endpoint refuses to dial a revoked device on every ALPN but pairing, so iroh-gossip no
+/// longer dials a revoked device it learned from the swarm and an embedder protocol dial to one
+/// fails "rejected locally"; and `peer_revoke`, `device_revoke`, `device_revocation_import`,
+/// `org_revoke` and `roster_install` close connections this node OPENED to a device they revoke —
+/// an `open_session` pipe ends and this node closes a held `connect_protocol` connection with code
+/// 401, where through 64 both ran until the peer hung up. `peer_remove` and a roster drop that
+/// revokes nothing refuse no dial and close nothing outbound. `severed` counts the ACCEPTED
+/// connections a revoke cut, exactly as through 64; the dialled connections it closes are not in it.
+/// Guard on `>= 65` before relying on an outbound session ending when its peer is revoked; to
 /// 62 with the self-enrollment EXIT and the surface an
 /// embedder needs to ship the ceremony at all (#214): [`Request::SelfEnrollDetach`] drops an
 /// adopted binding (the inverse of `pair { allow_self_enroll }`, and the only exit an enrolled
@@ -3420,7 +3430,7 @@ pub const API_VERSION: &str = "1.64";
 /// its REAL content is a meaning change to `reachable` — the field exists so the new meaning is
 /// observable at all. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 64;
+pub const API_MINOR: u32 = 65;
 
 #[cfg(test)]
 mod tests {

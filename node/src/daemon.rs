@@ -27,6 +27,7 @@ pub(crate) mod config_write;
 pub(crate) mod dial;
 pub(crate) mod dial_hint;
 pub(crate) mod handlers;
+pub(crate) mod hooks;
 pub(crate) mod lookup_hygiene;
 mod org_author;
 mod path_watch;
@@ -260,6 +261,10 @@ pub struct MeshState {
     pub(crate) admit_attested: std::sync::OnceLock<bool>,
     /// The effective `[network].keep_alive_secs` (#166), resolved at boot.
     pub(crate) keep_alive_secs: std::sync::OnceLock<u64>,
+    /// #229: the endpoint hooks `build_endpoint` installed — the dial gate and the registry of this
+    /// node's live connections by remote id. Set once at boot. UNSET on a mesh a test assembles by
+    /// hand over an unhooked endpoint, where there is nothing registered to close.
+    pub(crate) peer_hooks: std::sync::OnceLock<hooks::MeshHooks>,
     pub(crate) config_path: PathBuf,
     /// The relay posture (mode + custom URL set) currently APPLIED to the live endpoint — the
     /// runtime truth the `set_relays` verb (#53) diffs against. Seeded at boot from `[network]`
@@ -661,6 +666,7 @@ impl MeshState {
             local_discovery: std::sync::OnceLock::new(),
             admit_attested: std::sync::OnceLock::new(),
             keep_alive_secs: std::sync::OnceLock::new(),
+            peer_hooks: std::sync::OnceLock::new(),
             config_path,
             applied_relays: std::sync::Mutex::new(RelayPosture::default()),
             roster,
@@ -1180,6 +1186,24 @@ impl MeshState {
 
     pub fn set_audit(&self, sink: AuditSink) {
         let _ = self.audit.set(sink);
+    }
+
+    /// Install the endpoint hooks this mesh's endpoint was built with (#229), once, at boot.
+    pub(crate) fn set_peer_hooks(&self, h: hooks::MeshHooks) {
+        let _ = self.peer_hooks.set(h);
+    }
+
+    /// Close every live connection this node DIALLED to a device it now refuses to
+    /// dial (#229). Every revoke path calls it AFTER its write. Returns how many were closed; `0` on
+    /// a mesh with no hooks installed.
+    pub(crate) async fn close_refused_peer_conns(&self) -> usize {
+        let Some(h) = self.peer_hooks.get() else {
+            return 0;
+        };
+        let Some(gate) = h.gate() else {
+            return 0;
+        };
+        hooks::close_refused(&h.conns(), &gate).await
     }
 
     /// Record the on-disk app-blob store directory, once, at boot (#88) — alongside
@@ -1855,9 +1879,14 @@ pub(crate) mod testutil {
             relay_mode: "disabled".into(),
             ..Default::default()
         };
-        let endpoint = build_endpoint(iroh::SecretKey::from_bytes(&[7u8; 32]), &hermetic, false)
-            .await
-            .unwrap();
+        let endpoint = build_endpoint(
+            iroh::SecretKey::from_bytes(&[7u8; 32]),
+            &hermetic,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
         let mesh = MeshState::new(
             endpoint,
             gate,

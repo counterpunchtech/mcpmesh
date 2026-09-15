@@ -253,6 +253,14 @@ Four things worth knowing:
   announce the node as ready.
 - `connect_protocol` **dials; it does not authorize**. The remote side's gate decides whether to
   admit you, and closes the connection if you are not paired with them.
+- **Revoking the peer closes the connections you dialled too** (#229). The node's endpoint refuses
+  any dial to a device this node revoked, on your protocol as on every built-in but pairing, and a
+  revoke closes a `connect_protocol` connection you are holding with code 401 — so treat a close
+  there as possibly "revoked", not only "network". `peer_remove` does not: removal refuses no dial.
+- **Every non-pairing dial first reads the revocation store, with no timeout.** Two blocking-pool
+  reads per dial (before it, and again once the handshake completes). A wedged store — a stuck disk
+  — stalls every such dial, gossip's included, until the read returns; your own timeout around
+  `connect_protocol` still applies.
 
 `Node::endpoint_addr()` gives this node's currently-dialable address if your application has its own
 out-of-band channel and does not want a pairing invite. It authorizes nothing — a peer dialling it

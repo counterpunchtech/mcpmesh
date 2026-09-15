@@ -2552,6 +2552,15 @@ async fn sever_principals(mesh: &Arc<MeshState>, principals: &[String]) -> Resul
     if let Some(observe) = observer {
         observe(&mesh.services.get());
     }
+    // #229: the inbound registry below holds only ACCEPTED connections. Connections this node
+    // DIALLED — an `open_session`, an embedder's `connect_protocol`, a gossip link — are cut here,
+    // for every device the caller's revocation write now refuses. First, so a failing principal
+    // resolution below cannot skip it. Not counted in `severed`: that field has always counted the
+    // inbound registry, and a connection can sit in both.
+    let closed = mesh.close_refused_peer_conns().await;
+    if closed > 0 {
+        tracing::info!(closed, "closed live connections to now-refused devices");
+    }
     let store = mesh.store.clone();
     let roster = mesh.roster.view();
     let principals_w = principals.to_vec();
@@ -5886,6 +5895,7 @@ allow = []
             iroh::SecretKey::from_bytes(&[31u8; 32]),
             &hermetic,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -5980,6 +5990,7 @@ allow = []
             iroh::SecretKey::from_bytes(&[32u8; 32]),
             &hermetic,
             false,
+            None,
         )
         .await
         .unwrap();
