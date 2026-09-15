@@ -254,6 +254,8 @@ pub(crate) fn commit_observation(
                     probed_at: crate::util::epoch_now_i64(),
                     meta: String::new(),
                     services: Vec::new(),
+                    // No pong: an empty `services` here means "not asked", never "offers nothing".
+                    pong_at: None,
                     seq,
                     observed: committed_at,
                     path,
@@ -507,6 +509,7 @@ mod tests {
                 probed_at: crate::util::epoch_now_i64(),
                 meta: String::new(),
                 services: Vec::new(),
+                pong_at: Some(crate::util::epoch_now_i64()),
                 seq: 1,
                 observed: probe_observed,
                 path: PeerPath::Direct,

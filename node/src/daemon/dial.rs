@@ -1544,6 +1544,7 @@ mod source_tests {
                         probed_at: 1,
                         meta: String::new(),
                         services: vec![],
+                        pong_at: Some(1),
                         seq: 0,
                         observed: 0,
                         path: mcpmesh_local_api::PeerPath::Unknown,

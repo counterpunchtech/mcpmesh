@@ -6306,6 +6306,7 @@ allow = []
                 probed_at: crate::util::epoch_now_i64(),
                 meta: String::new(),
                 services: Vec::new(),
+                pong_at: Some(crate::util::epoch_now_i64()),
                 seq: 1,
                 observed: 1,
                 path: mcpmesh_local_api::PeerPath::Direct,
