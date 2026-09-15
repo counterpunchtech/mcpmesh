@@ -98,6 +98,32 @@ pub fn install_roster_view_and_sever(
         b"roster revoked",
         |eid, roster_user| mcpmesh_net::should_sever(eid, roster_user, &revoked, &active_devices),
     );
+    // (c) #229: close this node's OUTBOUND connections (and any other registered one) to devices
+    //     the new roster makes refused. Async (the refusal reads are redb, on the blocking pool)
+    //     and this function is sync, so it is spawned; the gate is already swapped, so a dial racing
+    //     it is refused at `before_connect` or at its `after_handshake` re-check. Every production
+    //     caller runs inside the runtime; a caller outside one gets a warning, not a silent skip.
+    if let Some(h) = mesh.peer_hooks.get().cloned()
+        && let Some(gate) = h.gate()
+    {
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                rt.spawn(async move {
+                    let closed = super::hooks::close_refused(&h.conns(), &gate).await;
+                    if closed > 0 {
+                        tracing::info!(
+                            closed,
+                            "roster install closed connections to now-refused devices"
+                        );
+                    }
+                });
+            }
+            Err(_) => tracing::warn!(
+                "roster installed outside a tokio runtime: connections this node opened to devices \
+                 it revoked were NOT closed"
+            ),
+        }
+    }
     // Trust event: a roster install/swap — recorded HERE, the shared choke point, so EVERY swap
     // is audited, including the AUTOMATIC gossip/URL convergences a rostered node lives on
     // (which never touch the manual verb). The terminus of org approve/revoke funnels through here
@@ -974,6 +1000,7 @@ mod org_join_liveness_tests {
             iroh::SecretKey::from_bytes(&[31u8; 32]),
             &hermetic,
             true,
+            None,
         )
         .await
         .unwrap();

@@ -2572,12 +2572,21 @@ async fn sever_principals(mesh: &Arc<MeshState>, principals: &[String]) -> Resul
     // device the store now calls `b64u:NEW` can still carry a session admitted as `b64u:OLD`; the
     // endpoint lookup alone would sever nothing for a revoke of `b64u:OLD` while the verb reported
     // success. No early return on empty `targets` for the same reason.
-    Ok(mesh.conn_registry.sever_matching_admitted(
+    let severed = mesh.conn_registry.sever_matching_admitted(
         mcpmesh_net::CLOSE_UNAUTHORIZED, // 401 — "no longer authorized"
         b"access revoked",
         |eid| targets.contains(eid),
         |admitted_as| principals.iter().any(|p| p == admitted_as),
-    ))
+    );
+    // #229: the registry above holds only ACCEPTED connections. Connections this node DIALLED — an
+    // `open_session`, an embedder's `connect_protocol`, a gossip link — are cut here, for every
+    // device the revocation now refuses. Not counted in `severed`: that field has always counted
+    // the inbound registry, and a connection can sit in both.
+    let closed = mesh.close_refused_peer_conns().await;
+    if closed > 0 {
+        tracing::info!(closed, "closed live connections to now-refused devices");
+    }
+    Ok(severed)
 }
 
 /// Revoke a peer's AUTHORIZATION: resolve the nickname to its devices' STABLE principals
@@ -5886,6 +5895,7 @@ allow = []
             iroh::SecretKey::from_bytes(&[31u8; 32]),
             &hermetic,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -5980,6 +5990,7 @@ allow = []
             iroh::SecretKey::from_bytes(&[32u8; 32]),
             &hermetic,
             false,
+            None,
         )
         .await
         .unwrap();

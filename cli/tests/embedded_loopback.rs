@@ -2107,3 +2107,196 @@ async fn connect_protocol_refuses_a_revoked_peer_without_dialling_it() {
     b.shutdown().await;
     a.shutdown().await;
 }
+
+/// Pair two hermetic embedded nodes: `a` serves the echo stub as `notes`, `b` redeems. Returns
+/// `(a, b, a_root, b_root, paired)`; the roots must outlive the nodes.
+async fn paired_pair() -> (
+    mcpmesh_node::Node,
+    mcpmesh_node::Node,
+    tempfile::TempDir,
+    tempfile::TempDir,
+    mcpmesh_local_api::PairResult,
+) {
+    let (a_root, b_root) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = NodeBuilder::new(a_root.path())
+        .config(hermetic())
+        .start()
+        .await
+        .expect("node a starts");
+    let b = NodeBuilder::new(b_root.path())
+        .config(hermetic())
+        .start()
+        .await
+        .expect("node b starts");
+    let mut a_ctl = a.control().await.expect("a control");
+    a_ctl
+        .register_service(
+            "notes",
+            BackendSpec::Run {
+                cmd: vec![STUB.into()],
+                env: Default::default(),
+                cwd: None,
+            },
+            vec![],
+        )
+        .await
+        .expect("register notes");
+    let invite = a_ctl.invite(vec!["notes".into()]).await.expect("invite");
+    let mut b_ctl = b.control().await.expect("b control");
+    let paired = timeout(Duration::from_secs(30), b_ctl.pair(&invite.invite_line))
+        .await
+        .expect("pair within 30s")
+        .expect("pair");
+    (a, b, a_root, b_root, paired)
+}
+
+/// #229: a LOCAL revoke severs an OUTBOUND `connect_protocol` connection this node holds.
+///
+/// `b` dials `a` on an embedder protocol, then `b` revokes `a`. `a` has NOT revoked `b`, so nothing
+/// on `a`'s side closes it, and `b`'s inbound sever registry never held it (it came from a dial, not
+/// an accept). Only the endpoint-hook registry reaches it. Removing the close pass from
+/// `sever_principals` leaves the connection open and fails the bounded wait.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_local_revoke_closes_a_held_outbound_connect_protocol_connection() {
+    use std::sync::Arc;
+
+    const ALPN: &[u8] = b"app/hold/1";
+
+    /// Holds every accepted connection until the far side closes it.
+    #[derive(Debug, Clone)]
+    struct Holder {
+        open: Arc<tokio::sync::Notify>,
+    }
+
+    impl mcpmesh_node::iroh::protocol::ProtocolHandler for Holder {
+        async fn accept(
+            &self,
+            conn: mcpmesh_node::iroh::endpoint::Connection,
+        ) -> Result<(), mcpmesh_node::iroh::protocol::AcceptError> {
+            self.open.notify_one();
+            conn.closed().await;
+            Ok(())
+        }
+    }
+
+    let (a, b, _ar, _br, paired) = paired_pair().await;
+    let open = Arc::new(tokio::sync::Notify::new());
+    a.accept_protocol(ALPN, Arc::new(Holder { open: open.clone() }))
+        .expect("register");
+
+    let conn = timeout(
+        Duration::from_secs(10),
+        b.connect_protocol(&paired.peer_nickname, ALPN),
+    )
+    .await
+    .expect("connect within 10s")
+    .expect("a paired, unrevoked peer connects");
+    timeout(Duration::from_secs(10), open.notified())
+        .await
+        .expect("a's handler is holding the connection before the revoke");
+    // The control: the connection is live right up to the revoke, so a close afterwards is the
+    // revoke's doing and not an idle timeout or a gate refusal.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        conn.close_reason().is_none(),
+        "control: the held connection must be open before the revoke"
+    );
+
+    let mut b_ctl = b.control().await.expect("b control");
+    b_ctl
+        .peer_revoke(&paired.peer_nickname, Some("stolen".into()))
+        .await
+        .expect("revoke");
+
+    let reason = timeout(Duration::from_secs(10), conn.closed())
+        .await
+        .expect(
+            "b's OUTBOUND connection to the device b just revoked must be closed by b, within a \
+             bounded wait",
+        );
+    assert!(
+        matches!(
+            reason,
+            mcpmesh_node::iroh::endpoint::ConnectionError::LocallyClosed
+        ),
+        "b itself must have closed it (not a remote close or a timeout): {reason:?}"
+    );
+
+    b.shutdown().await;
+    a.shutdown().await;
+}
+
+/// #229: a LOCAL revoke severs an OUTBOUND `open_session` this node holds.
+///
+/// Same shape as the `connect_protocol` case, through the service dial: the session pipe must end
+/// within a bounded wait once `b` revokes `a`. Removing the close pass from `sever_principals`
+/// leaves the session answering and fails the wait.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_local_revoke_ends_an_outbound_open_session() {
+    let (a, b, _ar, _br, paired) = paired_pair().await;
+
+    let session_ctl = b.control().await.expect("b session control");
+    let (reader, mut writer) = session_ctl
+        .open_session(paired.peer_nickname.clone(), "notes".into())
+        .await
+        .expect("open_session");
+    let mut lines = reader.into_inner();
+    let mut line = String::new();
+    writer
+        .write_all(
+            (json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}).to_string()
+                + "\n")
+                .as_bytes(),
+        )
+        .await
+        .expect("send initialize");
+    timeout(Duration::from_secs(10), lines.read_line(&mut line))
+        .await
+        .expect("initialize reply within 10s")
+        .expect("read initialize reply");
+    assert!(
+        line.contains("\"result\""),
+        "control: the session is live before the revoke: {line}"
+    );
+
+    let mut b_ctl = b.control().await.expect("b control");
+    b_ctl
+        .peer_revoke(&paired.peer_nickname, Some("stolen".into()))
+        .await
+        .expect("revoke");
+
+    // Keep asking: a live session answers every call, a severed one reaches EOF or an error.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut id = 2;
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the OUTBOUND session to a device b just revoked must end within 10s"
+        );
+        let sent = writer
+            .write_all(
+                (json!({
+                    "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                    "params": {"name": "echo", "arguments": {"text": "still-there"}}
+                })
+                .to_string()
+                    + "\n")
+                    .as_bytes(),
+            )
+            .await;
+        if sent.is_err() {
+            break;
+        }
+        line.clear();
+        match timeout(Duration::from_secs(2), lines.read_line(&mut line)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => break,
+            // Still answering, or slow: go round again until the deadline.
+            Ok(Ok(_)) | Err(_) => {}
+        }
+        id += 1;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    b.shutdown().await;
+    a.shutdown().await;
+}
