@@ -124,6 +124,30 @@ pub async fn probe_peer(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> ReachEn
     let seq = mesh
         .probe_seq
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // #223: never PING a device this node revoked. `reachability_of` probes every stored row, and a
+    // revocation keeps the row, so every `status` poll used to dial the device the operator had
+    // declared compromised — announcing this node, and its address, to whoever holds it.
+    //
+    // And commit NOTHING for it, the throttle arm's rule below (#89): no dial happened, so there is
+    // no evidence about the peer. Committing `reachable: false` stamped a fresh `probed_at` and
+    // broadcast a `Probe`-sourced transition for a probe that never went out. The row returned is
+    // uncommitted and never cached. Fails CLOSED on a join error, like every revocation read.
+    let m = mesh.clone();
+    let refused = tokio::task::spawn_blocking(move || super::dial::dial_refused(&m, &endpoint_id))
+        .await
+        .unwrap_or(true);
+    if refused {
+        return ReachEntry {
+            reachable: false,
+            rtt_ms: None,
+            probed_at: epoch_now_i64(),
+            meta: String::new(),
+            services: Vec::new(),
+            seq,
+            observed: seq,
+            path: mcpmesh_local_api::PeerPath::Unknown,
+        };
+    }
     let started = tokio::time::Instant::now();
     let outcome = tokio::time::timeout(PROBE_TIMEOUT, probe_once(mesh, endpoint_id, started)).await;
     // #89 gate (HIGH): a probe REFUSED by the peer's rate limiter is not evidence the peer is

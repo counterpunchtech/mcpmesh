@@ -1535,6 +1535,10 @@ impl crate::roster::distribute::DistributionHost for MeshState {
         &self.endpoint
     }
 
+    fn dial_refused(&self, endpoint_id: &[u8; 32]) -> bool {
+        dial::dial_refused(self, endpoint_id)
+    }
+
     fn roster(&self) -> &RosterGate {
         &self.roster
     }

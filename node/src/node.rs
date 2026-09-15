@@ -448,19 +448,19 @@ impl Node {
     /// admit you, and will close the connection if you are not paired with them. Symmetrically,
     /// your own handler is protected by your gate — see `accept_protocol`.
     ///
-    /// Errors when `peer` resolves to nobody, or when the dial fails. A peer that is simply offline
-    /// is a dial failure, not a distinct condition.
+    /// Errors when `peer` resolves to nobody, when every device it resolves to is REVOKED on this
+    /// node (the same "is REVOKED on this node" refusal `open_session` gives, and nothing is
+    /// dialled), or when the dial fails. A revoked device of a person with others is skipped. A
+    /// peer that is simply offline is a dial failure, not a distinct condition.
     pub async fn connect_protocol(
         &self,
         peer: &str,
         alpn: &[u8],
     ) -> anyhow::Result<iroh::endpoint::Connection> {
         let mesh = self.mesh();
-        let candidates = crate::daemon::dial::protocol_candidates(mesh, peer).await?;
-        anyhow::ensure!(
-            !candidates.is_empty(),
-            "no peer '{peer}' — 'status' lists your peers and roster members"
-        );
+        // Filtered (#223): a revoked device is never a candidate, and a peer whose every device is
+        // revoked gets the refusal `open_session` gives — before anything is dialled.
+        let candidates = crate::daemon::dial::connect_candidates(mesh, peer).await?;
         let mut last: Option<anyhow::Error> = None;
         for endpoint_id in candidates {
             let Ok(id) = iroh::EndpointId::from_bytes(&endpoint_id) else {

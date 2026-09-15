@@ -392,10 +392,36 @@ pub(crate) async fn blob_fetch(
     let work = async {
         // #83: resolve the caller's alternate sources to dialable addresses BEFORE the fetch, so a
         // name that resolves to nobody is a clean error rather than a silent skip mid-transfer.
-        let alternates = crate::daemon::dial::blob_source_addrs(mesh, &from).await?;
+        let sources = crate::daemon::dial::blob_source_addrs(mesh, &from).await?;
+        // #223: the ticket's publisher is source 0 of a real dial, and it is a REMOTE claim — a
+        // ticket naming a device this node revoked must not make the fetch contact it. The
+        // alternates were filtered above; this is the same predicate for the one source they skip.
+        let publisher = crate::blobs::provider::AppBlobs::ticket_publisher(&ticket)?;
+        let m = mesh.clone();
+        let publisher_refused =
+            crate::util::blocking("join blob publisher revocation", move || {
+                crate::daemon::dial::dial_refused(&m, &publisher)
+            })
+            .await?;
+        if publisher_refused {
+            tracing::warn!(
+                "blob ticket's publisher is REVOKED on this node; it will not be dialled"
+            );
+        }
         let hash = provider
-            .fetch_from(&ticket, &alternates)
+            .fetch_from_sources(&ticket, &sources.addrs, !publisher_refused)
             .await
+            .map_err(|e| {
+                // The caller NAMED these sources, so a failed fetch says why they were not tried —
+                // otherwise the only trace is a daemon log line the caller cannot see (#223).
+                match sources.skipped_revoked {
+                    0 => e,
+                    n => e.context(format!(
+                        "{n} named source{} skipped: revoked on this node",
+                        if n == 1 { "" } else { "s" }
+                    )),
+                }
+            })
             .context("fetch blob")?;
         // #80: pin the fetched blob across the EXPORT. It is in the store and in no scope — the
         // fetch creates no tag — so on a collecting node a sweep between the transfer completing
@@ -1580,6 +1606,19 @@ pub(crate) async fn peer_services(
 ) -> Result<mcpmesh_local_api::PeerServicesResult> {
     let mesh = state.mesh_required()?;
     let endpoint_id = resolve_peer_endpoint(mesh, &peer).await?;
+    // #223: this verb DIALS (a probe), so it asks the full outbound predicate — roster-revoked
+    // endpoints and roster devices under a revoked `b64u:` identity too. Checked HERE rather than
+    // in the shared resolver: `peer_diagnostics` and `peer_hint_clear` share it and dial nothing,
+    // and refusing a roster-revoked device there blocked legitimate operator actions. Before the
+    // cached probe, since a fresh cache entry would otherwise answer without any dial check.
+    let m = mesh.clone();
+    anyhow::ensure!(
+        !blocking("join peer_services revocation check", move || {
+            crate::daemon::dial::dial_refused(&m, &endpoint_id)
+        })
+        .await?,
+        "peer '{peer}' is REVOKED on this node"
+    );
     let entry = crate::daemon::reach::probe_peer_cached(mesh, endpoint_id).await;
     anyhow::ensure!(
         entry.reachable,
@@ -1893,7 +1932,7 @@ pub(crate) async fn resolve_peer_endpoint(mesh: &Arc<MeshState>, peer: &str) -> 
         // test for this guard, not by review. A direct device principal is the most precise way to
         // reach a revoked machine, so of the three selectors it is the one that most needed it.
         anyhow::ensure!(
-            !mesh.store.is_refused(&eid),
+            !store_refused(mesh, eid).await?,
             "peer '{peer}' is REVOKED on this node"
         );
         return Ok(eid);
@@ -1913,15 +1952,21 @@ pub(crate) async fn resolve_peer_endpoint(mesh: &Arc<MeshState>, peer: &str) -> 
     .context("join peer resolve for peer_services")??;
     let eid = eid
         .with_context(|| format!("no paired peer '{peer}' — 'mcpmesh status' lists your peers"))?;
-    // #85 ask 4: this feeds `peer_services` and `peer_diagnostics`, both of which DIAL. Revocation
-    // was inbound-only in the first cut, so those still reached out to a device the operator had
-    // declared stolen. Checked here rather than at each caller — this is the one resolver they
-    // share.
+    // #85 ask 4: this feeds `peer_services` (which DIALS), `peer_diagnostics` and `peer_hint_clear`
+    // (which do not — see `peer_diagnostics_never_dials`). The store revocation check here is #85's
+    // and predates the split; the full outbound predicate (#223) is asked by `peer_services` alone,
+    // because it is the only one of the three that reaches the device.
     anyhow::ensure!(
-        !mesh.store.is_refused(&eid),
+        !store_refused(mesh, eid).await?,
         "peer '{peer}' is REVOKED on this node"
     );
     Ok(eid)
+}
+
+/// `PeerStore::is_refused` on the blocking pool — redb reads never run on a runtime worker.
+async fn store_refused(mesh: &Arc<MeshState>, eid: [u8; 32]) -> Result<bool> {
+    let store = mesh.store.clone();
+    crate::util::blocking("join peer revocation check", move || store.is_refused(&eid)).await
 }
 
 /// Handle an `unregister_service` control request/// Handle an `unregister_service` control request (#50): remove the whole `[services.<name>]`
@@ -7133,6 +7178,194 @@ allow = []
              fetch that stopped WITHOUT answering, and firing it here means a subscriber tears \
              down twice for one transfer"
         );
+    }
+
+    /// A bare endpoint on the app-blob ALPN that COUNTS completed handshakes and serves nothing, so
+    /// whether a fetch dialled it is observable (#223).
+    async fn counting_blob_source() -> (
+        iroh::Endpoint,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let ep = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .alpns(vec![crate::blobs::APP_BLOB_ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (e, c) = (ep.clone(), n.clone());
+        let task = tokio::spawn(async move {
+            while let Some(incoming) = e.accept().await {
+                if incoming.await.is_ok() {
+                    c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        });
+        (ep, n, task)
+    }
+
+    /// A paired row for `ep` carrying its REAL address as the dial hint, so a dial to it on this
+    /// hermetic mesh actually lands — which is what makes a zero count mean "not dialled".
+    fn seed_source_row(mesh: &MeshState, nickname: &str, ep: &iroh::Endpoint) {
+        let addr = ep.addr();
+        assert!(
+            !addr.addrs.is_empty(),
+            "fixture: the source must have a dialable address"
+        );
+        mesh.store
+            .add(PeerEntry {
+                endpoint_id: *ep.id().as_bytes(),
+                nickname: nickname.into(),
+                services: vec![],
+                paired_at: None,
+                user_id: None,
+                last_addr: Some(serde_json::to_string(&addr).unwrap()),
+            })
+            .unwrap();
+    }
+
+    /// Wait (bounded, sleeping) until `n` is non-zero.
+    async fn await_count(n: &std::sync::atomic::AtomicUsize, what: &str) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        while n.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(tokio::time::Instant::now() < deadline, "{what}");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// #223: a `blob_fetch` naming a REVOKED device as an alternate source never contacts it.
+    ///
+    /// `blob_source_addrs` resolved through `protocol_candidates`, which applied no revocation
+    /// filter, so a fetch dialled a device this node had revoked and asked it for the blob. Both
+    /// sources are real, reachable endpoints that count handshakes, named in revoked-first order so
+    /// an unfiltered fetch dials the stolen one before the live one: the LIVE count proves the fetch
+    /// reached its alternates at all, so the stolen count of zero means "filtered", not "never got
+    /// that far". The publisher is an id-only ticket that fails at once on a hermetic mesh.
+    ///
+    /// Deleting the `dial_refused` filter in `protocol_candidates` fails the zero-count assertion
+    /// and the source count; dropping the `skipped_revoked` context in `blob_fetch` fails the
+    /// "named source skipped" assertion.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_blob_fetch_never_dials_a_revoked_alternate_source() {
+        tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            let (dir, mesh, state) = blob_mesh().await;
+            let (stolen_ep, stolen, _t1) = counting_blob_source().await;
+            let (live_ep, live, _t2) = counting_blob_source().await;
+            seed_source_row(&mesh, "stolen", &stolen_ep);
+            seed_source_row(&mesh, "live", &live_ep);
+            mesh.store
+                .revoke(crate::allowlist::RevokedEntry {
+                    endpoint_id: *stolen_ep.id().as_bytes(),
+                    revoked_at: 1,
+                    reason: None,
+                    source: "local".into(),
+                    signer_user_id: None,
+                    issued_at: None,
+                })
+                .unwrap();
+
+            let nowhere = iroh::SecretKey::from_bytes(&[23u8; 32]).public();
+            let ticket = iroh_blobs::ticket::BlobTicket::new(
+                iroh::EndpointAddr::from(nowhere),
+                iroh_blobs::Hash::new(b"revoked-source"),
+                iroh_blobs::BlobFormat::Raw,
+            )
+            .to_string();
+            let err = blob_fetch(
+                &state,
+                ticket,
+                dir.path().join("out.bin").to_string_lossy().into_owned(),
+                vec!["stolen".into(), "live".into()],
+            )
+            .await
+            .expect_err("nobody serves this blob");
+            await_count(&live, "control: the live alternate must be dialled").await;
+            // A stray dial to the stolen source would have landed well within this.
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            assert_eq!(
+                stolen.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "a revoked source must never be contacted by a blob fetch"
+            );
+            assert!(
+                format!("{err:#}").contains("tried 2 sources"),
+                "the publisher and the live alternate only — the revoked one is not a source: \
+                 {err:#}"
+            );
+            // …and the caller, who NAMED `stolen`, is told why it was not tried (#223 review).
+            assert!(
+                format!("{err:#}").contains("1 named source skipped: revoked on this node"),
+                "{err:#}"
+            );
+        })
+        .await
+        .expect("revoked-source test timed out");
+    }
+
+    /// #223 (review): a ticket whose PUBLISHER is a device this node revoked must not make the fetch
+    /// contact it. The alternates were filtered, and source 0 — the ticket's own address, a remote
+    /// party's claim — was dialled unconditionally.
+    ///
+    /// The revoked publisher carries its REAL address in the ticket, so an unfiltered fetch lands on
+    /// it; the live alternate is the control that the fetch ran at all. With every source refused
+    /// the fetch fails as an exhausted one does, having dialled nothing.
+    ///
+    /// Passing `with_publisher: true` unconditionally in `blob_fetch` fails the zero count and the
+    /// source counts.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_blob_fetch_never_dials_a_revoked_publisher() {
+        tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            let (dir, mesh, state) = blob_mesh().await;
+            let (stolen_ep, stolen, _t1) = counting_blob_source().await;
+            let (live_ep, live, _t2) = counting_blob_source().await;
+            seed_source_row(&mesh, "stolen", &stolen_ep);
+            seed_source_row(&mesh, "live", &live_ep);
+            mesh.store
+                .revoke(crate::allowlist::RevokedEntry {
+                    endpoint_id: *stolen_ep.id().as_bytes(),
+                    revoked_at: 1,
+                    reason: None,
+                    source: "local".into(),
+                    signer_user_id: None,
+                    issued_at: None,
+                })
+                .unwrap();
+            let ticket = iroh_blobs::ticket::BlobTicket::new(
+                stolen_ep.addr(),
+                iroh_blobs::Hash::new(b"revoked-publisher"),
+                iroh_blobs::BlobFormat::Raw,
+            )
+            .to_string();
+            let dest = || dir.path().join("out.bin").to_string_lossy().into_owned();
+
+            let err = blob_fetch(&state, ticket.clone(), dest(), vec!["live".into()])
+                .await
+                .expect_err("nobody serves this blob");
+            await_count(&live, "control: the live alternate must be dialled").await;
+            assert!(
+                format!("{err:#}").contains("tried 1 source)"),
+                "only the live alternate is a source: {err:#}"
+            );
+
+            // Every source refused: the fetch fails as an exhausted one, contacting nobody.
+            let err = blob_fetch(&state, ticket, dest(), vec!["stolen".into()])
+                .await
+                .expect_err("no dialable source");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("no source to try") && msg.contains("tried 0 sources"),
+                "{msg}"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            assert_eq!(
+                stolen.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "a revoked publisher must never be contacted by a blob fetch"
+            );
+        })
+        .await
+        .expect("revoked-publisher test timed out");
     }
 
     /// The blob control operations fail gracefully (Err, never a panic) in control-only mode — the

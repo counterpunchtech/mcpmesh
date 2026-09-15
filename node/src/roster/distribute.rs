@@ -63,6 +63,11 @@ pub trait DistributionHost: Send + Sync + 'static {
         serial: u64,
         channel: &'static str,
     ) -> impl Future<Output = Result<bool>> + Send;
+    /// Would dialling `endpoint_id` reach a device this host has REVOKED (#223)? Asked before an
+    /// announce's blob provider is contacted. BLOCKING (it may read storage): callers run it on the
+    /// blocking pool. Required rather than defaulted, because a default would have to pick an
+    /// answer, and `false` is fail-open.
+    fn dial_refused(&self, endpoint_id: &[u8; 32]) -> bool;
 }
 
 /// Per-fetch timeout: a hung/stalling blob provider can't hold a fetch slot forever;
@@ -150,6 +155,22 @@ pub async fn on_announce<H: DistributionHost>(
     // discovery-less deployment. Bounding the rest means constraining address lookup itself, which
     // is #203's, not this function's.
     if let Ok(ticket) = announce.blob_ticket.parse::<BlobTicket>() {
+        // #223: the announce is UNSIGNED gossip, so its provider can be any member — including one
+        // this node revoked. The roster signature protects what we would fetch, not the dial:
+        // contacting the provider tells it this node's id, address and that it is online, the same
+        // leak the reachability probe had. Checked before the address is even noted. Logged
+        // without the endpoint id. Fails CLOSED on a join error.
+        let (m, provider) = (mesh.clone(), *ticket.addr().id.as_bytes());
+        let refused = tokio::task::spawn_blocking(move || m.dial_refused(&provider))
+            .await
+            .unwrap_or(true);
+        if refused {
+            tracing::info!(
+                serial = announce.serial,
+                "roster announce names a blob provider REVOKED on this node; not fetching"
+            );
+            return Ok(()); // fail-safe: another member's announce or the URL poll converges
+        }
         if let Some(book) = mesh.addr_book() {
             // `note` filters (#203) — see `RosterAddrBook::note`. Boot always registers a book, so
             // this is the production path.

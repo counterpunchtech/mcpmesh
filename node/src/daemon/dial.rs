@@ -47,9 +47,13 @@ use crate::allowlist::PeerEntry;
 /// Refuse to DIAL a revoked endpoint (#85 ask 4).
 ///
 /// Revocation was inbound-only in the first cut: the gate refused a revoked device's connections,
-/// but every outbound path — `open_session`, `peer_services`, `peer_diagnostics`, blob sources —
-/// still read `PeerStore` directly and happily connected to the machine the operator had just
-/// declared stolen, handing it the request. The 0.45.0 gate proved it.
+/// but the outbound paths — `open_session`, `peer_services` — still read `PeerStore` directly and happily connected to the machine the operator had just declared
+/// stolen, handing it the request. The 0.45.0 gate proved it.
+///
+/// This comment used to list BLOB SOURCES among the covered paths, and they were not: they, and
+/// `Node::connect_protocol`, resolved through `protocol_candidates` with no filter at all until
+/// #223. The paths [`dial_refused`]'s doc lists now ask it; the same doc lists the dials that do
+/// NOT, so neither list is a claim of full coverage.
 ///
 /// That made the weaker verb stronger: `peer_remove` DELETES the row, so it blocked the dial;
 /// `peer_revoke`, the compromise claim, did not. Backwards, and in the direction that leaks data to
@@ -58,14 +62,89 @@ use crate::allowlist::PeerEntry;
 /// Both tables (#218, `PeerStore::is_refused`): a device carrying a revoked IDENTITY is refused
 /// inbound by the gate, so dialling it would be this same backwards verb one level up.
 ///
-/// Fails CLOSED on a read error, like every other revocation read.
-fn refuse_if_revoked(mesh: &Arc<MeshState>, id: &[u8; 32], peer: &str) -> Result<()> {
-    anyhow::ensure!(
-        !mesh.store.is_refused(id),
+/// Fails CLOSED on a read error, like every other revocation read. The reads are redb, so they run on
+/// the blocking pool — never on a runtime worker.
+async fn refuse_if_revoked(mesh: &Arc<MeshState>, id: [u8; 32], peer: &str) -> Result<()> {
+    let m = mesh.clone();
+    if crate::util::blocking("join dial revocation check", move || dial_refused(&m, &id)).await? {
+        return Err(revoked_refusal(peer));
+    }
+    Ok(())
+}
+
+/// The refusal every single-target outbound dial returns for a revoked peer — `open_session`'s
+/// `eid:` and nickname paths, and `connect_protocol` when every candidate is refused (#223), so an
+/// embedder sees one shape whichever verb it called.
+fn revoked_refusal(peer: &str) -> anyhow::Error {
+    anyhow::anyhow!(
         "{peer} is REVOKED on this node — dialling it would hand the request to a device you \
          declared compromised. Use `mcpmesh revoke undo` if that was a mistake"
-    );
-    Ok(())
+    )
+}
+
+/// Would dialling this endpoint reach a device this node has REVOKED? The one OUTBOUND revocation
+/// predicate (#223). Asked by: `open_session` (`refuse_if_revoked` and the race filter in
+/// `hinted_addrs`), `connect_protocol` and blob sources (`protocol_candidates`), a blob ticket's
+/// publisher (`blob_fetch`), `peer_services` (the only resolver caller that dials), the
+/// reachability probe (`reach::probe_peer`) — and its sibling cache writer, the session path
+/// watcher (`path_watch::observe`), which dials nothing but must not write the row the probe
+/// refuses to — the roster-gossip blob provider
+/// (`roster::distribute::on_announce`, through `DistributionHost::dial_refused`), and the gossip
+/// BOOTSTRAP set (`boot::gossip_bootstrap`, through [`refused_by`]).
+///
+/// **Not covered** — outbound traffic that can still reach a revoked device:
+///
+/// - **iroh-gossip's LEARNED peers.** The bootstrap set is filtered, but gossip dials neighbours it
+///   hears about from the swarm without asking this node (#229).
+/// - **Outbound connections already open** when a revocation lands are not severed (#229); the
+///   gate severs INBOUND ones.
+/// - **`AppBlobs::fetch` / `AppBlobs::fetch_from`**, the provider's raw pub API: it holds no store,
+///   so it dials whatever ticket and alternates it is handed. The daemon verb (`blob_fetch`) filters
+///   before calling it; an embedder calling the provider directly does not get that.
+/// - **The roster half of the pairing dials.** `redeem_invite` and `attest_to` hold a `PeerStore`
+///   and no roster, so they check [`PeerStore::is_refused`] alone: a roster-revoked endpoint, or a
+///   roster device under a revoked `b64u:` identity, is not refused there.
+///
+/// It mirrors what the composed gate refuses INBOUND, because dialling a device the gate would
+/// refuse is #85 ask 4's backwards verb:
+///
+/// 1. [`PeerStore::is_refused`] — the endpoint revocation table, and the identity the pair row
+///    carries (#218).
+/// 2. The installed roster's `revoked_endpoints` — composed-gate rule 1's roster half.
+/// 3. A ROSTER device whose roster `user_id` is spelled `b64u:X` with `X` identity-revoked —
+///    composed-gate rule 2, through the SAME [`PeerStore::is_roster_user_revoked`] the gate calls.
+///    [`PeerStore::is_refused`] answers `Unpaired` for a roster-only device, so without this the
+///    person→device race and an `eid:` dial reached a device the gate refuses.
+///
+/// Reads the roster VIEW rather than `RosterGate::roster_user`, which answers `None` for a
+/// degraded-stopped roster: the race draws its candidates from the view whatever its state, so the
+/// filter must see the same devices the race does. That can only refuse more, never less.
+///
+/// Blocking (redb): call it from the blocking pool. Fails CLOSED — every read it composes does.
+///
+/// [`PeerStore::is_refused`]: crate::allowlist::PeerStore::is_refused
+/// [`PeerStore::is_roster_user_revoked`]: crate::allowlist::PeerStore::is_roster_user_revoked
+pub(crate) fn dial_refused(mesh: &MeshState, id: &[u8; 32]) -> bool {
+    refused_by(&mesh.store, mesh.roster.view().as_deref(), id)
+}
+
+/// [`dial_refused`] over its two inputs, for a caller that holds them before a `MeshState` exists —
+/// the boot-time gossip bootstrap. The ONE definition; `dial_refused` is this over the mesh.
+pub(crate) fn refused_by(
+    store: &crate::allowlist::PeerStore,
+    view: Option<&mcpmesh_trust::roster::validate::RosterView>,
+    id: &[u8; 32],
+) -> bool {
+    if store.is_refused(id) {
+        return true;
+    }
+    let Some(view) = view else {
+        return false;
+    };
+    view.is_revoked(id)
+        || view
+            .resolve(id)
+            .is_some_and(|d| store.is_roster_user_revoked(&d.user_id))
 }
 
 pub async fn dial_service(
@@ -189,7 +268,7 @@ pub async fn dial_service_with_idle_timeout(
         if let Ok(bytes) = data_encoding::HEXLOWER.decode(hex.as_bytes())
             && let Ok(id) = <[u8; 32]>::try_from(bytes.as_slice())
         {
-            refuse_if_revoked(mesh, &id, peer)?;
+            refuse_if_revoked(mesh, id, peer).await?;
         }
         return dial_by_eid(mesh, hex, service, per_conn).await;
     }
@@ -248,7 +327,7 @@ pub async fn dial_service_with_idle_timeout(
         return Ok(watch_session(mesh, transport, conn));
     }
     let entry = single.with_context(|| format!("peer '{peer}' is not in the allowlist"))?;
-    refuse_if_revoked(mesh, &entry.endpoint_id, peer)?;
+    refuse_if_revoked(mesh, entry.endpoint_id, peer).await?;
     let endpoint_id = iroh::EndpointId::from_bytes(&entry.endpoint_id)
         .map_err(|e| anyhow::anyhow!("stored endpoint id for '{peer}' is invalid: {e}"))?;
     let addr = stored_dial_addr(entry.last_addr.as_deref(), endpoint_id);
@@ -340,11 +419,58 @@ async fn dial_by_eid(
 /// 3. Then the pairing store: an exact nickname, else every device of that `user_id` (not just the
 ///    first, which stranded a person whose first-stored device happened to be offline).
 ///
-/// Deduplicated, preserving order. Empty means "nobody by that name", which the caller reports.
+/// Deduplicated, preserving order, and FILTERED through [`dial_refused`] (#223): a refused device is
+/// never in `dialable`, only counted in `refused`, so no caller can dial one by forgetting to
+/// filter. Both empty means "nobody by that name"; `dialable` empty with `refused > 0` means
+/// "somebody, and every device of theirs is revoked" — the callers answer those differently.
 pub(crate) async fn protocol_candidates(
     mesh: &Arc<MeshState>,
     peer: &str,
+) -> anyhow::Result<Candidates> {
+    let resolved = resolve_candidates(mesh, peer).await?;
+    let mesh = mesh.clone();
+    crate::util::blocking("join dial revocation filter", move || {
+        let before = resolved.len();
+        let dialable: Vec<[u8; 32]> = resolved
+            .into_iter()
+            .filter(|id| !dial_refused(&mesh, id))
+            .collect();
+        Candidates {
+            refused: before - dialable.len(),
+            dialable,
+        }
+    })
+    .await
+}
+
+/// What [`protocol_candidates`] resolved: the endpoints that may be dialled, and how many were
+/// dropped as revoked. The refused ids themselves are deliberately not carried.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Candidates {
+    pub(crate) dialable: Vec<[u8; 32]>,
+    pub(crate) refused: usize,
+}
+
+/// [`protocol_candidates`] for a DIAL of one peer — `Node::connect_protocol` (#223).
+///
+/// Nobody by that name is "no peer"; somebody whose every device is revoked is the SAME refusal
+/// `open_session` returns ([`revoked_refusal`]), and nothing is dialled.
+pub(crate) async fn connect_candidates(
+    mesh: &Arc<MeshState>,
+    peer: &str,
 ) -> anyhow::Result<Vec<[u8; 32]>> {
+    let c = protocol_candidates(mesh, peer).await?;
+    if c.dialable.is_empty() {
+        if c.refused > 0 {
+            return Err(revoked_refusal(peer));
+        }
+        anyhow::bail!("no peer '{peer}' — 'status' lists your peers and roster members");
+    }
+    Ok(c.dialable)
+}
+
+/// The UNFILTERED resolution behind [`protocol_candidates`]. Private, so nothing dials from it.
+async fn resolve_candidates(mesh: &Arc<MeshState>, peer: &str) -> anyhow::Result<Vec<[u8; 32]>> {
     if let Some(hex) = peer.strip_prefix("eid:") {
         let bytes = data_encoding::HEXLOWER
             .decode(hex.as_bytes())
@@ -395,10 +521,18 @@ pub(crate) async fn protocol_candidates(
 ///
 /// Order is preserved and duplicates are dropped — including a device that two named people share,
 /// which would otherwise be dialled twice for one timeout each.
+///
+/// REVOKED devices are dropped (#223), and a name whose every device is revoked contributes
+/// nothing rather than failing the fetch: the publisher and the other sources may still serve it,
+/// and the name is not a typo. Such names are COUNTED in [`BlobSources::skipped_revoked`], which
+/// `blob_fetch` puts in its error if the fetch then fails — the caller named them, so the caller
+/// is told. Nothing is logged with the selector, which can be an `eid:`. If no source is left at
+/// all — the ticket's publisher included, which `blob_fetch` filters separately — the fetch fails
+/// with the provider's "no source to try".
 pub(crate) async fn blob_source_addrs(
     mesh: &Arc<MeshState>,
     from: &[String],
-) -> anyhow::Result<Vec<iroh::EndpointAddr>> {
+) -> anyhow::Result<BlobSources> {
     // Bounded before any work: each name costs a store scan and each candidate a dial timeout, so
     // an unbounded list is an unbounded wait on a request holding one of the connection's in-flight
     // slots. Refused rather than truncated — silently dropping the tail would make a fetch fail
@@ -411,14 +545,18 @@ pub(crate) async fn blob_source_addrs(
     );
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
+    let mut skipped_revoked = 0usize;
     for name in from {
-        let candidates = protocol_candidates(mesh, name).await?;
+        let Candidates { dialable, refused } = protocol_candidates(mesh, name).await?;
         anyhow::ensure!(
-            !candidates.is_empty(),
+            !dialable.is_empty() || refused > 0,
             "no blob source '{name}' — it must be a paired peer, a roster member, or an \
              `eid:`/`b64u:` principal"
         );
-        for eid in candidates {
+        if dialable.is_empty() {
+            skipped_revoked += 1;
+        }
+        for eid in dialable {
             if !seen.insert(eid) {
                 continue;
             }
@@ -435,7 +573,26 @@ pub(crate) async fn blob_source_addrs(
             ));
         }
     }
-    Ok(out)
+    if skipped_revoked > 0 {
+        // A count, never the selector: a caller-named source can be an `eid:`.
+        tracing::warn!(
+            skipped_revoked,
+            "blob sources skipped: REVOKED on this node, not dialled"
+        );
+    }
+    Ok(BlobSources {
+        addrs: out,
+        skipped_revoked,
+    })
+}
+
+/// What [`blob_source_addrs`] resolved (#223).
+#[derive(Debug)]
+pub(crate) struct BlobSources {
+    /// Dialable addresses, in the caller's order, deduplicated.
+    pub(crate) addrs: Vec<iroh::EndpointAddr>,
+    /// How many caller-NAMED sources contributed nothing because every device was revoked.
+    pub(crate) skipped_revoked: usize,
 }
 
 pub(crate) fn stored_dial_addr(
@@ -725,17 +882,19 @@ async fn hinted_addrs(
 ) -> Result<Vec<iroh::EndpointAddr>> {
     // #85 ask 4: drop revoked devices from the race. Filtering here covers BOTH racing paths (the
     // roster person→device race and the multi-device `user_id` race) at one seam — a person with
-    // three devices, one of them stolen, must still be reachable on the other two.
-    let candidates: Vec<[u8; 32]> = candidates
-        .into_iter()
-        .filter(|id| !mesh.store.is_refused(id))
-        .collect();
-    anyhow::ensure!(
-        !candidates.is_empty(),
-        "every device of that peer is REVOKED on this node"
-    );
-    let store = mesh.store.clone();
+    // three devices, one of them stolen, must still be reachable on the other two. Through
+    // `dial_refused` (#223), so a roster device under a revoked `b64u:` identity is dropped too.
+    let mesh = mesh.clone();
     crate::util::blocking("join dial-candidate hints", move || {
+        let candidates: Vec<[u8; 32]> = candidates
+            .into_iter()
+            .filter(|id| !dial_refused(&mesh, id))
+            .collect();
+        anyhow::ensure!(
+            !candidates.is_empty(),
+            "every device of that peer is REVOKED on this node"
+        );
+        let store = &mesh.store;
         let mut out = Vec::with_capacity(candidates.len());
         for eid in candidates {
             let Ok(id) = iroh::EndpointId::from_bytes(&eid) else {
@@ -931,7 +1090,10 @@ mod source_tests {
         .await;
 
         // A nickname resolves.
-        let out = blob_source_addrs(&mesh, &["alice".into()]).await.unwrap();
+        let out = blob_source_addrs(&mesh, &["alice".into()])
+            .await
+            .unwrap()
+            .addrs;
         assert_eq!(out.len(), 1, "a paired nickname must resolve to its device");
         assert_eq!(*out[0].id.as_bytes(), a);
 
@@ -939,7 +1101,8 @@ mod source_tests {
         // promise this, and it goes through a different store lookup than the nickname.
         let out = blob_source_addrs(&mesh, &["b64u:alice-key".into()])
             .await
-            .unwrap();
+            .unwrap()
+            .addrs;
         assert_eq!(*out[0].id.as_bytes(), a, "a b64u: user_id must resolve");
 
         // An `eid:` principal resolves without any store entry at all.
@@ -949,13 +1112,15 @@ mod source_tests {
             &[format!("eid:{}", data_encoding::HEXLOWER.encode(&stranger))],
         )
         .await
-        .unwrap();
+        .unwrap()
+        .addrs;
         assert_eq!(*out[0].id.as_bytes(), stranger);
 
         // ORDER is preserved — sources are tried in it, so a reordering changes which one answers.
         let out = blob_source_addrs(&mesh, &["bob".into(), "alice".into()])
             .await
-            .unwrap();
+            .unwrap()
+            .addrs;
         assert_eq!(
             out.iter().map(|x| *x.id.as_bytes()).collect::<Vec<_>>(),
             vec![b, a],
@@ -966,7 +1131,8 @@ mod source_tests {
         // one timeout each.
         let out = blob_source_addrs(&mesh, &["alice".into(), "b64u:alice-key".into()])
             .await
-            .unwrap();
+            .unwrap()
+            .addrs;
         assert_eq!(out.len(), 1, "one device named twice must be dialled once");
 
         // A name that resolves to NOBODY is an error, not an empty contribution. Otherwise the
@@ -991,6 +1157,777 @@ mod source_tests {
         assert!(
             format!("{err:#}").contains("too many blob sources"),
             "{err:#}"
+        );
+    }
+
+    fn revoke(mesh: &crate::daemon::MeshState, eid: [u8; 32]) {
+        mesh.store
+            .revoke(crate::allowlist::RevokedEntry {
+                endpoint_id: eid,
+                revoked_at: 1,
+                reason: None,
+                source: "local".into(),
+                signer_user_id: None,
+                issued_at: None,
+            })
+            .unwrap();
+    }
+
+    fn revoke_identity(mesh: &crate::daemon::MeshState, user_id: &str) {
+        mesh.store
+            .revoke_user(
+                user_id,
+                &crate::allowlist::RevokedEntry {
+                    endpoint_id: [0u8; 32],
+                    revoked_at: 1,
+                    reason: None,
+                    source: "local".into(),
+                    signer_user_id: None,
+                    issued_at: None,
+                },
+            )
+            .unwrap();
+    }
+
+    fn eid_principal(eid: [u8; 32]) -> String {
+        format!("eid:{}", data_encoding::HEXLOWER.encode(&eid))
+    }
+
+    /// #223: `connect_protocol`'s candidates are filtered through the outbound revocation predicate.
+    ///
+    /// `protocol_candidates` applied no filter at all, so `Node::connect_protocol` dialled a device
+    /// this node had revoked on any app ALPN, by every selector. Both sides of the boundary are
+    /// seeded in ONE store: bob's stolen laptop (revoked) next to his phone and carol (live), so a
+    /// filter that refuses everything fails the live assertions and one that refuses nothing fails
+    /// the revoked ones.
+    ///
+    /// Deleting the `dial_refused` filter in `protocol_candidates` fails the first `expect_err`;
+    /// making `connect_candidates` bail "no peer" for a refused-only set fails the `REVOKED`
+    /// substring assertion.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_protocol_candidates_never_include_a_revoked_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let (laptop, phone, carol) = (eid_of(51), eid_of(52), eid_of(53));
+        let mesh = mesh_with_peers(
+            dir.path(),
+            &[
+                ("bob-laptop", laptop, Some("b64u:bob")),
+                ("bob-phone", phone, Some("b64u:bob")),
+                ("carol", carol, None),
+            ],
+        )
+        .await;
+        // Precondition: every selector resolves BEFORE the revoke.
+        assert_eq!(
+            super::connect_candidates(&mesh, "bob-laptop")
+                .await
+                .unwrap(),
+            vec![laptop]
+        );
+        revoke(&mesh, laptop);
+
+        for sel in ["bob-laptop".to_string(), eid_principal(laptop)] {
+            let e = super::connect_candidates(&mesh, &sel)
+                .await
+                .expect_err("a revoked device must never be a connect_protocol candidate");
+            // The SAME refusal `open_session` gives (`refuse_if_revoked`), not "no peer".
+            assert!(
+                format!("{e:#}").contains(&format!("{sel} is REVOKED on this node")),
+                "{sel}: {e:#}"
+            );
+        }
+        // A person with one stolen device is still reachable on the other.
+        assert_eq!(
+            super::connect_candidates(&mesh, "b64u:bob").await.unwrap(),
+            vec![phone],
+            "the revoked laptop is dropped, the phone stays"
+        );
+        // The control: an unrevoked peer is untouched.
+        assert_eq!(
+            super::connect_candidates(&mesh, "carol").await.unwrap(),
+            vec![carol]
+        );
+        // Nobody by that name is still "no peer", NOT a revocation claim.
+        let e = super::connect_candidates(&mesh, "nobody")
+            .await
+            .expect_err("nobody resolves");
+        let msg = format!("{e:#}");
+        assert!(
+            msg.contains("no peer 'nobody'") && !msg.contains("REVOKED"),
+            "{msg}"
+        );
+
+        // Every device of the person revoked → the revocation refusal for the person.
+        revoke(&mesh, phone);
+        let e = super::connect_candidates(&mesh, "b64u:bob")
+            .await
+            .expect_err("every device revoked");
+        assert!(
+            format!("{e:#}").contains("b64u:bob is REVOKED on this node"),
+            "{e:#}"
+        );
+    }
+
+    /// #223: a revoked device is dropped from a blob fetch's source set, and a name whose every
+    /// device is revoked contributes nothing — it is not a typo, so it is not the typo error.
+    ///
+    /// Deleting the `dial_refused` filter in `protocol_candidates` fails the first assertion; making
+    /// the typo guard ignore `refused` fails the `stolen`-only one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blob_sources_drop_a_revoked_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let (stolen, carol) = (eid_of(54), eid_of(55));
+        let mesh = mesh_with_peers(
+            dir.path(),
+            &[("stolen", stolen, None), ("carol", carol, None)],
+        )
+        .await;
+        revoke(&mesh, stolen);
+
+        let out = blob_source_addrs(&mesh, &["stolen".into(), "carol".into()])
+            .await
+            .unwrap()
+            .addrs;
+        assert_eq!(
+            out.iter().map(|a| *a.id.as_bytes()).collect::<Vec<_>>(),
+            vec![carol],
+            "a revoked source must never reach the fetch's dial set"
+        );
+        let out = blob_source_addrs(&mesh, &[eid_principal(stolen)])
+            .await
+            .expect("a revoked-only source is dropped, not an error")
+            .addrs;
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    /// #223 (review, item 5 + item 2): `peer_services` — the one resolver caller that DIALS —
+    /// refuses a revoked roster device by every selector, while `peer_diagnostics` and
+    /// `peer_hint_clear`, which dial nothing, keep working on the same device.
+    ///
+    /// Fixture: `gone` is PAIRED (a nickname row) and its endpoint is in the roster's
+    /// `revoked_endpoints`, so the store alone admits it; `mallory` is a roster device under the
+    /// identity-revoked `b64u:mallory` with no row. Alice is the dialled control.
+    ///
+    /// Deleting the `dial_refused` check in `peer_services` fails the `REVOKED` assertions for all
+    /// three selectors — including the NICKNAME one, which the resolver's store check never
+    /// refused. Moving that check back into `resolve_peer_endpoint` fails the diagnostics and
+    /// hint-clear assertions.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn peer_services_refuses_revoked_roster_devices_while_read_only_verbs_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mallory, alice, gone) = (eid_of(71), eid_of(72), eid_of(73));
+        let mesh = mesh_with_peers(dir.path(), &[("gone", gone, None)]).await;
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+        mesh.roster.install(roster_view(
+            &[(mallory, "b64u:mallory"), (alice, "alice")],
+            &[gone],
+        ));
+        revoke_identity(&mesh, "b64u:mallory");
+        assert!(
+            !mesh.store.is_refused(&gone),
+            "fixture: the store alone admits `gone`"
+        );
+
+        for sel in [
+            "gone".to_string(),
+            eid_principal(gone),
+            eid_principal(mallory),
+        ] {
+            let e = crate::daemon::handlers::peer_services(&state, sel.clone())
+                .await
+                .expect_err("peer_services dials, so it must refuse a revoked roster device");
+            assert!(
+                format!("{e:#}").contains("is REVOKED on this node"),
+                "{sel}: {e:#}"
+            );
+        }
+        // The control: alice is dialled (and is unreachable on a hermetic mesh), never refused.
+        let e = crate::daemon::handlers::peer_services(&state, eid_principal(alice))
+            .await
+            .expect_err("alice is not running");
+        assert!(!format!("{e:#}").contains("REVOKED"), "{e:#}");
+
+        // The read-only verbs on the SAME revoked-but-paired device.
+        crate::daemon::handlers::peer_diagnostics(&state, "gone")
+            .await
+            .expect("peer_diagnostics dials nothing, so a roster revocation must not block it");
+        crate::daemon::handlers::peer_hint_clear(&state, "gone")
+            .await
+            .expect("clearing a stored hint dials nothing, so it must not be blocked either");
+    }
+
+    /// A bare endpoint on `ALPN_PING` that counts completed handshakes.
+    async fn counting_ping_peer() -> (
+        iroh::Endpoint,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let ep = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .alpns(vec![mcpmesh_net::ALPN_PING.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (e, c) = (ep.clone(), n.clone());
+        let task = tokio::spawn(async move {
+            while let Some(incoming) = e.accept().await {
+                if incoming.await.is_ok() {
+                    c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        });
+        (ep, n, task)
+    }
+
+    /// #223 (review): the reachability probe never PINGs a revoked device. `reachability_of` probes
+    /// every stored row and a revocation keeps the row, so each `status` poll dialled the device the
+    /// operator declared compromised. Both peers are real endpoints reachable through their stored
+    /// hint; the unrevoked one is the control that a probe lands at all.
+    ///
+    /// And a refused probe COMMITS NOTHING (#89: a probe that never went out is not evidence): the
+    /// stolen peer's cached row keeps its old `probed_at` and verdict, and no `Probe` frame is sent
+    /// for it — through `probe_peer` and through `status`'s background refresh.
+    ///
+    /// Deleting the refused early-return in `probe_peer` fails the zero count; committing a
+    /// `reachable: false` row there fails the unchanged-row assertion; broadcasting a transition
+    /// there fails the no-frame assertion; asking `store.is_refused` instead of `dial_refused` there
+    /// fails the zero count for the two roster-refused peers. The trailing `status.revoked`
+    /// assertions fail when `roster_revocations` is dropped from `status_result`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_reachability_probe_never_dials_a_revoked_peer() {
+        tokio::time::timeout(std::time::Duration::from_secs(90), async {
+            let dir = tempfile::tempdir().unwrap();
+            let mesh = mesh_with_peers(dir.path(), &[]).await;
+            // Three refused peers, one per clause of `dial_refused`: store-revoked, ROSTER-revoked,
+            // and a roster device under a revoked `b64u:` user. The last two are refused by nothing
+            // `PeerStore::is_refused` reads, so a probe that asked only the store dials them.
+            let (stolen_ep, stolen, _t1) = counting_ping_peer().await;
+            let (gone_ep, gone, _t2) = counting_ping_peer().await;
+            let (mal_ep, mal, _t3) = counting_ping_peer().await;
+            let (live_ep, live, _t4) = counting_ping_peer().await;
+            for (ep, nick) in [
+                (&stolen_ep, "stolen"),
+                (&gone_ep, "gone"),
+                (&mal_ep, "mal"),
+                (&live_ep, "live"),
+            ] {
+                mesh.store
+                    .add(crate::allowlist::PeerEntry {
+                        endpoint_id: *ep.id().as_bytes(),
+                        nickname: nick.into(),
+                        services: vec![],
+                        paired_at: None,
+                        user_id: None,
+                        last_addr: Some(serde_json::to_string(&ep.addr()).unwrap()),
+                    })
+                    .unwrap();
+            }
+            let id = |ep: &iroh::Endpoint| *ep.id().as_bytes();
+            revoke(&mesh, id(&stolen_ep));
+            mesh.roster.install(roster_view(
+                &[(id(&mal_ep), "b64u:mallory"), (id(&live_ep), "alice")],
+                &[id(&gone_ep)],
+            ));
+            revoke_identity(&mesh, "b64u:mallory");
+            let refused = [
+                ("stolen", id(&stolen_ep), &stolen),
+                ("gone", id(&gone_ep), &gone),
+                ("mal", id(&mal_ep), &mal),
+            ];
+            // An OLD verdict from before the revocation: reachable, probed at epoch 1. A committed
+            // refusal would flip it to `false` with a fresh stamp — a transition, and a frame.
+            // The live peer gets the SAME old row: it answers no pong, so its real probe commits
+            // `reachable: false` and broadcasts — the control that this harness can see a frame.
+            for eid in refused.iter().map(|r| r.1).chain([id(&live_ep)]) {
+                mesh.reachability.lock().unwrap().insert(
+                    eid,
+                    crate::daemon::reach::ReachEntry {
+                        reachable: true,
+                        rtt_ms: Some(1),
+                        probed_at: 1,
+                        meta: String::new(),
+                        services: vec![],
+                        seq: 0,
+                        observed: 0,
+                        path: mcpmesh_local_api::PeerPath::Unknown,
+                    },
+                );
+            }
+            let mut frames = mesh.reach_bcast.subscribe();
+
+            crate::daemon::reach::probe_peer(&mesh, id(&live_ep)).await;
+            for (_, eid, _) in &refused {
+                crate::daemon::reach::probe_peer(&mesh, *eid).await;
+            }
+            // `status`: the cached rows are stale (epoch 1), so this spawns background refreshes.
+            let _ = crate::daemon::reach::reachability_of(&mesh);
+            assert!(
+                live.load(std::sync::atomic::Ordering::SeqCst) > 0,
+                "control: a probe of an unrevoked peer must land"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            for (name, eid, count) in &refused {
+                assert_eq!(
+                    count.load(std::sync::atomic::Ordering::SeqCst),
+                    0,
+                    "a revoked peer must never be probed ({name})"
+                );
+                let cache = mesh.reachability.lock().unwrap();
+                let row = cache.get(eid).expect("the old row is still there");
+                assert!(
+                    row.reachable && row.probed_at == 1,
+                    "a probe that never dialled must not freshen or flip the cached row ({name})"
+                );
+            }
+            let refused_principals: Vec<String> = refused
+                .iter()
+                .map(|r| mcpmesh_net::EndpointId::from_bytes(r.1).principal())
+                .collect();
+            let mut live_frames = 0;
+            while let Ok(f) = frames.try_recv() {
+                assert!(
+                    !refused_principals
+                        .iter()
+                        .any(|p| f.peer.principal.as_deref() == Some(p.as_str())),
+                    "no Probe frame may be sent for a probe that never went out: {:?}",
+                    f.peer.principal
+                );
+                live_frames += 1;
+            }
+            assert!(
+                live_frames > 0,
+                "control: the live peer's real probe flips its row, so a frame IS sent for it"
+            );
+
+            // #223 review, item 2: each of those stale rows can be matched to its revocation —
+            // `status.revoked` names all three, the roster two with their roster sources.
+            let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+            let status = crate::control::status_result(&state).unwrap();
+            let source_of = |eid: [u8; 32]| {
+                let p = mcpmesh_net::EndpointId::from_bytes(eid).principal();
+                status
+                    .revoked
+                    .iter()
+                    .find(|r| r.principal == p)
+                    .map(|r| r.source.clone())
+            };
+            assert_eq!(source_of(id(&stolen_ep)).as_deref(), Some("local"));
+            assert_eq!(source_of(id(&gone_ep)).as_deref(), Some("roster"));
+            assert_eq!(source_of(id(&mal_ep)).as_deref(), Some("roster_identity"));
+            assert_eq!(
+                source_of(id(&live_ep)),
+                None,
+                "an unrevoked peer is not listed"
+            );
+        })
+        .await
+        .expect("probe test timed out");
+    }
+
+    /// #223 (review, item 1): the gossip BOOTSTRAP set excludes every device the outbound predicate
+    /// refuses. `device_endpoints()` dropped only the roster's own revocations, so gossip dialled a
+    /// `peer_revoke`d device and every device of a roster user spelled as a revoked `b64u:` identity.
+    ///
+    /// Fixture: alice (live), mallory (roster user `b64u:mallory`, identity-revoked, no row), bob's
+    /// device (store-revoked), and this node itself. Before the revocations all three peers are in
+    /// the set, so the expected `{alice}` cannot be met by refusing everything or by dropping only
+    /// ourselves. Deleting the `refused_by` filter in `gossip_bootstrap` fails the second assertion.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_gossip_bootstrap_excludes_refused_devices() {
+        let dir = tempfile::tempdir().unwrap();
+        let mesh = mesh_with_peers(dir.path(), &[]).await;
+        let (alice, mallory, bob, me) = (eid_of(81), eid_of(82), eid_of(83), eid_of(84));
+        let view = roster_view(
+            &[
+                (alice, "alice"),
+                (mallory, "b64u:mallory"),
+                (bob, "bob"),
+                (me, "me"),
+            ],
+            &[],
+        );
+        let ids = |b: crate::daemon::boot::bootstrap::GossipBootstrap| {
+            let mut v: Vec<[u8; 32]> = b.ids().iter().map(|e| *e.as_bytes()).collect();
+            v.sort();
+            v
+        };
+        let mut everyone = vec![alice, mallory, bob];
+        everyone.sort();
+        assert_eq!(
+            ids(crate::daemon::boot::bootstrap::gossip_bootstrap(
+                &mesh.store,
+                Some(&view),
+                &me
+            )),
+            everyone,
+            "fixture: before any revocation every other device bootstraps"
+        );
+        revoke_identity(&mesh, "b64u:mallory");
+        revoke(&mesh, bob);
+        assert_eq!(
+            ids(crate::daemon::boot::bootstrap::gossip_bootstrap(
+                &mesh.store,
+                Some(&view),
+                &me
+            )),
+            vec![alice],
+            "gossip must not bootstrap from a device this node refuses to dial"
+        );
+    }
+
+    /// #223 review, item 4: the bootstrap set the daemon SUBSCRIBES with is the filtered one. The
+    /// plan is what `compose_roster_transport` consumes — it takes no roster and no store — so this
+    /// pins the list the daemon actually builds, not only the helper.
+    ///
+    /// Passing `None` for the view inside `bootstrap::for_roster` fails the `{alice}` assertion.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_roster_transport_plan_bootstraps_without_refused_devices() {
+        let dir = tempfile::tempdir().unwrap();
+        let mesh = mesh_with_peers(dir.path(), &[]).await;
+        let (alice, mallory, bob, me) = (eid_of(91), eid_of(92), eid_of(93), eid_of(94));
+        mesh.roster.install(roster_view(
+            &[
+                (alice, "alice"),
+                (mallory, "b64u:mallory"),
+                (bob, "bob"),
+                (me, "me"),
+            ],
+            &[],
+        ));
+        revoke_identity(&mesh, "b64u:mallory");
+        revoke(&mesh, bob);
+        let cfg = crate::config::Config::default();
+        let our_id = iroh::EndpointId::from_bytes(&me).unwrap();
+        assert!(
+            crate::daemon::boot::plan_roster_transport(
+                &mesh.roster,
+                &mesh.store,
+                &cfg,
+                false,
+                &our_id
+            )
+            .await
+            .is_none(),
+            "a pure-pairing daemon plans no transport"
+        );
+        let plan = crate::daemon::boot::plan_roster_transport(
+            &mesh.roster,
+            &mesh.store,
+            &cfg,
+            true,
+            &our_id,
+        )
+        .await
+        .expect("roster mode with an installed roster plans a transport");
+        assert_eq!(plan.org_id, "acme");
+        let ids: Vec<[u8; 32]> = plan.bootstrap.ids().iter().map(|e| *e.as_bytes()).collect();
+        assert_eq!(
+            ids,
+            vec![alice],
+            "the daemon must subscribe gossip with the filtered bootstrap set"
+        );
+    }
+
+    /// A mesh whose roster-blob transport EXISTS, so `on_announce` gets as far as the fetch.
+    async fn mesh_with_roster_blobs(
+        dir: &std::path::Path,
+    ) -> std::sync::Arc<crate::daemon::MeshState> {
+        use std::sync::Arc;
+        let store = Arc::new(crate::allowlist::PeerStore::open(&dir.join("state.redb")).unwrap());
+        let pairs = Arc::new(crate::allowlist::AllowlistGate::new(store.clone()));
+        let roster = Arc::new(crate::roster::gate::RosterGate::empty());
+        let gate: Arc<dyn mcpmesh_net::TrustGate> = Arc::new(
+            crate::roster::gate::ComposedGate::new(roster.clone(), pairs),
+        );
+        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .bind()
+            .await
+            .unwrap();
+        let blobs = crate::roster::transport::RosterBlobs::new(&endpoint);
+        crate::daemon::MeshState::new(
+            endpoint,
+            gate,
+            store,
+            Arc::new(crate::pairing::LiveInvites::new()),
+            "test".into(),
+            dir.join("config.toml"),
+            roster,
+            Arc::new(mcpmesh_net::registry::ConnRegistry::new()),
+            None,
+            Some(blobs),
+            None,
+            None,
+        )
+    }
+
+    /// A bare endpoint on the ROSTER blob ALPN that counts completed handshakes, then closes.
+    async fn counting_roster_provider() -> (
+        iroh::Endpoint,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let ep = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .alpns(vec![crate::roster::transport::BLOB_ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (e, c) = (ep.clone(), n.clone());
+        let task = tokio::spawn(async move {
+            while let Some(incoming) = e.accept().await {
+                if let Ok(conn) = incoming.await {
+                    c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    conn.close(0u32.into(), b"test");
+                }
+            }
+        });
+        (ep, n, task)
+    }
+
+    /// #223 (review, item 3): a roster announce whose blob PROVIDER is revoked here is not fetched.
+    /// The announce is unsigned gossip; the roster signature protects the bytes, not the dial, which
+    /// tells the provider this node's id, address and that it is online.
+    ///
+    /// The control is the same announce naming an UNREVOKED provider: that one is dialled, so a zero
+    /// count for the revoked one means "refused", not "never got as far as a fetch". Deleting the
+    /// `dial_refused` check in `on_announce` fails the first `expect`: the fetch then runs, dials
+    /// the revoked provider, and errors. Asking `store.is_refused` in `MeshState::dial_refused`
+    /// fails it for the two roster-refused providers; noting the address before the check fails
+    /// the address-book assertions (the mesh carries a real `RosterAddrBook`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_roster_announce_from_a_revoked_provider_is_not_fetched() {
+        use std::sync::atomic::Ordering;
+        tokio::time::timeout(std::time::Duration::from_secs(90), async {
+            let dir = tempfile::tempdir().unwrap();
+            let mesh = mesh_with_roster_blobs(dir.path()).await;
+            // A REAL address book, as boot registers one, so "not even noted" is observable.
+            let book = std::sync::Arc::new(crate::roster::transport::RosterAddrBook::register(
+                &mesh.endpoint,
+                64,
+            ));
+            assert!(mesh.roster_addr_book.set(book.clone()).is_ok());
+            // One refused provider per clause of `dial_refused`: store-revoked, ROSTER-revoked, and
+            // a roster device under a revoked `b64u:` user — the last two invisible to the store.
+            let (stolen_ep, stolen, _t1) = counting_roster_provider().await;
+            let (gone_ep, gone, _t2) = counting_roster_provider().await;
+            let (mal_ep, mal, _t3) = counting_roster_provider().await;
+            let (live_ep, live, _t4) = counting_roster_provider().await;
+            let id = |ep: &iroh::Endpoint| *ep.id().as_bytes();
+            revoke(&mesh, id(&stolen_ep));
+            mesh.roster.install(roster_view(
+                &[(id(&mal_ep), "b64u:mallory")],
+                &[id(&gone_ep)],
+            ));
+            revoke_identity(&mesh, "b64u:mallory");
+            let announce = |ep: &iroh::Endpoint| crate::roster::transport::RosterAnnounce {
+                serial: 99,
+                roster_hash: "blake3:00".into(),
+                blob_ticket: iroh_blobs::ticket::BlobTicket::new(
+                    ep.addr(),
+                    iroh_blobs::Hash::new(b"roster"),
+                    iroh_blobs::BlobFormat::Raw,
+                )
+                .to_string(),
+            };
+
+            for ep in [&stolen_ep, &gone_ep, &mal_ep] {
+                crate::roster::distribute::on_announce(&mesh, announce(ep))
+                    .await
+                    .expect("a refused provider is a fail-safe no-op, not an error");
+            }
+
+            // The control, spawned: a fetch from a provider that closes on it may retry until the
+            // gossip fetch timeout, and only the DIAL matters here.
+            let (m, a) = (mesh.clone(), announce(&live_ep));
+            let control = tokio::spawn(async move {
+                let _ = crate::roster::distribute::on_announce(&m, a).await;
+            });
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+            while live.load(Ordering::SeqCst) == 0 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "control: an unrevoked provider must be dialled"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            control.abort();
+            assert!(
+                book.recorded_for(&id(&live_ep)).is_some(),
+                "control: an unrevoked provider's address IS noted"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            for (name, ep, count) in [
+                ("stolen", &stolen_ep, &stolen),
+                ("gone", &gone_ep, &gone),
+                ("mal", &mal_ep, &mal),
+            ] {
+                assert_eq!(
+                    count.load(Ordering::SeqCst),
+                    0,
+                    "a revoked roster-blob provider must never be contacted ({name})"
+                );
+                assert!(
+                    book.recorded_for(&id(ep)).is_none(),
+                    "a refused provider's address must not even be noted ({name})"
+                );
+            }
+        })
+        .await
+        .expect("announce test timed out");
+    }
+
+    /// A roster view whose users each own one primary device, plus revoked endpoints.
+    fn roster_view(
+        active: &[([u8; 32], &str)],
+        revoked: &[[u8; 32]],
+    ) -> mcpmesh_trust::roster::validate::RosterView {
+        use mcpmesh_trust::roster::{Roster, RosterDevice, RosterUser, encode_b64u};
+        let root = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let users = active
+            .iter()
+            .map(|(eid, uid)| RosterUser {
+                user_id: (*uid).into(),
+                display_name: (*uid).into(),
+                user_pk: encode_b64u(&[1u8; 32]),
+                groups: vec!["team".into()],
+                devices: vec![RosterDevice {
+                    endpoint_id: encode_b64u(eid),
+                    label: "d".into(),
+                    role: "primary".into(),
+                }],
+            })
+            .collect();
+        let r = mcpmesh_trust::roster::sign::mint_signed(
+            &root,
+            Roster {
+                format: "mcpmesh-roster/1".into(),
+                org_id: "acme".into(),
+                serial: 3,
+                issued_at: "2000-01-01T00:00:00Z".into(),
+                expires_at: "2999-01-01T00:00:00Z".into(),
+                groups: vec!["team".into()],
+                users,
+                revoked_endpoints: revoked.iter().map(|e| encode_b64u(e)).collect(),
+                successor_root_pk: None,
+                successor_sig: None,
+                sig: String::new(),
+            },
+        );
+        mcpmesh_trust::roster::validate::load_installed(&r, &root.verifying_key()).unwrap()
+    }
+
+    /// #223 item 2: the OUTBOUND twin of composed-gate rule 2. A roster device whose roster `user_id`
+    /// is spelled `b64u:mallory`, with that identity revoked and NO pair row, is refused by the
+    /// person→device race, by an `eid:` session dial, and by `connect_protocol` — as the gate
+    /// refuses it inbound.
+    ///
+    /// Fixture discriminates: alice is rostered alongside (never refused), and the identity table
+    /// also holds the bare string `alice`, which only the `b64u:` spelling rule keeps from refusing
+    /// her. A roster-REVOKED endpoint (rule 1's roster half) is refused on the `eid:` paths too.
+    ///
+    /// Deleting the roster-identity clause in `dial_refused` fails the first `expect_err`; dropping
+    /// the `b64u:` prefix check in `PeerStore::is_roster_user_revoked` fails the alice control;
+    /// deleting `view.is_revoked` in `dial_refused` fails the roster-revoked `eid:` assertions.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_roster_device_under_a_revoked_b64u_identity_is_refused_outbound() {
+        let dir = tempfile::tempdir().unwrap();
+        let mesh = mesh_with_peers(dir.path(), &[]).await;
+        let (mallory, alice, gone) = (eid_of(61), eid_of(62), eid_of(63));
+        mesh.roster.install(roster_view(
+            &[(mallory, "b64u:mallory"), (alice, "alice")],
+            &[gone],
+        ));
+        revoke_identity(&mesh, "b64u:mallory");
+        revoke_identity(&mesh, "alice");
+        // Fixture: no pair row for mallory, so `PeerStore::is_refused` alone reads `Unpaired`; and
+        // the inbound gate refuses her, which is the side this must agree with.
+        assert!(mesh.store.resolve(&mallory).unwrap().is_none());
+        assert!(
+            !mesh.store.is_refused(&mallory),
+            "fixture: the store alone admits no refusal"
+        );
+        assert!(
+            mesh.gate.resolve(&mallory.into()).is_none(),
+            "fixture: rule 2 refuses inbound"
+        );
+        assert!(
+            mesh.gate.resolve(&alice.into()).is_some(),
+            "fixture: alice is admitted inbound"
+        );
+
+        const BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+
+        // The person→device race.
+        let e =
+            match tokio::time::timeout(BOUND, super::dial_service(&mesh, "b64u:mallory", "notes"))
+                .await
+                .expect("the refusal is immediate, not a dial timeout")
+            {
+                Ok(_) => panic!("the race must refuse a device of a revoked roster identity"),
+                Err(e) => e,
+            };
+        assert!(
+            format!("{e:#}").contains("every device of that peer is REVOKED"),
+            "{e:#}"
+        );
+        // The `eid:` session dial, for mallory AND for the roster-revoked endpoint.
+        for eid in [mallory, gone] {
+            let sel = eid_principal(eid);
+            let e = match tokio::time::timeout(BOUND, super::dial_service(&mesh, &sel, "notes"))
+                .await
+                .expect("immediate")
+            {
+                Ok(_) => panic!("an eid: dial must refuse {sel}"),
+                Err(e) => e,
+            };
+            assert!(
+                format!("{e:#}").contains(&format!("{sel} is REVOKED on this node")),
+                "{e:#}"
+            );
+            let e = super::connect_candidates(&mesh, &sel)
+                .await
+                .expect_err("connect_protocol must refuse it too");
+            assert!(
+                format!("{e:#}").contains("is REVOKED on this node"),
+                "{e:#}"
+            );
+        }
+        let e = super::connect_candidates(&mesh, "b64u:mallory")
+            .await
+            .expect_err("connect_protocol by roster person");
+        assert!(
+            format!("{e:#}").contains("is REVOKED on this node"),
+            "{e:#}"
+        );
+
+        // The control: alice still resolves and is DIALLED — whatever the hermetic dial then does,
+        // it must not be the revocation refusal.
+        assert_eq!(
+            super::connect_candidates(&mesh, "alice").await.unwrap(),
+            vec![alice]
+        );
+        for sel in ["alice".to_string(), eid_principal(alice)] {
+            if let Err(e) = tokio::time::timeout(BOUND, super::dial_service(&mesh, &sel, "notes"))
+                .await
+                .expect("a hermetic id-only dial fails fast")
+            {
+                assert!(
+                    !format!("{e:#}").contains("REVOKED"),
+                    "a live roster device must be dialled, not refused ({sel}): {e:#}"
+                );
+            }
+        }
+
+        // Lifting the identity revocation hands mallory back to the outbound path.
+        assert!(mesh.store.unrevoke_user("b64u:mallory").unwrap());
+        assert_eq!(
+            super::connect_candidates(&mesh, "b64u:mallory")
+                .await
+                .unwrap(),
+            vec![mallory]
         );
     }
 }
