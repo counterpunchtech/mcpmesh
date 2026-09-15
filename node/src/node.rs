@@ -353,6 +353,60 @@ impl Node {
         self.mesh().register_app_protocol(alpn, handler)
     }
 
+    /// Is this connection's application data going over a relay or over a direct IP path (#213)?
+    ///
+    /// For a connection YOU hold — one from [`connect_protocol`](Self::connect_protocol) or handed
+    /// to your [`accept_protocol`](Self::accept_protocol) handler. It **measures**: it samples every
+    /// open path's application-frame counters (STREAM + DATAGRAM, both directions), watches the
+    /// connection's path events for 250ms — a path that closes inside the window is attributed
+    /// from its own final counters — and reports the path that moved. Any observed relay frame in
+    /// that window is `Relay`; otherwise a moving direct path is `Direct`. Only when nothing moved
+    /// does it fall back to the structural reading mcpmesh's own probes and session watcher use
+    /// (`Path::is_selected()`, or the single open path). An idle window whose structural reading
+    /// is `Unknown` is measured again, up to three windows (750ms) in all; nothing else is
+    /// retried, so a window that may have carried relayed frames is never followed by `Direct`.
+    ///
+    /// Measuring is what makes it usable on the **accepting** side. iroh keeps one selected
+    /// four-tuple per remote endpoint, not per connection (measured on iroh 1.0.3 and again on
+    /// 1.2.0), so the accept side of a second connection to the same peer can have `is_selected()`
+    /// false on every open path for long stretches while every byte flows over it. This does not
+    /// read that flag as the truth about the traffic; the counters are.
+    ///
+    /// `Unknown` means exactly that, and must never be rendered as private: an idle connection
+    /// with several open paths and none selected; a connection that is already closed (iroh
+    /// keeps a closed connection's path list and counters, so they are checked, not trusted); a
+    /// window that could not see every path — path events were lost, or a path disappeared with
+    /// no close event; or a transport mcpmesh does not model.
+    ///
+    /// **Best-effort evidence, not a guarantee.** The reading sees only what iroh's path list and
+    /// path events report, and two gaps are outside anything mcpmesh can observe: noq can send on a
+    /// newly validated path in the sub-millisecond gap before iroh's actor records it, and iroh's
+    /// own actor can drop a noq path event under load (its `Lagged` arm has no recovery), leaving a
+    /// path that is never listed. Frames in either gap are not attributed to any path. So `Direct`
+    /// means "no relay frames were observed in the window", not "no frame transited a relay".
+    ///
+    /// **If your rule is "never call a relayed call private"**, treat `Direct` as advisory: gate
+    /// on it at call setup, then re-check periodically for the life of the call (every few
+    /// seconds is cheap — one reading is at most 750ms of sampling and holds no lock across an
+    /// await), and treat a later `Relay` or `Unknown` as the call having become not-private. A
+    /// path can also genuinely
+    /// change mid-call (a direct path lost to a network change falls back to the relay), which
+    /// only a re-check will catch.
+    ///
+    /// ```no_run
+    /// # async fn f(conn: mcpmesh_node::iroh::endpoint::Connection) {
+    /// use mcpmesh_local_api::PeerPath;
+    /// match mcpmesh_node::Node::connection_path(&conn).await {
+    ///     PeerPath::Direct => { /* no relay frames observed; re-check during the call */ }
+    ///     PeerPath::Relay { .. } | PeerPath::Unknown => { /* ask before sending audio */ }
+    ///     _ => { /* a variant this version does not know: treat as not-private */ }
+    /// }
+    /// # }
+    /// ```
+    pub async fn connection_path(conn: &iroh::endpoint::Connection) -> mcpmesh_local_api::PeerPath {
+        crate::daemon::reach::measured_path(conn, crate::daemon::reach::PATH_MEASURE_WINDOW).await
+    }
+
     /// This node's currently-dialable address (#67) — its endpoint id plus whatever direct
     /// addresses and relay it has, exactly what a pairing invite embeds.
     ///
