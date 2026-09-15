@@ -302,7 +302,8 @@ impl ControlClient {
     /// Produce an endorsement of `subject` for someone else to redeem (#65).
     ///
     /// Signs with THIS node's user key. It is a statement for the recipient — it changes nothing
-    /// about your own trust in the subject, and only resolves for someone paired with you.
+    /// about your own trust in the subject, and only resolves for someone paired with you. Refused
+    /// when this node holds no user key of its own (enrolled, or none on disk — `api_minor >= 63`).
     pub async fn endorse_peer(
         &mut self,
         subject: &str,
@@ -640,7 +641,8 @@ impl ControlClient {
     /// daemon; this response is the only place it exists.
     ///
     /// `user_id` is safe to display and record — compare it after an import to confirm the right
-    /// identity came back. `api_minor >= 48`.
+    /// identity came back. `api_minor >= 48`. Refused (`-32602`) on a device ENROLLED into another
+    /// identity, whose local key is not the one it presents (`api_minor >= 63`, #219).
     pub async fn user_key_export(
         &mut self,
     ) -> Result<crate::protocol::UserKeyExportResult, ClientError> {
@@ -660,7 +662,8 @@ impl ControlClient {
     ///
     /// It does NOT get this device admitted by anyone: peers authorize per DEVICE, and a restored
     /// user key does not put this endpoint in anybody's allowlist. That is #85 ask 3, not shipped.
-    /// `api_minor >= 48`.
+    /// `api_minor >= 48`. Without `replace` it refuses to overwrite a key an earlier import wrote,
+    /// including within the same daemon lifetime (`api_minor >= 63`, #221).
     pub async fn user_key_import(
         &mut self,
         recovery_phrase: &str,

@@ -170,6 +170,27 @@ pub(crate) struct RelayPosture {
     pub(crate) urls: Vec<String>,
 }
 
+/// Why [`MeshState::sign_ceremony_binding`] refused (#221). The ceremony itself only sees `None`
+/// and answers the opaque refusal; the reason is for logs and tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SignBindingRefusal {
+    /// This device was ENROLLED into another identity (#86): it holds no key for what it presents.
+    Enrolled,
+    /// This node presents no identity, so there is nothing to enroll into.
+    NoIdentity,
+    /// An import or adoption landed since the ceremony snapshotted what it presents.
+    IdentityChanged,
+    /// No readable user key on disk.
+    NoKey,
+    /// The key on disk is not the one behind the presented `user_pk`.
+    KeyMismatch,
+}
+
+/// See [`MeshState::identity_gate_hook`] (#221).
+#[cfg(test)]
+pub(crate) type IdentityGateHook =
+    Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>;
+
 /// The mesh half of the daemon: the endpoint, the trust gate + its backing store, the live
 /// invite registry, and the running accept-loop task. Held (behind an `Arc`) inside
 /// [`DaemonState`] so the control API's `register_service` / `peer_add` / `pair` methods can
@@ -377,14 +398,22 @@ pub struct MeshState {
     ///
     /// A key this node minted itself and has never presented to anyone is not an identity worth
     /// protecting; a key it loaded from disk might be.
-    pub(crate) user_key_minted_at_boot: std::sync::OnceLock<bool>,
+    ///
+    /// **"Is the key ON DISK still the one boot minted"**, not "did boot mint one" (#221). It was a
+    /// set-once `OnceLock` no import cleared, so a second import in the same daemon lifetime found
+    /// it still `true` and silently discarded the first imported key under `replace: false`. An
+    /// import clears it ([`note_user_key_replaced`](Self::note_user_key_replaced)); nothing sets it
+    /// back but boot. Set by boot before serving; read and cleared under `user_key_lock`. Unset
+    /// (`false`) fails CLOSED: the guard applies.
+    user_key_still_boot_minted: std::sync::atomic::AtomicBool,
     /// A user key RESTORED from a recovery phrase (#85 ask 2), overriding the boot-derived binding.
     ///
     /// **Separate from [`adopted_binding`](Self::adopted_binding), and the distinction is
     /// load-bearing.** That field does not mean "the binding to present" — it means *this device
-    /// was enrolled into someone else's identity and holds no authority over it*, and two other
-    /// sites gate on exactly that reading: `peer_endorse` refuses, and `sign_binding` returns
-    /// `None` so `invite --as-self` cannot enroll a third device.
+    /// was enrolled into someone else's identity and holds no authority over it*, and the #86 gate
+    /// (`handlers::lock_own_user_key`) reads exactly that: `peer_endorse`, `device_revoke` and
+    /// `user_key_export` refuse, and `sign_binding` returns `None` so `invite --as-self` cannot
+    /// enroll a third device.
     ///
     /// An IMPORT is the opposite situation: the device now holds that user key. Reusing the
     /// adopted slot for it made a freshly-recovered machine unable to endorse or to enroll its
@@ -473,7 +502,19 @@ pub struct MeshState {
     /// file holding one key while the node PRESENTS another — both answering `Ok` with different
     /// `user_id`s, and the divergence surfacing only at the next restart. The export shares the
     /// lock so it cannot read a half-replaced file.
+    ///
+    /// #221: it is also the lock the #86 gate is checked UNDER. `peer_endorse`, `device_revoke`,
+    /// `user_key_export` and `inviter_ctx`'s `sign_binding` read `adopted_binding` after taking
+    /// it and hold it through reading the key and signing — or, for the export, building the
+    /// phrase (`handlers::lock_own_user_key`), so an
+    /// `adopt_hook` or `user_key_import` — which write under it — cannot land between the check and
+    /// the signature. Held only across file IO on a blocking thread, never a network await.
     pub(crate) user_key_lock: tokio::sync::Mutex<()>,
+    /// #221 test seam: runs ONCE inside an identity-signing path, after its #86 checks and before
+    /// the key is read — the window an adopt or import must not be able to land in. `None` except
+    /// in a test that installs one.
+    #[cfg(test)]
+    pub(crate) identity_gate_hook: std::sync::Mutex<Option<IdentityGateHook>>,
     /// Embedder-registered ALPNs → their handlers (#67), read by the accept loop's dispatch.
     ///
     /// mcpmesh had built the hard parts of a P2P application platform — identity, pairing, a trust
@@ -644,7 +685,7 @@ impl MeshState {
             roster_addr_book: std::sync::OnceLock::new(),
             self_binding: std::sync::OnceLock::new(),
             user_key_path: std::sync::OnceLock::new(),
-            user_key_minted_at_boot: std::sync::OnceLock::new(),
+            user_key_still_boot_minted: std::sync::atomic::AtomicBool::new(false),
             imported_binding: std::sync::RwLock::new(None),
             adopted_binding: std::sync::RwLock::new(None),
             recent_pairings: std::sync::Mutex::new(std::collections::VecDeque::new()),
@@ -660,6 +701,8 @@ impl MeshState {
             probes_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
             org_author_lock: tokio::sync::Mutex::new(()),
             user_key_lock: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            identity_gate_hook: std::sync::Mutex::new(None),
             app_protocols: std::sync::RwLock::new(std::collections::HashMap::new()),
             bound_alpns: std::sync::OnceLock::new(),
             ephemeral_services: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -1206,6 +1249,40 @@ impl MeshState {
             .expect("adopted_binding lock not poisoned") = None;
     }
 
+    /// Fire the #221 test seam, if one is installed. A no-op outside tests.
+    pub(crate) async fn run_identity_gate_hook(&self) {
+        #[cfg(test)]
+        {
+            let hook = self
+                .identity_gate_hook
+                .lock()
+                .expect("identity_gate_hook lock not poisoned")
+                .take();
+            if let Some(hook) = hook {
+                hook().await;
+            }
+        }
+    }
+
+    /// Boot (#85 ask 2): record whether it MINTED the user key rather than loading one.
+    pub(crate) fn note_user_key_minted_at_boot(&self, created: bool) {
+        self.user_key_still_boot_minted
+            .store(created, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// An import wrote a key over the file (#221): what is on disk now is a real identity, and the
+    /// `replace` guard must defend it for the rest of this lifetime.
+    pub(crate) fn note_user_key_replaced(&self) {
+        self.user_key_still_boot_minted
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Is the user key on disk still the one this boot minted (#85 ask 2, #221)?
+    pub(crate) fn user_key_still_boot_minted(&self) -> bool {
+        self.user_key_still_boot_minted
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Install the resolved `UserKey` path (#65). Set once, at boot, like `self_binding`.
     pub fn set_user_key_path(&self, path: PathBuf) {
         let _ = self.user_key_path.set(path);
@@ -1308,6 +1385,9 @@ impl MeshState {
     pub(crate) fn inviter_ctx(self: &Arc<Self>) -> crate::pairing::rendezvous::InviterCtx {
         let grant_mesh = self.clone();
         let record_mesh = self.clone();
+        // ONE snapshot, shared by what the ceremony PRESENTS and what `sign_binding` checks it is
+        // still signing for (#221).
+        let self_binding = self.self_binding();
         crate::pairing::rendezvous::InviterCtx {
             // #85 ask 3 — read once at boot, like `presence_mode`. Off unless asked for.
             admit_attested: self.admit_attested_devices(),
@@ -1316,7 +1396,7 @@ impl MeshState {
             store: self.store.clone(),
             invites: self.invites.clone(),
             config_path: self.config_path.clone(),
-            self_binding: self.self_binding(),
+            self_binding: self_binding.clone(),
             grant: Box::new(move |principal, nickname, services| {
                 let mesh = grant_mesh.clone();
                 Box::pin(async move {
@@ -1339,24 +1419,70 @@ impl MeshState {
                 })
             },
             sign_binding: {
-                let path = self.user_key_path.get().cloned();
-                // An ENROLLED device must not enroll a third (#86 gate). Boot always mints a LOCAL
-                // user key, so without this check `sign_binding` would sign with the local key
-                // while we PRESENT the adopted one — issuing bindings for an identity no peer has
-                // ever seen, and silently. The documented limitation was false until this returned
-                // `None`; now the refusal is real and the enrolling device is the one that holds
-                // the key.
-                let adopted = self.adopted_binding.read().ok().and_then(|g| g.clone());
-                Box::new(move |endpoint_id: &[u8; 32]| {
-                    if adopted.is_some() {
-                        return None;
-                    }
-                    let path = path.as_ref()?;
-                    let (user_key, _) = mcpmesh_trust::UserKey::load_or_generate(path).ok()?;
-                    Some(crate::pairing::binding_sig_for(&user_key, endpoint_id))
+                let mesh = self.clone();
+                let presented = self_binding;
+                Box::new(move |endpoint_id: [u8; 32]| {
+                    let mesh = mesh.clone();
+                    let presented = presented.clone();
+                    Box::pin(async move {
+                        mesh.sign_ceremony_binding(presented.as_ref(), &endpoint_id)
+                            .await
+                            .ok()
+                    })
+                        as std::pin::Pin<
+                            Box<dyn std::future::Future<Output = Option<String>> + Send>,
+                        >
                 })
             },
         }
+    }
+
+    /// `inviter_ctx`'s `sign_binding` (#86, #221): sign a device→user binding for `endpoint_id`
+    /// under the identity the ceremony PRESENTS, or say why not.
+    ///
+    /// Every check runs under `user_key_lock`, held through the key read and the signature, so an
+    /// adopt or import cannot land in between:
+    /// - an ENROLLED device must not enroll a third ([`SignBindingRefusal::Enrolled`]). Boot always
+    ///   mints a LOCAL key, so without this it would sign with that key while presenting the
+    ///   adopted identity — bindings for an identity no peer has ever seen.
+    /// - the ceremony presents the binding snapshotted when the connection was accepted; an import
+    ///   or adoption since then is [`SignBindingRefusal::IdentityChanged`].
+    /// - the key on disk must be the one behind the presented `user_pk`
+    ///   ([`SignBindingRefusal::KeyMismatch`]). Comparing snapshots cannot see a `user.key`
+    ///   replaced underneath the running node; a signature under that key would not verify under
+    ///   the `user_pk` the reply carries, and the redeemer would refuse after the single-use invite
+    ///   was already burned.
+    ///
+    /// `Ok` therefore always verifies under `presented.user_pk` for `endpoint_id`. The key is READ,
+    /// never minted. No network IO.
+    pub(crate) async fn sign_ceremony_binding(
+        self: &Arc<Self>,
+        presented: Option<&crate::pairing::rendezvous::SelfBinding>,
+        endpoint_id: &[u8; 32],
+    ) -> Result<String, SignBindingRefusal> {
+        let _key_guard = crate::daemon::handlers::lock_own_user_key(self, "sign_binding", "Enroll")
+            .await
+            .map_err(|_| SignBindingRefusal::Enrolled)?;
+        let presented = presented.ok_or(SignBindingRefusal::NoIdentity)?;
+        if self.self_binding().as_ref() != Some(presented) {
+            tracing::warn!(
+                "refusing a self-enrollment: this node's identity changed during the ceremony \
+                 (#221)"
+            );
+            return Err(SignBindingRefusal::IdentityChanged);
+        }
+        self.run_identity_gate_hook().await;
+        let user_key = crate::daemon::handlers::read_user_key(self)
+            .await
+            .map_err(|_| SignBindingRefusal::NoKey)?;
+        if mcpmesh_trust::roster::encode_b64u(&user_key.public_bytes()) != presented.user_pk {
+            tracing::warn!(
+                "refusing a self-enrollment: the user key on disk is not the one behind the \
+                 identity this node presents (#221)"
+            );
+            return Err(SignBindingRefusal::KeyMismatch);
+        }
+        Ok(crate::pairing::binding_sig_for(&user_key, endpoint_id))
     }
 
     /// Record that the installed roster was CONFIRMED current at `now` — the freshness `last_confirmed`

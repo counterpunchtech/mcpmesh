@@ -706,13 +706,47 @@ pub(crate) fn adopt_hook(mesh: &Arc<MeshState>) -> crate::pairing::rendezvous::A
     })
 }
 
+/// The #86 gate for every path that SIGNS with this node's user key, and the lock it is checked
+/// under (#221).
+///
+/// An ENROLLED device presents an identity it holds no key for, so signing with the LOCAL key boot
+/// minted underneath produces something no peer can redeem. The check used to be a bare read of
+/// `adopted_binding`, and the caller then read the key and signed — so an `adopt_hook` landing in
+/// between passed the gate. Returning the `user_key_lock` guard from the check makes that
+/// unrepresentable: a caller holding the result signs under the same lock hold the gate was
+/// checked in, and `adopt_hook`/`user_key_import`/`self_enroll_detach` write under it.
+///
+/// **Bind the guard to a named variable** (`let _key_guard = …`) and keep it until the signature is
+/// made — `let _ = …` drops it on the spot. Never hold it across a network await.
+///
+/// Refuses with `-32602` in the shape `peer_endorse` has always used.
+pub(crate) async fn lock_own_user_key<'m>(
+    mesh: &'m MeshState,
+    verb: &str,
+    action: &str,
+) -> Result<tokio::sync::MutexGuard<'m, ()>> {
+    let guard = mesh.user_key_lock.lock().await;
+    anyhow::ensure!(
+        mesh.adopted_binding
+            .read()
+            .expect("adopted_binding lock not poisoned")
+            .is_none(),
+        crate::control::InvalidParams(format!(
+            "{verb}: this device was enrolled into another device's identity (#86) and does not \
+             hold that user key. {action} from the device that does."
+        ))
+    );
+    Ok(guard)
+}
+
 /// Handle a `peer_endorse` control request (#65): sign a statement vouching for `subject`, for a
 /// third party to redeem with `peer_introduce`.
 ///
 /// The other half of an introduction. Without it nothing can produce `evidence` and the install
 /// half is unusable — which is what the first version shipped.
 ///
-/// Signs with THIS node's user key, reloaded from disk per request rather than held in memory.
+/// Signs with THIS node's user key, read from disk per request rather than held in memory — READ,
+/// never minted: a missing key is refused (#221).
 /// Endorsing changes nothing about our OWN trust in the subject: it is a statement for someone
 /// else, and they decide what it is worth.
 pub async fn endorse_peer(
@@ -733,27 +767,18 @@ pub async fn endorse_peer(
 
     // #86 gate: an ENROLLED device holds no authority over the identity it presents. Signing with
     // its LOCAL key would return an `endorsed_by` no peer has ever paired with, so every
-    // endorsement it produced would be silently unredeemable.
-    anyhow::ensure!(
-        mesh.adopted_binding
-            .read()
-            .expect("adopted_binding lock not poisoned")
-            .is_none(),
-        crate::control::InvalidParams(
-            "peer_endorse: this device was enrolled into another device's identity (#86) and does \
-             not hold that user key. Endorse from the device that does."
-                .into()
-        )
-    );
-    let path = mesh
-        .user_key_path
-        .get()
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("peer_endorse: this daemon has no user key path"))?;
+    // endorsement it produced would be silently unredeemable. #221: checked under
+    // `user_key_lock`, held until the signature is made.
+    let _key_guard = lock_own_user_key(mesh, "peer_endorse", "Endorse").await?;
     let subject_bytes = *subject_id.as_bytes();
     let subject_uid = params.subject_user_id.clone();
+    mesh.run_identity_gate_hook().await;
+    // READ, never `load_or_generate` (#221): a missing `user.key` used to be MINTED here, silently
+    // replacing the identity this node presents on disk — and the next self-enrollment ceremony
+    // then signed under the new key while presenting the old one. Refused instead, as
+    // `device_revoke` and `user_key_export` do.
+    let user_key = read_user_key(mesh).await?;
     let (endorsed_by, evidence) = blocking("join endorse", move || {
-        let (user_key, _created) = mcpmesh_trust::UserKey::load_or_generate(&path)?;
         let evidence =
             mcpmesh_trust::binding::endorse(&user_key, &subject_bytes, subject_uid.as_deref())?;
         anyhow::Ok((mcpmesh_trust::binding::user_id(&user_key), evidence))
@@ -2707,11 +2732,20 @@ where
 ///
 /// Errors when this node has no user key: there is nothing to export, and minting one here would
 /// hand back a phrase for an identity nobody has ever seen.
+///
+/// Refuses (`-32602`) on an ENROLLED device (#86, #219): the local key is not the identity this
+/// node presents, so its phrase would restore a stranger.
 pub(crate) async fn user_key_export(
     state: &DaemonState,
 ) -> Result<mcpmesh_local_api::UserKeyExportResult> {
     let mesh = state.mesh_required()?;
-    let _guard = mesh.user_key_lock.lock().await;
+    // #86 gate (#219): an ENROLLED device presents an identity it holds no key for. The LOCAL key
+    // boot minted underneath backs an identity no peer has ever paired with, so exporting it hands
+    // a person "backing up their identity" the wrong phrase — discovered only on the new hardware,
+    // as a stranger to every peer. Same predicate and shape as `peer_endorse`, checked BEFORE the
+    // key is read — and (#221) under `user_key_lock`, held until the phrase is built, so an
+    // adoption cannot land between the check and the read.
+    let _key_guard = lock_own_user_key(mesh, "user_key_export", "Export").await?;
     let path = mesh
         .user_key_path
         .get()
@@ -2725,6 +2759,7 @@ pub(crate) async fn user_key_export(
     // READ, never `load_or_generate` — that mints when the file is absent, so a "read-only" export
     // racing a missing key would leave a fresh random identity behind that became this node's at
     // the next restart. Refusing AFTER the side effect is not refusing.
+    mesh.run_identity_gate_hook().await;
     let bytes = blocking("join user key export", {
         let path = path.clone();
         move || std::fs::read(&path)
@@ -2791,7 +2826,10 @@ pub(crate) async fn user_key_import(
     //
     // Unset (a control-only or test daemon that never resolved a key) is treated as "not minted
     // here", which fails CLOSED: the guard applies, and the caller can still pass `replace`.
-    let minted_here = *mesh.user_key_minted_at_boot.get().unwrap_or(&false);
+    //
+    // "Still" (#221): an earlier import in this lifetime cleared it, so the key it wrote is
+    // defended like a loaded one. Read under `user_key_lock`, which every writer of the key holds.
+    let minted_here = mesh.user_key_still_boot_minted();
     let protects = existed && !minted_here;
     anyhow::ensure!(
         !protects || replace,
@@ -2873,6 +2911,9 @@ pub(crate) async fn user_key_import(
         }
         return Err(e);
     }
+    // #221: the key on disk is now a real identity. Cleared only once the write has landed — a
+    // failed write left the boot-minted key in place, still worth nothing.
+    mesh.note_user_key_replaced();
 
     // LIVE: the identity this node presents changes now, not at the next restart. A
     // restart-required answer would leave it presenting the OLD identity while its operator
@@ -3654,6 +3695,8 @@ mod tests {
         std::fs::write(&config_path, "").unwrap();
         let mesh = hermetic_mesh(config_path).await;
         let key_path = dir.path().join("user.key");
+        // On disk first, as boot leaves it: `peer_endorse` reads the key and never mints one (#221).
+        let (own, _) = mcpmesh_trust::UserKey::load_or_generate(&key_path).unwrap();
         mesh.set_user_key_path(key_path.clone());
         let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
 
@@ -3692,8 +3735,7 @@ mod tests {
         );
 
         // `endorsed_by` must be OUR user id, so a recipient paired with us can resolve it.
-        let (uk, _) = mcpmesh_trust::UserKey::load_or_generate(&key_path).unwrap();
-        assert_eq!(res.endorsed_by, mcpmesh_trust::binding::user_id(&uk));
+        assert_eq!(res.endorsed_by, mcpmesh_trust::binding::user_id(&own));
 
         // Endorsing must change NO local trust state — it is a statement for someone else.
         assert!(
@@ -4171,12 +4213,20 @@ mod tests {
         // Model a node whose key was LOADED, not minted this boot — the case the replace guard
         // defends, and the one an import has to survive.
         let (existing, _) = mcpmesh_trust::UserKey::load_or_generate(&key_path).unwrap();
-        let _ = mesh.user_key_minted_at_boot.set(false);
+        mesh.note_user_key_minted_at_boot(false);
+        // …and PRESENTS it, as boot does for a key it loads. `sign_binding` refuses when the
+        // identity it would sign for is not the one presented (#221).
+        let (user_pk, sig) =
+            mcpmesh_trust::binding::present(&existing, mesh.endpoint.id().as_bytes());
+        mesh.set_self_binding(Some(crate::pairing::rendezvous::SelfBinding {
+            user_pk,
+            sig,
+        }));
         let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
 
         // Precondition: before the import this device holds its own key and can enroll.
         assert!(
-            (mesh.inviter_ctx().sign_binding)(&[7u8; 32]).is_some(),
+            (mesh.inviter_ctx().sign_binding)([7u8; 32]).await.is_some(),
             "precondition: a device holding its own key can sign a device binding"
         );
 
@@ -4192,7 +4242,7 @@ mod tests {
             "an import must not mark this device as ENROLLED — it holds the key it just imported"
         );
         assert!(
-            (mesh.inviter_ctx().sign_binding)(&[7u8; 32]).is_some(),
+            (mesh.inviter_ctx().sign_binding)([7u8; 32]).await.is_some(),
             "…so `invite --as-self` must still be able to enroll another device, which is exactly \
              the remedy the recovery CLI tells a recovered person to use"
         );
@@ -4215,7 +4265,11 @@ mod tests {
         let config_path = dir.path().join("config.toml");
         std::fs::write(&config_path, "").unwrap();
         let mesh = hermetic_mesh(config_path).await;
-        mesh.set_user_key_path(dir.path().join("user.key"));
+        let key_path = dir.path().join("user.key");
+        // The key is on disk BEFORE anything runs, as boot leaves it — `peer_endorse` reads it and
+        // no longer mints one (#221).
+        mcpmesh_trust::UserKey::load_or_generate(&key_path).unwrap();
+        mesh.set_user_key_path(key_path);
         let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
         let subject = iroh::SecretKey::from_bytes(&[0x91; 32]).public();
 
@@ -4231,10 +4285,11 @@ mod tests {
         .expect("a device holding its own key can endorse");
 
         // Enroll this device into someone else's identity.
-        mesh.set_self_binding_live(Some(crate::pairing::rendezvous::SelfBinding {
+        let adopted = crate::pairing::rendezvous::SelfBinding {
             user_pk: "b64u:someone-elses".into(),
             sig: "b64u:sig".into(),
-        }));
+        };
+        mesh.set_self_binding_live(Some(adopted.clone()));
 
         let e = endorse_peer(
             &state,
@@ -4252,9 +4307,613 @@ mod tests {
 
         // …and it must refuse to sign enrollment bindings for a third device.
         assert!(
-            (mesh.inviter_ctx().sign_binding)(subject.as_bytes()).is_none(),
+            (mesh.inviter_ctx().sign_binding)(*subject.as_bytes())
+                .await
+                .is_none(),
             "an enrolled device must not sign a binding for a THIRD device — it would be for an \
              identity no peer has seen"
+        );
+        // …refused by the #86 GATE. The key check behind it would also refuse (the local key is
+        // not "someone-elses"), so without this a sign_binding with no gate at all passed here.
+        assert_eq!(
+            mesh.sign_ceremony_binding(Some(&adopted), subject.as_bytes())
+                .await,
+            Err(crate::daemon::SignBindingRefusal::Enrolled)
+        );
+    }
+
+    /// #219: `user_key_export` on an ENROLLED device must refuse, not hand back the LOCAL key.
+    ///
+    /// Boot always mints a local user key. On a device enrolled into someone else's identity
+    /// (#86) that key backs an identity no peer has ever paired with, and its `user_id` is not the
+    /// one the node presents. A person "backing up their identity" on that laptop would write down
+    /// the wrong phrase — and only find out on the new hardware, as a stranger to every peer.
+    ///
+    /// The same gate `peer_endorse` uses, checked BEFORE the key is read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_enrolled_device_refuses_to_export_the_local_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        let key_path = dir.path().join("user.key");
+        mesh.set_user_key_path(key_path.clone());
+        // The boot-minted LOCAL key and the binding derived from it — what an un-gated export
+        // would happily hand back.
+        let (local, _) = mcpmesh_trust::UserKey::load_or_generate(&key_path).unwrap();
+        let local_id = mcpmesh_trust::binding::user_id(&local);
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+
+        // Precondition: before enrollment the export works and names the local key, so the
+        // refusal below is the gate and not a broken fixture.
+        let before = user_key_export(&state)
+            .await
+            .expect("a device holding its own key exports it");
+        assert_eq!(before.user_id, local_id);
+
+        // Enroll this device into someone else's identity through the REAL adopt hook — the
+        // path a `mcpmesh-enroll:` redemption takes — so `adopted_binding` is set the way it is
+        // on a real enrolled device, and the key file still sits underneath.
+        adopt_hook(&mesh)(crate::pairing::rendezvous::SelfBinding {
+            user_pk: "b64u:someone-elses-identity".into(),
+            sig: "b64u:sig".into(),
+        })
+        .await
+        .expect("the hook persists and installs");
+        assert!(
+            key_path.exists(),
+            "the local boot key is still on disk underneath"
+        );
+        assert_ne!(
+            mesh.self_binding().expect("a binding").user_pk,
+            mcpmesh_trust::roster::encode_b64u(&local.public_bytes()),
+            "fixture: the presented identity is NOT the local key's"
+        );
+
+        // THE assertion: refused, with no phrase and no user_id in the answer.
+        let e = match user_key_export(&state).await {
+            Ok(out) => panic!(
+                "an enrolled device must refuse to export — it returned a phrase for {} instead \
+                 (the local key no peer has paired with)",
+                out.user_id
+            ),
+            Err(e) => e,
+        };
+        assert!(
+            e.downcast_ref::<crate::control::InvalidParams>().is_some(),
+            "the refusal must be the coded (-32602) one peer_endorse uses, not a bare failure: {e:#}"
+        );
+        let msg = format!("{e:#}");
+        assert!(
+            msg.contains("does not hold that user key") && msg.contains("#86"),
+            "and say WHY, in the same shape as peer_endorse: {msg}"
+        );
+        assert!(
+            !msg.contains(&local_id),
+            "the refusal must not leak the local user_id either: {msg}"
+        );
+    }
+
+    /// #221: the `replace` guard must protect an IMPORTED key, not only a loaded one.
+    ///
+    /// The guard reads "is the key on disk still the one boot minted". That was a set-once flag
+    /// that no import cleared, so within one daemon lifetime: boot mints B, import X is allowed
+    /// (B was boot-minted — right), and then import Z with `replace: false` ALSO succeeded,
+    /// discarding X — the user's restored identity — with `replaced: false` and no refusal.
+    ///
+    /// Fixture discriminates: B, X and Z are three distinct keys, and X is read back from disk.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_import_without_replace_is_refused_and_keeps_the_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        let key_path = dir.path().join("user.key");
+        // Boot: mint B, and record that it was minted this lifetime.
+        let (b, created) = mcpmesh_trust::UserKey::load_or_generate(&key_path).unwrap();
+        assert!(created, "fixture: boot MINTED the key");
+        mesh.set_user_key_path(key_path.clone());
+        mesh.note_user_key_minted_at_boot(true);
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+
+        let (x, _) = mcpmesh_trust::UserKey::load_or_generate(&dir.path().join("x.key")).unwrap();
+        let (z, _) = mcpmesh_trust::UserKey::load_or_generate(&dir.path().join("z.key")).unwrap();
+        let x_uid = mcpmesh_trust::binding::user_id(&x);
+        assert_ne!(
+            mcpmesh_trust::binding::user_id(&b),
+            x_uid,
+            "fixture: B != X"
+        );
+        assert_ne!(
+            mcpmesh_trust::binding::user_id(&z),
+            x_uid,
+            "fixture: Z != X"
+        );
+        let phrase = |k: &mcpmesh_trust::UserKey| {
+            crate::pairing::recovery::encode(&k.signing_key().to_bytes())
+        };
+
+        // CONTROL: the first import over a boot-minted key needs no replace (the new-laptop path).
+        let out = user_key_import(&state, phrase(&x), false)
+            .await
+            .expect("importing over a key boot minted seconds ago needs no replace");
+        assert_eq!(out.user_id, x_uid);
+        assert!(
+            !out.replaced,
+            "a boot-minted key is not a real identity discarded"
+        );
+
+        // THE assertion: X is now a real identity, and replace=false must defend it.
+        let e = user_key_import(&state, phrase(&z), false)
+            .await
+            .expect_err("a second import without replace must not discard the first imported key");
+        assert!(
+            format!("{e:#}").contains("Pass replace to do it anyway"),
+            "the refusal must be the replace guard's: {e:#}"
+        );
+        assert_eq!(
+            std::fs::read(&key_path).unwrap(),
+            x.signing_key().to_bytes().to_vec(),
+            "X must still be the key on disk"
+        );
+        assert_eq!(
+            mesh.self_binding().unwrap().user_pk,
+            x_uid,
+            "and still presented"
+        );
+
+        // With replace, it goes through and says it discarded something.
+        let out = user_key_import(&state, phrase(&z), true).await.unwrap();
+        assert!(
+            out.replaced,
+            "replacing X discarded a real identity, and must say so"
+        );
+    }
+
+    /// #221: the same guard across an enrollment. Import X, adopt Y (which does not touch the
+    /// key), import Z with `replace: false` — X is the key on disk and must be defended.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn import_adopt_import_without_replace_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        let key_path = dir.path().join("user.key");
+        mcpmesh_trust::UserKey::load_or_generate(&key_path).unwrap();
+        mesh.set_user_key_path(key_path.clone());
+        mesh.note_user_key_minted_at_boot(true);
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+        let (x, _) = mcpmesh_trust::UserKey::load_or_generate(&dir.path().join("x.key")).unwrap();
+        let (z, _) = mcpmesh_trust::UserKey::load_or_generate(&dir.path().join("z.key")).unwrap();
+        let phrase = |k: &mcpmesh_trust::UserKey| {
+            crate::pairing::recovery::encode(&k.signing_key().to_bytes())
+        };
+
+        user_key_import(&state, phrase(&x), false).await.unwrap();
+        let y = crate::pairing::rendezvous::SelfBinding {
+            user_pk: "b64u:Y-someone-elses".into(),
+            sig: "b64u:sig".into(),
+        };
+        adopt_hook(&mesh)(y.clone()).await.unwrap();
+
+        user_key_import(&state, phrase(&z), false)
+            .await
+            .expect_err("X is on disk under the enrollment; replace=false must defend it");
+        assert_eq!(
+            std::fs::read(&key_path).unwrap(),
+            x.signing_key().to_bytes().to_vec(),
+            "X must still be the key on disk"
+        );
+        assert_eq!(
+            mesh.self_binding().unwrap().user_pk,
+            y.user_pk,
+            "and a refused import changes nothing live: still enrolled as Y"
+        );
+        assert!(
+            mesh.adopted_binding_path().exists(),
+            "the enrollment file is untouched"
+        );
+    }
+
+    /// #221: a probe fired INSIDE a signing path, after its #86 checks and before it reads the
+    /// key, recording whether `user_key_lock` is held at that moment. Deterministic: no race, no
+    /// timing — the lock is either held there or it is not.
+    struct LockProbe {
+        fired: Arc<std::sync::atomic::AtomicBool>,
+        held: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl LockProbe {
+        fn install(mesh: &Arc<MeshState>) -> Self {
+            let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let held = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let hook: crate::daemon::IdentityGateHook = Box::new({
+                let (fired, held) = (fired.clone(), held.clone());
+                // The hook is taken when it fires, so this clone does not outlive the call.
+                let mesh = mesh.clone();
+                move || {
+                    Box::pin(async move {
+                        held.store(
+                            mesh.user_key_lock.try_lock().is_err(),
+                            std::sync::atomic::Ordering::SeqCst,
+                        );
+                        fired.store(true, std::sync::atomic::Ordering::SeqCst);
+                    })
+                }
+            });
+            *mesh.identity_gate_hook.lock().unwrap() = Some(hook);
+            Self { fired, held }
+        }
+
+        fn assert_held(&self, what: &str) {
+            assert!(
+                self.fired.load(std::sync::atomic::Ordering::SeqCst),
+                "fixture: {what} never reached the point between its checks and the key read"
+            );
+            assert!(
+                self.held.load(std::sync::atomic::Ordering::SeqCst),
+                "{what}: user_key_lock is NOT held between the #86 check and the key read, so an \
+                 adoption or import can land there"
+            );
+        }
+    }
+
+    /// A key-holding mesh presenting its own key's binding, as boot leaves it.
+    async fn key_holding_mesh(
+        dir: &tempfile::TempDir,
+    ) -> (
+        Arc<MeshState>,
+        mcpmesh_trust::UserKey,
+        crate::control::DaemonState,
+    ) {
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mesh = hermetic_mesh(config_path).await;
+        let key_path = dir.path().join("user.key");
+        let (own, _) = mcpmesh_trust::UserKey::load_or_generate(&key_path).unwrap();
+        mesh.set_user_key_path(key_path);
+        let (user_pk, sig) = mcpmesh_trust::binding::present(&own, mesh.endpoint.id().as_bytes());
+        mesh.set_self_binding(Some(crate::pairing::rendezvous::SelfBinding {
+            user_pk,
+            sig,
+        }));
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+        (mesh, own, state)
+    }
+
+    fn someone_elses_binding() -> crate::pairing::rendezvous::SelfBinding {
+        crate::pairing::rendezvous::SelfBinding {
+            user_pk: "b64u:someone-elses-identity".into(),
+            sig: "b64u:their-sig".into(),
+        }
+    }
+
+    /// The #86 gate's coded (-32602) refusal, and not some other failure.
+    fn is_gate_refusal<T>(r: Result<T>) -> bool {
+        matches!(r, Err(e) if e.downcast_ref::<crate::control::InvalidParams>().is_some()
+            && format!("{e:#}").contains("does not hold that user key"))
+    }
+
+    /// #221: `peer_endorse` holds `user_key_lock` from its #86 check through the signature.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn peer_endorse_holds_the_key_lock_from_its_gate_through_the_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mesh, own, state) = key_holding_mesh(&dir).await;
+        let subject = iroh::SecretKey::from_bytes(&[0x91; 32]).public();
+        let probe = LockProbe::install(&mesh);
+        let out = endorse_peer(
+            &state,
+            mcpmesh_local_api::PeerEndorseParams {
+                subject: subject.to_string(),
+                subject_user_id: None,
+            },
+        )
+        .await
+        .expect("a key-holding device endorses");
+        probe.assert_held("peer_endorse");
+        assert_eq!(out.endorsed_by, mcpmesh_trust::binding::user_id(&own));
+    }
+
+    /// #221: the same for `device_revoke` — the stolen-laptop path.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn device_revoke_holds_the_key_lock_from_its_gate_through_the_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mesh, own, state) = key_holding_mesh(&dir).await;
+        let lost = iroh::SecretKey::from_bytes(&[0x77; 32]).public();
+        let probe = LockProbe::install(&mesh);
+        let out = device_revoke(
+            &state,
+            mcpmesh_local_api::DeviceRevokeParams {
+                endpoint: mcpmesh_net::EndpointId::from_bytes(*lost.as_bytes()).principal(),
+                reason: None,
+            },
+        )
+        .await
+        .expect("a key-holding device signs a revocation");
+        probe.assert_held("device_revoke");
+        assert_eq!(out.user_id, mcpmesh_trust::binding::user_id(&own));
+    }
+
+    /// #221 (from #219): the same for `user_key_export`, whose check used to run BEFORE the lock.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn user_key_export_holds_the_key_lock_from_its_gate_through_the_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mesh, own, state) = key_holding_mesh(&dir).await;
+        let probe = LockProbe::install(&mesh);
+        let out = user_key_export(&state)
+            .await
+            .expect("a key-holding device exports");
+        probe.assert_held("user_key_export");
+        assert_eq!(out.user_id, mcpmesh_trust::binding::user_id(&own));
+    }
+
+    /// #221: the same for `sign_binding`, driven through the `InviterCtx` closure the ceremony
+    /// calls — and what it signs verifies under the `user_pk` the ceremony presents.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sign_binding_holds_the_key_lock_from_its_checks_through_the_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mesh, _own, _state) = key_holding_mesh(&dir).await;
+        let endpoint = [7u8; 32];
+        let ctx = mesh.inviter_ctx();
+        let presented = ctx.self_binding.clone().expect("presents its own");
+        let probe = LockProbe::install(&mesh);
+        let sig = (ctx.sign_binding)(endpoint)
+            .await
+            .expect("a key-holding device signs");
+        probe.assert_held("sign_binding");
+        mcpmesh_trust::binding::verify_presented(&presented.user_pk, &sig, &endpoint)
+            .expect("the signature must verify under the identity the ceremony presents");
+    }
+
+    /// #221: the check must come AFTER the lock is taken, not before it. An adoption holding
+    /// `user_key_lock` when a signing path starts (`adopt_hook` mid-write) must be SEEN.
+    ///
+    /// Deterministic on a current-thread runtime: the test holds the lock, spawns the path, and
+    /// yields once — the path runs until it parks on the lock (a path that reads the gate first
+    /// has read "not enrolled" by then). The test then installs the adoption as `adopt_hook` does
+    /// under that lock and releases it.
+    async fn outcome_when_an_adoption_holds_the_lock_at_start<T: Send + 'static>(
+        mesh: &Arc<MeshState>,
+        run: impl std::future::Future<Output = T> + Send + 'static,
+    ) -> T {
+        let guard = mesh.user_key_lock.lock().await;
+        let path = tokio::spawn(run);
+        tokio::task::yield_now().await;
+        assert!(
+            !path.is_finished(),
+            "the signing path must be parked on user_key_lock"
+        );
+        mesh.set_self_binding_live(Some(someone_elses_binding()));
+        drop(guard);
+        tokio::time::timeout(std::time::Duration::from_secs(10), path)
+            .await
+            .expect("the signing path finishes once the lock is released")
+            .expect("the signing path panicked")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn peer_endorse_checks_its_gate_after_taking_the_key_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mesh, _own, state) = key_holding_mesh(&dir).await;
+        let subject = iroh::SecretKey::from_bytes(&[0x91; 32]).public();
+        let refused = outcome_when_an_adoption_holds_the_lock_at_start(&mesh, async move {
+            is_gate_refusal(
+                endorse_peer(
+                    &state,
+                    mcpmesh_local_api::PeerEndorseParams {
+                        subject: subject.to_string(),
+                        subject_user_id: None,
+                    },
+                )
+                .await,
+            )
+        })
+        .await;
+        assert!(
+            refused,
+            "peer_endorse read the #86 gate before taking user_key_lock"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn device_revoke_checks_its_gate_after_taking_the_key_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mesh, _own, state) = key_holding_mesh(&dir).await;
+        let lost = iroh::SecretKey::from_bytes(&[0x77; 32]).public();
+        let refused = outcome_when_an_adoption_holds_the_lock_at_start(&mesh, async move {
+            is_gate_refusal(
+                device_revoke(
+                    &state,
+                    mcpmesh_local_api::DeviceRevokeParams {
+                        endpoint: mcpmesh_net::EndpointId::from_bytes(*lost.as_bytes()).principal(),
+                        reason: None,
+                    },
+                )
+                .await,
+            )
+        })
+        .await;
+        assert!(
+            refused,
+            "device_revoke read the #86 gate before taking user_key_lock"
+        );
+        assert!(
+            !mesh.store.is_revoked(lost.as_bytes()),
+            "and nothing was self-applied"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn user_key_export_checks_its_gate_after_taking_the_key_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mesh, _own, state) = key_holding_mesh(&dir).await;
+        let refused = outcome_when_an_adoption_holds_the_lock_at_start(&mesh, async move {
+            is_gate_refusal(user_key_export(&state).await)
+        })
+        .await;
+        assert!(
+            refused,
+            "user_key_export read the #86 gate before taking user_key_lock"
+        );
+    }
+
+    /// The GATE refusal specifically: a `sign_binding` that read the gate before the lock would
+    /// still refuse here, but as `IdentityChanged` — this pins which check saw the adoption.
+    #[tokio::test(flavor = "current_thread")]
+    async fn sign_binding_checks_its_gate_after_taking_the_key_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mesh, _own, _state) = key_holding_mesh(&dir).await;
+        let presented = mesh.self_binding().expect("presents its own");
+        let outcome = outcome_when_an_adoption_holds_the_lock_at_start(&mesh, {
+            let mesh = mesh.clone();
+            async move {
+                mesh.sign_ceremony_binding(Some(&presented), &[7u8; 32])
+                    .await
+            }
+        })
+        .await;
+        assert_eq!(
+            outcome,
+            Err(crate::daemon::SignBindingRefusal::Enrolled),
+            "sign_binding must see the adoption at its #86 gate, under the lock"
+        );
+    }
+
+    /// #221: `sign_binding` re-checks, under `user_key_lock`, that this node still presents the
+    /// binding `inviter_ctx` snapshotted for the ceremony. An IMPORT between the snapshot and the
+    /// signature would otherwise sign under X while the reply carries B's `user_pk` — a binding
+    /// that does not verify under the identity the redeemer was told it joined.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sign_binding_refuses_after_an_import_since_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mesh, _own, state) = key_holding_mesh(&dir).await;
+        let endpoint = [7u8; 32];
+        let ctx = mesh.inviter_ctx();
+        assert!(
+            (mesh.inviter_ctx().sign_binding)(endpoint).await.is_some(),
+            "control: with no change since the snapshot, a key-holding device signs"
+        );
+
+        let (x, _) = mcpmesh_trust::UserKey::load_or_generate(&dir.path().join("x.key")).unwrap();
+        let phrase = crate::pairing::recovery::encode(&x.signing_key().to_bytes());
+        user_key_import(&state, phrase, true).await.unwrap();
+
+        assert!(
+            (ctx.sign_binding)(endpoint).await.is_none(),
+            "an import since the snapshot: the key on disk is no longer the presented identity's"
+        );
+        assert_eq!(
+            mesh.sign_ceremony_binding(ctx.self_binding.as_ref(), &endpoint)
+                .await,
+            Err(crate::daemon::SignBindingRefusal::IdentityChanged),
+            "refused by the snapshot comparison, not only by the key check behind it"
+        );
+        assert!(
+            (mesh.inviter_ctx().sign_binding)(endpoint).await.is_some(),
+            "a ceremony accepted AFTER the import presents X and signs under X"
+        );
+    }
+
+    /// #221: the same for an ADOPTION between the snapshot and the signature — the ceremony
+    /// presented this device's own identity, and the device no longer holds authority over what it
+    /// presents.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sign_binding_refuses_after_an_adoption_since_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mesh, _own, _state) = key_holding_mesh(&dir).await;
+        let endpoint = [7u8; 32];
+        let ctx = mesh.inviter_ctx();
+        adopt_hook(&mesh)(someone_elses_binding()).await.unwrap();
+        assert!(
+            (ctx.sign_binding)(endpoint).await.is_none(),
+            "an adoption since the snapshot must refuse the signature"
+        );
+    }
+
+    /// #221 review (probe): `user.key` deleted under a running node. `peer_endorse` used
+    /// `load_or_generate` and MINTED key C in its place; the next self-enrollment ceremony compared
+    /// snapshots (B == B), read C and signed under C while presenting B — and the redeemer refused
+    /// that binding after the single-use invite was already burned. Now the endorse refuses and
+    /// mints nothing, and the ceremony refuses too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_deleted_user_key_is_not_minted_by_endorse_and_the_ceremony_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mesh, _own, state) = key_holding_mesh(&dir).await;
+        let key_path = mesh.user_key_path.get().cloned().unwrap();
+        let subject = iroh::SecretKey::from_bytes(&[0x91; 32]).public();
+        let endorse = || {
+            endorse_peer(
+                &state,
+                mcpmesh_local_api::PeerEndorseParams {
+                    subject: subject.to_string(),
+                    subject_user_id: None,
+                },
+            )
+        };
+        let ctx = mesh.inviter_ctx();
+        // Control: with the key in place, both work.
+        endorse()
+            .await
+            .expect("control: endorse with the key present");
+        assert!(
+            (ctx.sign_binding)([7u8; 32]).await.is_some(),
+            "control: the ceremony signs with the key present"
+        );
+
+        std::fs::remove_file(&key_path).unwrap();
+        let e = endorse()
+            .await
+            .expect_err("no key on disk: endorse must refuse, not mint");
+        assert!(
+            format!("{e:#}").contains("has no user key"),
+            "and say why: {e:#}"
+        );
+        assert!(
+            !key_path.exists(),
+            "endorse must not MINT a replacement key underneath the presented identity"
+        );
+        assert!(
+            (ctx.sign_binding)([7u8; 32]).await.is_none(),
+            "the ceremony presents B and must not sign with a key that is not B"
+        );
+    }
+
+    /// #221 review: the key-on-disk check itself. `user.key` replaced underneath the running node
+    /// with C (by any means) while it presents B: snapshots agree, so only comparing the key read to
+    /// the presented `user_pk` refuses.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sign_binding_refuses_a_key_on_disk_that_is_not_the_presented_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mesh, _own, _state) = key_holding_mesh(&dir).await;
+        let key_path = mesh.user_key_path.get().cloned().unwrap();
+        let ctx = mesh.inviter_ctx();
+        let presented = ctx.self_binding.clone().unwrap();
+        let sig = (ctx.sign_binding)([7u8; 32])
+            .await
+            .expect("control: B on disk signs");
+        mcpmesh_trust::binding::verify_presented(&presented.user_pk, &sig, &[7u8; 32])
+            .expect("control: and verifies under B");
+
+        let (c, _) = mcpmesh_trust::UserKey::load_or_generate(&dir.path().join("c.key")).unwrap();
+        std::fs::copy(dir.path().join("c.key"), &key_path).unwrap();
+        assert_eq!(
+            std::fs::read(&key_path).unwrap(),
+            c.signing_key().to_bytes().to_vec(),
+            "fixture: C is on disk"
+        );
+        assert_eq!(
+            mesh.self_binding().as_ref(),
+            Some(&presented),
+            "fixture: the snapshot comparison cannot see this"
+        );
+        assert!(
+            (ctx.sign_binding)([7u8; 32]).await.is_none(),
+            "C on disk while presenting B: a signature under C would not verify under B"
+        );
+        assert_eq!(
+            mesh.sign_ceremony_binding(Some(&presented), &[7u8; 32])
+                .await,
+            Err(crate::daemon::SignBindingRefusal::KeyMismatch)
         );
     }
 
@@ -4385,7 +5044,7 @@ mod tests {
             .expect("leaving an identity is a trust change an operator asks about later");
         assert_eq!(rec.target.as_deref(), Some(adopted.user_pk.as_str()));
         assert!(
-            (mesh.inviter_ctx().sign_binding)(&[7u8; 32]).is_some(),
+            (mesh.inviter_ctx().sign_binding)([7u8; 32]).await.is_some(),
             "…and having left, this device can enroll its owner's other devices again"
         );
     }
@@ -4545,7 +5204,7 @@ mod tests {
     async fn an_import_that_cannot_remove_the_enrollment_file_changes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let (mesh, _audit, adopted) = enrolled_mesh(&dir).await;
-        let _ = mesh.user_key_minted_at_boot.set(true);
+        mesh.note_user_key_minted_at_boot(true);
         let sidecar = mesh.adopted_binding_path();
         std::fs::remove_file(&sidecar).unwrap();
         std::fs::create_dir(&sidecar).unwrap();
@@ -4592,7 +5251,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let (mesh, _audit, adopted) = enrolled_mesh(&dir).await;
-        let _ = mesh.user_key_minted_at_boot.set(true);
+        mesh.note_user_key_minted_at_boot(true);
         let (x, _) = mcpmesh_trust::UserKey::load_or_generate(&dir.path().join("x.key")).unwrap();
         let phrase = crate::pairing::recovery::encode(&x.signing_key().to_bytes());
         let sidecar = mesh.adopted_binding_path();
@@ -4633,7 +5292,7 @@ mod tests {
         std::fs::create_dir(&key_path).unwrap();
         std::fs::write(key_path.join("pin"), b"x").unwrap();
         mesh.set_user_key_path(key_path.clone());
-        let _ = mesh.user_key_minted_at_boot.set(true);
+        mesh.note_user_key_minted_at_boot(true);
         let adopted = crate::pairing::rendezvous::SelfBinding {
             user_pk: "b64u:Y".into(),
             sig: "b64u:sig".into(),
@@ -4674,7 +5333,7 @@ mod tests {
             user_pk: "b64u:boot".into(),
             sig: "b64u:sig".into(),
         }));
-        let _ = mesh.user_key_minted_at_boot.set(true);
+        mesh.note_user_key_minted_at_boot(true);
         let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
 
         // Import X.
@@ -8185,7 +8844,7 @@ pub async fn peer_unrevoke(
 /// READ, never `load_or_generate` — the same discipline `user_key_export` follows: minting a key
 /// here would let a node with no identity sign a revocation under a freshly-invented one, which no
 /// peer would recognise and which would then become this node's identity at the next restart.
-async fn read_user_key(mesh: &Arc<MeshState>) -> Result<mcpmesh_trust::UserKey> {
+pub(crate) async fn read_user_key(mesh: &Arc<MeshState>) -> Result<mcpmesh_trust::UserKey> {
     let path = mesh
         .user_key_path
         .get()
@@ -8232,17 +8891,12 @@ pub(crate) async fn device_revoke(
     // regardless, so without this the call self-applied the revocation, severed sessions, audited
     // it and returned a token signed under a `b64u:` no peer has ever paired with — a silent
     // partial success on the stolen-laptop path. Refused BEFORE any of those side effects.
-    anyhow::ensure!(
-        mesh.adopted_binding
-            .read()
-            .expect("adopted_binding lock not poisoned")
-            .is_none(),
-        crate::control::InvalidParams(
-            "device_revoke: this device was enrolled into another device's identity (#86) and does \
-             not hold that user key. Revoke from the device that does."
-                .into()
-        )
-    );
+    //
+    // #221: checked under `user_key_lock` and held through the key read and the signature, so an
+    // adoption cannot land between the check and the token. Released before the self-apply and
+    // the session sever: the token is already signed by a device that held the key.
+    let key_guard = lock_own_user_key(mesh, "device_revoke", "Revoke").await?;
+    mesh.run_identity_gate_hook().await;
     let key = read_user_key(mesh).await?;
     let user_id = mcpmesh_trust::binding::user_id(&key);
     let issued_at = crate::util::epoch_now_u64();
@@ -8262,6 +8916,7 @@ pub(crate) async fn device_revoke(
         "{REVOKE_SCHEME}{}",
         data_encoding::BASE64URL_NOPAD.encode(&serde_json::to_vec(&token)?)
     );
+    drop(key_guard);
 
     // Apply it to OURSELVES too. A node that hands out a revocation of a device while still
     // admitting that device is telling its peers to do something it does not do — and the stolen
