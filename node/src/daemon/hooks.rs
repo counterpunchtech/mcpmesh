@@ -207,53 +207,46 @@ impl MeshHooks {
 }
 
 impl EndpointHooks for MeshHooks {
-    fn before_connect<'a>(
-        &'a self,
-        remote_addr: &'a EndpointAddr,
-        alpn: &'a [u8],
-    ) -> impl Future<Output = BeforeConnectOutcome> + Send + 'a {
-        async move {
-            if alpn == ALPN_PAIR || !self.refuses(*remote_addr.id.as_bytes()).await {
-                BeforeConnectOutcome::Accept
-            } else {
-                BeforeConnectOutcome::Reject
-            }
+    async fn before_connect(
+        &self,
+        remote_addr: &EndpointAddr,
+        alpn: &[u8],
+    ) -> BeforeConnectOutcome {
+        if alpn == ALPN_PAIR || !self.refuses(*remote_addr.id.as_bytes()).await {
+            BeforeConnectOutcome::Accept
+        } else {
+            BeforeConnectOutcome::Reject
         }
     }
 
-    fn after_handshake<'a>(
-        &'a self,
-        conn: &'a Connection,
-    ) -> impl Future<Output = AfterHandshakeOutcome> + Send + 'a {
-        async move {
-            if conn.alpn() == ALPN_PAIR {
-                return AfterHandshakeOutcome::Accept;
-            }
-            let id = *conn.remote_id().as_bytes();
-            let weak = conn.weak_handle();
-            // `closed()` is taken NOW, while `conn` is a live strong handle, so the watcher is
-            // guaranteed the close event however the connection later ends.
-            let closed = weak.closed();
-            // REGISTER before the re-check (the TOCTOU close): a revoke whose write lands before
-            // the re-check refuses here; one whose write lands after it runs its close pass after
-            // this insert and finds the entry.
-            let key = self.conns.insert(id, weak);
-            let conns = self.conns.clone();
-            tokio::spawn(async move {
-                closed.await;
-                conns.remove(&id, key);
-            });
-            // Outbound only: a dial that passed `before_connect` and was revoked while its
-            // handshake ran. Inbound connections are the gate's to refuse, with its own codes.
-            if conn.side() == Side::Client && self.refuses(id).await {
-                self.conns.remove(&id, key);
-                return AfterHandshakeOutcome::Reject {
-                    error_code: mcpmesh_net::CLOSE_UNAUTHORIZED.into(),
-                    reason: REVOKED_REASON.to_vec(),
-                };
-            }
-            AfterHandshakeOutcome::Accept
+    async fn after_handshake(&self, conn: &Connection) -> AfterHandshakeOutcome {
+        if conn.alpn() == ALPN_PAIR {
+            return AfterHandshakeOutcome::Accept;
         }
+        let id = *conn.remote_id().as_bytes();
+        let weak = conn.weak_handle();
+        // `closed()` is taken NOW, while `conn` is a live strong handle, so the watcher is
+        // guaranteed the close event however the connection later ends.
+        let closed = weak.closed();
+        // REGISTER before the re-check (the TOCTOU close): a revoke whose write lands before
+        // the re-check refuses here; one whose write lands after it runs its close pass after
+        // this insert and finds the entry.
+        let key = self.conns.insert(id, weak);
+        let conns = self.conns.clone();
+        tokio::spawn(async move {
+            closed.await;
+            conns.remove(&id, key);
+        });
+        // Outbound only: a dial that passed `before_connect` and was revoked while its
+        // handshake ran. Inbound connections are the gate's to refuse, with its own codes.
+        if conn.side() == Side::Client && self.refuses(id).await {
+            self.conns.remove(&id, key);
+            return AfterHandshakeOutcome::Reject {
+                error_code: mcpmesh_net::CLOSE_UNAUTHORIZED.into(),
+                reason: REVOKED_REASON.to_vec(),
+            };
+        }
+        AfterHandshakeOutcome::Accept
     }
 }
 
