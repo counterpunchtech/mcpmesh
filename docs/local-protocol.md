@@ -1877,7 +1877,8 @@ things:
   with no shape change: `peer_services` refuses a roster-revoked device and a roster device under a
   revoked `b64u:` identity (through 63 only this node's own revocation tables were checked); the
   reachability probe never dials a revoked peer and commits nothing for it — no `source: "probe"`
-  frame, no refreshed `status.reachability` row; `blob_fetch` never dials a revoked publisher or
+  frame, no refreshed `status.reachability` row — and a session still open to one pushes no
+  `source: "session"` frame either; `blob_fetch` never dials a revoked publisher or
   named source; `status.revoked` also lists roster refusals (`source` `"roster"` /
   `"roster_identity"`), so a reachability row the probe no longer refreshes can be matched to its
   revocation; `pair` refuses an invite whose address names a different endpoint than its inviter

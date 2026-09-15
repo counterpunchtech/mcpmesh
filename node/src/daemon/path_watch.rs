@@ -164,6 +164,19 @@ async fn observe(
     // HAPPENS, so the frame must not queue behind cache maintenance (#124 review).
     let refreshed = super::dial_hint::observed_for(&strong);
     drop(strong);
+    // #223: a session to a peer this node has REVOKED commits nothing. Outbound sessions are not
+    // severed on revocation (#229), and an inbound sever races this task, so without this a path
+    // event on such a session seeded `reachable: true` with a fresh stamp and pushed a `Session`
+    // frame — the row the probe now refuses to write, written by the other writer. The watcher keeps
+    // running: a revocation lifted mid-session makes the next observation count again. Fails CLOSED
+    // on a join error, like every revocation read.
+    let m = mesh.clone();
+    let refused = tokio::task::spawn_blocking(move || super::dial::dial_refused(&m, &endpoint_id))
+        .await
+        .unwrap_or(true);
+    if refused {
+        return true;
+    }
     commit_observation(mesh, endpoint_id, seq, &observed);
     if let Some(addr) = refreshed {
         super::dial_hint::refresh(mesh, endpoint_id, addr);
@@ -772,6 +785,56 @@ mod tests {
         assert!(observe(&mesh, eid, &weak, crate::daemon::reach::selected_path).await);
         assert_eq!(
             rx.try_recv().expect("a Direct reading pushes").peer.path,
+            PeerPath::Direct
+        );
+    }
+
+    /// #223: a live session to a REVOKED peer commits no observation — no seeded `reachable: true`
+    /// row, no `Session` frame. Outbound sessions are not severed on revocation (#229), so this
+    /// watcher can outlive the revocation; the reachability probe refuses to write that row, and the
+    /// watcher must not write it instead. The control is the same `observe` after the revocation is
+    /// lifted, which pushes — so the silence is the revocation, not a fixture that cannot emit.
+    ///
+    /// Deleting the `dial_refused` check in `observe` fails the first two assertions.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_to_a_revoked_peer_commits_no_observation() {
+        let (mesh, conn, eid, _guards) = an_already_direct_connection("mallet").await;
+        mesh.store
+            .revoke(crate::allowlist::RevokedEntry {
+                endpoint_id: eid,
+                revoked_at: 1,
+                reason: None,
+                source: "local".into(),
+                signer_user_id: None,
+                issued_at: None,
+            })
+            .unwrap();
+        let mut rx = mesh.reach_bcast.subscribe();
+        let weak = conn.weak_handle();
+
+        assert!(
+            observe(&mesh, eid, &weak, crate::daemon::reach::selected_path).await,
+            "the connection is alive, so the watcher keeps running"
+        );
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "a session to a revoked peer must not push a frame"
+        );
+        assert!(
+            mesh.reachability.lock().unwrap().get(&eid).is_none(),
+            "a session to a revoked peer must not seed a reachable row"
+        );
+
+        assert!(mesh.store.unrevoke(&eid).unwrap());
+        assert!(observe(&mesh, eid, &weak, crate::daemon::reach::selected_path).await);
+        assert_eq!(
+            rx.try_recv()
+                .expect("once unrevoked, the reading pushes")
+                .peer
+                .path,
             PeerPath::Direct
         );
     }

@@ -86,7 +86,9 @@ fn revoked_refusal(peer: &str) -> anyhow::Error {
 /// predicate (#223). Asked by: `open_session` (`refuse_if_revoked` and the race filter in
 /// `hinted_addrs`), `connect_protocol` and blob sources (`protocol_candidates`), a blob ticket's
 /// publisher (`blob_fetch`), `peer_services` (the only resolver caller that dials), the
-/// reachability probe (`reach::probe_peer`), the roster-gossip blob provider
+/// reachability probe (`reach::probe_peer`) — and its sibling cache writer, the session path
+/// watcher (`path_watch::observe`), which dials nothing but must not write the row the probe
+/// refuses to — the roster-gossip blob provider
 /// (`roster::distribute::on_announce`, through `DistributionHost::dial_refused`), and the gossip
 /// BOOTSTRAP set (`boot::gossip_bootstrap`, through [`refused_by`]).
 ///

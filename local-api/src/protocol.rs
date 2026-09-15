@@ -3151,7 +3151,8 @@ pub const API_VERSION: &str = "1.64";
 /// its `status.reachability` row is not refreshed (never probed reads `age_secs` absent), where
 /// through 63 every stale read dialled it and committed whatever came back — including
 /// `reachable: true` from a revoked device that still pairs this node, since that device answers
-/// the ping; `status.revoked` also lists roster refusals (`source: "roster"` for the roster's
+/// the ping — and a live session's path watcher does not write that row either (no `source:
+/// "session"` frame for a revoked peer); `status.revoked` also lists roster refusals (`source: "roster"` for the roster's
 /// `revoked_endpoints`, `"roster_identity"` for a roster device under a revoked `b64u:` user), so a
 /// row that probe no longer refreshes can be matched to its revocation; `blob_fetch` never dials
 /// a revoked ticket publisher or named `from` source, and when the fetch then fails its message
