@@ -1364,7 +1364,7 @@ this correction, because it describes behaviour that already shipped — the rel
 | `source` | producer | when | what it licenses |
 |---|---|---|---|
 | `"probe"` | a completing **probe** | `status`, `subscribe`'s snapshot, or `peer_services` refreshes a stale entry | "a fresh throwaway dial toward this peer went via a relay." Says nothing about the connection anyone is using. |
-| `"session"` | a **live session** | its selected path changed under it (0.20.0) | "the connection this peer's traffic is actually on just changed." A real statement about a live link. |
+| `"session"` | a **live session** | its selected path changed under it (0.20.0), or — since 0.55.2 — the session opened on a path that differs from the cached row (#225) | "the connection this peer's traffic is actually on just changed." A real statement about a live link. |
 | `"unknown"` | — | the daemon predates `api_minor` 30, or named a producer you predate | Neither. Hedge to the weaker (probe-level) claim. |
 
 That distinction is the difference between warning a user that their call has silently degraded and
@@ -1402,6 +1402,10 @@ that wait short-circuits the moment a path becomes `direct`. So a `direct → re
 damped and emits nothing, while a `relay → direct → relay` flap emits the `direct` immediately and
 the return to `relay` after the window: two frames for a blip. Do not treat a single `direct` frame
 as durable evidence of locality — it may be a hole-punch that did not survive.
+
+The same window shapes a session's **opening** reading (#225). A session whose hole-punch has not
+finished within the ~600ms reports the `relay` it is really on, then `direct` when the punch lands:
+two frames for one opening, the first of them true at the time.
 
 This is the **pairing-mode probe**. Roster-mode presence travels on the gossip topic and surfaces
 through `status`; it is not (yet) an event here.

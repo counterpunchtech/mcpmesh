@@ -87,6 +87,10 @@ pub(crate) fn spawn(
     endpoint_id: [u8; 32],
     conn: &iroh::endpoint::Connection,
 ) -> tokio::task::JoinHandle<()> {
+    // SUBSCRIBE FIRST, then read (#225). `path_events()` does not replay: a selection made before
+    // this line is never delivered as an event. Taking the reading after subscribing means a change
+    // can land before the reading (the reading sees it) or after (an event reports it), never in
+    // between.
     let mut events = conn.path_events();
     let weak = conn.weak_handle();
     LIVE_WATCHERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -94,6 +98,15 @@ pub(crate) fn spawn(
         // Decrement on EVERY exit path, including a `break`, so the counter cannot drift.
         let _guard = WatcherGuard;
         use n0_future::StreamExt as _;
+        // #225: the path ALREADY selected when we subscribed. A dialed session subscribes only
+        // after the dial and the stream open have returned, and a loopback hole-punch can select
+        // Direct within 4-11ms of the connection — measured winning that race under load, so the
+        // relay->direct move this watcher exists to report was never seen and no frame was pushed. The
+        // reading goes through the same observation an event does, so it emits exactly the frame
+        // a `Selected` would have, and nothing when `decide` finds the path unchanged or Unknown.
+        if !observe(&mesh, endpoint_id, &weak, super::reach::selected_path).await {
+            return;
+        }
         while let Some(event) = events.next().await {
             match event {
                 // The only event that means "application data moved" — the same semantics #64
@@ -110,34 +123,52 @@ pub(crate) fn spawn(
                 // follows a meaningful change is what we act on.
                 _ => continue,
             }
-            // Ticket FIRST, before observing — ordering is by observation START, exactly as
-            // `probe_peer` does it. See `commit_observation`.
-            let seq = mesh
-                .probe_seq
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            // Let the change HOLD before believing it. `settle` returns early on `Direct`, so a
-            // relay→direct recovery reports promptly, while a flap that returns to Direct inside
-            // the window reports Direct and `decide` then finds nothing changed — no frame.
-            let Some(strong) = weak.upgrade() else { break };
-            let observed =
-                super::reach::settle(PATH_CHANGE_SETTLE, || super::reach::selected_path(&strong))
-                    .await;
-            // #124: the selected path just settled, so THIS is the moment the connection knows
-            // the peer's real direct address — not accept time, when only the relay path exists.
-            // Refreshing here means the stored dial hint tracks reality instead of being written
-            // once at pairing and going permanently stale after a network change.
-            // Emit FIRST. #92's whole point is that a path change is reported WHEN IT HAPPENS, so
-            // the frame must not queue behind cache maintenance (#124 review).
-            let refreshed = super::dial_hint::observed_for(&strong);
-            drop(strong);
-            commit_observation(&mesh, endpoint_id, seq, &observed);
-            // #124: the selected path just settled, so this is the moment the connection knows the
-            // peer's real direct address — not accept time, when only the relay path exists.
-            if let Some(addr) = refreshed {
-                super::dial_hint::refresh(&mesh, endpoint_id, addr);
+            if !observe(&mesh, endpoint_id, &weak, super::reach::selected_path).await {
+                break;
             }
         }
     })
+}
+
+/// Take ONE observation of the connection's selected path and commit it (#92 item 2).
+///
+/// Shared by the watcher's initial reading (#225) and every `Selected`/`Lagged` event, so the two
+/// cannot diverge. Returns `false` when the connection is gone and the watcher should stop.
+///
+/// `read` is always [`selected_path`](super::reach::selected_path) in production. It is a
+/// parameter only so a test can hand in the `Unknown` a live loopback connection never produces
+/// (iroh 1.2 keeps reporting a closed connection's last selected path).
+async fn observe(
+    mesh: &std::sync::Arc<super::MeshState>,
+    endpoint_id: [u8; 32],
+    weak: &iroh::endpoint::WeakConnectionHandle,
+    read: fn(&iroh::endpoint::Connection) -> PeerPath,
+) -> bool {
+    // Ticket FIRST, before observing — ordering is by observation START, exactly as `probe_peer`
+    // does it. See `commit_observation`.
+    let seq = mesh
+        .probe_seq
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Let the change HOLD before believing it. `settle` returns early on `Direct`, so a
+    // relay→direct recovery reports promptly, while a flap that returns to Direct inside the window
+    // reports Direct and `decide` then finds nothing changed — no frame.
+    let Some(strong) = weak.upgrade() else {
+        return false;
+    };
+    let observed = super::reach::settle(PATH_CHANGE_SETTLE, || read(&strong)).await;
+    // #124: the selected path just settled, so THIS is the moment the connection knows the peer's
+    // real direct address — not accept time, when only the relay path exists. Refreshing here
+    // means the stored dial hint tracks reality instead of being written once at pairing and going
+    // permanently stale after a network change. Read now, while the strong handle is held; applied
+    // after the commit, because #92's whole point is that a path change is reported WHEN IT
+    // HAPPENS, so the frame must not queue behind cache maintenance (#124 review).
+    let refreshed = super::dial_hint::observed_for(&strong);
+    drop(strong);
+    commit_observation(mesh, endpoint_id, seq, &observed);
+    if let Some(addr) = refreshed {
+        super::dial_hint::refresh(mesh, endpoint_id, addr);
+    }
+    true
 }
 
 /// Commit a settled observation for `endpoint_id` and emit if it changed anything.
@@ -536,6 +567,212 @@ mod tests {
         assert!(
             commit_observation(&mesh, eid, 2, &PeerPath::Direct).is_none(),
             "a repeat observation is not news, however fresh its ticket"
+        );
+    }
+
+    const TEST_ALPN: &[u8] = b"mcpmesh/path-watch/test";
+
+    /// A live localhost connection whose selected path is ALREADY `Direct`, plus the hermetic mesh
+    /// that knows its remote as `name`. Returns the guards that must outlive the test.
+    #[allow(clippy::type_complexity)]
+    async fn an_already_direct_connection(
+        name: &str,
+    ) -> (
+        std::sync::Arc<crate::daemon::MeshState>,
+        iroh::endpoint::Connection,
+        [u8; 32],
+        (tempfile::TempDir, iroh::Endpoint, iroh::Endpoint),
+    ) {
+        let mk = || {
+            iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .relay_mode(iroh::RelayMode::Disabled)
+                .alpns(vec![TEST_ALPN.to_vec()])
+                .bind()
+        };
+        let server = mk().await.expect("bind server");
+        let client = mk().await.expect("bind client");
+        let accepting = server.clone();
+        tokio::spawn(async move {
+            while let Some(incoming) = accepting.accept().await {
+                if let Ok(conn) = incoming.await {
+                    // Hold the connection open until the client drops it.
+                    tokio::spawn(async move { conn.closed().await });
+                }
+            }
+        });
+        let conn = client
+            .connect(server.addr(), TEST_ALPN)
+            .await
+            .expect("connect over loopback");
+        // The precondition the fix is about: the path is selected BEFORE any watcher exists.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while crate::daemon::reach::selected_path(&conn) != PeerPath::Direct {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("precondition: the loopback connection selects a direct path");
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+        std::fs::write(&cfg, "").unwrap();
+        let mesh = crate::daemon::testutil::hermetic_mesh(cfg).await;
+        let eid = *server.id().as_bytes();
+        mesh.store
+            .add(crate::allowlist::PeerEntry {
+                endpoint_id: eid,
+                nickname: name.into(),
+                services: vec![],
+                paired_at: None,
+                user_id: None,
+                last_addr: None,
+            })
+            .unwrap();
+        (mesh, conn, eid, (dir, server, client))
+    }
+
+    /// How long the #225 tests give a watcher's initial reading. An already-Direct reading returns
+    /// on `settle`'s first poll, so this only has to cover task scheduling — and it stays well
+    /// under the ~5s at which iroh sometimes emits a later `Selected` on a loopback connection.
+    const INITIAL_READING_WAIT: Duration = Duration::from_millis(1500);
+
+    /// Drain the events already queued on a test-side `path_events()` subscription; `true` if any
+    /// was a `Selected`.
+    async fn saw_selected(events: &mut iroh::endpoint::PathEventStream) -> bool {
+        use n0_future::StreamExt as _;
+        let mut selected = false;
+        while let Ok(Some(event)) = tokio::time::timeout(Duration::ZERO, events.next()).await {
+            selected |= matches!(event, iroh::endpoint::PathEvent::Selected { .. });
+        }
+        selected
+    }
+
+    /// #225: a watcher that subscribes AFTER the path was selected must still report it.
+    ///
+    /// `path_events()` does not replay, so before the fix a watcher attached to a session whose
+    /// relay->direct move had already happened received no `Selected` event and pushed nothing, for
+    /// the life of the session. That was `live_path_events.rs` timing out at 120s under load: the
+    /// dial side subscribes only after the dial returns, and the punch won the race.
+    ///
+    /// The path is Direct before `spawn` is called, every time. What would otherwise be luck is a
+    /// LATER `Selected` event (iroh sometimes emits one ~5s in) driving the frame through the event
+    /// arm instead. So the test subscribes to the same connection's events BEFORE spawning, and
+    /// refuses a frame that arrived after a `Selected` it could have come from.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_path_selected_before_the_watcher_subscribes_is_still_pushed() {
+        let (mesh, conn, eid, _guards) = an_already_direct_connection("frank").await;
+        let mut rx = mesh.reach_bcast.subscribe();
+        let mut events = conn.path_events();
+
+        let _watcher = spawn(mesh.clone(), eid, &conn);
+
+        let frame = tokio::time::timeout(INITIAL_READING_WAIT, rx.recv())
+            .await
+            .expect(
+                "a watcher attached to an already-Direct session must push its path — with no \
+                 initial reading it waits for a Selected event that already happened",
+            )
+            .expect("broadcast channel alive");
+        assert!(
+            !saw_selected(&mut events).await,
+            "a Selected event arrived before the frame, so the frame proves nothing about the \
+             initial reading"
+        );
+        assert_eq!(frame.peer.path, PeerPath::Direct);
+        assert_eq!(frame.source, mcpmesh_local_api::ReachabilitySource::Session);
+    }
+
+    /// The INITIAL reading is deduplicated too: a second watcher on a session whose path is
+    /// already reported pushes nothing. Without this, every session opened to a peer would re-push
+    /// the path a consumer already holds.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_watcher_on_an_already_reported_path_emits_nothing() {
+        let (mesh, conn, eid, _guards) = an_already_direct_connection("ivan").await;
+        let mut rx = mesh.reach_bcast.subscribe();
+        let mut events = conn.path_events();
+
+        let _first = spawn(mesh.clone(), eid, &conn);
+        let frame = tokio::time::timeout(INITIAL_READING_WAIT, rx.recv())
+            .await
+            .expect("precondition: the first watcher's initial reading pushes the path")
+            .expect("broadcast channel alive");
+        assert_eq!(frame.peer.path, PeerPath::Direct);
+
+        let _second = spawn(mesh.clone(), eid, &conn);
+        let second = tokio::time::timeout(INITIAL_READING_WAIT, rx.recv()).await;
+        assert!(
+            !saw_selected(&mut events).await,
+            "a Selected event arrived during the test, so silence would not isolate the initial \
+             reading"
+        );
+        assert!(
+            second.is_err(),
+            "the second watcher's initial reading found the path unchanged and must push nothing, \
+             got {second:?}"
+        );
+    }
+
+    /// The initial reading and a later `Selected` for the SAME path must not both emit: the event
+    /// arm runs the same `observe`, and `decide` finds nothing changed the second time.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_selected_event_for_the_path_already_reported_emits_nothing() {
+        let (mesh, conn, eid, _guards) = an_already_direct_connection("grace").await;
+        let mut rx = mesh.reach_bcast.subscribe();
+        let weak = conn.weak_handle();
+
+        assert!(
+            observe(&mesh, eid, &weak, crate::daemon::reach::selected_path).await,
+            "the connection is alive"
+        );
+        let first = rx.try_recv().expect("the initial reading pushes the path");
+        assert_eq!(first.peer.path, PeerPath::Direct);
+
+        // Exactly what the watcher does on a `Selected` event for the path it already reported.
+        assert!(
+            observe(&mesh, eid, &weak, crate::daemon::reach::selected_path).await,
+            "the connection is alive"
+        );
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "a second observation of an unchanged path must not push a duplicate frame"
+        );
+    }
+
+    /// An `Unknown` reading is never pushed and never seeds the cache — so the initial reading
+    /// cannot turn "we do not know" (a connection with no selected path) into a frame. Driven
+    /// through the real `observe` on a live connection, with only the reading substituted: a
+    /// closed loopback connection still reports its last selected path, so it cannot supply one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unknown_reading_emits_nothing() {
+        let (mesh, conn, eid, _guards) = an_already_direct_connection("heidi").await;
+        let mut rx = mesh.reach_bcast.subscribe();
+        let weak = conn.weak_handle();
+
+        assert!(
+            observe(&mesh, eid, &weak, |_| PeerPath::Unknown).await,
+            "the connection is alive, so the reading really is taken"
+        );
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "an Unknown reading must not be pushed"
+        );
+        assert!(
+            mesh.reachability.lock().unwrap().get(&eid).is_none(),
+            "an Unknown reading must not seed the cache either"
+        );
+
+        // The same call with the REAL reading does push — so the silence above is the Unknown
+        // rule, not a fixture that can never emit.
+        assert!(observe(&mesh, eid, &weak, crate::daemon::reach::selected_path).await);
+        assert_eq!(
+            rx.try_recv().expect("a Direct reading pushes").peer.path,
+            PeerPath::Direct
         );
     }
 

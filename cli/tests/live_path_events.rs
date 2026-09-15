@@ -50,6 +50,37 @@ use tokio::time::timeout;
 /// multiplication of it.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Wait for the session's `Direct` frame, allowing a `Relay` frame before it (#225).
+///
+/// The watcher now takes a reading when it subscribes, so a session whose punch has not finished
+/// within the settle window first reports the relay it is really on — a correct frame, not the one
+/// under test. Every frame on the way must still be the watcher's own. Bounded as before: this
+/// waits on a real hole-punch and asserts no latency budget.
+async fn recv_direct_frame(
+    rx: &mut tokio::sync::broadcast::Receiver<mcpmesh::daemon::ReachTransition>,
+) -> mcpmesh::daemon::ReachTransition {
+    timeout(Duration::from_secs(120), async {
+        loop {
+            let frame = rx.recv().await.expect("broadcast channel alive");
+            assert_eq!(
+                frame.source,
+                mcpmesh_local_api::ReachabilitySource::Session,
+                "every frame here must come from the session watcher: {frame:?}"
+            );
+            match frame.peer.path {
+                mcpmesh_local_api::PeerPath::Direct => return frame,
+                mcpmesh_local_api::PeerPath::Relay { .. } => continue,
+                ref other => panic!("the watcher pushed a path it must never push: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect(
+        "a live path change must push a Direct Reachability frame — with no watcher on the \
+         session this times out, which is exactly the #92 item 2 defect",
+    )
+}
+
 fn assemble(
     endpoint: iroh::Endpoint,
     store: Arc<PeerStore>,
@@ -249,13 +280,7 @@ async fn a_live_relay_to_direct_transition_pushes_a_frame() {
 
         // The event under test. Generous: this waits on a real hole-punch, it does not assert a
         // latency budget — a tight bound here is what made #110 flaky.
-        let frame = timeout(Duration::from_secs(120), rx.recv())
-            .await
-            .expect(
-                "a live path change must push a Reachability frame — with no watcher on the \
-                 session this times out, which is exactly the #92 item 2 defect",
-            )
-            .expect("broadcast channel alive");
+        let frame = recv_direct_frame(&mut rx).await;
 
         assert_eq!(
             frame.peer.path,
@@ -318,10 +343,7 @@ async fn status_agrees_with_the_frame_the_watcher_just_pushed() {
             .await
             .expect("open a mesh session to the peer");
 
-        let frame = timeout(Duration::from_secs(120), rx.recv())
-            .await
-            .expect("a live path change must push a frame")
-            .expect("broadcast channel alive");
+        let frame = recv_direct_frame(&mut rx).await;
 
         // `reachability_of` is what `status` projects from. It must already reflect the pushed
         // value, with NO probe needed to reconcile them.

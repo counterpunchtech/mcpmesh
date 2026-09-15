@@ -531,13 +531,58 @@ async fn status_reports_live_storage_bytes() {
     .expect("status storage test timed out");
 }
 
+/// Hang guard for a spawned daemon's readiness (#228) — a PRECONDITION, NOT a latency budget.
+///
+/// Readiness includes the first exec of a freshly linked `mcpmesh` binary, which on macOS waits for
+/// the OS's first-exec code assessment and queues behind every other freshly linked binary. The
+/// same class of wait measured 12–21s for a small stub (#228); the old 10s bound here failed a
+/// full-suite run after a rebuild and passed on the rerun. No test is about boot latency, so the
+/// bound only separates slow from hung, and the elapsed time is logged so drift stays visible.
+const DAEMON_READY_GUARD: Duration = Duration::from_secs(60);
+
+/// Wait until the spawned daemon's control socket answers (#228).
+///
+/// Fails FAST if the daemon exits first — a daemon that cannot boot must not read as a slow one
+/// and burn the whole guard. On expiry it says whether the process is still running and whether
+/// the socket file exists, with the daemon's stderr, so the failure is a diagnosis.
+async fn wait_for_daemon(
+    socket: &std::path::Path,
+    child: &mut std::process::Child,
+    stderr: &std::path::Path,
+) -> mcpmesh::client::ControlClient {
+    let started = std::time::Instant::now();
+    let stderr_of = || std::fs::read_to_string(stderr).unwrap_or_default();
+    loop {
+        if let Ok(client) = connect_control(socket).await {
+            eprintln!("#228 daemon ready in {:?}", started.elapsed());
+            return client;
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!(
+                "the daemon EXITED ({status}) after {:?}, before its socket answered; stderr:\n{}",
+                started.elapsed(),
+                stderr_of()
+            );
+        }
+        if started.elapsed() >= DAEMON_READY_GUARD {
+            panic!(
+                "the daemon's socket did not answer within {DAEMON_READY_GUARD:?}: process still \
+                 running, socket file {}; stderr:\n{}",
+                if socket.exists() { "present" } else { "absent" },
+                stderr_of()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// `[limits].audit_retain_months = N` prunes months older than the window AT BOOT — driven
 /// through the REAL daemon subprocess, because the helper being correct does not prove boot
 /// calls it. Default (no key) keeps everything: the keep-forever default is a deliberate
 /// decision recorded in the spec, and this test pins BOTH sides.
 #[tokio::test(flavor = "multi_thread")]
 async fn boot_prunes_audit_months_older_than_the_configured_retention() {
-    timeout(Duration::from_secs(60), async {
+    timeout(Duration::from_secs(180), async {
         for (config, old_survives) in [
             (
                 "[network]\nrelay_mode = \"disabled\"\n[limits]\naudit_retain_months = 2\n",
@@ -586,22 +631,15 @@ async fn boot_prunes_audit_months_older_than_the_configured_retention() {
                 .env("XDG_STATE_HOME", &state)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
+                .stderr(std::fs::File::create(tmp.path().join("daemon.stderr")).unwrap())
                 .spawn()
                 .expect("spawn daemon");
             let mut child = KillOnDrop(child);
 
             // Wait for the daemon to come up (socket answers), then inspect the dir.
             let socket = runtime.join("mcpmesh").join("mcpmesh.sock");
-            let mut client = None;
-            for _ in 0..200 {
-                if let Ok(c) = connect_control(&socket).await {
-                    client = Some(c);
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            let mut client = client.expect("daemon came up");
+            let mut client =
+                wait_for_daemon(&socket, &mut child.0, &tmp.path().join("daemon.stderr")).await;
 
             assert_eq!(
                 audit_dir.join("2020-01.jsonl").exists(),
