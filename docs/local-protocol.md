@@ -1364,7 +1364,7 @@ this correction, because it describes behaviour that already shipped — the rel
 | `source` | producer | when | what it licenses |
 |---|---|---|---|
 | `"probe"` | a completing **probe** | `status`, `subscribe`'s snapshot, or `peer_services` refreshes a stale entry | "a fresh throwaway dial toward this peer went via a relay." Says nothing about the connection anyone is using. |
-| `"session"` | a **live session** | its selected path changed under it (0.20.0), or — since 0.55.1 — the session opened on a path that differs from the cached row (#225) | "the connection this peer's traffic is actually on just changed." A real statement about a live link. |
+| `"session"` | a **live session** | its selected path changed under it (0.20.0), or — since 0.55.2 — the session opened on a path that differs from the cached row (#225) | "the connection this peer's traffic is actually on just changed." A real statement about a live link. |
 | `"unknown"` | — | the daemon predates `api_minor` 30, or named a producer you predate | Neither. Hedge to the weaker (probe-level) claim. |
 
 That distinction is the difference between warning a user that their call has silently degraded and
