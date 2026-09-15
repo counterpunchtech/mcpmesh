@@ -189,10 +189,21 @@ Mutations run (each restored from a backup copy, not `git checkout`):
 | drop `close_reason` checks from the measured reading | `connection_path_reads_unknown_on_a_closed_connection` (`Direct` vs `Unknown`) |
 | `connection_path` returns `Unknown` | both `connection_path_reads_direct_*` tests |
 
-The two `connection_path_reads_direct_*` integration tests catch their mutations only on a
-multi-address host, where the two connections settle on different tuples: on a single-address CI
-runner both accept sides would read `Direct` with or without the fix. **The unit tests are the real
-pin**; the integration tests prove the API reads the accept side of a real connection at all.
+The two `connection_path_reads_direct_*` integration tests assert the property #213 is about, not
+"every sample is Direct" (a single `Unknown` during iroh's hole-punch round is inside the contract):
+never `Relay` with relays disabled; `Direct` for ≥ 80% of readings and on the last one; no run of
+non-`Direct` readings spanning more than 1.5s. Every non-`Direct` reading is printed with the
+connection's path list (`id:kind:selected`) before and after it.
+
+Their fixture seeks the #213 shape: fresh node pairs, three at a time, up to two batches, keeping the
+first whose accept sides are BOTH unselected across three checks (measured on iroh 1.2.0: a fresh
+pair reaches it in ~1 of 3 trials; redialing on the same nodes reaches it only on the first dial).
+Measured discrimination, not assumed: `connection_path ⇒ Unknown` fails both tests; dropping the
+single-path rule failed the idle test in exactly the runs whose fixture reached the shape (2 of 4 —
+the other two reached it in none of their six pairs; misses cluster, which points at host address
+state no harness knob controls). A run that misses says so (`FIXTURE: did NOT reach`). **The unit
+tests are the real pin**; the integration tests prove the API reads a real accept side in the #213
+shape when the host produces it.
 
 Not covered by any test: the `From<iroh::endpoint::PathEvent> for ObservedEvent` projection. iroh
 marks every `PathEvent` variant `#[non_exhaustive]`, so no code outside iroh can construct one
