@@ -414,17 +414,19 @@ pub(crate) mod testpeer {
         dialer: [u8; 32],
         services: &[(&str, &[&str])],
     ) -> LoopbackPeer {
-        loopback_peer_with(dir, seed, dialer, services, None).await
+        loopback_peer_with(dir, seed, dialer, services, None, false).await
     }
 
     /// [`loopback_peer`] that lets the dialer open at most `max_bidi` concurrent streams per
-    /// connection — QUIC's stream-credit limit, which this peer advertises and the dialer obeys.
+    /// connection — QUIC's stream-credit limit, which this peer advertises and the dialer obeys —
+    /// and, with `throttle_ping`, answers every ping with the rate limiter's close instead of a pong.
     pub(crate) async fn loopback_peer_with(
         dir: &std::path::Path,
         seed: u8,
         dialer: [u8; 32],
         services: &[(&str, &[&str])],
         max_bidi: Option<u32>,
+        throttle_ping: bool,
     ) -> LoopbackPeer {
         let store = Arc::new(PeerStore::open(&dir.join(format!("peer-{seed}.redb"))).unwrap());
         store
@@ -503,6 +505,9 @@ pub(crate) mod testpeer {
                         tokio::spawn(mcpmesh_net::run_mesh_connection(
                             conn, gate, services, registry,
                         ));
+                    } else if alpn == ALPN_PING && throttle_ping {
+                        ping.fetch_add(1, Ordering::SeqCst);
+                        conn.close(0u32.into(), crate::daemon::reach::PING_THROTTLE_CLOSE);
                     } else if alpn == ALPN_PING {
                         ping.fetch_add(1, Ordering::SeqCst);
                         tokio::spawn(async move {
@@ -1287,6 +1292,7 @@ mod tests {
             dialer_id(),
             &[("echo", &[me.as_str()])],
             Some(1),
+            false,
         )
         .await;
         let mesh = dialer_mesh(dir.path(), &peer).await;
@@ -1330,6 +1336,7 @@ mod tests {
             dialer_id(),
             &[("echo", &[me.as_str()])],
             Some(1),
+            false,
         )
         .await;
         let mesh = dialer_mesh(dir.path(), &x).await;
