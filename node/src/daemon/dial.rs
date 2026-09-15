@@ -96,10 +96,10 @@ fn revoked_refusal(peer: &str) -> anyhow::Error {
 /// [`MeshHooks`](super::hooks::MeshHooks), whose `before_connect` asks [`refused_by`] for every
 /// dial on every ALPN except the pairing one — so iroh-gossip's LEARNED peers (ForwardJoin,
 /// Shuffle), which gossip dials without asking this node, are refused too. The call-site filters
-/// above stay: they refuse
-/// with a useful error before resolving anything, where the hook can only answer "rejected
-/// locally". Connections already open when a revocation lands are closed by every revoke path
-/// through the same hook's registry (`MeshState::close_refused_peer_conns`).
+/// above stay: they refuse with a useful error before resolving anything, where the hook can only
+/// answer "rejected locally". Connections already open when a revocation lands are closed through
+/// the same hook's registry by `sever_principals` (`peer_revoke`, `device_revoke`,
+/// `device_revocation_import`) and `install_roster_view_and_sever` (every roster install).
 ///
 /// **Not covered** — outbound traffic that can still reach a revoked device:
 ///
