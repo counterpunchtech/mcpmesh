@@ -179,16 +179,127 @@ async fn open_session(
     Some(SessionTransport::new(recv, send, MAX_FRAME_BYTES))
 }
 
-/// Did this session get SERVED? A served session answers `initialize` with the stub's serverInfo;
-/// a refused one yields an error frame or a closed stream. `None` (the stream never opened) is
-/// not served.
-async fn session_served(transport: Option<&mut SessionTransport>) -> bool {
+/// Hang guard for a session's answer (#228) — NOT a latency budget.
+///
+/// Serving means the server spawning `echo_mcp_stub` and relaying its `initialize` reply. Measured
+/// on macOS: ~10–300ms normally, but the FIRST exec of a freshly linked stub waits for the OS's
+/// first-exec code assessment, which queues behind every other freshly linked binary being
+/// assessed — and a suite run after any change relinks dozens of them. Reproduced by replacing the
+/// stub with a fresh copy and exec'ing 8 fresh copies of a 66MB test binary alongside: the round trip
+/// took 12–21s, while the server accepted the stream, read `initialize` and returned from `spawn`
+/// within 2ms — the wait was the child's first exec. The old 5s bound failed all 8 tests at once in
+/// 11 of 12 such runs; a warm stub answers in milliseconds, which is why the same binary passed alone.
+///
+/// No test here is ABOUT that latency, so the bound only separates slow from hung. It is also the
+/// refusal bound: a refusal spawns nothing and answers at once, so it waits this long only when
+/// something is broken.
+const SESSION_ANSWER_GUARD: Duration = Duration::from_secs(60);
+
+/// Assert this session was REFUSED — definitively (#228).
+///
+/// A refusal is an answer that is not the stub's serverInfo (the -32054 error frame), a closed
+/// stream, a transport error, or a stream that never opened. Running out of time is NOT a refusal:
+/// the old `session_served` read a 5s timeout as "not served", so under the same load that broke the
+/// preconditions, a session that WAS about to be served — the exact defect these tests exist to
+/// catch — would have read as refused and passed. The bound is the same hang guard, and expiry
+/// fails the test.
+async fn assert_refused(transport: Option<&mut SessionTransport>, what: &str) {
     let Some(transport) = transport else {
-        return false;
+        return; // the stream never opened: refused at the connection
     };
-    match timeout(Duration::from_secs(5), transport.recv_value()).await {
-        Ok(Ok(Some(v))) => v["result"]["serverInfo"]["name"] == "echo-stub",
-        _ => false,
+    match timeout(SESSION_ANSWER_GUARD, transport.recv_value()).await {
+        Ok(Ok(Some(v))) => assert!(
+            v["result"]["serverInfo"]["name"] != "echo-stub",
+            "{what}: the session was SERVED: {v}"
+        ),
+        Ok(Ok(None) | Err(_)) => {}
+        Err(_) => panic!(
+            "{what}: neither served nor refused within {SESSION_ANSWER_GUARD:?} — a hang is \
+             not a refusal"
+        ),
+    }
+}
+
+/// Assert this session was SERVED, logging how long it took (#228).
+///
+/// On expiry it reports which stage it was stuck in, so the next failure is a diagnosis rather
+/// than a rerun: whether the stream opened at all, whether the server had spawned a stub child
+/// (spawned-but-silent vs never-spawned), and how long a DIRECT stub round trip takes right now
+/// (a slow one means process spawn is the cost, not the daemon).
+async fn assert_served(transport: Option<&mut SessionTransport>, what: &str) {
+    let started = std::time::Instant::now();
+    let Some(transport) = transport else {
+        panic!("{what}: the session stream never opened (open_bi or the initialize write failed)");
+    };
+    match timeout(SESSION_ANSWER_GUARD, transport.recv_value()).await {
+        Ok(Ok(Some(v))) if v["result"]["serverInfo"]["name"] == "echo-stub" => {
+            eprintln!("#228 `{what}`: served in {:?}", started.elapsed());
+        }
+        Ok(Ok(Some(v))) => panic!(
+            "{what}: answered but NOT served after {:?}: {v}",
+            started.elapsed()
+        ),
+        Ok(Ok(None)) => panic!(
+            "{what}: stream closed without a reply after {:?}",
+            started.elapsed()
+        ),
+        Ok(Err(e)) => panic!("{what}: transport error after {:?}: {e}", started.elapsed()),
+        Err(_) => panic!(
+            "{what}: no initialize reply within {SESSION_ANSWER_GUARD:?} (stream opened, \
+             initialize sent). Stub children of this process: {}. Direct stub round trip now: {}",
+            stub_children(),
+            direct_stub_round_trip()
+        ),
+    }
+}
+
+/// The `echo_mcp_stub` children of this test process, via `pgrep` — diagnostic only.
+fn stub_children() -> String {
+    match std::process::Command::new("pgrep")
+        .args(["-P", &std::process::id().to_string(), "-f", "echo_mcp_stub"])
+        .output()
+    {
+        Ok(out) if out.stdout.is_empty() => "none (the server never spawned one)".into(),
+        Ok(out) => format!(
+            "pids {}",
+            String::from_utf8_lossy(&out.stdout)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        Err(e) => format!("unknown (pgrep failed: {e})"),
+    }
+}
+
+/// Spawn the stub directly and time one `initialize` round trip, bounded — diagnostic only.
+fn direct_stub_round_trip() -> String {
+    use std::io::{BufRead, Write};
+    let started = std::time::Instant::now();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let outcome = (|| -> std::io::Result<String> {
+            let mut child = std::process::Command::new(STUB)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()?;
+            let spawned = started.elapsed();
+            let mut stdin = child.stdin.take().expect("piped");
+            writeln!(stdin, "{}", initialize_frame("echo"))?;
+            let mut line = String::new();
+            std::io::BufReader::new(child.stdout.take().expect("piped")).read_line(&mut line)?;
+            drop(stdin);
+            let _ = child.wait();
+            Ok(format!(
+                "spawn {spawned:?}, reply after {:?}",
+                started.elapsed()
+            ))
+        })();
+        let _ = tx.send(outcome);
+    });
+    match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(Ok(timing)) => timing,
+        Ok(Err(e)) => format!("failed: {e}"),
+        Err(_) => "no reply within 10s".into(),
     }
 }
 
@@ -206,16 +317,17 @@ async fn session_served(transport: Option<&mut SessionTransport>) -> bool {
 /// stays up throughout, which is what proves no sever was involved.
 #[tokio::test]
 async fn a_grant_is_live_on_an_already_open_connection() {
-    timeout(Duration::from_secs(60), async {
+    timeout(Duration::from_secs(180), async {
         let (mesh, addr, _registry, peers, _dir) = paired_mesh(&["alice"]).await;
         let alice = &peers[0];
 
         let conn = dial(&alice.endpoint, addr).await;
         let mut before = open_session(&conn, "later").await;
-        assert!(
-            !session_served(before.as_mut()).await,
-            "`later` admits nobody yet, so this session must be refused (setup)"
-        );
+        assert_refused(
+            before.as_mut(),
+            "`later` admits nobody yet, so this session must be refused (setup)",
+        )
+        .await;
 
         // The grant path: append to allow + swap the live registry. No sever anywhere.
         mcpmesh::daemon::grant_service_access(
@@ -234,10 +346,11 @@ async fn a_grant_is_live_on_an_already_open_connection() {
         );
 
         let mut after = open_session(&conn, "later").await;
-        assert!(
-            session_served(after.as_mut()).await,
-            "a grant must be visible to the NEXT session on an ALREADY-OPEN connection"
-        );
+        assert_served(
+            after.as_mut(),
+            "a grant must be visible to the NEXT session on an ALREADY-OPEN connection",
+        )
+        .await;
     })
     .await
     .expect("grant-goes-live test timed out");
@@ -251,16 +364,17 @@ async fn a_grant_is_live_on_an_already_open_connection() {
 /// it is a contract test, not a Part-A regression test — see the grant test above for that.
 #[tokio::test]
 async fn a_new_session_on_an_open_connection_is_refused_after_revoke() {
-    timeout(Duration::from_secs(60), async {
+    timeout(Duration::from_secs(180), async {
         let (mesh, addr, _registry, peers, _dir) = paired_mesh(&["alice"]).await;
         let alice = &peers[0];
 
         let conn = dial(&alice.endpoint, addr).await;
         let mut first = open_session(&conn, "echo").await;
-        assert!(
-            session_served(first.as_mut()).await,
-            "the granted peer must be served BEFORE the revoke (setup)"
-        );
+        assert_served(
+            first.as_mut(),
+            "the granted peer must be served BEFORE the revoke (setup)",
+        )
+        .await;
 
         revoke_service_allow(&mesh, "echo".into(), alice.principal.clone())
             .await
@@ -269,10 +383,11 @@ async fn a_new_session_on_an_open_connection_is_refused_after_revoke() {
         // SAME connection, NEW bi-stream. The connection may also have been severed — either way
         // this session must NOT be served.
         let mut second = open_session(&conn, "echo").await;
-        assert!(
-            !session_served(second.as_mut()).await,
-            "a revoked peer must not open a NEW session on its already-open connection"
-        );
+        assert_refused(
+            second.as_mut(),
+            "a revoked peer must not open a NEW session on its already-open connection",
+        )
+        .await;
     })
     .await
     .expect("new-session-after-revoke test timed out");
@@ -282,16 +397,13 @@ async fn a_new_session_on_an_open_connection_is_refused_after_revoke() {
 /// merely refuse her next session.
 #[tokio::test]
 async fn revoke_severs_the_live_connection() {
-    timeout(Duration::from_secs(60), async {
+    timeout(Duration::from_secs(180), async {
         let (mesh, addr, _registry, peers, _dir) = paired_mesh(&["alice"]).await;
         let alice = &peers[0];
 
         let conn = dial(&alice.endpoint, addr).await;
         let mut session = open_session(&conn, "echo").await;
-        assert!(
-            session_served(session.as_mut()).await,
-            "served before revoke"
-        );
+        assert_served(session.as_mut(), "served before revoke").await;
 
         revoke_service_allow(&mesh, "echo".into(), alice.principal.clone())
             .await
@@ -310,17 +422,17 @@ async fn revoke_severs_the_live_connection() {
 /// connected, served, and still granted. Over-severing would be a self-inflicted outage.
 #[tokio::test]
 async fn revoke_does_not_sever_an_unrelated_peer() {
-    timeout(Duration::from_secs(60), async {
+    timeout(Duration::from_secs(180), async {
         let (mesh, addr, _registry, peers, _dir) = paired_mesh(&["alice", "bob"]).await;
         let (alice, bob) = (&peers[0], &peers[1]);
 
         let alice_conn = dial(&alice.endpoint, addr.clone()).await;
         let mut alice_session = open_session(&alice_conn, "echo").await;
-        assert!(session_served(alice_session.as_mut()).await, "alice served");
+        assert_served(alice_session.as_mut(), "alice served").await;
 
         let bob_conn = dial(&bob.endpoint, addr).await;
         let mut bob_session = open_session(&bob_conn, "echo").await;
-        assert!(session_served(bob_session.as_mut()).await, "bob served");
+        assert_served(bob_session.as_mut(), "bob served").await;
 
         revoke_service_allow(&mesh, "echo".into(), alice.principal.clone())
             .await
@@ -344,10 +456,11 @@ async fn revoke_does_not_sever_an_unrelated_peer() {
 
         // ...and bob can still open a NEW session on his connection.
         let mut bob_second = open_session(&bob_conn, "echo").await;
-        assert!(
-            session_served(bob_second.as_mut()).await,
-            "revoking alice must not affect bob's new sessions"
-        );
+        assert_served(
+            bob_second.as_mut(),
+            "revoking alice must not affect bob's new sessions",
+        )
+        .await;
     })
     .await
     .expect("unrelated-peer regression timed out");
@@ -357,17 +470,17 @@ async fn revoke_does_not_sever_an_unrelated_peer() {
 /// guarantee as `service_allow_revoke`, via the shared resolve→sever helper.
 #[tokio::test]
 async fn removing_a_peer_severs_its_live_connection() {
-    timeout(Duration::from_secs(60), async {
+    timeout(Duration::from_secs(180), async {
         let (mesh, addr, _registry, peers, _dir) = paired_mesh(&["alice", "bob"]).await;
         let (alice, bob) = (&peers[0], &peers[1]);
 
         let alice_conn = dial(&alice.endpoint, addr.clone()).await;
         let mut alice_session = open_session(&alice_conn, "echo").await;
-        assert!(session_served(alice_session.as_mut()).await, "alice served");
+        assert_served(alice_session.as_mut(), "alice served").await;
 
         let bob_conn = dial(&bob.endpoint, addr).await;
         let mut bob_session = open_session(&bob_conn, "echo").await;
-        assert!(session_served(bob_session.as_mut()).await, "bob served");
+        assert_served(bob_session.as_mut(), "bob served").await;
 
         // `revoke_service_allow` is per-service; `peer_remove`'s authorization half strips the
         // peer from EVERY service and severs — drive it through the same public entry the daemon
@@ -405,16 +518,13 @@ async fn removing_a_peer_severs_its_live_connection() {
 /// fires at the top of the sever with the live registry as of that instant.
 #[tokio::test]
 async fn the_unpair_path_swaps_the_registry_before_it_severs() {
-    timeout(Duration::from_secs(60), async {
+    timeout(Duration::from_secs(180), async {
         let (mesh, addr, _registry, peers, _dir) = paired_mesh(&["alice"]).await;
         let alice = &peers[0];
 
         let conn = dial(&alice.endpoint, addr).await;
         let mut session = open_session(&conn, "echo").await;
-        assert!(
-            session_served(session.as_mut()).await,
-            "served before revoke"
-        );
+        assert_served(session.as_mut(), "served before revoke").await;
 
         // Record EVERY sever, not just the last: a reversal that severs twice would otherwise
         // hide the stale first observation behind a fresh second one.
@@ -462,17 +572,18 @@ async fn the_unpair_path_swaps_the_registry_before_it_severs() {
 /// an implementation that simply deleted the row.
 #[tokio::test]
 async fn peer_revoke_severs_the_live_connection_and_refuses_the_next_dial() {
-    timeout(Duration::from_secs(60), async {
+    timeout(Duration::from_secs(180), async {
         let (mesh, addr, _registry, peers, dir) = paired_mesh(&["alice"]).await;
         let alice = &peers[0];
         let state = mcpmesh::control::DaemonState::with_mesh("test", mesh.clone());
 
         let conn = dial(&alice.endpoint, addr.clone()).await;
         let mut session = open_session(&conn, "echo").await;
-        assert!(
-            session_served(session.as_mut()).await,
-            "precondition: served before the revoke — otherwise the sever below proves nothing"
-        );
+        assert_served(
+            session.as_mut(),
+            "precondition: served before the revoke — otherwise the sever below proves nothing",
+        )
+        .await;
 
         let out = mcpmesh::daemon::peer_revoke(
             &state,
@@ -499,16 +610,13 @@ async fn peer_revoke_severs_the_live_connection_and_refuses_the_next_dial() {
         // the unrevoke below restores service, which is only possible if the row was never
         // deleted. That is the stronger statement anyway: it is about behaviour, not storage.)
         let redial = dial(&alice.endpoint, addr.clone()).await;
-        let refused = timeout(Duration::from_secs(10), async {
-            let mut s = open_session(&redial, "echo").await;
-            session_served(s.as_mut()).await
-        })
-        .await;
-        assert!(
-            !matches!(refused, Ok(true)),
+        let mut refused = open_session(&redial, "echo").await;
+        assert_refused(
+            refused.as_mut(),
             "a revoked peer must be refused on a FRESH connection too, even though its pair row is \
-             intact: {refused:?}"
-        );
+             intact",
+        )
+        .await;
 
         // …and lifting it restores service, which is the whole reason the row survived.
         mcpmesh::daemon::peer_unrevoke(
@@ -521,10 +629,11 @@ async fn peer_revoke_severs_the_live_connection_and_refuses_the_next_dial() {
         .expect("unrevoke succeeds");
         let back = dial(&alice.endpoint, addr).await;
         let mut s = open_session(&back, "echo").await;
-        assert!(
-            session_served(s.as_mut()).await,
-            "unrevoking must restore the peer — the pair row was never touched"
-        );
+        assert_served(
+            s.as_mut(),
+            "unrevoking must restore the peer — the pair row was never touched",
+        )
+        .await;
         drop(dir);
     })
     .await
@@ -535,17 +644,14 @@ async fn peer_revoke_severs_the_live_connection_and_refuses_the_next_dial() {
 /// on this path it would cut a peer the operator never named while telling them it worked.
 #[tokio::test]
 async fn peer_revoke_does_not_sever_an_unrelated_peer() {
-    timeout(Duration::from_secs(60), async {
+    timeout(Duration::from_secs(180), async {
         let (mesh, addr, _registry, peers, _dir) = paired_mesh(&["alice", "bob"]).await;
         let (alice, bob) = (&peers[0], &peers[1]);
         let state = mcpmesh::control::DaemonState::with_mesh("test", mesh.clone());
 
         let bob_conn = dial(&bob.endpoint, addr).await;
         let mut bob_session = open_session(&bob_conn, "echo").await;
-        assert!(
-            session_served(bob_session.as_mut()).await,
-            "bob served first"
-        );
+        assert_served(bob_session.as_mut(), "bob served first").await;
 
         mcpmesh::daemon::peer_revoke(
             &state,
@@ -564,8 +670,8 @@ async fn peer_revoke_does_not_sever_an_unrelated_peer() {
             "bob's connection must survive alice's revocation"
         );
         // Round-trip on the ALREADY-OPEN session, exactly as `revoke_does_not_sever_an_unrelated_peer`
-        // does: `session_served` is a one-shot that finishes the stream it checks, so calling it
-        // twice would report a dead session whether or not the sever was over-broad — a test that
+        // does: `assert_served` consumes the one `initialize` reply the stream carries, so checking
+        // it twice would report a dead session whether or not the sever was over-broad — a test that
         // fails for its own reasons proves nothing about the code.
         let bob_session = bob_session.as_mut().expect("bob's session opened");
         bob_session
