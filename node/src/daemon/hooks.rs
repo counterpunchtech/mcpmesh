@@ -31,6 +31,11 @@
 //! connections and gossip links all land here; [`close_refused`] is what the revoke paths call. The
 //! #215 MCP connection cache's own `close_to` is superseded by it.
 //!
+//! **Cost to a stranger.** Registration happens after the handshake and before any gate, so an
+//! unpaired peer that completes a QUIC handshake costs one map entry and one parked watcher task
+//! until its connection closes — which the accept loop's gate does at once. No blocking read runs
+//! for an inbound connection.
+//!
 //! [`dial_refused`]: super::dial::dial_refused
 //! [`PeerStore::is_refused`]: crate::allowlist::PeerStore::is_refused
 use std::collections::{HashMap, HashSet};
@@ -138,12 +143,27 @@ impl PeerConns {
 /// AFTER its write, so a connection registered before the write is found here and one registered
 /// after it is refused by its own `after_handshake` re-check. Returns how many were closed.
 pub(crate) async fn close_refused(conns: &PeerConns, gate: &DialGate) -> usize {
-    let mut refused = HashSet::new();
-    for id in conns.remote_ids() {
-        if gate.refuses(id).await {
-            refused.insert(id);
-        }
+    let ids = conns.remote_ids();
+    if ids.is_empty() {
+        return 0;
     }
+    // ONE blocking-pool hop for the whole set, not one per peer.
+    let g = gate.clone();
+    let refused = match crate::util::blocking("join revoke close-pass refusal reads", move || {
+        ids.into_iter()
+            .filter(|id| super::dial::refused_by(&g.store, g.roster.view().as_deref(), id))
+            .collect::<HashSet<_>>()
+    })
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            // Not fail-closed: closing EVERY connection on a join failure would turn a panicked
+            // read into a node-wide disconnect. The dial veto still refuses new dials.
+            tracing::warn!(%e, "revoke close pass failed; connections to refused devices stay open");
+            return 0;
+        }
+    };
     if refused.is_empty() {
         return 0;
     }
@@ -843,5 +863,47 @@ mod tests {
             "this node must have closed it: {reason:?}"
         );
         crate::daemon::boot::shutdown_booted(booted).await;
+    }
+
+    /// The hooks never keep their endpoint alive (iroh `hooks.rs:60-64`: a hook holding the
+    /// `Endpoint` is a reference cycle). Observed through the store `Arc` the armed gate holds:
+    /// once the endpoint is closed and dropped — with connections that were registered, watched and
+    /// closed — the endpoint's copy of the hooks must be dropped too, returning the count to ours.
+    ///
+    /// Mutation: stashing an `Endpoint` clone in `MeshHooks`, or a strong `Connection` in the
+    /// registry, keeps the count up and fails the wait.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_hooks_do_not_keep_their_endpoint_alive() {
+        let (store, _tmp) = store();
+        let hooks = MeshHooks::new();
+        let _armed = hooks.arm(DialGate::new(store.clone(), Arc::new(RosterGate::empty())));
+        let a = hooked(65, &hooks, false).await;
+        let (p, _acc) = holder(&[ALPN_MCP]).await;
+        let conn = dial(&a, &p, ALPN_MCP).await.expect("dial");
+        assert_eq!(
+            hooks.conns().len(),
+            1,
+            "control: the connection was registered"
+        );
+        drop(hooks);
+        assert_eq!(
+            Arc::strong_count(&store),
+            2,
+            "control: the endpoint's hooks hold the only other reference"
+        );
+
+        conn.close(0u32.into(), b"done");
+        drop(conn);
+        a.close().await;
+        drop(a);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while Arc::strong_count(&store) != 1 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a closed, dropped endpoint must release its hooks (strong count {})",
+                Arc::strong_count(&store)
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 }

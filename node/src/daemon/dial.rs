@@ -95,8 +95,8 @@ fn revoked_refusal(peer: &str) -> anyhow::Error {
 /// **Beneath all of them, the endpoint hook (#229).** A booted node's endpoint carries
 /// [`MeshHooks`](super::hooks::MeshHooks), whose `before_connect` asks [`refused_by`] for every
 /// dial on every ALPN except the pairing one — so iroh-gossip's LEARNED peers (ForwardJoin,
-/// Shuffle), which gossip dials without asking this node, and `AppBlobs::fetch`/`fetch_from` called
-/// directly on a node's provider are refused too. The call-site filters above stay: they refuse
+/// Shuffle), which gossip dials without asking this node, are refused too. The call-site filters
+/// above stay: they refuse
 /// with a useful error before resolving anything, where the hook can only answer "rejected
 /// locally". Connections already open when a revocation lands are closed by every revoke path
 /// through the same hook's registry (`MeshState::close_refused_peer_conns`).
@@ -104,7 +104,10 @@ fn revoked_refusal(peer: &str) -> anyhow::Error {
 /// **Not covered** — outbound traffic that can still reach a revoked device:
 ///
 /// - **An endpoint without the hook**: a mesh a test assembles by hand over `build_endpoint(..,
-///   None)`, and an `AppBlobs` an embedder builds over its OWN endpoint.
+///   None)`.
+/// - **`AppBlobs::fetch` / `AppBlobs::fetch_from`**, the provider's raw pub API, filter nothing
+///   themselves. On a booted node the provider shares the hooked endpoint, so its dials should meet
+///   the veto, but no test drives that path; the daemon verb (`blob_fetch`) filters before calling.
 /// - **The roster half of the pairing dials.** `redeem_invite` and `attest_to` hold a `PeerStore`
 ///   and no roster, so they check [`PeerStore::is_refused`] alone: a roster-revoked endpoint, or a
 ///   roster device under a revoked `b64u:` identity, is not refused there.
