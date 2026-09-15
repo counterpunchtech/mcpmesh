@@ -24,6 +24,7 @@
 mod accept;
 pub(crate) mod boot;
 pub(crate) mod config_write;
+mod conn_cache;
 pub(crate) mod dial;
 pub(crate) mod dial_hint;
 pub(crate) mod handlers;
@@ -484,6 +485,8 @@ pub struct MeshState {
     ///
     /// std `Mutex`, held only for the insert/remove and never across an await.
     pub(crate) probes_inflight: std::sync::Mutex<std::collections::HashSet<[u8; 32]>>,
+    /// The per-peer client connection cache for MCP sessions (#215) — see `conn_cache`.
+    pub(crate) conn_cache: conn_cache::McpConnCache,
     /// Serializes an org AUTHORING verb's whole read-modify-write (#66).
     ///
     /// `org_approve`/`org_revoke` read `roster.json`, mutate, bump the serial, re-sign, and only
@@ -705,6 +708,7 @@ impl MeshState {
             self_net_change: std::sync::Mutex::new(None),
             probe_seq: std::sync::atomic::AtomicU64::new(0),
             probes_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            conn_cache: conn_cache::McpConnCache::new(),
             org_author_lock: tokio::sync::Mutex::new(()),
             user_key_lock: tokio::sync::Mutex::new(()),
             #[cfg(test)]
@@ -1870,6 +1874,21 @@ pub(crate) mod testutil {
         config_path: PathBuf,
         invites: Arc<LiveInvites>,
     ) -> Arc<MeshState> {
+        hermetic_mesh_inner(config_path, invites, false).await
+    }
+
+    /// [`hermetic_mesh`] whose endpoint carries the #229 hooks, ARMED over this mesh's store and
+    /// roster gate and installed on the mesh — as `boot_node` does. The revoke paths' close pass and
+    /// the `before_connect` veto only exist on such a mesh, so a test of either needs this one.
+    pub(crate) async fn hermetic_hooked_mesh(config_path: PathBuf) -> Arc<MeshState> {
+        hermetic_mesh_inner(config_path, Arc::new(LiveInvites::new()), true).await
+    }
+
+    async fn hermetic_mesh_inner(
+        config_path: PathBuf,
+        invites: Arc<LiveInvites>,
+        hooked: bool,
+    ) -> Arc<MeshState> {
         let dir = config_path.parent().unwrap();
         let store = Arc::new(PeerStore::open(&dir.join("state.redb")).unwrap());
         let pairs = Arc::new(AllowlistGate::new(store.clone()));
@@ -1879,11 +1898,12 @@ pub(crate) mod testutil {
             relay_mode: "disabled".into(),
             ..Default::default()
         };
+        let hooks = hooked.then(crate::daemon::hooks::MeshHooks::new);
         let endpoint = build_endpoint(
             iroh::SecretKey::from_bytes(&[7u8; 32]),
             &hermetic,
             false,
-            None,
+            hooks.clone(),
         )
         .await
         .unwrap();
@@ -1901,6 +1921,13 @@ pub(crate) mod testutil {
             None,
             None,
         );
+        if let Some(hooks) = hooks {
+            let _armed = hooks.arm(crate::daemon::hooks::DialGate::new(
+                mesh.store.clone(),
+                mesh.roster.clone(),
+            ));
+            mesh.set_peer_hooks(hooks);
+        }
         // Model a BOOTED daemon: `MeshState::new` installs an EMPTY registry, and boot then swaps
         // in the built services before the control socket exists. #100 made that load-bearing —
         // `status` and `peer_services` now answer from the registry, so a harness that left it

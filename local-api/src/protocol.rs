@@ -1006,6 +1006,10 @@ pub struct OpenSessionParams {
     /// No per-connection KEEPALIVE: iroh caps the per-path keepalive at 5s and discards larger
     /// values, so one could only make pings more frequent — the node-wide knob already refuses that
     /// direction (#56).
+    ///
+    /// **Its own connection (#215, `api_minor >= 66`).** Sessions to one peer normally share a single
+    /// QUIC connection; a session that sets this cannot, because the timeout is a property of the
+    /// connection. It dials its own, and plain sessions never join it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_timeout_secs: Option<u64>,
 }
@@ -3046,7 +3050,7 @@ pub const API_NAME: &str = "mcpmesh-local/1";
 ///   thirty have, see [`API_MINOR`]'s history. "Every surface change" is what this line used
 ///   to claim, and it was wrong in both directions: minor 9's entry records surface changes that
 ///   shipped WITHOUT a bump, and six bumps changed no type at all. Read the history, not the rule.
-pub const API_VERSION: &str = "1.65";
+pub const API_VERSION: &str = "1.66";
 /// The integer MINOR of [`API_VERSION`] — see there. Bumped from 0 to 1 when params validation
 /// became strict (#34); to 2 with the `set_nickname` verb + `StatusResult.self_nickname` (#37);
 /// to 3 when `allow`/grant strings became STABLE principals — `b64u:`/`eid:`/roster names,
@@ -3171,7 +3175,20 @@ pub const API_VERSION: &str = "1.65";
 /// 401, where through 64 both ran until the peer hung up. `peer_remove` and a roster drop that
 /// revokes nothing refuse no dial and close nothing outbound. `severed` counts the ACCEPTED
 /// connections a revoke cut, exactly as through 64; the dialled connections it closes are not in it.
-/// Guard on `>= 65` before relying on an outbound session ending when its peer is revoked; to
+/// Guard on `>= 65` before relying on an outbound session ending when its peer is revoked; to 66
+/// when sessions to one peer began SHARING one QUIC connection (#215) — no type in this file
+/// changed; two meanings did. A connection-level event (the peer closing, an idle timeout, a
+/// revoke's close pass) now ends EVERY `open_session` pipe to that device at once, not one. And
+/// `peer_services` answers only from a pong: a live session's path watcher writes a reachable row
+/// with no services in it, and through 65 this verb answered `[]` from that row for up to a TTL,
+/// indistinguishable from "offers you nothing". From 66 an empty list means the peer's pong named no
+/// services, and a probe that fetched no pong fails retryably ("could not be fetched just now")
+/// rather than answering `[]`. Guard on `>= 66` before treating an empty `peer_services` answer as
+/// "offers nothing". A peer that dies without closing its connection changes `open_session`'s
+/// failure shape too: a session to it opens at once on the still-open shared connection and ends
+/// (EOF) at the idle timeout, where through 65 it failed at open with `-32055`. Crate-level, a
+/// MINOR release of `mcpmesh-node` (0.57 → 0.58): `daemon::ReachEntry` gained the pub field
+/// `pong_at` and became `#[non_exhaustive]`; to
 /// 62 with the self-enrollment EXIT and the surface an
 /// embedder needs to ship the ceremony at all (#214): [`Request::SelfEnrollDetach`] drops an
 /// adopted binding (the inverse of `pair { allow_self_enroll }`, and the only exit an enrolled
@@ -3430,7 +3447,7 @@ pub const API_VERSION: &str = "1.65";
 /// its REAL content is a meaning change to `reachable` — the field exists so the new meaning is
 /// observable at all. A downstream
 /// that diffs types across a multi-minor bump sees nothing for any of them.
-pub const API_MINOR: u32 = 65;
+pub const API_MINOR: u32 = 66;
 
 #[cfg(test)]
 mod tests {

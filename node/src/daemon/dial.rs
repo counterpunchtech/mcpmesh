@@ -2,6 +2,9 @@
 //! endpoint resolution, the staggered person→device race, the explicit dial timeout, and the
 //! control↔mesh byte pipe with its service-name injection. Split out of `daemon.rs`
 //! mechanically — no API change; `daemon` re-exports the public entry points.
+//!
+//! Since #215 a session to a peer this node already holds a mesh connection to is a new bi-stream
+//! on that connection rather than a new dial — see `conn_cache`.
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -288,11 +291,9 @@ pub async fn dial_service_with_idle_timeout(
             // #186: a rostered device often ALSO has a paired row, and its hint is the only address
             // anyone has on a network with no discovery.
             warn_if_per_session_dropped(&per_conn, peer, "a roster person");
-            let candidates = hinted_addrs(mesh, candidates).await?;
-            let (transport, conn) = race_dial(&mesh.endpoint, candidates, service)
+            return race_or_reuse(mesh, candidates, service)
                 .await
-                .with_context(|| format!("dial {peer}/{service}"))?;
-            return Ok(watch_session(mesh, transport, conn));
+                .with_context(|| format!("dial {peer}/{service}"));
         }
     }
     // Pairing-mode fallback. `peer` is resolved to stored entries by, in order:
@@ -327,22 +328,112 @@ pub async fn dial_service_with_idle_timeout(
         // old code kept only the ids — making a two-device person unreachable offline while a
         // one-device person was fine.
         warn_if_per_session_dropped(&per_conn, peer, "a user_id with several devices");
-        let multi = hinted_addrs(mesh, multi).await?;
-        let (transport, conn) = race_dial(&mesh.endpoint, multi, service)
+        return race_or_reuse(mesh, multi, service)
             .await
-            .with_context(|| format!("dial {peer}/{service}"))?;
-        return Ok(watch_session(mesh, transport, conn));
+            .with_context(|| format!("dial {peer}/{service}"));
     }
     let entry = single.with_context(|| format!("peer '{peer}' is not in the allowlist"))?;
     refuse_if_revoked(mesh, entry.endpoint_id, peer).await?;
     let endpoint_id = iroh::EndpointId::from_bytes(&entry.endpoint_id)
         .map_err(|e| anyhow::anyhow!("stored endpoint id for '{peer}' is invalid: {e}"))?;
     let addr = stored_dial_addr(entry.last_addr.as_deref(), endpoint_id);
-    let (transport, conn) =
-        connect_with_timeout(&mesh.endpoint, addr, service, DIAL_TIMEOUT, per_conn)
-            .await
-            .with_context(|| format!("dial {peer}/{service}"))?;
-    Ok(watch_session(mesh, transport, conn))
+    dial_single(mesh, addr, service, per_conn)
+        .await
+        .with_context(|| format!("dial {peer}/{service}"))
+}
+
+/// ONE session to ONE device, on the connection this node already holds to it when there is one
+/// (#215).
+///
+/// A session with a per-connection transport config (#166) is dialled as before and never cached:
+/// `ConnectOptions::with_transport_config` is per CONNECTION, so a session that asked for its own
+/// idle timeout needs its own connection — sharing would either apply that timeout to sessions
+/// that never asked for it or silently drop it, and #166 refuses the silent drop twice over.
+///
+/// `DIAL_TIMEOUT` bounds the whole thing, including a wait on another caller's in-flight dial, so a
+/// dead peer costs a second session the same bounded wait it always did.
+async fn dial_single(
+    mesh: &Arc<MeshState>,
+    addr: iroh::EndpointAddr,
+    service: &str,
+    per_conn: Option<iroh::endpoint::QuicTransportConfig>,
+) -> Result<SessionTransport> {
+    if per_conn.is_some() {
+        let (transport, conn) =
+            connect_with_timeout(&mesh.endpoint, addr, service, DIAL_TIMEOUT, per_conn).await?;
+        return Ok(watch_session(mesh, transport, conn));
+    }
+    let peer = *addr.id.as_bytes();
+    let endpoint = mesh.endpoint.clone();
+    let opened =
+        mesh.conn_cache
+            .session_on(
+                &[peer],
+                DIAL_TIMEOUT,
+                |id| refused_now(mesh.clone(), id),
+                || async move {
+                    connect_with_timeout(&endpoint, addr, service, DIAL_TIMEOUT, None).await
+                },
+            )
+            .await?;
+    Ok(opened_session(mesh, opened))
+}
+
+/// The racing paths' share of #215: a live connection to ANY candidate device is reused without a
+/// race; a dial already in flight to any candidate is waited on rather than raced beside (its
+/// loser would otherwise live as long as its session); and a race's winner is cached.
+///
+/// The cache is consulted AFTER `hinted_addrs`, whose [`dial_refused`] filter drops revoked devices
+/// before any of them can be matched against a cached connection or given a `Dialing` slot. The
+/// cache asks again at the moment it hands a connection out (`refused_now`), which alone would keep
+/// a revoked device's connection from being reused — so the ordering is defence in depth, not an
+/// independent guard: moving the cache ahead of `hinted_addrs` fails no test on its own, and fails
+/// `a_raced_dial_never_reuses_a_connection_to_a_revoked_device` together with dropping that check.
+/// #229's close pass additionally closes the connection on the revoke verbs; a revocation written
+/// without one closes nothing, which is why neither in-cache guard relies on it.
+///
+/// The deadline keeps the race's own shape: every candidate gets its stagger slot plus a full
+/// `DIAL_TIMEOUT`, so a person with several devices is not cut short by a bound sized for one.
+async fn race_or_reuse(
+    mesh: &Arc<MeshState>,
+    candidates: Vec<[u8; 32]>,
+    service: &str,
+) -> Result<SessionTransport> {
+    let addrs = hinted_addrs(mesh, candidates).await?;
+    let peers: Vec<[u8; 32]> = addrs.iter().map(|a| *a.id.as_bytes()).collect();
+    let deadline = DIAL_TIMEOUT + DIAL_STAGGER * peers.len() as u32;
+    let endpoint = mesh.endpoint.clone();
+    let opened = mesh
+        .conn_cache
+        .session_on(
+            &peers,
+            deadline,
+            |id| refused_now(mesh.clone(), id),
+            || async move { race_dial(&endpoint, addrs, service).await },
+        )
+        .await?;
+    Ok(opened_session(mesh, opened))
+}
+
+/// [`dial_refused`] on the blocking pool, for the connection cache's hand-out check. A join error is
+/// an `Err`, which the cache treats as a refusal (fail closed) and reports as a failed check — not
+/// as a revocation, since nothing says the device was revoked.
+async fn refused_now(mesh: Arc<MeshState>, id: [u8; 32]) -> Result<bool> {
+    crate::util::blocking("join reuse revocation check", move || {
+        dial_refused(&mesh, &id)
+    })
+    .await
+}
+
+/// A session from the cache: a reused stream as is, a fresh connection with its path watcher.
+///
+/// One path watcher per CONNECTION: `decide` already suppresses repeat observations, so a watcher
+/// per session on a shared connection would only cost tasks.
+fn opened_session(mesh: &Arc<MeshState>, opened: super::conn_cache::Opened) -> SessionTransport {
+    match opened {
+        super::conn_cache::Opened::Reused(transport) => transport,
+        super::conn_cache::Opened::Fresh(transport, conn) => watch_session(mesh, transport, conn),
+    }
 }
 
 /// Attach the #92 item 2 path watcher to an OUTBOUND session and hand back the transport.
@@ -397,11 +488,9 @@ async fn dial_by_eid(
         .flatten()
         .and_then(|e| e.last_addr);
     let addr = stored_dial_addr(last_addr.as_deref(), endpoint_id);
-    let (transport, conn) =
-        connect_with_timeout(&mesh.endpoint, addr, service, DIAL_TIMEOUT, per_conn)
-            .await
-            .with_context(|| format!("dial eid:{hex}/{service}"))?;
-    Ok(watch_session(mesh, transport, conn))
+    dial_single(mesh, addr, service, per_conn)
+        .await
+        .with_context(|| format!("dial eid:{hex}/{service}"))
 }
 
 /// Assemble the single-nickname dial [`iroh::EndpointAddr`]: the stored `endpoint_id` plus,
@@ -1026,7 +1115,7 @@ where
 /// back, so no version gate is needed on either peer.
 ///
 /// The legacy spelling is DEPRECATED as of 0.51.0 and removed at 1.0.
-fn inject_service(mut frame: Value, service: &str) -> Value {
+pub(crate) fn inject_service(mut frame: Value, service: &str) -> Value {
     let Some(obj) = frame.as_object_mut() else {
         return frame;
     };
@@ -1455,6 +1544,7 @@ mod source_tests {
                         probed_at: 1,
                         meta: String::new(),
                         services: vec![],
+                        pong_at: Some(1),
                         seq: 0,
                         observed: 0,
                         path: mcpmesh_local_api::PeerPath::Unknown,

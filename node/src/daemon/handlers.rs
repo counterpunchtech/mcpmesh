@@ -1624,6 +1624,14 @@ pub(crate) async fn peer_services(
         entry.reachable,
         "peer '{peer}' is unreachable — cannot fetch its shared services"
     );
+    // #215: a reachable row with no pong holds no services at all — a session's path watcher wrote
+    // it, and the probe that should have filled it was refused by the peer's limiter or fetched
+    // nothing. Its empty list is "not asked", and answering it would tell the caller the peer
+    // offers nothing. Refuse, retryably, instead.
+    anyhow::ensure!(
+        entry.pong_at.is_some(),
+        "peer '{peer}' is reachable, but its shared services could not be fetched just now — retry"
+    );
     Ok(mcpmesh_local_api::PeerServicesResult {
         services: entry.services,
     })
@@ -6306,6 +6314,7 @@ allow = []
                 probed_at: crate::util::epoch_now_i64(),
                 meta: String::new(),
                 services: Vec::new(),
+                pong_at: Some(crate::util::epoch_now_i64()),
                 seq: 1,
                 observed: 1,
                 path: mcpmesh_local_api::PeerPath::Direct,

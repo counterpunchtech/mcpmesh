@@ -15,7 +15,11 @@ use super::MeshState;
 
 /// One cached reachability probe result (spec: pairing-mode liveness). Ephemeral, in-memory —
 /// stored in `MeshState::reachability`, keyed by endpoint-id. `probed_at` is epoch seconds.
+///
+/// `#[non_exhaustive]` (#215): construct one inside this crate only, so the next field added is
+/// not another breaking change for embedders that read these rows.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct ReachEntry {
     pub reachable: bool,
     pub rtt_ms: Option<u64>,
@@ -26,6 +30,15 @@ pub struct ReachEntry {
     /// The services this peer currently grants US (#52), read from its pong — the discovery
     /// answer. Only services whose allow admits our principal; empty if it shares nothing.
     pub services: Vec<String>,
+    /// When the pong that `meta` and `services` came from arrived (epoch seconds), or `None` when
+    /// this row carries no pong at all (#215 review).
+    ///
+    /// A live session's path watcher seeds a `reachable: true` row with empty `meta`/`services` and
+    /// a fresh `probed_at`. Without this field that row's empty `services` meant both "the peer
+    /// offers you nothing" and "nobody has asked yet", and `peer_services` answered the second as
+    /// the first — for a full TTL after every session-first flow, which is the ordinary embedder
+    /// flow once sessions share a connection.
+    pub pong_at: Option<i64>,
     /// Monotonic ticket taken when this probe STARTED (#58 review). Probes of one peer overlap
     /// routinely — `reachability_of` spawns a refresh per stale peer, and BOTH `status` and
     /// `subscribe` call it — and they complete out of order, so a slow probe that started earlier
@@ -143,6 +156,7 @@ pub async fn probe_peer(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> ReachEn
             probed_at: epoch_now_i64(),
             meta: String::new(),
             services: Vec::new(),
+            pong_at: None,
             seq,
             observed: seq,
             path: mcpmesh_local_api::PeerPath::Unknown,
@@ -166,6 +180,10 @@ pub async fn probe_peer(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> ReachEn
     // - The check below matches `Ok(Err(_))` only: a refusal whose CONNECTION_CLOSE arrives
     //   after PROBE_TIMEOUT surfaces as `Elapsed` and commits `reachable: false` normally — a
     //   lost close frame is indistinguishable from a dead peer, so that is the honest verdict.
+    //
+    // The previous entry may be a session path watcher's reachable row with no pong (#215). It is
+    // returned as it is, `pong_at: None` included — that field IS the "services unknown" flag, and
+    // `peer_services` refuses on it rather than answering `[]`.
     if let Ok(Err(e)) = &outcome
         && e.downcast_ref::<ProbeThrottled>().is_some()
     {
@@ -181,6 +199,7 @@ pub async fn probe_peer(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> ReachEn
             probed_at: epoch_now_i64(),
             meta: String::new(),
             services: Vec::new(),
+            pong_at: None,
             seq,
             // Never cached (that is the point of this arm), so no other probe ever compares
             // against it. It carries our own start ticket rather than a fresh one so the row is
@@ -201,12 +220,15 @@ pub async fn probe_peer(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> ReachEn
     let observed = mesh
         .probe_seq
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let probed_at = epoch_now_i64();
     let entry = ReachEntry {
         reachable,
         rtt_ms,
-        probed_at: epoch_now_i64(),
+        probed_at,
         meta,
         services,
+        // A reachable verdict here always came with a pong; an unreachable one never did.
+        pong_at: reachable.then_some(probed_at),
         seq,
         observed,
         path,
@@ -218,15 +240,27 @@ pub async fn probe_peer(mesh: &Arc<MeshState>, endpoint_id: [u8; 32]) -> ReachEn
             .reachability
             .lock()
             .expect("reachability lock not poisoned");
-        match cache.get(&endpoint_id) {
-            // A newer probe already landed. Drop ours and report THEIRS, so a caller never acts on
-            // a value the cache disagrees with.
-            Some(newer) if !supersedes(seq, newer) => Outcome::Superseded(newer.clone()),
+        match cache.get_mut(&endpoint_id) {
+            // A newer writer already landed. Drop our VERDICT and report THEIRS, so a caller never
+            // acts on a value the cache disagrees with — but keep our PONG if theirs carries none
+            // (#215 final review). The newer writer is routinely the session path watcher, whose
+            // first reading (#225) takes a later ticket than the probe `peer_services` just started
+            // and holds no `meta`/`services`; discarding the pong here answered `[]` right after a
+            // session opened, 9 runs out of 10. Only the payload and its `pong_at` move: the row's
+            // `probed_at` and tickets stay the winner's, so nothing about its freshness is forged.
+            Some(newer) if !supersedes(seq, newer) => {
+                if newer.reachable && newer.pong_at.is_none() && entry.pong_at.is_some() {
+                    newer.meta.clone_from(&entry.meta);
+                    newer.services.clone_from(&entry.services);
+                    newer.pong_at = entry.pong_at;
+                }
+                Outcome::Superseded(newer.clone())
+            }
             // #176: our probe started LATER, but it found nothing while a pong landed INSIDE our
             // window. Drop ours — see `contradicted_by`.
             Some(pong) if contradicted_by(&entry, seq, pong) => Outcome::Superseded(pong.clone()),
             other => {
-                let previous = other.cloned();
+                let previous = other.map(|e| e.clone());
                 cache.insert(endpoint_id, entry.clone());
                 Outcome::Committed(previous)
             }
@@ -1136,7 +1170,11 @@ pub(crate) async fn probe_peer_cached(mesh: &Arc<MeshState>, endpoint_id: [u8; 3
             .expect("reachability lock not poisoned");
         cache.get(&endpoint_id).and_then(|e| {
             let age = (epoch_now_i64() - e.probed_at).max(0);
-            (age <= REACH_TTL_SECS).then(|| e.clone())
+            // #215 review: a REACHABLE row must also carry a pong, because this verb's answer IS
+            // the pong's `services`. A live session's path watcher seeds a reachable row with none.
+            // An unreachable row has no services to be wrong about, so it keeps the plain TTL (#89).
+            let has_payload = !e.reachable || e.pong_at.is_some();
+            (age <= REACH_TTL_SECS && has_payload).then(|| e.clone())
         })
     };
     match fresh {
@@ -1265,6 +1303,7 @@ mod tests {
             probed_at: 1_700_000_000,
             meta: String::new(),
             services: Vec::new(),
+            pong_at: None,
             seq: 0,
             observed: 0,
             path: mcpmesh_local_api::PeerPath::Unknown,
@@ -2531,6 +2570,191 @@ mod tests {
             !admitted.contains(&"private".to_string()),
             "never a non-admitted service"
         );
+    }
+
+    /// #215 review: the ordinary embedder flow — open a session, THEN ask `peer_services`. The
+    /// session's path watcher seeds a fresh, reachable row with no pong; before the fix the verb
+    /// returned that row's empty list, indistinguishable from "offers nothing". The row is seeded
+    /// through `path_watch::commit_observation`, the real writer, so the fixture holds exactly what a
+    /// live daemon holds. Mutation: `probe_peer_cached` ignoring `pong_at` → `[]`, no ping dial.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn peer_services_after_a_session_opens_still_fetches_the_pong() {
+        use crate::daemon::conn_cache::testpeer::{
+            dialer_id, dialer_mesh, dialer_principal, loopback_peer,
+        };
+        use std::sync::atomic::Ordering;
+        let dir = tempfile::tempdir().unwrap();
+        let me = dialer_principal();
+        let peer = loopback_peer(dir.path(), 52, dialer_id(), &[("echo", &[me.as_str()])]).await;
+        let mesh = dialer_mesh(dir.path(), &peer).await;
+
+        let _session = crate::daemon::dial::dial_service(&mesh, "bob", "echo")
+            .await
+            .expect("session");
+        let seq = mesh
+            .probe_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::daemon::path_watch::commit_observation(
+            &mesh,
+            peer.id,
+            seq,
+            &mcpmesh_local_api::PeerPath::Direct,
+        )
+        .expect("precondition: the watcher seeds a fresh, pong-less row");
+
+        let got = super::probe_peer_cached(&mesh, peer.id).await;
+        assert_eq!(
+            got.services,
+            vec!["echo".to_string()],
+            "a row with no pong must not answer peer_services — `[]` here reads as 'offers nothing'"
+        );
+        assert_eq!(
+            peer.ping_accepts.load(Ordering::SeqCst),
+            1,
+            "the payload can only come from a ping dial"
+        );
+        assert!(
+            got.pong_at.is_some(),
+            "and the refreshed row now carries its pong"
+        );
+    }
+
+    /// #215 final review: the probe `peer_services` triggers LOSES the commit race to the path
+    /// watcher's reading, which takes a later ticket — so the pong it fetched was thrown away and
+    /// the caller got the watcher's pong-less row, `[]`. Deterministic: the watcher's row is seeded
+    /// through `commit_observation` with a ticket above anything the probe can draw, so the probe
+    /// is superseded every time. The pong must be merged into that row — without forging its
+    /// freshness. Mutation: drop the merge in the `Superseded` arm → `[]`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_superseded_probe_still_delivers_its_pong() {
+        use crate::daemon::conn_cache::testpeer::{
+            dialer_id, dialer_mesh, dialer_principal, loopback_peer,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let me = dialer_principal();
+        let peer = loopback_peer(dir.path(), 54, dialer_id(), &[("echo", &[me.as_str()])]).await;
+        let mesh = dialer_mesh(dir.path(), &peer).await;
+
+        let watcher_seq = 1u64 << 40;
+        crate::daemon::path_watch::commit_observation(
+            &mesh,
+            peer.id,
+            watcher_seq,
+            &mcpmesh_local_api::PeerPath::Direct,
+        )
+        .expect(
+            "precondition: the watcher seeds a pong-less row with a ticket the probe cannot beat",
+        );
+        let seeded = mesh
+            .reachability
+            .lock()
+            .unwrap()
+            .get(&peer.id)
+            .cloned()
+            .unwrap();
+
+        let got = super::probe_peer_cached(&mesh, peer.id).await;
+        assert_eq!(
+            got.services,
+            vec!["echo".to_string()],
+            "a superseded probe must still hand its pong to the caller"
+        );
+        let row = mesh
+            .reachability
+            .lock()
+            .unwrap()
+            .get(&peer.id)
+            .cloned()
+            .unwrap();
+        assert_eq!(row.services, vec!["echo".to_string()], "and to the cache");
+        assert!(row.pong_at.is_some(), "the cached row now carries a pong");
+        assert_eq!(
+            (row.seq, row.probed_at, row.observed),
+            (seeded.seq, seeded.probed_at, seeded.observed),
+            "the merge adds the payload only — it must not re-stamp the winning row's freshness or \
+             its ordering tickets"
+        );
+    }
+
+    /// The natural shape of the same race, as the reviewer ran it: open a session, then at once
+    /// ask for services. The path watcher's first reading (#225) races the probe; before the fix
+    /// this returned `[]` in 9 runs out of 10. Ten runs, each on a fresh node and peer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn peer_services_right_after_a_session_opens_returns_the_services_every_time() {
+        use crate::daemon::conn_cache::testpeer::{
+            dialer_id, dialer_mesh, dialer_principal, loopback_peer,
+        };
+        let me = dialer_principal();
+        for run in 0..10u8 {
+            let dir = tempfile::tempdir().unwrap();
+            let peer = loopback_peer(
+                dir.path(),
+                90 + run,
+                dialer_id(),
+                &[("echo", &[me.as_str()])],
+            )
+            .await;
+            let mesh = dialer_mesh(dir.path(), &peer).await;
+            let _session = crate::daemon::dial::dial_service(&mesh, "bob", "echo")
+                .await
+                .expect("session");
+            let got = super::probe_peer_cached(&mesh, peer.id).await;
+            assert_eq!(
+                got.services,
+                vec!["echo".to_string()],
+                "run {run}: services right after a session opens"
+            );
+        }
+    }
+
+    /// The throttle arm fetches no pong, so the row it returns may be the watcher's pong-less one.
+    /// `peer_services` must not answer `[]` from it — "offers nothing" is a claim this node cannot
+    /// make — but refuse, retryably. The peer answers every ping with the limiter's close.
+    /// Mutation: drop the pong check in `handlers::peer_services` → `Ok([])`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn peer_services_never_answers_empty_from_a_throttled_probe() {
+        use crate::daemon::conn_cache::testpeer::{
+            dialer_id, dialer_mesh, dialer_principal, loopback_peer_with,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let me = dialer_principal();
+        let peer = loopback_peer_with(
+            dir.path(),
+            55,
+            dialer_id(),
+            &[("echo", &[me.as_str()])],
+            None,
+            true,
+        )
+        .await;
+        let mesh = dialer_mesh(dir.path(), &peer).await;
+        let state = crate::control::DaemonState::with_mesh("test", mesh.clone());
+        let seq = mesh
+            .probe_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::daemon::path_watch::commit_observation(
+            &mesh,
+            peer.id,
+            seq,
+            &mcpmesh_local_api::PeerPath::Direct,
+        )
+        .expect("precondition: a pong-less reachable row");
+
+        let got = crate::daemon::handlers::peer_services(&state, "bob".into()).await;
+        match got {
+            Ok(r) => panic!(
+                "a throttled probe fetched no services; answering {:?} claims the peer offers \
+                 nothing",
+                r.services
+            ),
+            Err(e) => {
+                let msg = format!("{e:#}");
+                assert!(
+                    msg.contains("could not be fetched"),
+                    "the refusal says the answer is unknown, not empty: {msg}"
+                );
+            }
+        }
     }
 
     #[test]

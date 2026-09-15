@@ -30,8 +30,9 @@
 //! **One registry for every OUTBOUND sever.** Connections this node DIALS — `open_session`,
 //! embedder `connect_protocol` connections, gossip links it opened — land here; [`close_refused`] is
 //! what the revoke paths call. INBOUND connections are not registered: the accept loop's
-//! `ConnRegistry` already tracks and severs them, and counts them in `severed`. This registry will
-//! supersede the #215 MCP connection cache's own close-on-revoke once that lands on top of it.
+//! `ConnRegistry` already tracks and severs them, and counts them in `severed`. It is also what closes
+//! the #215 MCP connection cache's shared connections on revoke: the cache has no close path of its
+//! own, and a connection this pass closes reads as dead to it.
 //!
 //! **Cost.** Nothing runs for an inbound connection, so a stranger's handshake costs this module
 //! nothing. Each outbound non-pair dial costs two blocking-pool hops (`before_connect`, and the
